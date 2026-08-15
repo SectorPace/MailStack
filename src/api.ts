@@ -1,0 +1,4 @@
+let csrf='';
+export async function login(username:string,password:string){const r=await fetch('/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username,password})});if(!r.ok)throw new Error('LOGIN_FAILED');const j=await r.json();csrf=j.csrf;return j}
+export async function api(path:string,init:RequestInit={}){const method=init.method||'GET';const headers:any={'content-type':'application/json',...(init.headers||{})};if(!['GET','HEAD'].includes(method))headers['x-csrf-token']=csrf;const r=await fetch(path,{...init,headers});if(r.status===401)throw new Error('AUTH_REQUIRED');const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.message||j.error||'REQUEST_FAILED');return j}
+export async function session(){const r=await fetch('/api/auth/session');if(!r.ok)return false;const j=await r.json();csrf=j.csrf;return true}

@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+CTL=/opt/mailstack/backend/mailstackctl.py
+need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || exec sudo -- "$0" "$@"; }
+admin_change(){
+  local user p1 p2
+  read -r -p '新管理员用户名 [admin]: ' user; user=${user:-admin}
+  while :; do
+    read -r -s -p '新管理员密码（至少 12 个字符）: ' p1; echo
+    read -r -s -p '再次输入新密码: ' p2; echo
+    [[ $p1 == "$p2" ]] || { echo '两次密码不一致。'; continue; }
+    [[ ${#p1} -ge 12 ]] || { echo '密码至少 12 个字符。'; continue; }
+    break
+  done
+  printf '{"action":"admin.set","data":{"username":%s,"password":%s}}\n' "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$user")" "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$p1")" | "$CTL"
+  systemctl restart mailstack-web
+  echo '管理员账户已更新，所有 Web 会话已失效。'
+}
+change_port(){
+  local port bind
+  read -r -p '管理端口 [8787]: ' port; port=${port:-8787}
+  [[ $port =~ ^[0-9]+$ ]] && ((port>=1024 && port<=65535)) || { echo '端口必须为 1024-65535。'; return 1; }
+  read -r -p '监听地址 [127.0.0.1]: ' bind; bind=${bind:-127.0.0.1}
+  [[ $bind == 127.0.0.1 || $bind == ::1 || $bind == 0.0.0.0 ]] || { echo '只允许 127.0.0.1、::1 或 0.0.0.0。'; return 1; }
+  if [[ $bind == 0.0.0.0 ]]; then read -r -p '公网监听有风险，输入 PUBLIC 确认: ' x; [[ $x == PUBLIC ]] || return 1; fi
+  sed -i -E "s/^Environment=PORT=.*/Environment=PORT=$port/;s/^Environment=HOST=.*/Environment=HOST=$bind/" /etc/systemd/system/mailstack-web.service
+  systemctl daemon-reload; systemctl restart mailstack-web
+  echo "后台监听: $bind:$port"
+}
+menu(){
+ while :; do
+  clear || true
+  cat <<'EOF'
+MailStack VPS 管理菜单
+
+1) 查看服务状态
+2) 重启管理后台
+3) 查看管理后台日志
+4) 修改管理员用户名和密码
+5) 修改管理监听地址和端口
+6) 查看邮件服务状态
+7) 查看邮件队列
+8) 刷新邮件队列
+9) 运行安全扫描
+10) 显示后台访问方式
+0) 退出
+EOF
+  read -r -p '请选择: ' n
+  case $n in
+   1) systemctl --no-pager status mailstack-web || true;;
+   2) systemctl restart mailstack-web; echo '已重启';;
+   3) journalctl -u mailstack-web -n 100 --no-pager;;
+   4) admin_change;;
+   5) change_port;;
+   6) systemctl --no-pager status postfix dovecot || true;;
+   7) postqueue -p || true;;
+   8) postqueue -f; echo '已提交刷新';;
+   9) printf '{"action":"security.scan","data":{}}\n' | "$CTL" | python3 -m json.tool;;
+   10) grep -E '^Environment=(HOST|PORT)=' /etc/systemd/system/mailstack-web.service; echo '推荐使用 SSH 隧道访问。';;
+   0) return;; *) echo '无效选项';;
+  esac
+  read -r -p '按 Enter 继续...' _
+ done
+}
+need_root "$@"
+case ${1:-menu} in menu) menu;; admin) admin_change;; port) change_port;; status) systemctl --no-pager status mailstack-web;; logs) journalctl -u mailstack-web -f;; *) echo '用法: mailstack [menu|admin|port|status|logs]'; exit 1;; esac
