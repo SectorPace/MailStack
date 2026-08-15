@@ -10,3 +10,7 @@ dist/
 coverage/
 .vscode/
 .idea/
+
+# Python cache
+__pycache__/
+*.py[cod]

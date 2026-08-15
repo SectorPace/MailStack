@@ -136,5 +136,23 @@ systemctl is-active --quiet mailstack-web || { journalctl -u mailstack-web -n 80
 HEALTH_HOST='127.0.0.1'
 [[ $ADMIN_HOST == '::1' ]] && HEALTH_HOST='[::1]'
 curl -fsS "http://$HEALTH_HOST:$ADMIN_PORT/api/health" >/dev/null || { echo '后台健康检查失败'; journalctl -u mailstack-web -n 80 --no-pager; exit 1; }
-printf '\n安装完成。管理员: %s\n监听地址: %s:%s\n快捷命令: mailstack\n' "$ADMIN_USER" "$ADMIN_HOST" "$ADMIN_PORT"
-[[ $ADMIN_HOST == 127.0.0.1 ]] && echo "SSH 隧道: ssh -L $ADMIN_PORT:127.0.0.1:$ADMIN_PORT root@服务器IP"
+PUBLIC_IP=$(
+  curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null \
+  || hostname -I 2>/dev/null | awk '{print $1}'
+)
+
+printf '\n安装完成。\n'
+printf '管理员：%s\n' "$ADMIN_USER"
+
+if [[ $ADMIN_HOST == "0.0.0.0" ]]; then
+  printf '后台地址：http://%s:%s\n' "${PUBLIC_IP:-VPS公网IP}" "$ADMIN_PORT"
+else
+  printf '后台地址：http://%s:%s\n' "$ADMIN_HOST" "$ADMIN_PORT"
+fi
+
+printf '快捷命令：ms（兼容命令：mailstack）\n'
+
+if [[ $ADMIN_HOST == "0.0.0.0" ]]; then
+  printf '提示：请确认云安全组和服务器防火墙已放行 TCP %s。\n' "$ADMIN_PORT"
+  printf '安全建议：请尽快配置 HTTPS 和访问来源限制。\n'
+fi
