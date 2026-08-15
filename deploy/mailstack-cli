@@ -8,7 +8,14 @@ SERVICE=mailstack-web
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then exec sudo -- "$0" "$@"; fi
 
-C0='\033[0m'; B='\033[1m'; RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; CYAN='\033[36m'; GRAY='\033[90m'
+C0=$(tput sgr0 2>/dev/null || true)
+B=$(tput bold 2>/dev/null || true)
+RED=$(tput setaf 1 2>/dev/null || true)
+GREEN=$(tput setaf 2 2>/dev/null || true)
+YELLOW=$(tput setaf 3 2>/dev/null || true)
+BLUE=$(tput setaf 4 2>/dev/null || true)
+CYAN=$(tput setaf 6 2>/dev/null || true)
+GRAY=$(tput setaf 8 2>/dev/null || true)
 line(){ printf "${BLUE}%*s${C0}\n" 72 '' | tr ' ' '='; }
 section(){ printf "\n${CYAN}${B}[%s]${C0}\n" "$1"; }
 ok(){ printf "${GREEN}✓ %s${C0}\n" "$*"; }
