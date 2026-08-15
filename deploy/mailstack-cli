@@ -1,66 +1,233 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+VERSION="v0.1-beta1"
 CTL=/opt/mailstack/backend/mailstackctl.py
-need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || exec sudo -- "$0" "$@"; }
-admin_change(){
-  local user p1 p2
-  read -r -p '新管理员用户名 [admin]: ' user; user=${user:-admin}
-  while :; do
-    read -r -s -p '新管理员密码（至少 12 个字符）: ' p1; echo
-    read -r -s -p '再次输入新密码: ' p2; echo
-    [[ $p1 == "$p2" ]] || { echo '两次密码不一致。'; continue; }
-    [[ ${#p1} -ge 12 ]] || { echo '密码至少 12 个字符。'; continue; }
-    break
-  done
-  printf '{"action":"admin.set","data":{"username":%s,"password":%s}}\n' "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$user")" "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$p1")" | "$CTL"
-  systemctl restart mailstack-web
-  echo '管理员账户已更新，所有 Web 会话已失效。'
-}
-change_port(){
-  local port bind
-  read -r -p '管理端口 [8787]: ' port; port=${port:-8787}
-  [[ $port =~ ^[0-9]+$ ]] && ((port>=1024 && port<=65535)) || { echo '端口必须为 1024-65535。'; return 1; }
-  read -r -p '监听地址 [0.0.0.0]: ' bind; bind=${bind:-0.0.0.0}
-  [[ $bind == 127.0.0.1 || $bind == ::1 || $bind == 0.0.0.0 ]] || { echo '只允许 127.0.0.1、::1 或 0.0.0.0。'; return 1; }
-  if [[ $bind == 0.0.0.0 ]]; then read -r -p '公网监听有风险，输入 PUBLIC 确认: ' x; [[ $x == PUBLIC ]] || return 1; fi
-  sed -i -E "s/^Environment=PORT=.*/Environment=PORT=$port/;s/^Environment=HOST=.*/Environment=HOST=$bind/" /etc/systemd/system/mailstack-web.service
-  systemctl daemon-reload; systemctl restart mailstack-web
-  echo "后台监听: $bind:$port"
-}
-menu(){
- while :; do
-  clear || true
-  cat <<'EOF'
-MailStack VPS 管理菜单
+SOURCE_DIR=/opt/mailstack-source
+BACKUP_DIR=/var/backups/mailstack
+SERVICE=mailstack-web
 
-1) 查看服务状态
-2) 重启管理后台
-3) 查看管理后台日志
-4) 修改管理员用户名和密码
-5) 修改管理监听地址和端口
-6) 查看邮件服务状态
-7) 查看邮件队列
-8) 刷新邮件队列
-9) 运行安全扫描
-10) 显示后台访问方式
-0) 退出
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then exec sudo -- "$0" "$@"; fi
+
+C0='\033[0m'; B='\033[1m'; RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; CYAN='\033[36m'; GRAY='\033[90m'
+line(){ printf "${BLUE}%*s${C0}\n" 72 '' | tr ' ' '='; }
+section(){ printf "\n${CYAN}${B}[%s]${C0}\n" "$1"; }
+ok(){ printf "${GREEN}✓ %s${C0}\n" "$*"; }
+warn(){ printf "${YELLOW}! %s${C0}\n" "$*"; }
+fail(){ printf "${RED}✗ %s${C0}\n" "$*"; }
+pause(){ read -r -p '按 Enter 返回菜单...' _; }
+confirm(){ local word=${2:-YES} answer; read -r -p "$1 输入 $word 确认: " answer; [[ $answer == "$word" ]]; }
+unit_state(){ systemctl is-active "$1" 2>/dev/null || true; }
+port_value(){ sed -n 's/^Environment=PORT=//p' /etc/systemd/system/mailstack-web.service 2>/dev/null | tail -n1; }
+bind_value(){ sed -n 's/^Environment=HOST=//p' /etc/systemd/system/mailstack-web.service 2>/dev/null | tail -n1; }
+public_ip(){ curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}'; }
+
+banner(){
+ clear 2>/dev/null || true
+ printf "${BLUE}${B}"
+ cat <<'EOF'
+ __  __       _ _ ____  _             _    
+|  \/  | __ _(_) / ___|| |_ __ _  ___| | __
+| |\/| |/ _` | | \___ \| __/ _` |/ __| |/ /
+| |  | | (_| | | |___) | || (_| | (__|   < 
+|_|  |_|\__,_|_|_|____/ \__\__,_|\___|_|\_\
 EOF
-  read -r -p '请选择: ' n
-  case $n in
-   1) systemctl --no-pager status mailstack-web || true;;
-   2) systemctl restart mailstack-web; echo '已重启';;
-   3) journalctl -u mailstack-web -n 100 --no-pager;;
-   4) admin_change;;
-   5) change_port;;
-   6) systemctl --no-pager status postfix dovecot || true;;
-   7) postqueue -p || true;;
-   8) postqueue -f; echo '已提交刷新';;
-   9) printf '{"action":"security.scan","data":{}}\n' | "$CTL" | python3 -m json.tool;;
-   10) grep -E '^Environment=(HOST|PORT)=' /etc/systemd/system/mailstack-web.service; echo '推荐使用 SSH 隧道访问。';;
-   0) return;; *) echo '无效选项';;
-  esac
-  read -r -p '按 Enter 继续...' _
+ printf "${C0}"
+ line
+ printf "${B}MailStack VPS 管理中心 · 快捷命令 ms${C0}  ${CYAN}%s${C0}\n" "$VERSION"
+}
+
+summary(){
+ local host port state os kernel arch mem disk ip
+ host=$(bind_value); host=${host:-0.0.0.0}; port=$(port_value); port=${port:-8787}; state=$(unit_state "$SERVICE")
+ os=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown Linux}")
+ kernel=$(uname -r); arch=$(uname -m); mem=$(free -h 2>/dev/null | awk '/Mem:/{print $3 "/" $2}'); disk=$(df -h / | awk 'NR==2{print $3 "/" $2 " (" $5 ")"}'); ip=$(public_ip)
+ printf "系统: ${CYAN}%s${C0}  内核: %s  架构: %s\n" "$os" "$kernel" "$arch"
+ printf "内存: %s  根分区: %s\n" "${mem:-N/A}" "${disk:-N/A}"
+ if [[ $state == active ]]; then printf "后台: ${GREEN}运行中${C0}"; else printf "后台: ${RED}%s${C0}" "${state:-未安装}"; fi
+ printf "  监听: ${YELLOW}%s:%s${C0}\n" "$host" "$port"
+ [[ -n ${ip:-} ]] && printf "访问: ${GREEN}http://%s:%s${C0}\n" "$ip" "$port"
+ line
+}
+
+show_status(){ systemctl --no-pager --full status "$SERVICE" || true; }
+restart_web(){ systemctl restart "$SERVICE"; systemctl is-active --quiet "$SERVICE" && ok '管理后台已重启' || fail '重启失败'; }
+start_web(){ systemctl start "$SERVICE"; ok '启动命令已执行'; }
+stop_web(){ confirm '将关闭 Web 管理后台。' STOP || return; systemctl stop "$SERVICE"; ok '管理后台已停止'; }
+logs_web(){ journalctl -u "$SERVICE" -n 150 --no-pager; }
+logs_live(){ echo '按 Ctrl+C 退出实时日志'; journalctl -u "$SERVICE" -f; }
+
+admin_change(){
+ local user p1 p2 payload
+ read -r -p '新管理员用户名 [admin]: ' user; user=${user:-admin}
+ while :; do
+   read -r -s -p '新密码（至少 12 个字符）: ' p1; echo
+   read -r -s -p '再次输入新密码: ' p2; echo
+   [[ $p1 == "$p2" ]] || { warn '两次密码不一致'; continue; }
+   [[ ${#p1} -ge 12 ]] || { warn '密码不足 12 个字符'; continue; }
+   break
+ done
+ payload=$(python3 - "$user" "$p1" <<'PY'
+import json,sys
+print(json.dumps({'action':'admin.set','data':{'username':sys.argv[1],'password':sys.argv[2]}}))
+PY
+)
+ printf '%s\n' "$payload" | "$CTL" >/dev/null
+ unset p1 p2 payload
+ systemctl restart "$SERVICE"
+ ok '管理员账户已更新，全部旧 Web 会话已失效'
+}
+
+change_port(){
+ local port bind x
+ read -r -p "管理端口 [$(port_value | grep . || echo 8787)]: " port; port=${port:-$(port_value)}; port=${port:-8787}
+ [[ $port =~ ^[0-9]+$ ]] && ((port>=1024 && port<=65535)) || { fail '端口必须为 1024-65535'; return 1; }
+ read -r -p "监听地址 [$(bind_value | grep . || echo 0.0.0.0)]: " bind; bind=${bind:-$(bind_value)}; bind=${bind:-0.0.0.0}
+ [[ $bind == 127.0.0.1 || $bind == ::1 || $bind == 0.0.0.0 ]] || { fail '只允许 127.0.0.1、::1 或 0.0.0.0'; return 1; }
+ sed -i -E "s/^Environment=PORT=.*/Environment=PORT=$port/;s/^Environment=HOST=.*/Environment=HOST=$bind/" /etc/systemd/system/mailstack-web.service
+ systemctl daemon-reload; systemctl restart "$SERVICE"
+ ok "后台监听已改为 $bind:$port"
+ [[ $bind == 0.0.0.0 ]] && warn "请在云安全组和防火墙放行 TCP $port"
+}
+
+health_check(){
+ local port host
+ port=$(port_value); port=${port:-8787}; host=127.0.0.1
+ section 'Web 与 API'
+ systemctl is-active --quiet "$SERVICE" && ok 'mailstack-web 正在运行' || fail 'mailstack-web 未运行'
+ curl -fsS "http://$host:$port/api/health" && echo && ok '健康接口正常' || fail '健康接口失败'
+ curl -s -o /dev/null -w '未登录 Session HTTP 状态: %{http_code}\n' "http://$host:$port/api/auth/session" || true
+ section '构建文件'
+ [[ -s /opt/mailstack/ui/dist/index.html ]] && ok '前端 index.html 存在' || fail '缺少前端构建文件'
+ [[ -s /opt/mailstack/server.cjs ]] && ok '生产 API 构建文件存在' || fail '缺少 server.cjs'
+ section '管理员配置'
+ [[ -s /etc/mailstack/admin.json ]] && ok '管理员配置存在' || fail '缺少管理员配置'
+}
+
+mail_status(){
+ for u in postfix dovecot opendkim rspamd clamav-daemon fail2ban; do
+   if systemctl list-unit-files "$u.service" >/dev/null 2>&1; then
+     printf '%-18s %s\n' "$u" "$(unit_state "$u")"
+   else printf '%-18s %s\n' "$u" '未安装'; fi
  done
 }
-need_root "$@"
-case ${1:-menu} in menu) menu;; admin) admin_change;; port) change_port;; status) systemctl --no-pager status mailstack-web;; logs) journalctl -u mailstack-web -f;; *) echo '用法: mailstack [menu|admin|port|status|logs]'; exit 1;; esac
+restart_mail(){
+ local u
+ for u in postfix dovecot opendkim rspamd clamav-daemon; do systemctl try-restart "$u" 2>/dev/null || true; done
+ ok '已尝试重启已安装的邮件服务'
+}
+queue_show(){ postqueue -p 2>/dev/null || warn 'Postfix 未安装或不可用'; }
+queue_flush(){ postqueue -f; ok '队列刷新请求已提交'; }
+queue_delete_deferred(){ confirm '将删除全部 deferred 邮件，操作不可撤销。' DELETE || return; postsuper -d ALL deferred; }
+mail_logs(){ journalctl -u postfix -u dovecot -u opendkim -n 200 --no-pager; }
+
+security_scan(){ printf '{"action":"security.scan","data":{}}\n' | "$CTL" | python3 -m json.tool; }
+firewall_status(){
+ command -v ufw >/dev/null && ufw status verbose || true
+ command -v firewall-cmd >/dev/null && firewall-cmd --list-all || true
+ command -v nft >/dev/null && nft list ruleset 2>/dev/null | sed -n '1,160p' || true
+}
+network_info(){ ip -brief address; echo; ss -lntup; }
+
+backup_create(){
+ install -d -m 0700 "$BACKUP_DIR"
+ local file="$BACKUP_DIR/mailstack-$(date +%Y%m%d-%H%M%S).tar.gz" items=()
+ for p in /etc/mailstack /etc/postfix /etc/dovecot /etc/opendkim /etc/systemd/system/mailstack-web.service /opt/mailstack; do [[ -e $p ]] && items+=("${p#/}"); done
+ (cd / && tar -czf "$file" "${items[@]}")
+ chmod 0600 "$file"; ok "备份已创建: $file"; ls -lh "$file"
+}
+backup_list(){ install -d -m 0700 "$BACKUP_DIR"; ls -lh "$BACKUP_DIR" || true; }
+backup_restore(){
+ local file
+ backup_list; read -r -p '输入要恢复的完整备份路径: ' file
+ [[ -f $file ]] || { fail '备份不存在'; return 1; }
+ confirm '恢复会覆盖现有 MailStack 和邮件配置。' RESTORE || return
+ systemctl stop "$SERVICE" 2>/dev/null || true
+ tar -xzf "$file" -C /
+ systemctl daemon-reload; systemctl restart "$SERVICE"
+ ok '备份已恢复，请立即检查服务和配置'
+}
+
+update_system(){
+ if command -v apt-get >/dev/null; then apt-get update && apt-get upgrade -y
+ elif command -v dnf >/dev/null; then dnf upgrade -y
+ elif command -v yum >/dev/null; then yum update -y
+ else warn '当前包管理器未自动支持'; return 1; fi
+}
+update_mailstack(){
+ [[ -d $SOURCE_DIR ]] || { fail '缺少 /opt/mailstack-source'; return 1; }
+ if [[ -d $SOURCE_DIR/.git ]]; then git -C "$SOURCE_DIR" pull --ff-only; fi
+ bash "$SOURCE_DIR/deploy/install.sh" --reuse-admin
+ ok 'MailStack 更新完成'
+}
+repair_install(){
+ [[ -x $SOURCE_DIR/deploy/install.sh ]] || { fail '缺少安装源，请重新 git clone'; return 1; }
+ bash "$SOURCE_DIR/deploy/install.sh" --reuse-admin
+}
+
+uninstall_program(){
+ warn '卸载程序将停止并删除 Web 后台，但保留 /etc/mailstack 和邮件数据。'
+ confirm '确认卸载 MailStack 程序。' UNINSTALL || return
+ systemctl disable --now "$SERVICE" 2>/dev/null || true
+ rm -f /etc/systemd/system/mailstack-web.service /etc/sudoers.d/mailstack-web /usr/local/bin/mailstack /usr/local/bin/ms
+ rm -rf /opt/mailstack /opt/mailstack-source
+ systemctl daemon-reload
+ ok 'MailStack 程序已卸载，管理配置和邮件数据已保留'
+ exit 0
+}
+purge_mailstack(){
+ fail '彻底清除将删除 MailStack 程序、/etc/mailstack 配置和管理凭据。'
+ warn 'Postfix、Dovecot、Linux 用户及邮箱数据默认仍不删除。'
+ confirm '确认彻底清除 MailStack 管理组件。' PURGE-MAILSTACK || return
+ systemctl disable --now "$SERVICE" 2>/dev/null || true
+ rm -f /etc/systemd/system/mailstack-web.service /etc/sudoers.d/mailstack-web /usr/local/bin/mailstack /usr/local/bin/ms
+ rm -rf /opt/mailstack /opt/mailstack-source /etc/mailstack
+ systemctl daemon-reload
+ ok 'MailStack 管理组件已彻底清除，邮件服务和邮箱数据未删除'
+ exit 0
+}
+
+menu(){
+ while :; do
+  banner; summary
+  cat <<EOF
+${CYAN}${B}后台管理${C0}
+ 1) 查看后台状态        2) 启动后台          3) 停止后台
+ 4) 重启后台            5) 查看最近日志      6) 实时日志
+ 7) 修改管理员账户      8) 修改监听地址/端口 9) 后台健康诊断
+
+${CYAN}${B}邮件系统${C0}
+10) 邮件服务状态       11) 重启邮件服务     12) 查看邮件队列
+13) 刷新邮件队列       14) 清空延迟队列     15) 查看邮件日志
+
+${CYAN}${B}安全与网络${C0}
+16) 运行安全扫描       17) 防火墙状态       18) 网络与监听端口
+
+${CYAN}${B}备份与维护${C0}
+19) 创建配置备份       20) 查看备份         21) 恢复备份
+22) 更新 MailStack     23) 修复/重新安装    24) 更新系统软件包
+
+${RED}${B}卸载与清除${C0}
+25) 卸载程序并保留配置 26) 彻底清除管理组件
+
+27) 显示系统摘要        28) 显示版本与路径     0) 退出
+EOF
+  line; read -r -p '请选择: ' n
+  case $n in
+   1) show_status;; 2) start_web;; 3) stop_web;; 4) restart_web;; 5) logs_web;; 6) logs_live;;
+   7) admin_change;; 8) change_port;; 9) health_check;; 10) mail_status;; 11) restart_mail;;
+   12) queue_show;; 13) queue_flush;; 14) queue_delete_deferred;; 15) mail_logs;; 16) security_scan;;
+   17) firewall_status;; 18) network_info;; 19) backup_create;; 20) backup_list;; 21) backup_restore;;
+   22) update_mailstack;; 23) repair_install;; 24) update_system;; 25) uninstall_program;; 26) purge_mailstack;;
+   27) summary;; 28) echo "版本: $VERSION"; echo "运行目录: /opt/mailstack"; echo "源码目录: $SOURCE_DIR"; echo "配置目录: /etc/mailstack";;
+   0) exit 0;; *) warn '无效选项';;
+  esac
+  pause
+ done
+}
+
+case ${1:-menu} in
+ menu) menu;; admin) admin_change;; port) change_port;; status) show_status;; logs) logs_live;;
+ health) health_check;; backup) backup_create;; update) update_mailstack;; repair) repair_install;;
+ uninstall) uninstall_program;; purge) purge_mailstack;; version) echo "$VERSION";;
+ *) echo '用法: mailstack [menu|admin|port|status|logs|health|backup|update|repair|uninstall|purge|version]'; exit 1;;
+esac

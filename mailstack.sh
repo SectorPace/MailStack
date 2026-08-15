@@ -30,11 +30,13 @@ MailStack ${VERSION}
   --non-interactive
 
 安装完成后的快捷命令：
-  mailstack
-  mailstack admin
-  mailstack port
-  mailstack status
-  mailstack logs
+  ms
+  ms admin
+  ms port
+  ms status
+  ms logs
+
+兼容命令：mailstack
 EOF
 }
 copy_source(){
@@ -49,7 +51,7 @@ install_cmd(){
   copy_source
   green "正在运行 MailStack 安装器..."
   bash "$INSTALL_DIR/deploy/install.sh" "$@"
-  green "安装完成。以后在 VPS 直接运行：mailstack"
+  green "安装完成。以后在 VPS 直接运行：ms"
 }
 update_cmd(){
   need_root update
@@ -70,7 +72,7 @@ uninstall_cmd(){
   local purge=0
   [[ ${1:-} == --purge ]] && purge=1
   systemctl disable --now mailstack-web 2>/dev/null || true
-  rm -f /etc/systemd/system/mailstack-web.service /etc/sudoers.d/mailstack-web /usr/local/bin/mailstack
+  rm -f /etc/systemd/system/mailstack-web.service /etc/sudoers.d/mailstack-web /usr/local/bin/mailstack /usr/local/bin/ms
   systemctl daemon-reload
   rm -rf /opt/mailstack /opt/mailstack-source
   if ((purge)); then
@@ -87,9 +89,9 @@ case "$cmd" in
   uninstall) uninstall_cmd "$@";;
   status) need_root status; systemctl --no-pager status mailstack-web || true;;
   logs) need_root logs; journalctl -u mailstack-web -f;;
-  admin) need_root admin; /usr/local/bin/mailstack admin;;
-  port) need_root port; /usr/local/bin/mailstack port;;
-  menu) need_root menu; /usr/local/bin/mailstack menu;;
+  admin) need_root admin; /usr/local/bin/ms admin;;
+  port) need_root port; /usr/local/bin/ms port;;
+  menu) need_root menu; /usr/local/bin/ms menu;;
   version|-v|--version) echo "$VERSION";;
   help|-h|--help) usage;;
   *) red "未知命令：$cmd"; usage; exit 1;;
