@@ -38,10 +38,11 @@ MailStack ${VERSION}
 EOF
 }
 copy_source(){
+  rm -rf "$INSTALL_DIR"
   mkdir -p "$INSTALL_DIR"
-  rsync -a --delete \
-    --exclude .git --exclude node_modules --exclude dist \
-    "$(dirname "$SELF")/" "$INSTALL_DIR/"
+  tar -C "$(dirname "$SELF")" \
+    --exclude=.git --exclude=node_modules --exclude=dist \
+    -cf - . | tar -C "$INSTALL_DIR" -xf -
 }
 install_cmd(){
   need_root install "$@"
@@ -58,7 +59,9 @@ update_cmd(){
   trap 'rm -rf "$tmp"' EXIT
   green "正在从 GitHub 获取最新版本..."
   git clone --depth 1 "$REPO_URL" "$tmp/repo"
-  rsync -a --delete --exclude .git --exclude node_modules --exclude dist "$tmp/repo/" "$INSTALL_DIR/"
+  rm -rf "$INSTALL_DIR"
+  mkdir -p "$INSTALL_DIR"
+  tar -C "$tmp/repo" --exclude=.git --exclude=node_modules --exclude=dist -cf - . | tar -C "$INSTALL_DIR" -xf -
   bash "$INSTALL_DIR/deploy/install.sh" --reuse-admin
   green "更新完成。"
 }
