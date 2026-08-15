@@ -156,9 +156,90 @@ def security_scan():
   if os.path.exists(p) and os.stat(p).st_mode & 0o077: add('AUTH_FAIL',p+' permissions are too broad','high')
  if not certs(): add('DNS_WARN','No MailStack-managed TLS certificate found','medium')
  return {'score':max(0,100-len(events)*12),'events':events}
+
+SETUP_CONFIG=ETC/'setup.json'
+def valid_ip(value):
+ try: return str(ipaddress.ip_address(str(value)))
+ except Exception: raise ValueError('invalid server IP address')
+def setup_identity(data):
+ domain=str(data.get('domain','')).strip().lower(); host=str(data.get('mailHost','')).strip().lower(); ip=valid_ip(data.get('serverIp',''))
+ if not DOMAIN_RE.fullmatch(domain) or not DOMAIN_RE.fullmatch(host) or not host.endswith('.'+domain): raise ValueError('invalid domain or mail hostname')
+ run(['postconf','-e',f'myhostname = {host}']); run(['postconf','-e',f'mydomain = {domain}']); run(['postfix','check']); run(['systemctl','reload','postfix'])
+ keydir=pathlib.Path('/etc/opendkim/keys')/domain; keydir.mkdir(parents=True,exist_ok=True)
+ pub=''
+ if run(['which','opendkim-genkey'],check=False).returncode==0:
+  run(['opendkim-genkey','-b','2048','-D',str(keydir),'-d',domain,'-s','mail']); os.chmod(keydir/'mail.private',0o600)
+  raw=(keydir/'mail.txt').read_text(); match=re.search(r'p=([^"\s)]+)',raw); pub=match.group(1) if match else ''
+ cfg={'domain':domain,'mailHost':host,'serverIp':ip,'postmaster':str(data.get('postmaster') or 'postmaster@'+domain),'dkimSelector':'mail','updatedAt':datetime.datetime.now().isoformat()}
+ atomic(SETUP_CONFIG,json.dumps(cfg,indent=2)+'\n',0o600); return {'applied':True,'identity':cfg,'dkimPublicKey':pub}
+def dig(name,typ):
+ p=run(['dig','+short',typ,name],check=False,timeout=15); return [x.strip().strip('"') for x in p.stdout.splitlines() if x.strip()]
+def setup_dns_verify(data):
+ domain=str(data.get('domain','')).lower(); host=str(data.get('mailHost','')).lower(); ip=valid_ip(data.get('serverIp','')); selector=str(data.get('dkimSelector','mail'))
+ if not DOMAIN_RE.fullmatch(domain) or not DOMAIN_RE.fullmatch(host): raise ValueError('invalid domain')
+ expected_spf=str(data.get('expectedSpf','')).strip(); relay=str(data.get('selectedRelay','direct')); ses_from=str(data.get('sesMailFrom','')); ses_region=str(data.get('sesRegion','us-east-1'))
+ observed={'a':dig(host,'A'),'mx':dig(domain,'MX'),'spf':dig(domain,'TXT'),'dkim':dig(f'{selector}._domainkey.{domain}','TXT'),'dmarc':dig(f'_dmarc.{domain}','TXT')}
+ spf_records=[x for x in observed['spf'] if x.startswith('v=spf1')]
+ checks={'a':ip in observed['a'],'mx':any(host in x for x in observed['mx']),'spfSingle':len(spf_records)==1,'spfExpected':bool(expected_spf) and expected_spf in spf_records,'dkim':any('v=DKIM1' in x and re.search(r'p=[A-Za-z0-9+/]{100,}={0,2}',x) for x in observed['dkim']),'dmarc':any(x.startswith('v=DMARC1') and 'rua=mailto:' in x for x in observed['dmarc'])}
+ if relay=='ses':
+  observed['sesMx']=dig(ses_from,'MX'); observed['sesSpf']=dig(ses_from,'TXT'); ses_spf=[x for x in observed['sesSpf'] if x.startswith('v=spf1')]
+  checks['sesMailFromMx']=any(f'feedback-smtp.{ses_region}.amazonses.com' in x for x in observed['sesMx']); checks['sesMailFromSpf']=len(ses_spf)==1 and 'include:amazonses.com' in ses_spf[0]
+ return {'verified':all(checks.values()),'checks':checks,'observed':observed,'spfRecordCount':len(spf_records)}
+def setup_relay(data):
+ import smtplib
+ host=str(data.get('host','')).strip(); port=int(data.get('port',587)); user=str(data.get('username','')); password=str(data.get('password',''))
+ if not host or port not in (25,465,587,2525): raise ValueError('invalid relay endpoint')
+ if port==465:
+  client=smtplib.SMTP_SSL(host,port,timeout=20,context=ssl.create_default_context())
+ else:
+  client=smtplib.SMTP(host,port,timeout=20); client.ehlo()
+  if port in (587,2525): client.starttls(context=ssl.create_default_context()); client.ehlo()
+ try:
+  if user or password: client.login(user,password)
+  code,msg=client.noop()
+ finally: client.quit()
+ return {'connected':200 <= int(code) < 400,'code':int(code),'message':msg.decode(errors='replace') if isinstance(msg,bytes) else str(msg)}
+def setup_relay_apply(data):
+ host=str(data.get('host','')).strip(); port=int(data.get('port',587)); user=str(data.get('username','')); password=str(data.get('password',''))
+ setup_relay(data)
+ relay=f'[{host}]:{port}'; secret=f'{relay} {user}:{password}\n'; atomic('/etc/postfix/sasl_passwd',secret,0o600); run(['postmap','/etc/postfix/sasl_passwd'])
+ for item in [f'relayhost = {relay}','smtp_sasl_auth_enable = yes','smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd','smtp_sasl_security_options = noanonymous','smtp_tls_security_level = encrypt']:
+  run(['postconf','-e',item])
+ run(['postfix','check']); run(['systemctl','reload','postfix']); return {'applied':True,'relayhost':relay}
+def setup_cert_issue(data):
+ domain=str(data.get('mailHost','')).lower(); email=str(data.get('email','')).strip()
+ if not DOMAIN_RE.fullmatch(domain) or '@' not in email: raise ValueError('invalid certificate domain or email')
+ acme='/root/.acme.sh/acme.sh'
+ if not os.path.exists(acme): raise RuntimeError('acme.sh is not installed; install it before issuing a certificate')
+ run([acme,'--issue','--standalone','-d',domain,'--accountemail',email],timeout=240)
+ target=ETC/'tls'/domain; target.mkdir(parents=True,exist_ok=True)
+ run([acme,'--install-cert','-d',domain,'--key-file',str(target/'privkey.pem'),'--fullchain-file',str(target/'fullchain.pem'),'--reloadcmd','systemctl reload postfix dovecot'],timeout=120)
+ return {'issued':True,'domain':domain}
+def setup_send_test(data):
+ sender=str(data.get('sender','')); recipient=str(data.get('recipient','')); username=str(data.get('username','')); password=str(data.get('password','')); display=str(data.get('displayName','MailStack Administrator'))[:80]
+ if not ADDRESS_RE.fullmatch(sender) or not ADDRESS_RE.fullmatch(recipient) or not USER_RE.fullmatch(username) or len(password)<12: raise ValueError('invalid mailbox or weak password')
+ try: pwd.getpwnam(username)
+ except KeyError:
+  shell=run(['which','nologin'],check=False).stdout.strip() or '/usr/sbin/nologin'; run(['useradd','-m','-c',display,'-s',shell,username]); run(['chpasswd'],input=username+':'+password+'\n')
+ body='From: '+sender+'\nTo: '+recipient+'\nSubject: MailStack connectivity test\n\nThis message was sent by MailStack setup verification.\n'
+ p=run(['/usr/sbin/sendmail','-f',sender,'--',recipient],input=body,timeout=30,check=False)
+ if p.returncode: raise RuntimeError((p.stderr or p.stdout or 'sendmail failed')[-1000:])
+ return {'queued':True,'sender':sender,'recipient':recipient}
+def setup_status():
+ try: cfg=json.loads(SETUP_CONFIG.read_text())
+ except Exception: cfg={}
+ return {'identityConfigured':bool(cfg),'identity':cfg,'postfixActive':run(['systemctl','is-active','--quiet','postfix'],check=False).returncode==0,'dovecotActive':run(['systemctl','is-active','--quiet','dovecot'],check=False).returncode==0}
+
 def main(req):
  action=req.get('action'); data=req.get('data') or {}
  if action=='snapshot': return status()
+ if action=='setup.status': return setup_status()
+ if action=='setup.identity.apply': return setup_identity(data)
+ if action=='setup.dns.verify': return setup_dns_verify(data)
+ if action=='setup.relay.test': return setup_relay(data)
+ if action=='setup.relay.apply': return setup_relay_apply(data)
+ if action=='setup.cert.issue': return setup_cert_issue(data)
+ if action=='setup.mail.test': return setup_send_test(data)
  if action=='domains.list': return domain_list()
  if action=='domains.add':
   d=str(data.get('name','')).lower();

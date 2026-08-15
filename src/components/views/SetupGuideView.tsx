@@ -19,11 +19,14 @@ import {
   Mail,
   UserCheck,
   Lock,
+  Eye,
+  EyeOff,
   Zap,
   Play,
   RotateCcw
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
+import { api } from '../../api';
 import { LiquidGlass } from '../common/LiquidGlass';
 
 export const SetupGuideView: React.FC = () => {
@@ -33,18 +36,20 @@ export const SetupGuideView: React.FC = () => {
   const [currentStep, setCurrentStep] = useState<number>(1);
 
   // Form State
-  const [domainName, setDomainName] = useState('sectorpace.com');
-  const [mailHost, setMailHost] = useState('mail.sectorpace.com');
-  const [serverIp, setServerIp] = useState('163.192.27.230');
+  const [domainName, setDomainName] = useState('');
+  const [mailHost, setMailHost] = useState('');
+  const [serverIp, setServerIp] = useState('');
   const [adminUsername, setAdminUsername] = useState('admin');
-  const [adminPassword, setAdminPassword] = useState('SecurePass@2026');
+  const [adminPassword, setAdminPassword] = useState('');
   const [adminDisplayName, setAdminDisplayName] = useState('System Administrator');
-  const [selectedRelay, setSelectedRelay] = useState<'direct' | 'oracle' | 'ses' | 'sendgrid' | 'custom'>('oracle');
-  const [relayHost, setRelayHost] = useState('smtp.email.us-sanjose-1.oci.oraclecloud.com');
+  const [selectedRelay, setSelectedRelay] = useState<'direct' | 'oracle' | 'ses' | 'sendgrid' | 'custom'>('direct');
+  const [relayHost, setRelayHost] = useState('');
   const [relayPort, setRelayPort] = useState(587);
-  const [relayUser, setRelayUser] = useState('ocid1.user.oc1..aaaaaaaaxample');
-  const [relayPass, setRelayPass] = useState('OCI-Token-Secret#2026');
+  const [relayUser, setRelayUser] = useState('');
+  const [relayPass, setRelayPass] = useState('');
   const [dkimSelector, setDkimSelector] = useState('mail');
+  const [dkimPublicKey, setDkimPublicKey] = useState('');
+  const [privacyMode, setPrivacyMode] = useState(true);
   const [dmarcPolicy, setDmarcPolicy] = useState<'none' | 'quarantine' | 'reject'>('none');
 
   // Interactive Verification States
@@ -74,59 +79,103 @@ export const SetupGuideView: React.FC = () => {
     { num: 6, titleZh: '完成与生效', titleEn: 'Ready', icon: <CheckCircle2 className="w-4 h-4" /> },
   ];
 
-  // Dynamic DNS records computed from current wizard inputs
-  const dkimPublicShort = `MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0w9B7q2rXw1A4J7d8L2m5n9k8o7p6q5r4s3t2u1v0w9x8y7z6a5b4c3d2e1f0g9h8i7j6k5l4m3n2o1p0q9r8s7t6u5v4w3x2y1z0a9b8c7d6e5f4g3h2i1j0k9l8m7n6o5p4q3r2s1t0u9v8w7x6y5z4a3b2c1d0e9f8g7h6i5j4k3l2m1n0o9p8q7r6s5t4u3v2w1x0y9z8a7b6c5d4e3f2g1h0i9j8k7l6m5n4o3p2q1r0s9t8u7v6w5x4y3z2a1b0c9d8e7f6g5h4i3j2k1l0m9n8o7p6q5r4s3t2u1v0w9x8y7z6a5b4c3d2e1f0g9h8i7j6k5l4m3n2o1p0q9r8s7t6u5v4w3x2y1z0DAQAB`;
-  let spfValue = `v=spf1 mx ~all`;
-  if (selectedRelay === 'oracle') spfValue = `v=spf1 mx include:spf.us-sanjose-1.oci.oraclecloud.com ~all`;
-  else if (selectedRelay === 'ses') spfValue = `v=spf1 mx include:amazonses.com ~all`;
-  else if (selectedRelay === 'sendgrid') spfValue = `v=spf1 mx include:sendgrid.net ~all`;
-
-  const dnsRecords = [
-    { type: 'A', name: `mail.${domainName}`, content: serverIp, desc: '邮件服务器主 A 记录 (Cloudflare 须保持灰云 DNS-Only)' },
-    { type: 'MX', name: domainName, content: `mail.${domainName}`, priority: 10, desc: '主邮件交换记录 (优先级 10)' },
-    { type: 'TXT', name: domainName, content: spfValue, desc: 'SPF 发信 IP 授权及中继白名单策略' },
-    { type: 'TXT', name: `${dkimSelector}._domainkey.${domainName}`, content: `v=DKIM1; k=rsa; p=${dkimPublicShort}`, desc: '2048 位 OpenDKIM RSA 签名公钥' },
-    { type: 'TXT', name: `_dmarc.${domainName}`, content: `v=DMARC1; p=${dmarcPolicy}; rua=mailto:admin@${domainName}; fo=1`, desc: 'DMARC 防伪对齐规则与报告投递邮箱' },
+  // Standards-aware DNS plan. One SPF record is emitted per owner name.
+  const inferOracleSpf = () => {
+    const h = relayHost.toLowerCase();
+    if (h.includes('eu-') || h.includes('frankfurt') || h.includes('london') || h.includes('amsterdam')) return 'eu.rp.oracleemaildelivery.com';
+    if (h.includes('ap-') || h.includes('tokyo') || h.includes('seoul') || h.includes('sydney') || h.includes('singapore') || h.includes('mumbai')) return 'ap.rp.oracleemaildelivery.com';
+    return 'rp.oracleemaildelivery.com';
+  };
+  const inferSesRegion = () => relayHost.match(/email-smtp\.([a-z0-9-]+)\.amazonaws\.com/i)?.[1] || 'us-east-1';
+  const providerMechanism = selectedRelay === 'oracle'
+    ? `include:${inferOracleSpf()}`
+    : selectedRelay === 'sendgrid'
+      ? 'include:sendgrid.net'
+      : '';
+  const rootSpfParts = ['v=spf1', `a:${mailHost || 'mail.example.com'}`, 'mx'];
+  if (selectedRelay === 'direct' && serverIp) rootSpfParts.push(`ip4:${serverIp}`);
+  if (providerMechanism) rootSpfParts.push(providerMechanism);
+  rootSpfParts.push('~all');
+  const rootSpf = rootSpfParts.join(' ');
+  const sesMailFrom = domainName ? `bounce.${domainName}` : 'bounce.example.com';
+  const realDnsRecords: Array<{ type: string; name: string; content: string; priority?: number; desc: string }> = [
+    { type: 'A', name: mailHost || 'mail.example.com', content: serverIp || '203.0.113.10', desc: '邮件服务器 A 记录；Cloudflare 必须为 DNS Only' },
+    { type: 'MX', name: domainName || 'example.com', content: mailHost || 'mail.example.com', priority: 10, desc: '接收邮件的主 MX 记录，优先级 10' },
+    { type: 'TXT', name: domainName || 'example.com', content: rootSpf, desc: '域名只能保留一条 SPF TXT，请合并所有授权发送源' },
+    { type: 'TXT', name: `${dkimSelector}._domainkey.${domainName || 'example.com'}`, content: dkimPublicKey ? `v=DKIM1; k=rsa; p=${dkimPublicKey}` : '完成步骤 1 后由服务器生成真实 DKIM 公钥', desc: 'OpenDKIM 2048 位 RSA 公钥，不能使用演示密钥' },
+    { type: 'TXT', name: `_dmarc.${domainName || 'example.com'}`, content: `v=DMARC1; p=${dmarcPolicy}; rua=mailto:postmaster@${domainName || 'example.com'}; adkim=s; aspf=s; pct=100`, desc: 'DMARC 初次建议 p=none，观察报告后再提高策略' },
   ];
-
-  const handleVerifyDns = () => {
-    setIsVerifyingDns(true);
-    setTimeout(() => {
-      setIsVerifyingDns(false);
-      setDnsVerified(true);
-      confetti({ particleCount: 30, spread: 60 });
-      showToast('success', language === 'zh' ? 'DNS 解析探测全部通过' : 'DNS Records Verified', 'MX, SPF, DKIM 2048, DMARC 响应正常');
-    }, 1000);
+  if (selectedRelay === 'ses') {
+    const region = inferSesRegion();
+    realDnsRecords.push(
+      { type: 'MX', name: sesMailFrom, content: `feedback-smtp.${region}.amazonses.com`, priority: 10, desc: 'Amazon SES 自定义 MAIL FROM 专用 MX' },
+      { type: 'TXT', name: sesMailFrom, content: 'v=spf1 include:amazonses.com ~all', desc: 'Amazon SES 自定义 MAIL FROM 专用 SPF，不要创建第二条同名 SPF' },
+    );
+  }
+  const maskDomain = (value: string) => value.replace(/(^|\.)[^.]+(?=\.)/g, '$1••••');
+  const maskIp = (value: string) => value.replace(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/, '$1.$2.•••.•••');
+  const displayValue = (value: string) => {
+    if (!privacyMode) return value;
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(value)) return maskIp(value);
+    if (value.includes('p=') && value.includes('DKIM1')) return 'v=DKIM1; k=rsa; p=••••••••••••••••';
+    if (value.includes('@')) return value.replace(/[A-Za-z0-9._%+-]+@[^;\s]+/g, 'postmaster@example.com');
+    if (value.includes('v=spf1')) return value.replace(/ip4:\d+\.\d+\.\d+\.\d+/g, 'ip4:203.0.113.10');
+    if (/([a-z0-9-]+\.)+[a-z]{2,}/i.test(value)) return value.replace(/([a-z0-9-]+\.)+[a-z]{2,}/gi, 'example.com');
+    return value;
   };
+  const dnsRecords = realDnsRecords.map(r => ({ ...r, displayName: privacyMode ? maskDomain(r.name) : r.name, displayContent: displayValue(r.content) }));
 
-  const handleTestRelay = () => {
-    setIsTestingRelay(true);
-    setTimeout(() => {
-      setIsTestingRelay(false);
-      setRelayTested(true);
-      confetti({ particleCount: 30, spread: 60 });
-      showToast('success', language === 'zh' ? 'SMTP 出站中继握手成功' : 'Relay Connected', `${relayHost}:${relayPort} STARTTLS 身份鉴权通过`);
-    }, 1100);
+  const [identityApplied, setIdentityApplied] = useState(false);
+  const [lastResult, setLastResult] = useState<any>(null);
+  const [operationError, setOperationError] = useState('');
+  const post = async (path: string, body: any) => api(path, { method: 'POST', body: JSON.stringify(body) });
+  const failOperation = (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    setOperationError(message); showToast('error', language === 'zh' ? '操作失败' : 'Operation failed', message);
   };
-
-  const handleIssueCert = () => {
-    setIsIssuingCert(true);
-    setTimeout(() => {
-      setIsIssuingCert(false);
-      setCertIssued(true);
-      confetti({ particleCount: 35, spread: 60 });
-      showToast('success', language === 'zh' ? 'Let\'s Encrypt 证书签发成功' : 'SSL Certificate Issued', `${mailHost} SAN: smtp, imap 均已自动装配`);
-    }, 1200);
+  const handleApplyIdentity = async () => {
+    setOperationError('');
+    try {
+      const result = await post('/api/setup/identity', { domain: domainName, mailHost, serverIp, postmaster: `postmaster@${domainName}` });
+      setLastResult(result); setDkimPublicKey(result.dkimPublicKey || ''); setIdentityApplied(true); setCurrentStep(2);
+      showToast('success', language === 'zh' ? '身份配置已写入服务器' : 'Identity applied', `${mailHost} / ${serverIp}`);
+    } catch (error) { failOperation(error); }
   };
-
-  const handleSendTestMail = () => {
-    setIsSendingTestMail(true);
-    setTimeout(() => {
-      setIsSendingTestMail(false);
-      setTestMailSent(true);
-      confetti({ particleCount: 50, spread: 80, origin: { y: 0.6 } });
-      showToast('success', language === 'zh' ? '端到端测试信投递成功！' : 'Test Email Delivered!', `SPF: PASS | DKIM: PASS | DMARC: PASS | 综合评分: 98/100`);
-    }, 1300);
+  const handleVerifyDns = async () => {
+    setIsVerifyingDns(true); setOperationError('');
+    try {
+      const result = await post('/api/setup/dns/verify', { domain: domainName, mailHost, serverIp, dkimSelector, expectedSpf: rootSpf, selectedRelay, sesMailFrom, sesRegion: inferSesRegion() });
+      setLastResult(result); setDnsVerified(Boolean(result.verified));
+      if (!result.verified) throw new Error(language === 'zh' ? 'DNS 尚未全部生效，请查看检测结果并稍后重试' : 'DNS verification is incomplete');
+      confetti({ particleCount: 30, spread: 60 }); showToast('success', language === 'zh' ? '权威 DNS 实测通过' : 'Authoritative DNS verified', 'A / MX / SPF / DKIM / DMARC');
+    } catch (error) { setDnsVerified(false); failOperation(error); } finally { setIsVerifyingDns(false); }
+  };
+  const handleTestRelay = async () => {
+    setIsTestingRelay(true); setOperationError('');
+    try {
+      const payload = selectedRelay === 'direct' ? { host: '127.0.0.1', port: 25, username: '', password: '' } : { host: relayHost, port: relayPort, username: relayUser, password: relayPass };
+      const tested = await post('/api/setup/relay/test', payload);
+      if (!tested.connected) throw new Error('SMTP relay connection failed');
+      const applied = selectedRelay === 'direct' ? tested : await post('/api/setup/relay/apply', payload);
+      setLastResult(applied); setRelayTested(true); showToast('success', language === 'zh' ? (selectedRelay === 'direct' ? '本机 Postfix SMTP 实测通过' : 'SMTP 中继实测并写入 Postfix') : 'SMTP path verified', applied.relayhost || '127.0.0.1:25');
+    } catch (error) { setRelayTested(false); failOperation(error); } finally { setIsTestingRelay(false); }
+  };
+  const handleIssueCert = async () => {
+    setIsIssuingCert(true); setOperationError('');
+    try {
+      const result = await post('/api/setup/cert/issue', { mailHost, email: `postmaster@${domainName}` });
+      setLastResult(result); setCertIssued(Boolean(result.issued)); confetti({ particleCount: 35, spread: 60 });
+      showToast('success', language === 'zh' ? '证书已真实签发并安装' : 'Certificate issued and installed', mailHost);
+    } catch (error) { setCertIssued(false); failOperation(error); } finally { setIsIssuingCert(false); }
+  };
+  const handleSendTestMail = async () => {
+    setIsSendingTestMail(true); setOperationError('');
+    try {
+      const address = `${adminUsername}@${domainName}`;
+      const result = await post('/api/setup/mail/test', { sender: address, recipient: address, username: adminUsername, password: adminPassword, displayName: adminDisplayName });
+      setLastResult(result); setTestMailSent(Boolean(result.queued)); confetti({ particleCount: 35, spread: 60 });
+      showToast('success', language === 'zh' ? '测试邮件已由 Postfix 接收排队' : 'Test message accepted by Postfix', result.recipient);
+    } catch (error) { setTestMailSent(false); failOperation(error); } finally { setIsSendingTestMail(false); }
   };
 
   const handleFinishWizard = () => {
@@ -171,12 +220,23 @@ export const SetupGuideView: React.FC = () => {
             </div>
           </div>
 
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => setPrivacyMode(v => !v)}
+              className="px-3.5 py-1.5 rounded-xl border border-white/10 text-xs text-slate-400 hover:text-slate-200 hover:bg-white/5 transition-all cursor-pointer flex items-center gap-1.5"
+              title={language === 'zh' ? '仅影响页面显示与截图，复制仍需明确选择' : 'Masks values on screen'}
+            >
+              {privacyMode ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+              {language === 'zh' ? (privacyMode ? '隐私模式：开' : '隐私模式：关') : (privacyMode ? 'Privacy: On' : 'Privacy: Off')}
+            </button>
           <button
             onClick={() => setCurrentSection('dashboard')}
             className="px-3.5 py-1.5 rounded-xl border border-white/10 text-xs text-slate-400 hover:text-slate-200 hover:bg-white/5 transition-all cursor-pointer shrink-0"
           >
             {language === 'zh' ? '跳过并进入控制台' : 'Skip to Dashboard'}
           </button>
+          </div>
         </div>
 
         {/* Step Progress Pills */}
@@ -187,13 +247,14 @@ export const SetupGuideView: React.FC = () => {
             return (
               <button
                 key={step.num}
-                onClick={() => setCurrentStep(step.num)}
+                disabled
+                aria-current={isCurrent ? 'step' : undefined}
                 className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
                   isCurrent
                     ? 'bg-cyan-500/20 border-cyan-400/60 text-cyan-300 shadow-[0_0_12px_rgba(0,242,195,0.15)]'
                     : isDone
                     ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                    : 'bg-white/[0.03] border-white/10 text-slate-400 hover:bg-white/[0.06]'
+                    : 'bg-white/[0.03] border-white/10 text-slate-500 cursor-not-allowed'
                 }`}
               >
                 <div className="flex items-center justify-between text-[10px] font-mono mb-1">
@@ -212,6 +273,9 @@ export const SetupGuideView: React.FC = () => {
           })}
         </div>
       </LiquidGlass>
+
+      {operationError && <div className="p-3 rounded-xl border border-rose-400/30 bg-rose-500/10 text-rose-300 text-xs break-all">{operationError}</div>}
+      {lastResult && <details className="p-3 rounded-xl border border-white/10 bg-white/[0.03] text-xs"><summary className="cursor-pointer font-bold">{language === 'zh' ? '查看服务器返回结果' : 'View server result'}</summary><pre className="mt-2 overflow-auto whitespace-pre-wrap">{JSON.stringify(lastResult, null, 2)}</pre></details>}
 
       {/* STEP 1: Domain & Hostname */}
       {currentStep === 1 && (
@@ -238,7 +302,7 @@ export const SetupGuideView: React.FC = () => {
                 type="text"
                 value={domainName}
                 onChange={(e) => setDomainName(e.target.value)}
-                placeholder="sectorpace.com"
+                placeholder="example.com"
                 className="w-full h-10 px-3.5 rounded-xl border border-white/10 bg-white/[0.05] text-slate-100 focus:outline-none focus:ring-1 focus:ring-cyan-400 font-bold"
               />
               <p className="text-[10px] text-slate-400 font-sans">
@@ -254,7 +318,7 @@ export const SetupGuideView: React.FC = () => {
                 type="text"
                 value={mailHost}
                 onChange={(e) => setMailHost(e.target.value)}
-                placeholder="mail.sectorpace.com"
+                placeholder="mail.example.com"
                 className="w-full h-10 px-3.5 rounded-xl border border-white/10 bg-white/[0.05] text-slate-100 focus:outline-none focus:ring-1 focus:ring-cyan-400 font-bold"
               />
               <p className="text-[10px] text-slate-400 font-sans">
@@ -270,7 +334,7 @@ export const SetupGuideView: React.FC = () => {
                 type="text"
                 value={serverIp}
                 onChange={(e) => setServerIp(e.target.value)}
-                placeholder="163.192.27.230"
+                placeholder="203.0.113.10"
                 className="w-full h-10 px-3.5 rounded-xl border border-white/10 bg-white/[0.05] text-cyan-300 focus:outline-none focus:ring-1 focus:ring-cyan-400 font-bold"
               />
               <p className="text-[10px] text-slate-400 font-sans">
@@ -296,8 +360,8 @@ export const SetupGuideView: React.FC = () => {
 
           <div className="flex justify-end pt-4 border-t border-white/10">
             <button
-              onClick={() => setCurrentStep(2)}
-              className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 text-slate-950 font-bold text-xs flex items-center gap-2 transition-all shadow-[0_0_15px_rgba(0,242,195,0.25)] cursor-pointer"
+              onClick={handleApplyIdentity}
+              className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 text-slate-950 font-bold text-xs flex items-center gap-2 transition-all shadow-[0_0_15px_rgba(0,242,195,0.25)] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <span>{language === 'zh' ? '下一步：配置权威 DNS 防伪记录' : 'Next: Configure DNS Records'}</span>
               <ArrowRight className="w-4 h-4" />
@@ -354,9 +418,9 @@ export const SetupGuideView: React.FC = () => {
                         {r.type}
                       </span>
                     </td>
-                    <td className="p-3 font-bold text-slate-200">{r.name}</td>
+                    <td className="p-3 font-bold text-slate-200">{r.displayName}</td>
                     <td className="p-3 text-slate-300 max-w-xs truncate">
-                      {r.content}
+                      {r.displayContent}
                     </td>
                     <td className="p-3">
                       <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-amber-300 border border-amber-500/30">
@@ -365,10 +429,10 @@ export const SetupGuideView: React.FC = () => {
                     </td>
                     <td className="p-3 text-right">
                       <button
-                        onClick={() => copyText(r.content, `dns-${i}`, `${r.type} 记录值`)}
+                        onClick={() => { if (!privacyMode || window.confirm(language === 'zh' ? '将复制真实 DNS 值。真实值可能包含域名、公网 IP 或 DKIM 公钥，是否继续？' : 'Copy the real DNS value?')) copyText(r.content, `dns-${i}`, `${r.type} 记录值`); }}
                         className="px-2 py-1 rounded bg-white/10 hover:bg-white/20 text-slate-300 text-[11px] cursor-pointer"
                       >
-                        {copiedKey === `dns-${i}` ? '✓ 已复制' : '复制值'}
+                        {copiedKey === `dns-${i}` ? '✓ 已复制' : privacyMode ? '复制真实值' : '复制值'}
                       </button>
                     </td>
                   </tr>
@@ -383,7 +447,7 @@ export const SetupGuideView: React.FC = () => {
             <div className="space-y-1">
               <div className="font-bold text-amber-300">反向解析 (PTR / rDNS) 关键提醒：</div>
               <p className="text-[11px] text-amber-200/90 leading-relaxed font-sans">
-                请登录您的服务器主机商后台（如 Oracle Cloud, 阿里云 ECS, AWS EC2, DigitalOcean），为公网 IP <code className="bg-amber-950/60 px-1 py-0.5 rounded">{serverIp}</code> 设置 PTR 反向解析指向 <code className="bg-amber-950/60 px-1 py-0.5 rounded">{mailHost}</code>。
+                请登录您的服务器主机商后台（如 Oracle Cloud, 阿里云 ECS, AWS EC2, DigitalOcean），为公网 IP <code className="bg-amber-950/60 px-1 py-0.5 rounded">{privacyMode ? maskIp(serverIp) : serverIp}</code> 设置 PTR 反向解析指向 <code className="bg-amber-950/60 px-1 py-0.5 rounded">{privacyMode ? maskDomain(mailHost) : mailHost}</code>。
               </p>
             </div>
           </div>
@@ -399,7 +463,8 @@ export const SetupGuideView: React.FC = () => {
 
             <button
               onClick={() => setCurrentStep(3)}
-              className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 text-slate-950 font-bold text-xs flex items-center gap-2 transition-all shadow-[0_0_15px_rgba(0,242,195,0.25)] cursor-pointer"
+              disabled={!dnsVerified}
+              className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 text-slate-950 font-bold text-xs flex items-center gap-2 transition-all shadow-[0_0_15px_rgba(0,242,195,0.25)] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <span>下一步：配置出站中继与 25 端口策略</span>
               <ArrowRight className="w-4 h-4" />
@@ -419,7 +484,7 @@ export const SetupGuideView: React.FC = () => {
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                 {language === 'zh'
-                  ? '大部分云服务商默认拦截外发 25 端口。通过配置企业中继 (Oracle OCI / AWS SES / SendGrid / 自建 SmartHost)，可经 587/465 端口保证 100% 投递成功。'
+                  ? '大部分云服务商默认拦截外发 25 端口。通过配置企业中继 (Oracle OCI / AWS SES / SendGrid / 自建 SmartHost)，可经 587/465 端口提交邮件，但不能保证最终送达。'
                   : 'Bypass cloud provider port 25 blocking using high-reputation SMTP relay networks.'}
               </p>
             </div>
@@ -437,9 +502,10 @@ export const SetupGuideView: React.FC = () => {
           {/* Relay Provider Selection */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             {[
-              { id: 'oracle', name: 'Oracle Cloud OCI SJC1', desc: '推荐 • 免费每月 3,000 封高信誉投递', host: 'smtp.email.us-sanjose-1.oci.oraclecloud.com', port: 587 },
-              { id: 'ses', name: 'Amazon SES', desc: 'AWS 全球高可用发信中继', host: 'email-smtp.us-east-1.amazonaws.com', port: 587 },
-              { id: 'sendgrid', name: 'Twilio SendGrid', desc: '专业事务邮件出站中继', host: 'smtp.sendgrid.net', port: 587 },
+              { id: 'direct', name: '直接投递', desc: '使用本机 Postfix；需云厂商开放出站 25 端口', host: '', port: 25 },
+              { id: 'oracle', name: 'Oracle OCI Email Delivery', desc: 'SPF 按发送大区使用 rp / ap.rp / eu.rp', host: '', port: 587 },
+              { id: 'ses', name: 'Amazon SES', desc: '需要区域 SMTP Endpoint；自定义 MAIL FROM 另配 MX + SPF', host: '', port: 587 },
+              { id: 'sendgrid', name: 'Twilio SendGrid', desc: '应优先使用控制台生成的 Domain Authentication DNS 记录', host: 'smtp.sendgrid.net', port: 587 },
             ].map((prov) => (
               <button
                 key={prov.id}
@@ -459,6 +525,10 @@ export const SetupGuideView: React.FC = () => {
                 <div className="text-[10px] font-mono text-cyan-400/80 mt-2">{prov.host}:{prov.port}</div>
               </button>
             ))}
+          </div>
+
+          <div className="p-3.5 rounded-xl border border-amber-500/30 bg-amber-500/10 text-xs text-amber-200 leading-relaxed">
+            <strong>SPF 规范：</strong>同一个主机名只能发布一条以 <code>v=spf1</code> 开头的 TXT 记录。MailStack 会合并直接投递与中继授权，不会生成重复 SPF。Oracle 使用区域级 <code>oracleemaildelivery.com</code> include；Amazon SES 自定义 MAIL FROM 使用 <code>bounce.域名</code> 的专用 MX 与 SPF；SendGrid 的 DKIM/CNAME 必须以账号控制台生成值为准。
           </div>
 
           {/* Relay Credentials Form */}
@@ -515,7 +585,8 @@ export const SetupGuideView: React.FC = () => {
 
             <button
               onClick={() => setCurrentStep(4)}
-              className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 text-slate-950 font-bold text-xs flex items-center gap-2 transition-all shadow-[0_0_15px_rgba(0,242,195,0.25)] cursor-pointer"
+              disabled={!relayTested}
+              className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 text-slate-950 font-bold text-xs flex items-center gap-2 transition-all shadow-[0_0_15px_rgba(0,242,195,0.25)] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <span>下一步：TLS 证书与安全装配</span>
               <ArrowRight className="w-4 h-4" />
@@ -580,7 +651,8 @@ export const SetupGuideView: React.FC = () => {
 
             <button
               onClick={() => setCurrentStep(5)}
-              className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 text-slate-950 font-bold text-xs flex items-center gap-2 transition-all shadow-[0_0_15px_rgba(0,242,195,0.25)] cursor-pointer"
+              disabled={!certIssued}
+              className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 text-slate-950 font-bold text-xs flex items-center gap-2 transition-all shadow-[0_0_15px_rgba(0,242,195,0.25)] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <span>下一步：创建管理员并进行发信测试</span>
               <ArrowRight className="w-4 h-4" />
@@ -611,7 +683,7 @@ export const SetupGuideView: React.FC = () => {
               className="px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-400 to-cyan-500 text-slate-950 font-bold text-xs flex items-center gap-1.5 cursor-pointer shadow-[0_0_15px_rgba(52,211,153,0.3)] disabled:opacity-50"
             >
               <Play className={`w-3.5 h-3.5 ${isSendingTestMail ? 'animate-spin' : ''}`} />
-              <span>{isSendingTestMail ? '投递中...' : testMailSent ? '✓ 全链路测试通过' : '发送端到端测试信'}</span>
+              <span>{isSendingTestMail ? '投递中...' : testMailSent ? '✓ Postfix 已接收测试邮件' : '发送端到端测试信'}</span>
             </button>
           </div>
 
@@ -654,10 +726,10 @@ export const SetupGuideView: React.FC = () => {
                   <CheckCircle2 className="w-4 h-4 text-emerald-400" />
                   <span>端到端全链路邮件投递诊断结果：</span>
                 </span>
-                <span className="px-2 py-0.5 rounded bg-emerald-400/20 text-emerald-300 font-bold">100/100 A+</span>
+                <span className="px-2 py-0.5 rounded bg-emerald-400/20 text-emerald-300 font-bold">已排队</span>
               </div>
               <p className="text-[11px] text-emerald-200/90 font-sans">
-                Postfix 发信队列响应正常，OpenDKIM 2048 位签名校验成功，SPF 对齐通过，未触发反垃圾拦截。
+                Postfix 已接受测试邮件进入队列。该结果不代表收件方已接收，也不代表 SPF、DKIM 或 DMARC 已通过。请继续查看队列和收件方邮件头。
               </p>
             </div>
           )}
@@ -673,7 +745,8 @@ export const SetupGuideView: React.FC = () => {
 
             <button
               onClick={() => setCurrentStep(6)}
-              className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 text-slate-950 font-bold text-xs flex items-center gap-2 transition-all shadow-[0_0_15px_rgba(0,242,195,0.25)] cursor-pointer"
+              disabled={!testMailSent}
+              className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 text-slate-950 font-bold text-xs flex items-center gap-2 transition-all shadow-[0_0_15px_rgba(0,242,195,0.25)] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <span>下一步：完成部署并生效</span>
               <ArrowRight className="w-4 h-4" />
@@ -691,10 +764,10 @@ export const SetupGuideView: React.FC = () => {
 
           <div className="space-y-2 max-w-lg mx-auto">
             <h2 className="text-2xl font-black text-slate-900 dark:text-white tracking-tight">
-              {language === 'zh' ? '🎉 企业级邮件服务已成功开通！' : '🎉 Email Service Successfully Deployed!'}
+              {language === 'zh' ? '配置步骤已完成' : '🎉 Email Service Successfully Deployed!'}
             </h2>
             <p className="text-xs text-slate-400 leading-relaxed font-sans">
-              您的邮件域名 <strong className="text-cyan-400">@{domainName}</strong> 已完成全套权威 DNS、2048 位 DKIM 签名、出站中继与 TLS 安全证书配置，已具备向 Gmail / Outlook 等全球服务商高信誉发信能力。
+              您的邮件域名 <strong className="text-cyan-400">@{domainName}</strong> 已完成本向导要求的服务器写入和在线检测。邮件送达与信誉仍需通过真实收件和邮件头持续验证。
             </p>
           </div>
 
@@ -708,8 +781,8 @@ export const SetupGuideView: React.FC = () => {
               <div className="font-bold text-cyan-400 mt-0.5">{selectedRelay.toUpperCase()}</div>
             </div>
             <div className="p-3 rounded-xl border border-white/10 bg-white/[0.03]">
-              <div className="text-[10px] text-slate-400 uppercase">综合送达率评分</div>
-              <div className="font-bold text-emerald-400 mt-0.5">98/100 (A+)</div>
+              <div className="text-[10px] text-slate-400 uppercase">向导验证状态</div>
+              <div className="font-bold text-emerald-400 mt-0.5">已完成</div>
             </div>
           </div>
 

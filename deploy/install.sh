@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo '请使用 root 运行'; exit 1; }
 BASE=$(cd "$(dirname "$0")/.." && pwd)
-ADMIN_USER='admin'; ADMIN_PASS=''; ADMIN_PORT='8787'; ADMIN_HOST='0.0.0.0'; NONINTERACTIVE=0; REUSE_ADMIN=0
+ADMIN_USER='admin'; ADMIN_PASS=''; ADMIN_PORT='8787'; ADMIN_HOST='127.0.0.1'; NONINTERACTIVE=0; REUSE_ADMIN=0
 usage(){ cat <<EOF
 用法: $0 [选项]
   --admin-user NAME       Web 管理员用户名
@@ -23,7 +23,7 @@ install_dependencies(){
  if command -v apt-get >/dev/null 2>&1; then
    export DEBIAN_FRONTEND=noninteractive
    apt-get update
-   apt-get install -y ca-certificates curl git gnupg python3 rsync sudo tar
+   apt-get install -y ca-certificates curl dnsutils git gnupg opendkim opendkim-tools python3 rsync sudo tar
    if ! command -v node >/dev/null 2>&1 || [[ $(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0) -lt 20 ]]; then
      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
      apt-get install -y nodejs
@@ -69,8 +69,9 @@ fi
 [[ $ADMIN_USER =~ ^[A-Za-z][A-Za-z0-9_.-]{2,31}$ ]] || { echo '管理员用户名格式不正确'; exit 1; }
 [[ $ADMIN_PORT =~ ^[0-9]+$ ]] && ((ADMIN_PORT>=1024&&ADMIN_PORT<=65535)) || { echo '管理端口必须为 1024-65535'; exit 1; }
 [[ $ADMIN_HOST == 127.0.0.1 || $ADMIN_HOST == ::1 || $ADMIN_HOST == 0.0.0.0 ]] || { echo '管理地址只允许 127.0.0.1、::1、0.0.0.0'; exit 1; }
-if [[ $ADMIN_HOST == 0.0.0.0 ]]; then
- echo '提示：管理后台将监听公网地址，请配置云安全组、防火墙和 HTTPS。'
+if [[ $ADMIN_HOST == 0.0.0.0 && $NONINTERACTIVE -eq 0 ]]; then
+ read -r -p '警告：公网监听必须额外配置 HTTPS 和防火墙。输入 PUBLIC 确认: ' x
+ [[ $x == PUBLIC ]] || exit 1
 fi
 
 install -d -m 0755 /opt/mailstack/ui /opt/mailstack/backend
@@ -78,9 +79,8 @@ rm -rf /opt/mailstack/ui/src /opt/mailstack/ui/dist /opt/mailstack/ui/node_modul
 cp -a "$BASE/src" "$BASE/index.html" "$BASE/package.json" "$BASE/vite.config.ts" "$BASE/tsconfig.json" /opt/mailstack/ui/
 cp "$BASE/backend/mailstackctl.py" /opt/mailstack/backend/mailstackctl.py
 chmod 0755 /opt/mailstack/backend/mailstackctl.py
-cp "$BASE/deploy/mailstack-cli" /usr/local/bin/ms
-chmod 0755 /usr/local/bin/ms
-ln -sfn /usr/local/bin/ms /usr/local/bin/mailstack
+cp "$BASE/deploy/mailstack-cli" /usr/local/bin/mailstack
+chmod 0755 /usr/local/bin/mailstack
 
 cd /opt/mailstack/ui
 rm -f package-lock.json
@@ -88,17 +88,8 @@ npm install --include=optional
 npm run build
 # Build the authenticated production backend independently. It is bundled with Express,
 # so runtime module resolution does not depend on /opt/mailstack/ui/node_modules.
-install -d -m 0755 /opt/mailstack/ui/backend
-cp "$BASE/backend/server.production.ts" \
-  /opt/mailstack/ui/backend/server.production.ts
-
-cd /opt/mailstack/ui
-
-npx --no-install esbuild backend/server.production.ts \
-  --bundle \
-  --platform=node \
-  --format=cjs \
-  --sourcemap \
+npx --no-install esbuild "$BASE/backend/server.production.ts" \
+  --bundle --platform=node --format=cjs --sourcemap \
   --outfile=/opt/mailstack/server.cjs
 [[ -s /opt/mailstack/ui/dist/index.html ]] || { echo '前端构建失败：缺少 dist/index.html'; exit 1; }
 [[ -s /opt/mailstack/server.cjs ]] || { echo '后端构建失败：缺少 server.cjs'; exit 1; }
@@ -145,5 +136,5 @@ systemctl is-active --quiet mailstack-web || { journalctl -u mailstack-web -n 80
 HEALTH_HOST='127.0.0.1'
 [[ $ADMIN_HOST == '::1' ]] && HEALTH_HOST='[::1]'
 curl -fsS "http://$HEALTH_HOST:$ADMIN_PORT/api/health" >/dev/null || { echo '后台健康检查失败'; journalctl -u mailstack-web -n 80 --no-pager; exit 1; }
-printf '\n安装完成。管理员: %s\n监听地址: %s:%s\n快捷命令: ms（兼容命令: mailstack）\n' "$ADMIN_USER" "$ADMIN_HOST" "$ADMIN_PORT"
+printf '\n安装完成。管理员: %s\n监听地址: %s:%s\n快捷命令: mailstack\n' "$ADMIN_USER" "$ADMIN_HOST" "$ADMIN_PORT"
 [[ $ADMIN_HOST == 127.0.0.1 ]] && echo "SSH 隧道: ssh -L $ADMIN_PORT:127.0.0.1:$ADMIN_PORT root@服务器IP"
