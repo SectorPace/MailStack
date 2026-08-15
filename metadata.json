@@ -1,6 +1,0 @@
-{
-  "name": "MailStack Admin Console",
-  "description": "MailStack 邮件管理中心与主控制台 (Mail server administration panel with domains, users, relays, queue, logs, certificates and diagnostic tools)",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
