@@ -1,5 +1,5 @@
 import express from 'express'; import path from 'path'; import fs from 'fs'; import crypto from 'crypto'; import {spawn} from 'child_process';
-const app=express(), PORT=Number(process.env.PORT||8787), HOST=process.env.HOST||'127.0.0.1', DIST=process.env.DIST_DIR||path.join(process.cwd(),'dist');
+const app=express(), PORT=Number(process.env.PORT||8787), HOST=process.env.HOST||'0.0.0.0', DIST=process.env.DIST_DIR||path.join(process.cwd(),'dist');
 app.disable('x-powered-by'); app.set('trust proxy','loopback'); app.use(express.json({limit:'256kb'}));
 const ADMIN_FILE=process.env.ADMIN_FILE||'/etc/mailstack/admin.json'; const sessions=new Map<string,{expires:number,csrf:string,user:string}>();
 function credentials(){try{return JSON.parse(fs.readFileSync(ADMIN_FILE,'utf8'))}catch{return null}}

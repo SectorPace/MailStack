@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo '请使用 root 运行'; exit 1; }
 BASE=$(cd "$(dirname "$0")/.." && pwd)
-ADMIN_USER='admin'; ADMIN_PASS=''; ADMIN_PORT='8787'; ADMIN_HOST='127.0.0.1'; NONINTERACTIVE=0; REUSE_ADMIN=0
+ADMIN_USER='admin'; ADMIN_PASS=''; ADMIN_PORT='8787'; ADMIN_HOST='0.0.0.0'; NONINTERACTIVE=0; REUSE_ADMIN=0
 usage(){ cat <<EOF
 用法: $0 [选项]
   --admin-user NAME       Web 管理员用户名
@@ -50,7 +50,7 @@ if ((REUSE_ADMIN)); then
  [[ -s /etc/mailstack/admin.json ]] || { echo '没有可复用的管理员配置'; exit 1; }
  if [[ -f /etc/systemd/system/mailstack-web.service ]]; then
    ADMIN_PORT=$(sed -n 's/^Environment=PORT=//p' /etc/systemd/system/mailstack-web.service | tail -n1); ADMIN_PORT=${ADMIN_PORT:-8787}
-   ADMIN_HOST=$(sed -n 's/^Environment=HOST=//p' /etc/systemd/system/mailstack-web.service | tail -n1); ADMIN_HOST=${ADMIN_HOST:-127.0.0.1}
+   ADMIN_HOST=$(sed -n 's/^Environment=HOST=//p' /etc/systemd/system/mailstack-web.service | tail -n1); ADMIN_HOST=${ADMIN_HOST:-0.0.0.0}
  fi
 else
  if [[ -z $ADMIN_PASS && $NONINTERACTIVE -eq 0 ]]; then
@@ -93,7 +93,7 @@ cp "$BASE/backend/server.production.ts" \
 
 cd /opt/mailstack/ui
 
-npx --no-install esbuild backend/server.production.ts \
+./node_modules/.bin/esbuild backend/server.production.ts \
   --bundle \
   --platform=node \
   --format=cjs \
