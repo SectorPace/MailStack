@@ -88,8 +88,17 @@ npm install --include=optional
 npm run build
 # Build the authenticated production backend independently. It is bundled with Express,
 # so runtime module resolution does not depend on /opt/mailstack/ui/node_modules.
-npx --no-install esbuild "$BASE/backend/server.production.ts" \
-  --bundle --platform=node --format=cjs --sourcemap \
+install -d -m 0755 /opt/mailstack/ui/backend
+cp "$BASE/backend/server.production.ts" \
+  /opt/mailstack/ui/backend/server.production.ts
+
+cd /opt/mailstack/ui
+
+npx --no-install esbuild backend/server.production.ts \
+  --bundle \
+  --platform=node \
+  --format=cjs \
+  --sourcemap \
   --outfile=/opt/mailstack/server.cjs
 [[ -s /opt/mailstack/ui/dist/index.html ]] || { echo '前端构建失败：缺少 dist/index.html'; exit 1; }
 [[ -s /opt/mailstack/server.cjs ]] || { echo '后端构建失败：缺少 server.cjs'; exit 1; }
