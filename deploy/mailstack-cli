@@ -20,7 +20,7 @@ change_port(){
   local port bind
   read -r -p '管理端口 [8787]: ' port; port=${port:-8787}
   [[ $port =~ ^[0-9]+$ ]] && ((port>=1024 && port<=65535)) || { echo '端口必须为 1024-65535。'; return 1; }
-  read -r -p '监听地址 [127.0.0.1]: ' bind; bind=${bind:-127.0.0.1}
+  read -r -p '监听地址 [0.0.0.0]: ' bind; bind=${bind:-0.0.0.0}
   [[ $bind == 127.0.0.1 || $bind == ::1 || $bind == 0.0.0.0 ]] || { echo '只允许 127.0.0.1、::1 或 0.0.0.0。'; return 1; }
   if [[ $bind == 0.0.0.0 ]]; then read -r -p '公网监听有风险，输入 PUBLIC 确认: ' x; [[ $x == PUBLIC ]] || return 1; fi
   sed -i -E "s/^Environment=PORT=.*/Environment=PORT=$port/;s/^Environment=HOST=.*/Environment=HOST=$bind/" /etc/systemd/system/mailstack-web.service

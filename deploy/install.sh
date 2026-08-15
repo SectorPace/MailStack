@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo '请使用 root 运行'; exit 1; }
 BASE=$(cd "$(dirname "$0")/.." && pwd)
-ADMIN_USER='admin'; ADMIN_PASS=''; ADMIN_PORT='8787'; ADMIN_HOST='127.0.0.1'; NONINTERACTIVE=0; REUSE_ADMIN=0
+ADMIN_USER='admin'; ADMIN_PASS=''; ADMIN_PORT='8787'; ADMIN_HOST='0.0.0.0'; NONINTERACTIVE=0; REUSE_ADMIN=0
 usage(){ cat <<EOF
 用法: $0 [选项]
   --admin-user NAME       Web 管理员用户名
