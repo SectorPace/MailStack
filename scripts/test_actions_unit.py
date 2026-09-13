@@ -513,7 +513,14 @@ class DispatchGate(unittest.TestCase):
 
 
 class TotpActions(unittest.TestCase):
-    """The four admin.totp.* actions: whitelisting, dispatch and 2FA policy."""
+    """The four admin.totp.* actions: whitelisting, dispatch and 2FA policy.
+
+    Tests that drive begin/enable/disable/consume_recovery are skipped when
+    python3-cryptography is unavailable, mirroring TotpEnvelope: those
+    operations are fail-closed by design (no self-made encryption), so there
+    is nothing to exercise without the crypto backend. Allowlist-gate tests
+    (unregistered action, dispatch table membership) keep running everywhere.
+    """
 
     NEW_ACTIONS = (
         "admin.totp.begin",
@@ -534,6 +541,7 @@ class TotpActions(unittest.TestCase):
             with self.assertRaises(ValueError):
                 dispatcher.dispatch("admin.totp.destroy", {})
 
+    @unittest.skipIf(totp.AESGCM is None, "python3-cryptography is not installed")
     def test_begin_returns_a_fresh_unenabled_enrollment(self):
         with sandbox():
             seed_admin()
@@ -550,6 +558,7 @@ class TotpActions(unittest.TestCase):
             with self.assertRaises(ValueError):
                 dispatcher.dispatch("admin.totp.begin", {})
 
+    @unittest.skipIf(totp.AESGCM is None, "python3-cryptography is not installed")
     def test_enable_requires_a_valid_live_code(self):
         with sandbox():
             seed_admin()
@@ -564,6 +573,7 @@ class TotpActions(unittest.TestCase):
             with self.assertRaises(ValueError):
                 dispatcher.dispatch("admin.totp.enable", {"code": "123456"})
 
+    @unittest.skipIf(totp.AESGCM is None, "python3-cryptography is not installed")
     def test_enable_with_a_live_code_returns_recovery_codes_and_public_state(self):
         with sandbox():
             seed_admin()
@@ -580,6 +590,7 @@ class TotpActions(unittest.TestCase):
             self.assertNotIn("secret", json.dumps(public))
             self.assertNotIn(begin["secret"], json.dumps(public))
 
+    @unittest.skipIf(totp.AESGCM is None, "python3-cryptography is not installed")
     def test_recovery_code_is_single_use(self):
         with sandbox():
             seed_admin()
@@ -601,6 +612,7 @@ class TotpActions(unittest.TestCase):
             with self.assertRaises(ValueError):
                 dispatcher.dispatch("admin.totp.consume_recovery", {"code": "deadbeef-cafe0123"})
 
+    @unittest.skipIf(totp.AESGCM is None, "python3-cryptography is not installed")
     def test_disable_requires_a_valid_credential(self):
         with sandbox():
             seed_admin()
@@ -610,6 +622,7 @@ class TotpActions(unittest.TestCase):
                     dispatcher.dispatch("admin.totp.disable", {"code": bad})
             self.assertTrue(dispatcher.dispatch("admin.get", {})["twoFactorEnabled"])
 
+    @unittest.skipIf(totp.AESGCM is None, "python3-cryptography is not installed")
     def test_disable_with_a_recovery_code_consumes_it_and_clears_state(self):
         with sandbox():
             seed_admin()
@@ -620,6 +633,7 @@ class TotpActions(unittest.TestCase):
             self.assertFalse(public["twoFactorEnabled"])
             self.assertEqual(public["recoveryCodesRemaining"], 0)
 
+    @unittest.skipIf(totp.AESGCM is None, "python3-cryptography is not installed")
     def test_concurrent_recovery_consumption_succeeds_exactly_once(self):
         # The double-spend regression: two requests racing on the same recovery
         # code must not both succeed. The fix wraps the whole load-modify-save
