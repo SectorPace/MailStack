@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.8--beta.6-2476ff">
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.8.0--beta.7-2476ff">
   <img alt="Status" src="https://img.shields.io/badge/status-public%20beta-f0a53a">
   <img alt="Security" src="https://img.shields.io/badge/security-hardened-27b36a">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-27b36a">
@@ -26,7 +26,7 @@
   <img alt="Node.js" src="https://img.shields.io/badge/Node.js-20%20%7C%2022%20%7C%2024-3c873a">
 </p>
 
-> **版本状态：v0.8-beta.6（公开测试）。** 本版本是「冲 98」安全加固收官与 0.5.3-rc.1 平台成果的合并发布：九发行版本地实测 + musl 兑底 + Docker 化 + 安全加固 PR-A1..A6 与 PR-B1..B6 共十二项，无接口与数据格式变更。建议先在全新测试 VPS 上部署，不要直接覆盖生产邮件服务器。
+> **版本状态：v0.8.0-beta.7（公开测试）。** 本版本是 v0.8-beta.6 的 CI/安装器修复版：修复干净 checkout 下容器安装矩阵必失败的源码拷贝缺失（scripts/deploy/VERSION 未随构建进入 /opt/mailstack/ui）、rockylinux:9 容器 curl-minimal 包冲突阻断安装、非 systemd 精简容器缺 /etc/init.d 目录、CI 单测对 Path.stat 全局 mock 在 Python 3.11/3.12 上破坏 glob 的环境敏感缺陷，并将生产依赖 qs 升至 6.16.0（CVE 修复）。无接口与数据格式变更。
 >
 > **重要声明：MailStack 不保证邮件进入收件箱。** 实际送达结果受 IP 与域名信誉、DNS 身份认证（MX / SPF / DKIM / DMARC / PTR）、邮件内容、退信与投诉率、Relay 服务商策略以及接收方规则影响。
 
@@ -410,7 +410,7 @@ printf '%s\n' 'YourStrongPass123' | sudo bash ./mailstack.sh install \
 
 ```bash
 ms upgrade              # 升级到最新签名 Release
-ms upgrade v0.8-beta.6  # 钉扎到指定版本
+ms upgrade v0.8.0-beta.7  # 钉扎到指定版本
 ```
 
 升级通道设计：
@@ -619,7 +619,7 @@ mailstack.sh                      统一入口：install / update(upgrade) / doc
 │   └── verification/             Ubuntu 24.04 / Debian 12 真机记录、邮件投递 E2E
 ├── .github/workflows/ci.yml / release.yml
 ├── .env.example
-└── CHANGELOG.md                  v0.1.0-beta.1 → v0.8-beta.6 全量变更
+└── CHANGELOG.md                  v0.1.0-beta.1 → v0.8.0-beta.7 全量变更
 ```
 
 ## 开发指南
@@ -686,7 +686,7 @@ npm test             # Node 测试
 
 | 文档 | 内容 |
 |---|---|
-| [CHANGELOG.md](CHANGELOG.md) | v0.1.0-beta.1 → v0.8-beta.6 逐版本变更，含每个安全修复的完整背景 |
+| [CHANGELOG.md](CHANGELOG.md) | v0.1.0-beta.1 → v0.8.0-beta.7 逐版本变更，含每个安全修复的完整背景 |
 | [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) | 发行版支持矩阵与平台能力注记 |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署：端口模型、卷布局、首启口令 |
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | STRIDE 威胁模型（资产分级、信任边界、非目标） |

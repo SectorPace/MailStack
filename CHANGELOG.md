@@ -2,6 +2,51 @@
 
 All notable changes to the MailStack project are documented in this file.
 
+## [v0.8.0-beta.7] - 2026-09-13
+
+> 0.8.0-beta.7 是 v0.8-beta.6 的 CI / 安装器修复版：自 fb0df337 起 CI 连续全红
+> （build、install-matrix、supply-chain 三线独立失败），本版逐一定位并修复四个
+> 根因及一个被掩盖的连带问题，全部在本地以与 CI 等价的方式复现验证通过
+> （ubuntu:24.04 与 rockylinux:9 容器内完整安装断言 ALL-CHECKS-PASSED；
+> Python 单测 106/106 于 3.11 / 3.12 / 3.14 三版本通过）。无接口与数据格式变更。
+
+### 🐛 CI 修复（自 fb0df337 起三线全红）
+- **build(24) 单测环境敏感缺陷**: `test_actions_unit.py` 的 KeyPermissionScan 对
+  `pathlib.Path.stat` 做整表 return_value mock；Python ≤ 3.12 的 `Path.glob/rglob`
+  目录遍历内部调用 `Path.stat`，被 mock 后静默返回空 → 扫描器找不到任何 DKIM/
+  备份文件 → 4 个用例断言拿到 None（CI 的 3.11 必红，3.14 开发机新 glob 不再调
+  `Path.stat` 才侥幸全绿）。改为选择性 mock：仅目标路径返回伪造 `os.stat_result`，
+  其余走真实 stat；伪造值同时携带本机 opendkim 组 gid（无 grp / 无组时为 0），
+  0640-is-pass 用例不再对宿主环境敏感。
+- **install-matrix（apt 系三发行版）源码构建必失败**: `deploy/install.sh` 拷贝源码
+  到 `/opt/mailstack/ui` 的清单缺 `scripts`、`deploy`、`mailstack.sh`、`VERSION`，
+  而源码构建路径 `build:all` → `build:manifest`（`generate_manifest.mjs` 的
+  criticalFiles）需要它们做源码树哈希与版本一致性校验 → 干净 checkout（无预构建
+  dist/）必现 MODULE_NOT_FOUND。发布归档带 dist/ 走不到该路径，长期掩盖。
+- **install-matrix（rockylinux:9）curl-minimal 包冲突**: rockylinux:9 基础镜像自带
+  `curl-minimal`，与完整 `curl` 二进制互斥，`dnf install curl` 直接报冲突中止安装
+  （`dnf remove curl-minimal` 不可行——它在 dnf 的受保护依赖链上会被连带拒绝）。
+  改为检测到 curl-minimal 存在时给 install 传 `--allowerasing` 同事务替换；CI 的
+  rocky bootstrap 同步加旗标。
+- **supply-chain 审计门禁**: 生产依赖 qs 两条 moderate 通告（GHSA-x5fp-wj9c-mxmx、
+  GHSA-4mjr-xmp4-gh2g）经 express 4.22.2 钉死的 `~6.15.1` 传导且无可达修复版
+  （registry 无 6.15.4）。`package.json` 加 `overrides: {"qs": "^6.16.0"}`，lockfile
+  实际变更仅 qs 6.15.3→6.16.0、body-parser 1.20.6→1.20.8；`--omit=dev` 的
+  moderate 门禁与 high 门禁均恢复 exit 0。
+
+### 🔧 安装器连带修复（被上述问题掩盖）
+- **非 systemd 精简容器缺 `/etc/init.d`**: rockylinux:9 minimal 镜像未装
+  initscripts，init.d 生成路径的 sed 重定向报 No such file or directory 中止安装。
+  生成前 `install -d -m 0755 /etc/init.d` 预建目录（真实系统幂等无副作用）。
+
+### ✅ 验证 (Verification)
+- ubuntu:24.04 / rockylinux:9 容器内以 CI 完全相同的方式复现 install-matrix
+  step 3/4：健康自检、权限模型、sudoers 单条、fail2ban jail、签名信任锚、
+  回环投递全部通过。
+- Python 单测 106/106 于 3.11 (Windows) / 3.12 (WSL) / 3.14 (Windows) 通过；
+  npm test 86/86、vitest 12/12、tsc 零错、shellcheck 零告警、
+  verify_release_consistency 100%、npm audit 双门禁 exit 0。
+
 ## [v0.8-beta.6] - 2026-09-12
 
 > 0.8-beta.6 是「冲98」安全加固收官与 0.5.3-rc.1 平台成果的合并发布：在九发行版

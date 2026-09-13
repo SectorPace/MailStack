@@ -309,6 +309,18 @@ install_packages(){
              mark_degraded 'python3-cryptography：未能安装，管理后台 2FA（TOTP 信封加密）不可用（fail-closed；doctor 报告）'; }
       ;;
     dnf|yum)
+      # rockylinux/almalinux 容器基础镜像自带 curl-minimal（功能子集包），与完整
+      # curl 二进制冲突，dnf 拒绝安装（"problem with installed package
+      # curl-minimal"）→ 整个安装直接失败。先 remove 不行：curl-minimal 在
+      # dnf 的受保护依赖链上（remove 会连带删 dnf 本体而被拒绝）。唯一解是给
+      # install 传 --allowerasing，同一事务内用完整 curl 替换掉 curl-minimal
+      # （dnf 4/5 均支持；老 yum 无此镜像场景，不加）。真实服务器无
+      # curl-minimal，此分支为空操作；条件限定 curl-minimal 存在才加旗标，
+      # 绝不在干净系统上放开 allowerasing 的擦除能力。
+      local _dnf_flags=()
+      if [[ "$pm" == "dnf" ]] && rpm -q curl-minimal >/dev/null 2>&1; then
+        _dnf_flags=(--allowerasing)
+      fi
       # EPEL 前置：标准 EL 发行版包名是 epel-release；Oracle Linux 的包名是
       # oracle-epel-release-el<N>（Oracle 官方文档确认 OL9 为 oracle-epel-release-el9，
       # 网络检索核实）。两者都失败只记录不中断：缺 EPEL 仅影响 opendkim/fail2ban
@@ -321,7 +333,7 @@ install_packages(){
           || { warn "EPEL 仓库未能启用（epel-release 与 oracle-epel-release-el${_el_major} 均不可用），opendkim 等 EPEL 包可能装不上（将按可选组件降级处理）"; \
                mark_degraded "EPEL 仓库：未能启用（epel-release / oracle-epel-release-el${_el_major} 均不可用），opendkim、fail2ban 等 EPEL 包可能缺失（核心邮件栈仍从主仓库装齐）"; }
       fi
-      "$pm" install -y ca-certificates curl bind-utils git gnupg2 openssl hostname python3 rsync sudo tar
+      "$pm" install -y "${_dnf_flags[@]}" ca-certificates curl bind-utils git gnupg2 openssl hostname python3 rsync sudo tar
       "$pm" install -y cronie socat
       "$pm" install -y postfix cyrus-sasl cyrus-sasl-plain
       "$pm" install -y dovecot dovecot-pigeonhole

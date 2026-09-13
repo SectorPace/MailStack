@@ -413,7 +413,12 @@ if [[ "$BASE" != "/opt/mailstack-source" ]]; then
   tar -C "$BASE" --exclude=.git --exclude=node_modules -cf - . | tar -C /opt/mailstack-source -xf -
 fi
 rm -rf /opt/mailstack/ui/*
-for item in src lib backend webmail public dist index.html package.json package-lock.json vite.config.ts tsconfig.json; do [[ -e "$BASE/$item" ]] && cp -a "$BASE/$item" /opt/mailstack/ui/; done
+# scripts/deploy/mailstack.sh/VERSION 必须随源码进 ui 树：源码构建路径的
+# build:manifest（generate_manifest.mjs）按 criticalFiles 清单逐个读取并哈希
+# 这些文件（含 VERSION 的版本一致性校验），缺任何一个都会 MODULE_NOT_FOUND /
+# "critical source file is missing" 而安装失败。干净 checkout（无预构建 dist/）
+# 必走此路径——发布归档带 dist/ 时走不到，容易漏测。
+for item in src lib backend webmail public dist index.html package.json package-lock.json vite.config.ts tsconfig.json scripts deploy mailstack.sh VERSION; do [[ -e "$BASE/$item" ]] && cp -a "$BASE/$item" /opt/mailstack/ui/; done
 rm -rf /opt/mailstack/backend/mailstackctl
 cp -a "$BASE/backend/mailstackctl" /opt/mailstack/backend/mailstackctl
 cp "$BASE/backend/mailstackctl.py" /opt/mailstack/backend/mailstackctl.py
@@ -844,6 +849,10 @@ else
   SETSID_PREFIX="${SETSID_BIN:+$SETSID_BIN }"
   INITD_TEMPLATE="$BASE/deploy/init.d-mailstack.in.sh"
   [[ -f "$INITD_TEMPLATE" ]] || fail "缺少 init.d 模板文件: $INITD_TEMPLATE（发布包不完整）"
+  # 精简容器镜像可能没有 /etc/init.d（rockylinux:9 minimal 未装 initscripts）；
+  # 预建目录，否则下方 sed 重定向报 No such file or directory 中止安装。
+  # 真实系统已存在该目录，幂等无副作用。
+  install -d -m 0755 /etc/init.d
   sed -e "s|@SETSID_PREFIX@|${SETSID_PREFIX}|g" \
       -e "s|@ADMIN_PORT@|${ADMIN_PORT}|g" \
       -e "s|@ADMIN_HOST@|${ADMIN_HOST}|g" \

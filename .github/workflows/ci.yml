@@ -105,7 +105,7 @@ jobs:
           - { distro: 'ubuntu:24.04', bootstrap: 'apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl' }
           - { distro: 'ubuntu:22.04', bootstrap: 'apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl' }
           - { distro: 'debian:12', bootstrap: 'apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl' }
-          - { distro: 'rockylinux:9', bootstrap: 'dnf install -y --setopt=install_weak_deps=False ca-certificates curl' }
+          - { distro: 'rockylinux:9', bootstrap: 'dnf install -y --allowerasing --setopt=install_weak_deps=False ca-certificates curl' }
     steps:
       - uses: actions/checkout@v4
       - name: Malicious domain must never reach the Caddyfile (${{ matrix.distro }})

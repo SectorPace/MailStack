@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.8--beta.6-2476ff">
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.8.0--beta.7-2476ff">
   <img alt="Status" src="https://img.shields.io/badge/status-public%20beta-f0a53a">
   <img alt="Security" src="https://img.shields.io/badge/security-hardened-27b36a">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-27b36a">
@@ -26,7 +26,7 @@
   <img alt="Node.js" src="https://img.shields.io/badge/Node.js-20%20%7C%2022%20%7C%2024-3c873a">
 </p>
 
-> **Release status: v0.8-beta.6 (public beta).** This release merges the 0.5.3-rc.1 platform work (nine-distro live testing + musl fallback + Docker) with the "Push-to-98" security hardening finale: twelve hardening items across PR-A1..A6 and PR-B1..B6, no interface or data-format changes. Test on a fresh VPS first; do not overwrite a production mail server.
+> **Release status: v0.8.0-beta.7 (public beta).** This is a CI/installer fix release on top of v0.8-beta.6: source files needed by the from-source build path (scripts/deploy/VERSION) are now copied into /opt/mailstack/ui (clean-checkout container installs previously failed), the rockylinux:9 curl-minimal package conflict no longer blocks installation, non-systemd minimal containers get /etc/init.d pre-created, the unit-test Path.stat mock no longer breaks glob on Python 3.11/3.12, and the production dependency qs is upgraded to 6.16.0 (CVE fixes). No interface or data-format changes.
 >
 > **Important disclaimer: MailStack does not guarantee inbox placement.** Actual deliverability depends on IP and domain reputation, DNS authentication (MX / SPF / DKIM / DMARC / PTR), message content, bounce and complaint rates, relay provider policies, and recipient-side rules.
 
@@ -410,7 +410,7 @@ After installation `/usr/local/bin/ms` is linked. Run `ms` anywhere on the serve
 
 ```bash
 ms upgrade              # upgrade to the latest signed release
-ms upgrade v0.8-beta.6  # pin to a specific version
+ms upgrade v0.8.0-beta.7  # pin to a specific version
 ```
 
 Channel design:
@@ -619,7 +619,7 @@ mailstack.sh                      Unified entry: install / update(upgrade) / doc
 │   └── verification/             Ubuntu 24.04 / Debian 12 real-machine records, mail delivery E2E
 ├── .github/workflows/ci.yml / release.yml
 ├── .env.example
-└── CHANGELOG.md                  v0.1.0-beta.1 → v0.8-beta.6 full changelog
+└── CHANGELOG.md                  v0.1.0-beta.1 → v0.8.0-beta.7 full changelog
 ```
 
 ## Development Guide
@@ -686,7 +686,7 @@ Do **not** disclose vulnerabilities in public issues. Use GitHub Private Vulnera
 
 | Document | Content |
 |---|---|
-| [CHANGELOG.md](CHANGELOG.md) | v0.1.0-beta.1 → v0.8-beta.6 per-version changes, with the full background of every security fix |
+| [CHANGELOG.md](CHANGELOG.md) | v0.1.0-beta.1 → v0.8.0-beta.7 per-version changes, with the full background of every security fix |
 | [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) | Distribution support matrix and capability notes |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment: port model, volume layout, first-start password |
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | STRIDE threat model (asset tiers, trust boundaries, non-goals) |

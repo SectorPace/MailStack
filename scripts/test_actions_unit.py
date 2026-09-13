@@ -1521,15 +1521,55 @@ class KeyPermissionScan(unittest.TestCase):
         return None
 
     @staticmethod
-    def _stat(mode):
-        return os.stat_result((0o100000 | mode, 0, 0, 1, 0, 0, 1, 0.0, 0.0, 0.0))
+    def _stat(mode, gid=0):
+        return os.stat_result((0o100000 | mode, 0, 0, 1, 0, gid, 1, 0.0, 0.0, 0.0))
+
+    @staticmethod
+    def _local_opendkim_gid():
+        """gid a correctly-permissioned DKIM key carries on THIS machine.
+
+        The scanner treats root:opendkim as the owner contract; machines that
+        already have the group (mail-stack dev boxes, WSL test rigs) must see
+        it in the faked stat, or the 0640-is-pass matrix goes red for reasons
+        that have nothing to do with the code under test.
+        """
+        try:
+            import grp
+        except ImportError:
+            return 0
+        try:
+            return grp.getgrnam('opendkim').gr_gid
+        except (KeyError, OSError):
+            return 0
+
+    @contextlib.contextmanager
+    def _patch_stat(self, paths, mode, gid=0):
+        """Fake stat() only for the given paths; everything else stays real.
+
+        A blanket ``return_value`` mock on Path.stat breaks Path.glob/rglob on
+        Python <= 3.12 (its directory iteration consults Path.stat), so the
+        scanner silently finds zero files and the assertions see None -- red
+        on CI (3.11), green on 3.14 dev machines whose glob no longer calls
+        Path.stat. Faking only the target paths keeps glob fully functional.
+        """
+        wanted = {os.fspath(p) for p in paths}
+        fake = self._stat(mode, gid)
+        real = pathlib.Path.stat
+
+        def selective(path, *args, **kwargs):
+            if os.fspath(path) in wanted:
+                return fake
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(pathlib.Path, 'stat', autospec=True,
+                               side_effect=selective):
+            yield
 
     def test_sasl_passwd_mode_0644_is_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
             sasl = pathlib.Path(tmp) / 'sasl_passwd'
             sasl.write_text('smtp.example user:pass\n', encoding='utf-8')
-            with mock.patch.object(pathlib.Path, 'stat', autospec=True,
-                                   return_value=self._stat(0o644)):
+            with self._patch_stat([sasl], 0o644):
                 checks = telemetry.key_permission_scan(
                     sasl_passwd=sasl,
                     dkim_key_dir=pathlib.Path(tmp) / 'no-keys',
@@ -1540,8 +1580,7 @@ class KeyPermissionScan(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sasl = pathlib.Path(tmp) / 'sasl_passwd'
             sasl.write_text('smtp.example user:pass\n', encoding='utf-8')
-            with mock.patch.object(pathlib.Path, 'stat', autospec=True,
-                                   return_value=self._stat(0o600)):
+            with self._patch_stat([sasl], 0o600):
                 checks = telemetry.key_permission_scan(
                     sasl_passwd=sasl,
                     dkim_key_dir=pathlib.Path(tmp) / 'no-keys',
@@ -1551,18 +1590,18 @@ class KeyPermissionScan(unittest.TestCase):
     def test_dkim_private_key_mode_0640_is_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
             keys = pathlib.Path(tmp)
-            (keys / 'mail.private').write_text('KEY', encoding='utf-8')
-            with mock.patch.object(pathlib.Path, 'stat', autospec=True,
-                                   return_value=self._stat(0o640)):
+            key = keys / 'mail.private'
+            key.write_text('KEY', encoding='utf-8')
+            with self._patch_stat([key], 0o640, gid=self._local_opendkim_gid()):
                 checks = telemetry.key_permission_scan(dkim_key_dir=keys)
             self.assertEqual(self._status(checks, 'DKIM key mail.private'), 'PASS')
 
     def test_dkim_private_key_mode_0644_is_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
             keys = pathlib.Path(tmp)
-            (keys / 'mail.private').write_text('KEY', encoding='utf-8')
-            with mock.patch.object(pathlib.Path, 'stat', autospec=True,
-                                   return_value=self._stat(0o644)):
+            key = keys / 'mail.private'
+            key.write_text('KEY', encoding='utf-8')
+            with self._patch_stat([key], 0o644):
                 checks = telemetry.key_permission_scan(dkim_key_dir=keys)
             self.assertEqual(self._status(checks, 'DKIM key mail.private'), 'FAIL')
 
@@ -1570,8 +1609,7 @@ class KeyPermissionScan(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             archive = pathlib.Path(tmp) / 'mailstack-backup-20240101-010101.tar.gz.gpg'
             archive.write_bytes(b'ciphertext')
-            with mock.patch.object(pathlib.Path, 'stat', autospec=True,
-                                   return_value=self._stat(0o644)):
+            with self._patch_stat([archive], 0o644):
                 checks = telemetry.key_permission_scan(backup_dir=pathlib.Path(tmp))
             self.assertEqual(self._status(checks, f'backup {archive.name}'), 'FAIL')
 
@@ -1579,8 +1617,7 @@ class KeyPermissionScan(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             archive = pathlib.Path(tmp) / 'mailstack-backup-20240101-010101.tar.gz.gpg'
             archive.write_bytes(b'ciphertext')
-            with mock.patch.object(pathlib.Path, 'stat', autospec=True,
-                                   return_value=self._stat(0o600)):
+            with self._patch_stat([archive], 0o600):
                 checks = telemetry.key_permission_scan(backup_dir=pathlib.Path(tmp))
             self.assertEqual(self._status(checks, f'backup {archive.name}'), 'PASS')
 
