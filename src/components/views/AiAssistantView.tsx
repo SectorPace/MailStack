@@ -15,7 +15,7 @@ import {
   User,
   Zap,
   HelpCircle
-} from 'lucide-react';
+} from '@/lib/icons';
 import { LiquidGlass } from '../common/LiquidGlass';
 import { api } from '../../api';
 
@@ -34,7 +34,7 @@ export const AiAssistantView: React.FC = () => {
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const selectedDomain = domains.find((d) => d.id === selectedDomainId) || domains[0];
-  const domainName = selectedDomain?.name || 'sectorpace.com';
+  const domainName = selectedDomain?.name || '';
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -90,13 +90,8 @@ export const AiAssistantView: React.FC = () => {
         body: JSON.stringify({
           message: userMsg.content,
           domain: domainName,
-          records: [
-            { type: 'A', name: `mail.${domainName}`, content: '163.192.27.230' },
-            { type: 'MX', name: domainName, content: `mail.${domainName}`, priority: 10 },
-            { type: 'TXT', name: domainName, content: 'v=spf1 mx include:spf.us-sanjose-1.oci.oraclecloud.com ~all' },
-            { type: 'TXT', name: `mail._domainkey.${domainName}`, content: 'v=DKIM1; k=rsa; p=MIIBIjANBgkqhki...' },
-            { type: 'TXT', name: `_dmarc.${domainName}`, content: `v=DMARC1; p=none; rua=mailto:admin@${domainName}` },
-          ],
+          // Send only verified domain identity; do not invent DNS observations.
+          records: [],
           history: historyPayload,
         }),
       });
@@ -109,7 +104,7 @@ export const AiAssistantView: React.FC = () => {
       };
 
       setMessages((prev) => [...prev, assistantMsg]);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error('Chat error:', err);
       const fallbackMsg: ChatMessage = {
         id: 'msg-err-' + Date.now(),

@@ -15,10 +15,10 @@ git config user.email "你的 GitHub 邮箱"
 git remote add origin https://github.com/SectorPace/MailStack.git
 git add .
 git status
-git commit -m "Release MailStack v0.1-beta1"
-git tag -a v0.1-beta1 -m "MailStack v0.1-beta1"
+git commit -m "Release MailStack v0.5.1-beta.1"
+git tag -a v0.5.1-beta.1 -m "MailStack v0.5.1-beta.1"
 git push -u origin main
-git push origin v0.1-beta1
+git push origin v0.5.1-beta.1
 ```
 
 如果已有 origin：

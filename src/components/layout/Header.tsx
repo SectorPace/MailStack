@@ -14,8 +14,8 @@ import {
   Github,
   Star,
   ExternalLink
-} from 'lucide-react';
-import { motion, AnimatePresence } from 'motion/react';
+} from '@/lib/icons';
+import { motion, AnimatePresence } from '@/lib/motion';
 
 export const Header: React.FC = () => {
   const {
@@ -110,7 +110,7 @@ export const Header: React.FC = () => {
 
         {/* GitHub Button - Pure Icon with Liquid Glass Floating Bubble style */}
         <a
-          href="https://github.com"
+          href="https://github.com/SectorPace/MailStack"
           target="_blank"
           rel="noreferrer noopener"
           className="w-9 h-9 liquid-glass-btn rounded-xl flex items-center justify-center text-slate-700 dark:text-slate-200 hover:text-cyan-600 dark:hover:text-white transition-all group shrink-0 relative overflow-hidden"

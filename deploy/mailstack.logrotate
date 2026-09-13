@@ -1,0 +1,38 @@
+# /etc/logrotate.d/mailstack
+# MailStack Logrotate Policy for production Linux hosts
+#
+# rpc 审计与安装日志由 root 写入；web/webmail 日志仅存在于非 systemd 环境
+# （systemd 环境走 journald），由对应服务账号写入。
+# 服务日志使用 copytruncate：init 脚本的重定向 fd 不会跟随 logrotate 的
+# rename，不 copytruncate 会导致轮转后进程继续写入旧 inode（新文件永远为空）。
+
+/var/log/mailstack-rpc-audit.log
+/var/log/mailstack-install.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+}
+
+/var/log/mailstack-web.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+
+/var/log/mailstack-webmail.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

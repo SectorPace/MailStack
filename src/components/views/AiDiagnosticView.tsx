@@ -1,26 +1,48 @@
 import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
+import { api } from '../../api';
 import { AiDnsDiagnostic } from '../dns/AiDnsDiagnostic';
-import { Sparkles, Globe, Server, Bot, ArrowRight, ShieldCheck, Zap } from 'lucide-react';
+import { Sparkles, Globe, Server, Bot, ArrowRight, ShieldCheck, Zap } from '@/lib/icons';
 import { LiquidGlass } from '../common/LiquidGlass';
 
 export const AiDiagnosticView: React.FC = () => {
   const { domains, language, themeMode, setCurrentSection, showToast } = useApp();
   const [selectedDomainId, setSelectedDomainId] = useState(domains[0]?.id || '');
-  const [serverIp, setServerIp] = useState('163.192.27.230');
+  const [serverIp, setServerIp] = useState('');
   const [relayProvider, setRelayProvider] = useState('oracle');
+  // Set when the server IP lookup fails. Without it the A record and the SPF
+  // record silently vanish from the generated table and the operator copies a
+  // record set that is missing two of its five entries, with nothing to explain
+  // why. Better to say the IP could not be determined than to imply it is blank.
+  const [identityUnavailable, setIdentityUnavailable] = useState(false);
 
   const selectedDomain = domains.find((d) => d.id === selectedDomainId) || domains[0];
-  const domainName = selectedDomain?.name || 'sectorpace.com';
+  const domainName = selectedDomain?.name || '';
+  const dkimKey = selectedDomain?.dkimPublicKey || '';
 
-  // Sample records for the selected domain
-  const records = [
-    { type: 'A', name: `mail.${domainName}`, content: serverIp, priority: undefined },
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const status = await api('/api/setup/status');
+        if (status?.identity?.serverIp) setServerIp(status.identity.serverIp);
+        if (status?.identity?.domain && !selectedDomainId) setSelectedDomainId(status.identity.domain);
+      } catch (_) {
+        setIdentityUnavailable(true);
+      }
+    })();
+  }, []);
+
+  React.useEffect(() => {
+    if (!selectedDomainId && domains[0]?.id) setSelectedDomainId(domains[0].id);
+  }, [domains, selectedDomainId]);
+
+  const records = domainName ? [
+    ...(serverIp ? [{ type: 'A', name: `mail.${domainName}`, content: serverIp, priority: undefined }] : []),
     { type: 'MX', name: domainName, content: `mail.${domainName}`, priority: 10 },
-    { type: 'TXT', name: domainName, content: `v=spf1 mx include:spf.us-sanjose-1.oci.oraclecloud.com ~all` },
-    { type: 'TXT', name: `mail._domainkey.${domainName}`, content: `v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCg...` },
-    { type: 'TXT', name: `_dmarc.${domainName}`, content: `v=DMARC1; p=none; rua=mailto:admin@${domainName}` },
-  ];
+    ...(serverIp ? [{ type: 'TXT', name: domainName, content: relayProvider === 'ses' ? 'v=spf1 include:amazonses.com ~all' : `v=spf1 ip4:${serverIp} ~all` }] : []),
+    ...(dkimKey ? [{ type: 'TXT', name: `mail._domainkey.${domainName}`, content: `v=DKIM1; k=rsa; p=${dkimKey}` }] : []),
+    { type: 'TXT', name: `_dmarc.${domainName}`, content: `v=DMARC1; p=none; rua=mailto:postmaster@${domainName}` },
+  ] : [];
 
   return (
     <div className="p-6 space-y-6 max-w-7xl mx-auto font-sans">
@@ -84,7 +106,7 @@ export const AiDiagnosticView: React.FC = () => {
               type="text"
               value={serverIp}
               onChange={(e) => setServerIp(e.target.value)}
-              placeholder="163.192.27.230"
+              placeholder="203.0.113.10"
               className="w-full h-9 px-3 rounded-xl border text-xs font-mono bg-white/80 dark:bg-slate-950/80 border-slate-200 dark:border-white/10 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-1 focus:ring-cyan-500"
             />
           </div>
@@ -108,6 +130,22 @@ export const AiDiagnosticView: React.FC = () => {
           </div>
         </div>
       </LiquidGlass>
+
+      {identityUnavailable && (
+        <LiquidGlass variant="panel" glowColor="amber" className="p-4 flex items-start gap-3">
+          <ShieldCheck className="w-5 h-5 shrink-0 mt-0.5 text-amber-400" />
+          <div className="text-sm">
+            <p className="font-medium">
+              {language === 'zh' ? '无法读取服务器公网 IP' : 'Server public IP unavailable'}
+            </p>
+            <p className="opacity-70 mt-1">
+              {language === 'zh'
+                ? 'A 记录与 SPF 记录需要服务器 IP，本次未能获取，因此下表中这两条记录被省略。请手动填写 IP，或稍后重试。'
+                : 'The A and SPF records need the server IP, which could not be read, so both are omitted from the table below. Enter the IP manually or retry later.'}
+            </p>
+          </div>
+        </LiquidGlass>
+      )}
 
       {/* Main AI Diagnostic Engine Component */}
       <AiDnsDiagnostic

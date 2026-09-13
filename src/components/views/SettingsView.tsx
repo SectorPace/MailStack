@@ -1,6 +1,9 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { AdminAccountSettings } from './AdminAccountSettings';
+import { AiProviderSettings } from './AiProviderSettings';
 import { useApp } from '../../context/AppContext';
+import { api } from '../../api';
+import { getErrorMessage } from '../../utils/errors';
 import { MailStackLogo } from '../common/MailStackLogo';
 import { LogoCustomizerModal } from '../modals/LogoCustomizerModal';
 import { BackgroundCustomizerModal } from '../modals/BackgroundCustomizerModal';
@@ -20,8 +23,13 @@ import {
   ArrowRight,
   Zap,
   Layers,
-  Wand2
-} from 'lucide-react';
+  Wand2,
+  RotateCcw,
+  Trash2,
+  FileArchive,
+  Lock,
+  AlertCircle
+} from '@/lib/icons';
 
 export const SettingsView: React.FC = () => {
   const {
@@ -35,16 +43,107 @@ export const SettingsView: React.FC = () => {
     setCurrentSection,
     setIsOnboardingModalOpen,
     backgroundConfig,
+    saveSettings,
   } = useApp();
   const [isLogoModalOpen, setIsLogoModalOpen] = useState(false);
   const [isBgModalOpen, setIsBgModalOpen] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [saveBusy, setSaveBusy] = useState(false);
+  const [backups, setBackups] = useState<any[]>([]);
+  const [includeMails, setIncludeMails] = useState(false);
+  const [backupPassphrase, setBackupPassphrase] = useState('');
+  const [restoreConfirmModal, setRestoreConfirmModal] = useState<any | null>(null);
+  const [restorePassphrase, setRestorePassphrase] = useState('');
+  const [restoreBusy, setRestoreBusy] = useState(false);
 
-  const handleBackup = () => {
-    showToast('success', language === 'zh' ? '备份生成完成' : 'Backup Generated', `mailstack-config-backup-${Date.now()}.tar.gz (${language === 'zh' ? '已保存至本地' : 'saved to local'})`);
+  const loadBackups = async () => {
+    try {
+      const list = await api('/api/backups');
+      setBackups(Array.isArray(list) ? list : []);
+    } catch {
+      setBackups([]);
+    }
   };
 
-  const handleManualSave = () => {
-    showToast('success', language === 'zh' ? '设置已保存' : 'Settings Saved', language === 'zh' ? '所有系统参数与外观配置已实时生效' : 'All parameters and styling synced');
+  useEffect(() => {
+    loadBackups();
+  }, []);
+
+  const handleBackup = async () => {
+    setBackupBusy(true);
+    try {
+      const passphrase = backupPassphrase.trim();
+      const res = await api('/api/backups', {
+        method: 'POST',
+        body: JSON.stringify({ includeMails, ...(passphrase ? { passphrase } : {}) }),
+      });
+      showToast(
+        'success',
+        language === 'zh' ? '备份生成完成' : 'Backup Generated',
+        res.backup?.name || 'mailstack-backup.tar.gz'
+      );
+      setBackupPassphrase('');
+      loadBackups();
+    } catch (e: unknown) {
+      showToast('error', language === 'zh' ? '备份生成失败' : 'Backup Failed', getErrorMessage(e));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const handleRestore = async (b: any) => {
+    if (b.encrypted && !restorePassphrase.trim()) {
+      return showToast(
+        'error',
+        language === 'zh' ? '需要解密口令' : 'Passphrase Required',
+        language === 'zh' ? '该备份已加密，请先输入口令' : 'This backup is encrypted; enter the passphrase first'
+      );
+    }
+    setRestoreBusy(true);
+    try {
+      const passphrase = restorePassphrase.trim();
+      const res = await api('/api/backups/restore', {
+        method: 'POST',
+        body: JSON.stringify({ filename: b.name, confirm: true, ...(passphrase ? { passphrase } : {}) }),
+      });
+      showToast(
+        'success',
+        language === 'zh' ? '备份已成功还原' : 'Backup Restored',
+        res.message || '配置已成功恢复并重新载入服务'
+      );
+      setRestoreConfirmModal(null);
+      setRestorePassphrase('');
+      loadBackups();
+    } catch (e: unknown) {
+      showToast('error', language === 'zh' ? '还原失败' : 'Restore Failed', getErrorMessage(e));
+    } finally {
+      setRestoreBusy(false);
+    }
+  };
+
+  const handleDeleteBackup = async (name: string) => {
+    if (!window.confirm(language === 'zh' ? `确认删除备份 ${name} 吗？` : `Delete backup ${name}?`)) return;
+    try {
+      await api(`/api/backups/${encodeURIComponent(name)}`, {
+        method: 'DELETE',
+        body: JSON.stringify({ confirm: true }),
+      });
+      showToast('success', language === 'zh' ? '备份已删除' : 'Backup Deleted', name);
+      loadBackups();
+    } catch (e: unknown) {
+      showToast('error', language === 'zh' ? '删除失败' : 'Delete Failed', getErrorMessage(e));
+    }
+  };
+
+  const handleManualSave = async () => {
+    setSaveBusy(true);
+    try {
+      await saveSettings(settings);
+    } catch (e: unknown) {
+      console.error('Failed to save settings:', getErrorMessage(e));
+    } finally {
+      setSaveBusy(false);
+    }
   };
 
   const isLight = themeMode === 'light';
@@ -452,31 +551,188 @@ export const SettingsView: React.FC = () => {
 
       <AdminAccountSettings />
 
-      {/* Section 3: Backup & Snapshot */}
-      <div className={`p-6 rounded-2xl liquid-glass-card flex flex-wrap items-center justify-between gap-4 transition-all ${
+      <AiProviderSettings />
+
+      {/* Section 3: Disaster Recovery & Full Backup / Restore Table */}
+      <div className={`p-6 rounded-2xl liquid-glass-card space-y-4 transition-all ${
         isLight ? 'bg-white/90 border-white/90' : ''
       }`}>
-        <div>
-          <div className={`text-sm font-bold ${isLight ? 'text-slate-900' : 'text-white'}`}>
-            {language === 'zh' ? '系统快照与配置备份' : 'Configuration Snapshot & Backup'}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b pb-4 border-slate-700/40">
+          <div>
+            <div className={`text-sm font-bold flex items-center gap-2 ${isLight ? 'text-slate-900' : 'text-white'}`}>
+              <FileArchive className={`w-4 h-4 ${isLight ? 'text-sky-600' : 'text-cyan-400'}`} />
+              <span>{language === 'zh' ? '系统快照与灾备恢复 (Disaster Recovery & Backups)' : 'Disaster Recovery & Backups'}</span>
+            </div>
+            <div className={`text-xs mt-0.5 ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
+              {language === 'zh' ? '完整备份 /etc/mailstack, Postfix, Dovecot, OpenDKIM 配置与邮箱数据' : 'Full archive of configuration sources and mailbox data'}
+            </div>
           </div>
-          <div className={`text-xs mt-0.5 ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
-            {language === 'zh' ? '打包所有域名、用户映射、DKIM 密钥与中继路由策略' : 'Archive all domains, credentials, DKIM keys, and routing rules'}
+
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={includeMails}
+                onChange={(e) => setIncludeMails(e.target.checked)}
+                className="rounded text-cyan-400 focus:ring-0"
+              />
+              <span>{language === 'zh' ? '包含邮箱邮件数据 (/var/vmail)' : 'Include Maildir Data'}</span>
+            </label>
+
+            <button
+              disabled={backupBusy}
+              onClick={handleBackup}
+              className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer shadow-md ${
+                isLight
+                  ? 'bg-sky-600 hover:bg-sky-500 text-white'
+                  : 'bg-cyan-400 hover:bg-cyan-300 text-slate-950 shadow-[0_0_15px_rgba(0,242,195,0.25)]'
+              }`}
+            >
+              <Download className={backupBusy ? "animate-spin w-4 h-4" : "w-4 h-4"} />
+              <span>{backupBusy ? (language === 'zh' ? '正在打包...' : 'Backing up...') : (language === 'zh' ? '创建全量备份' : 'Create Backup')}</span>
+            </button>
           </div>
         </div>
 
-        <button
-          onClick={handleBackup}
-          className={`px-4 py-2.5 rounded-xl border text-xs font-semibold flex items-center gap-2 transition-all cursor-pointer ${
-            isLight
-              ? 'bg-slate-100 hover:bg-slate-200 border-slate-300 text-slate-800'
-              : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
-          }`}
-        >
-          <Download className={`w-4 h-4 ${isLight ? 'text-sky-600' : 'text-cyan-400'}`} />
-          <span>{language === 'zh' ? '生成全量快照备份' : 'Create Snapshot Backup'}</span>
-        </button>
+        {/* Optional at-rest encryption: filled passphrase triggers gpg symmetric
+            encryption server-side; cleared immediately after submission. */}
+        <div className={`flex flex-col sm:flex-row sm:items-center gap-2 p-3 rounded-xl border ${
+          isLight ? 'bg-slate-50/80 border-slate-200/80' : 'bg-slate-950/80 border-slate-800/80'
+        }`}>
+          <div className="flex items-center gap-2 text-xs shrink-0">
+            <Lock className={`w-3.5 h-3.5 ${isLight ? 'text-sky-600' : 'text-cyan-400'}`} />
+            <span className={isLight ? 'text-slate-600' : 'text-slate-400'}>
+              {language === 'zh' ? '加密口令（可选）' : 'Encryption passphrase (optional)'}
+            </span>
+          </div>
+          <input
+            type="password"
+            value={backupPassphrase}
+            onChange={(e) => setBackupPassphrase(e.target.value)}
+            placeholder={language === 'zh' ? '填写后备份将以 GPG AES256 加密，还原时需要同一口令' : 'When set, the archive is GPG AES256 encrypted; the same passphrase restores it'}
+            autoComplete="new-password"
+            className={`flex-1 px-3 py-2 rounded-lg border focus:outline-none transition-all text-xs ${
+              isLight
+                ? 'bg-white border-slate-300 text-slate-900 focus:border-sky-600'
+                : 'bg-slate-900/80 border-slate-700 text-white focus:border-cyan-400'
+            }`}
+          />
+        </div>
+
+        {backups.length === 0 ? (
+          <div className="py-6 text-center text-xs text-slate-500">
+            {language === 'zh' ? '暂无历史备份。点击上方按钮可立即创建安全快照。' : 'No backups found. Click above to create one.'}
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs font-mono">
+              <thead>
+                <tr className="border-b border-slate-800/60 text-slate-400 font-sans">
+                  <th className="pb-2 font-medium">{language === 'zh' ? '备份文件名' : 'Archive Name'}</th>
+                  <th className="pb-2 font-medium">{language === 'zh' ? '创建时间' : 'Created At'}</th>
+                  <th className="pb-2 font-medium">{language === 'zh' ? '文件大小' : 'Size'}</th>
+                  <th className="pb-2 font-medium">{language === 'zh' ? '包含邮件' : 'Mails'}</th>
+                  <th className="pb-2 font-medium text-right">{language === 'zh' ? '操作' : 'Actions'}</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/30">
+                {backups.map((b) => (
+                  <tr key={b.name} className="hover:bg-slate-800/20">
+                    <td className="py-2.5 font-bold text-slate-200">
+                      <span className="inline-flex items-center gap-1.5">
+                        {b.name}
+                        {b.encrypted && (
+                          <span
+                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 text-[10px] font-bold"
+                            title={language === 'zh' ? '已加密备份，还原需要口令' : 'Encrypted backup; restore requires the passphrase'}
+                          >
+                            <Lock className="w-2.5 h-2.5" />
+                            {language === 'zh' ? '加密' : 'ENC'}
+                          </span>
+                        )}
+                      </span>
+                    </td>
+                    <td className="py-2.5 text-slate-400 font-sans">{new Date(b.createdAt).toLocaleString()}</td>
+                    <td className="py-2.5 text-slate-400">{(b.size / 1024).toFixed(1)} KB</td>
+                    <td className="py-2.5">
+                      <span className={`px-2 py-0.5 rounded text-[10px] ${b.includeMails ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-700/50 text-slate-400'}`}>
+                        {b.includeMails ? 'YES' : 'NO'}
+                      </span>
+                    </td>
+                    <td className="py-2.5 text-right font-sans">
+                      <div className="flex items-center justify-end gap-2">
+                        <button
+                          disabled={restoreBusy}
+                          onClick={() => setRestoreConfirmModal(b)}
+                          className="px-2.5 py-1 rounded-lg text-xs font-semibold bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 transition-all flex items-center gap-1"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          <span>{language === 'zh' ? '还原' : 'Restore'}</span>
+                        </button>
+                        <button
+                          onClick={() => handleDeleteBackup(b.name)}
+                          className="p-1 rounded-lg text-red-400 hover:bg-red-500/20 transition-all"
+                          title={language === 'zh' ? '删除' : 'Delete'}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
+
+      {restoreConfirmModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+          <div className="p-6 rounded-2xl bg-slate-900 border border-slate-800 max-w-md w-full space-y-4 shadow-2xl font-sans">
+            <div className="flex items-center gap-3 text-amber-400">
+              <AlertCircle className="w-6 h-6" />
+              <h3 className="font-bold text-base text-white">{language === 'zh' ? '确认从备份还原？' : 'Confirm Backup Restore'}</h3>
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              {language === 'zh'
+                ? `即将还原备份文件「${restoreConfirmModal.name}」。系统将在还原前自动生成安全回滚快照，并重新载入邮件服务。`
+                : `Restoring from "${restoreConfirmModal.name}". A safety rollback snapshot will be created automatically.`}
+            </p>
+            {restoreConfirmModal.encrypted && (
+              <div className="space-y-1.5">
+                <label className="text-xs text-cyan-300 flex items-center gap-1.5 font-semibold">
+                  <Lock className="w-3.5 h-3.5" />
+                  {language === 'zh' ? '该备份已加密，请输入解密口令' : 'This backup is encrypted; enter the passphrase'}
+                </label>
+                <input
+                  type="password"
+                  value={restorePassphrase}
+                  onChange={(e) => setRestorePassphrase(e.target.value)}
+                  placeholder={language === 'zh' ? '解密口令' : 'Decryption passphrase'}
+                  autoComplete="off"
+                  className="w-full px-3 py-2 rounded-lg border border-slate-700 bg-slate-950 text-white text-xs focus:outline-none focus:border-cyan-400"
+                />
+              </div>
+            )}
+            <div className="flex items-center justify-end gap-3 pt-2 border-t border-slate-800">
+              <button
+                onClick={() => { setRestoreConfirmModal(null); setRestorePassphrase(''); }}
+                className="px-4 py-2 rounded-xl text-xs text-slate-400 hover:text-white"
+              >
+                {language === 'zh' ? '取消' : 'Cancel'}
+              </button>
+              <button
+                disabled={restoreBusy || (restoreConfirmModal.encrypted && !restorePassphrase.trim())}
+                onClick={() => handleRestore(restoreConfirmModal)}
+                className="px-4 py-2 rounded-xl text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 flex items-center gap-2 shadow-lg disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <RotateCcw className={restoreBusy ? "animate-spin w-3.5 h-3.5" : "w-3.5 h-3.5"} />
+                <span>{restoreBusy ? (language === 'zh' ? '正在还原...' : 'Restoring...') : (language === 'zh' ? '立即确认还原' : 'Confirm Restore')}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {isLogoModalOpen && (
         <LogoCustomizerModal onClose={() => setIsLogoModalOpen(false)} />

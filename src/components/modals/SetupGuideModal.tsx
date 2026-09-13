@@ -1,11 +1,15 @@
-import React from 'react';
+import React, { Suspense, lazy } from 'react';
 import { useApp } from '../../context/AppContext';
-import { SetupGuideView } from '../views/SetupGuideView';
-import { X, Sparkles } from 'lucide-react';
-import { LiquidGlass } from '../common/LiquidGlass';
+import { X } from '@/lib/icons';
+
+const SetupGuideView = lazy(() =>
+  import('../views/SetupGuideView').then((module) => ({
+    default: module.SetupGuideView,
+  }))
+);
 
 export const SetupGuideModal: React.FC = () => {
-  const { isOnboardingModalOpen, setIsOnboardingModalOpen, language } = useApp();
+  const { isOnboardingModalOpen, setIsOnboardingModalOpen } = useApp();
 
   if (!isOnboardingModalOpen) return null;
 
@@ -23,9 +27,12 @@ export const SetupGuideModal: React.FC = () => {
         </div>
 
         <div className="-mt-10">
-          <SetupGuideView />
+          <Suspense fallback={<div className="p-12 text-center text-slate-400">Loading setup guide...</div>}>
+            <SetupGuideView />
+          </Suspense>
         </div>
       </div>
     </div>
   );
 };
+

@@ -5,97 +5,67 @@
 <h1 align="center">MailStack</h1>
 
 <p align="center">
-  Multi-domain mail server deployment and visual administration for Linux VPS environments
+  Multi-Domain Mail Server Deployment and Administration for systemd Linux
 </p>
 
 <p align="center">
   <a href="README.md">简体中文</a> ·
   <a href="README_EN.md">English</a> ·
-  <a href="https://github.com/SectorPace/MailStack/issues">Issue Tracker</a> ·
+  <a href="https://github.com/SectorPace/MailStack">GitHub Repository</a> ·
   <a href="https://github.com/SectorPace/MailStack/releases">Releases</a>
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.1--beta1-2476ff">
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.5.0--beta.2-2476ff">
   <img alt="Status" src="https://img.shields.io/badge/status-public%20beta-f0a53a">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-27b36a">
   <img alt="Platform" src="https://img.shields.io/badge/platform-systemd%20Linux-22c7d6">
 </p>
 
-> [!WARNING]
-> **MailStack v0.1-beta1 is a public beta.** Test it on a fresh VPS first. Do not install it over an existing production mail server. Create a VPS snapshot and back up all mail data and configuration before updating, restoring, or uninstalling.
+> **Release status: v0.5.1-beta.1.** This is a public beta. Test it on a fresh VPS before considering any production deployment.
 
 ## Overview
 
-MailStack combines common mail server capabilities, a Web administration console, and a VPS terminal management menu in one project. Its goal is to simplify the deployment and administration of Postfix, Dovecot, outbound SMTP Relay, TLS, DKIM, DNS, mail queues, and service logs.
+MailStack integrates Postfix, Dovecot, a Liquid Glass Web administration console, outbound SMTP relay support, TLS, DKIM and DNS guidance, mail queue and log administration, security checks, and a configurable AI mail assistant.
 
-The Web console is built with React, TypeScript, Vite, and a Liquid Glass visual design. It supports Chinese, English, Light mode, and Dark mode. After installation, administrators can sign in through the VPS public IP and management port, or manage the service from the terminal with the `ms` command.
+MailStack cannot guarantee inbox placement. Delivery depends on IP and domain reputation, authentication, message content, bounces and complaints, relay-provider policies, and recipient-side filtering.
 
-MailStack cannot guarantee inbox placement. Delivery also depends on IP and domain reputation, PTR, SPF, DKIM, DMARC, message content, complaint rates, bounce rates, SMTP Relay provider policies, and recipient-side filtering.
+## Features
 
-## Main Features
-
-### Web Administration Console
-
-- Administrator username and password authentication
-- HttpOnly session cookie
-- CSRF request protection
-- Login failure rate limiting
-- Administrator username and password changes
-- Automatic revocation of all existing sessions after credentials change
-- Custom management port and listening address
-- Public listening by default for VPS administration
-- Chinese and English interfaces
+- Liquid Glass React administration console
+- Simplified Chinese and English interfaces
 - Light and Dark themes
-- Liquid Glass visual style
+- Custom Web administrator username, password, port, and listening address
+- `mailstack` VPS management command
+- Domain, local mailbox user, and alias administration
+- Postfix and Dovecot service status management
+- Outbound SMTP Relay configuration and provider presets
+- TLS certificate, DKIM, and DNS management views
+- Mail Queue, logs, services, and Security Center
+- HttpOnly session cookie and CSRF protection
+- Restricted privileged helper instead of arbitrary shell execution
+- Gemini, Groq, OpenRouter, Mistral, Cerebras, and custom compatible APIs
+- Local rule-based diagnostics when no external AI API is configured
 
-### Mail System Administration
+## Service Ports & Environment Variables
 
-- Mail domain management
-- Linux mailbox user management
-- Mail address alias management
-- Postfix and Dovecot service status
-- SMTP Relay configuration and provider presets
-- TLS certificate administration interface
-- DKIM and DNS setup guidance
-- MX, SPF, DKIM, DMARC, and PTR recommendations
-- Mail queue inspection and flushing
-- Deferred queue cleanup
-- Mail service log inspection
-- Security status and basic diagnostics
+| Service / Module | Default Port | Env Variable | Default Bind | Description |
+|---|---|---|---|---|
+| **Admin Console** | `8787` | `PORT`, `HOST` | `127.0.0.1:8787` | Web control plane & privileged RPC dispatcher |
+| **Webmail Client** | `18788` | `WEBMAIL_PORT`, `WEBMAIL_HOST` | `127.0.0.1:18788` | Standalone Webmail client |
+| **Secure Cookie** | - | `COOKIE_SECURE` | `0` (local) / `1` (caddy/direct) | Enables `Secure; SameSite=Strict` flags |
+| **Node Environment** | - | `NODE_ENV` | `production` | Production runtime |
 
-### AI Mail Assistant
+## Access & Deployment Modes
 
-- Mail DNS configuration analysis
-- TLS and SMTP Relay troubleshooting
-- Bounce and log excerpt explanation
-- Gemini REST API
-- OpenAI-compatible API
-- Groq, OpenRouter, Mistral, and Cerebras presets
-- Custom public HTTPS API endpoints
-- Local rule-based mode without an external API
+| Mode | Bind Address | Use Case | Security | Recommended Access |
+|---|---|---|:---:|---|
+| **`local`** | `127.0.0.1` | Default baseline | 🟢 **High** | Local SSH Port Forwarding (`ssh -L 8787:...`) |
+| **`caddy`** | `127.0.0.1` + Caddy | Public multi-domain | 🟢 **High** | Fully automated Let's Encrypt TLS certificates |
+| **`direct`** | `127.0.0.1` | Custom Nginx/Proxy | 🟡 **Medium** | User-managed reverse proxy & TLS termination |
+| **`plain`** | `0.0.0.0` | Isolated testing | 🔴 **Low** | Plaintext HTTP, requires `--i-understand-plain-http` |
 
-AI API keys remain on the server and are never returned to the browser. Custom API endpoints reject loopback, private, link-local, and reserved addresses to reduce SSRF risk.
-
-Third-party free quotas, models, regional restrictions, and data policies may change. Always verify the provider's current console and terms before relying on a free tier.
-
-## System Requirements
-
-Recommended test environment:
-
-- A fresh Debian or Ubuntu VPS
-- systemd
-- Root or sudo access
-- At least 1 GB RAM, with 2 GB or more recommended
-- A usable public IPv4 address
-- A domain with manageable DNS records
-- Access to the cloud security group or VPS firewall
-
-The installer attempts to install base dependencies on supported systems. On Debian and Ubuntu, if Node.js 20 or later is unavailable, the installer attempts to install Node.js 22.
-
-Other Linux distributions may require additional adaptation because package names, systemd units, log paths, and mail component versions differ.
-
-## Quick Installation
+## Quick Start
 
 ```bash
 git clone https://github.com/SectorPace/MailStack.git
@@ -104,395 +74,153 @@ chmod +x mailstack.sh
 sudo bash ./mailstack.sh install
 ```
 
-The installer asks for:
-
-- Web administrator username
-- Web administrator password
-- Management port
-- Listening address
-
-Default values:
-
-```text
-Listening address: 0.0.0.0
-Management port: 8787
-```
-
-After installation, open:
-
-```text
-http://VPS_PUBLIC_IP:8787
-```
-
-The corresponding TCP management port must also be allowed in the cloud security group and the Linux firewall.
-
-> [!IMPORTANT]
-> Public access is enabled by default for convenient VPS administration. For production use, configure HTTPS, a strong password, firewall controls, and source IP restrictions as soon as possible. Do not use an unencrypted HTTP login page on the public Internet long-term.
-
-## Non-Interactive Installation
-
-The password is passed through standard input to avoid exposing it in shell history or process arguments:
+The installer asks for the Web administrator username, password, management port, and listening address. The default endpoint is `127.0.0.1:8787`.
 
 ```bash
-printf '%s\n' 'YourStrongPasswordHere' | sudo bash ./mailstack.sh install \
-  --admin-user admin \
-  --admin-port 8787 \
-  --admin-host 0.0.0.0 \
-  --admin-password-stdin \
-  --non-interactive
+ssh -L 8787:127.0.0.1:8787 root@SERVER_IP
 ```
 
-The administrator password must contain at least 12 characters.
+Open `http://127.0.0.1:8787` locally after establishing the tunnel.
 
-## The `ms` VPS Command
-
-After installation, run the following command from any directory on the VPS:
+## VPS Commands
 
 ```bash
-ms
+mailstack
+mailstack admin
+mailstack port
+mailstack status
+mailstack logs
 ```
 
-`ms` is the official MailStack management command. The project also keeps `mailstack` as a compatibility alias, but all new documentation uses `ms`.
-
-Common subcommands:
+## Update
 
 ```bash
-ms status
-ms logs
-ms health
-ms admin
-ms port
-ms backup
-ms update
-ms repair
-ms uninstall
-ms purge
-ms version
+cd MailStack
+git pull
+sudo bash ./mailstack.sh update
 ```
 
-If the current account is not root, add `sudo`:
+Create a VPS snapshot and back up MailStack, Postfix, Dovecot, DKIM, and mailbox data before updating.
+
+## Uninstall
+
+Preserve MailStack administration settings:
 
 ```bash
-sudo ms
+sudo bash ./mailstack.sh uninstall
 ```
 
-## VPS Management Menu
-
-Run:
+Remove `/etc/mailstack` as well:
 
 ```bash
-ms
+sudo bash ./mailstack.sh uninstall --purge
 ```
 
-The menu provides the following operations.
+The uninstall flow does not automatically remove Postfix, Dovecot, Linux mailbox users, or mailbox data.
 
-### Web Console Management
+## AI Diagnostics
 
-```text
-1) Show Web console status
-2) Start the Web console
-3) Stop the Web console
-4) Restart the Web console
-5) Show recent Web logs
-6) Follow live Web logs
-7) Change administrator credentials
-8) Change listening address and port
-9) Run Web console health diagnostics
-```
+The AI Center supports DNS and delivery configuration guidance, TLS and relay troubleshooting, log analysis, Gemini REST, OpenAI-compatible endpoints, provider presets, custom public HTTPS endpoints, and an offline rule-based mode.
 
-### Mail System
+API keys remain on the server and are not returned to the browser. Custom API endpoints reject loopback, private, link-local, multicast, and reserved targets to reduce SSRF risk.
 
-```text
-10) Show mail service status
-11) Restart installed mail services
-12) Show the mail queue
-13) Flush the mail queue
-14) Delete the deferred queue
-15) Show mail service logs
-```
+Third-party free quotas, model availability, regional restrictions, and data policies may change. Verify the provider's current console and terms before relying on a free tier.
 
-### Security and Network
+## Security Recommendations
 
-```text
-16) Run a security scan
-17) Show firewall status
-18) Show network interfaces and listening ports
-```
+- Keep the Web console on `127.0.0.1` by default
+- Use an SSH tunnel, VPN, or HTTPS reverse proxy
+- Do not expose the management port directly to the public Internet
+- Protect SMTP, AI, ACME DNS, and DKIM credentials
+- Never commit `.env`, `/etc/mailstack`, `sasl_passwd`, or private keys
+- Configure MX, SPF, DKIM, DMARC, and PTR
+- Monitor certificate expiry, disk space, queues, and failed logins
+- Back up configuration and create a VPS snapshot before dangerous operations
 
-### Backup and Maintenance
+## Administrator Two-Factor Authentication (2FA)
 
-```text
-19) Create a configuration backup
-20) List backups
-21) Restore a backup
-22) Update MailStack
-23) Repair or reinstall MailStack
-24) Update system packages
-```
+The admin console supports time-based one-time passwords (TOTP, RFC 6238): after a correct password, a 6-digit authenticator code is required.
 
-### Uninstall and Cleanup
+**Enrollment:**
 
-```text
-25) Uninstall the program and preserve configuration
-26) Purge MailStack administration components
-```
+1. Open the 2FA card on the Account Settings page and start the enrollment (the server generates a fresh TOTP secret);
+2. Add the account in your authenticator app (e.g. Google Authenticator, 1Password) by pasting the displayed `otpauth://` URI or entering the secret manually;
+3. Enter the current 6-digit code to confirm and enable 2FA;
+4. Enabling shows **10 one-time recovery codes** (`xxxxxxxx-xxxxxxxx`) exactly once. Store them offline immediately: only their hashes are kept server-side, and they cannot be shown again after closing the dialog.
 
-Dangerous operations require an explicit confirmation phrase to reduce accidental deletion.
+**Recovery-code sign-in:** when 2FA is enabled and no authenticator code is available, enter any unused recovery code in the code field at login. Each code is consumed once; the remaining count is visible on the Account Settings page.
 
-## Updating MailStack
+**Disabling:** click disable on the 2FA card and provide a current TOTP code or an unused recovery code.
 
-After installation, update MailStack from any directory on the VPS:
+Additional behavior: enabling/disabling 2FA or changing the admin password revokes all existing sessions; codes are replay-protected (each 30-second step is accepted at most once); a server clock skew beyond roughly 30 seconds will keep codes failing — enable NTP (see `docs/DISASTER_RECOVERY.md`).
+
+## Signed Upgrade Channel
+
+`ms upgrade` now uses the **official signed Release assets** by default and exclusively:
+
+- Downloads the triple: `MailStack-<tag>.tar.gz` + `SHA256SUMS` + `SHA256SUMS.sig`;
+- Verifies the detached signature on `SHA256SUMS` with `ssh-keygen -Y verify` (ed25519, identity `mailstack-release`, trust anchor at `/etc/mailstack/release-allowed-signers` installed at setup time), then checks the archive checksum;
+- **Releases without a signature are refused outright**; any signature or checksum failure aborts before any install script runs;
+- `ms upgrade <tag>` pins a specific release instead of unconditionally following latest;
+- A non-official `MAILSTACK_REPO_URL` is rejected.
 
 ```bash
-sudo ms update
+ms upgrade             # upgrade to the latest signed release (signature verified)
+ms upgrade v0.5.2-rc.5 # pin a specific release tag (signature verified)
 ```
 
-The updater attempts to:
-
-- Retrieve the latest source
-- Preserve the administrator account
-- Preserve the management port and listening address
-- Update the front end and production API
-- Update the `ms` command
-- Restart `mailstack-web`
-- Verify the systemd service and health endpoint
-
-Create a backup before updating:
-
-```bash
-sudo ms backup
-```
-
-If an update fails or the installation becomes inconsistent:
-
-```bash
-sudo ms repair
-```
-
-Check status and logs:
-
-```bash
-sudo ms status
-sudo ms logs
-```
-
-If the `ms` command itself is accidentally removed, restore it from the source directory:
-
-```bash
-cd ~/MailStack
-sudo cp deploy/mailstack-cli /usr/local/bin/ms
-sudo chmod 0755 /usr/local/bin/ms
-sudo ln -sfn /usr/local/bin/ms /usr/local/bin/mailstack
-```
-
-## Changing the Administrator Account
-
-Run on the VPS:
-
-```bash
-sudo ms admin
-```
-
-Alternatively, sign in to the Web console and change the administrator username and password in System Settings.
-
-After new credentials are saved, all existing Web sessions are revoked. Sign in again with the new credentials.
-
-The MailStack administrator account is independent from:
-
-- The Linux root account
-- SSH accounts
-- Mailbox users
-- Postfix SASL users
-- Dovecot mailbox authentication users
-
-Administrator credentials are stored in:
-
-```text
-/etc/mailstack/admin.json
-```
-
-Passwords are derived with PBKDF2-SHA256, a random salt, and repeated iterations. Plaintext passwords are not stored.
-
-## Changing the Management Port
-
-```bash
-sudo ms port
-```
-
-The command can configure:
-
-- The management port
-- `0.0.0.0` for public listening
-- `127.0.0.1` for IPv4 loopback-only listening
-- `::1` for IPv6 loopback-only listening
-
-After a change, the script reloads systemd and restarts the Web console.
-
-When changing the port, also update:
-
-- The cloud security group
-- UFW, firewalld, or nftables
-- The HTTPS reverse proxy
-- Monitoring and access URLs
-
-## Backup and Restore
-
-Create a backup:
-
-```bash
-sudo ms backup
-```
-
-Default backup directory:
-
-```text
-/var/backups/mailstack/
-```
-
-Depending on what exists on the system, a backup may include:
-
-```text
-/etc/mailstack
-/etc/postfix
-/etc/dovecot
-/etc/opendkim
-/etc/systemd/system/mailstack-web.service
-/opt/mailstack
-```
-
-Use the `ms` menu to list and restore backups.
-
-> [!CAUTION]
-> Restoring a backup overwrites current configuration. Create a separate VPS snapshot and verify that the backup archive is complete before restoring.
-
-## Uninstallation
-
-### Uninstall the Program and Keep Configuration
-
-```bash
-sudo ms uninstall
-```
-
-This mode removes the MailStack Web application, systemd service, and command shortcuts, while preserving `/etc/mailstack` and mail data.
-
-### Purge MailStack Administration Components
-
-```bash
-sudo ms purge
-```
-
-This mode also removes the administrator and MailStack management configuration under `/etc/mailstack`.
-
-By default, neither mode automatically removes:
-
-- Postfix
-- Dovecot
-- Linux mailbox users
-- Mailbox data
-- The mail queue
-
-This behavior reduces the risk of accidentally deleting real mailbox data.
-
-## Installation Paths
-
-```text
-/opt/mailstack                  MailStack runtime directory
-/opt/mailstack/ui               Front-end source and build output
-/opt/mailstack/server.cjs       Production Web API
-/opt/mailstack/backend          Restricted privileged helper
-/opt/mailstack-source           Source copy used for updates and repairs
-/etc/mailstack                  Administrator and MailStack configuration
-/usr/local/bin/ms               Official command shortcut
-/usr/local/bin/mailstack        Compatibility alias
-/var/backups/mailstack          Default backup directory
-```
+Developer mode: setting `MAILSTACK_ALLOW_UNSAFE_GIT=1` switches to a `git clone` upgrade path. **Never use it in production**: it executes the remote repository's `install.sh` as root without any signature verification, effectively handing the host to that git remote.
 
 ## Project Structure
 
 ```text
-mailstack.sh                    Install, update, and uninstall entry point
-deploy/install.sh               System installer
-deploy/mailstack-cli            VPS management menu and ms command
-backend/server.production.ts    Authentication and Web API
-backend/mailstackctl.py         Restricted privileged helper
-src/                            React administration console source
-assets/mailstack-logo.png       Project logo
+mailstack.sh                  Unified install, update, and uninstall entry point
+deploy/install.sh             Interactive and non-interactive installer
+deploy/mailstack-cli          VPS management menu
+backend/server.production.ts  Authenticated Web API
+backend/mailstackctl.py       Restricted privileged helper
+src/                          React administration console
+assets/mailstack-logo.png     Project logo
 ```
 
-## Development Build
-
-Install dependencies:
+## Development
 
 ```bash
-npm install --include=optional
-```
-
-Run type checking:
-
-```bash
+npm install
 npm run lint
-```
-
-Build the front end:
-
-```bash
 npm run build
 ```
 
-The installer builds the authenticated production API separately from:
+## Docker Deployment (Optional)
 
-```text
-backend/server.production.ts
+MailStack can also run as a single container (`ubuntu:24.04` base, reusing the same
+non-interactive installer):
+
+```bash
+docker compose build
+MAILSTACK_ADMIN_PASSWORD='Your-Strong-Admin-Pass-7' docker compose up -d
 ```
 
-This separation prevents the old development server from being confused with the authenticated production API.
-
-## Security Recommendations
-
-- Use a strong, unique password for the Web administrator
-- Configure HTTPS for the public Web endpoint as soon as possible
-- Restrict the Web console by source IP where practical
-- Never commit SMTP passwords, AI keys, DKIM private keys, or ACME DNS credentials
-- Never commit `.env`, `admin.json`, `ai-provider.json`, or `sasl_passwd`
-- Monitor certificate expiration
-- Monitor disk usage and mail queue growth
-- Configure MX, SPF, DKIM, DMARC, and PTR
-- Create a VPS snapshot and MailStack backup before updating
-- Redact logs before posting them in an Issue
+There is no systemd inside the container: the six core processes are orchestrated by
+the entrypoint (`docker/entrypoint.sh` + tini). The admin password is initialized on
+first boot via environment variable or generated randomly and printed once — plaintext
+passwords never enter any image layer. Ports, volumes, upgrades, differences from the
+bare-metal install, and known limitations (outbound port 25, WSL2) are documented in
+[docs/DOCKER.md](docs/DOCKER.md).
 
 ## Known Limitations
 
-- This is still a Beta release
-- End-to-end validation is not complete across every Linux distribution
-- Advanced SMTP Relay failover and duplicate-delivery prevention require further testing
-- Initial ACME issuance, DNS-01 automation, and certificate rollback require further development
-- DKIM, Rspamd, ClamAV, Fail2ban, and firewall behavior may require distribution-specific adaptation
-- AI guidance does not replace administrator review
-- AI diagnostics cannot guarantee inbox placement
-- Mock or demonstration data must not be interpreted as live server state
+- This is a Beta release without complete end-to-end validation across every distribution
+- Advanced relay failover and duplicate-delivery prevention require more testing
+- Initial ACME issuance, DNS API credential rotation, and multi-CA rollback require further work
+- DKIM, Rspamd, ClamAV, Fail2ban, and firewall behavior varies by distribution
+- AI guidance requires administrator review and cannot guarantee delivery
+- Demo or Mock data must not be interpreted as live server state
 
-## Reporting Issues
+## Contributing
 
-When opening an Issue, include:
-
-- Linux distribution and version
-- CPU architecture
-- MailStack version
-- Installation or update method
-- Relevant systemd service status
-- Redacted logs
-- Reproducible steps
-
-Do not publicly submit:
-
-- SMTP passwords
-- Administrator passwords or hashes
-- AI API keys
-- DKIM or TLS private keys
-- ACME DNS credentials
-- Mailbox content
-- Unredacted production logs
+Please include the operating system, MailStack version, installation method, relevant service state, redacted logs, and reproducible steps. Never post SMTP passwords, administrator hashes, AI keys, DKIM or TLS private keys, ACME DNS credentials, mailbox content, or unredacted production logs.
 
 ## License
 
-MailStack is released under the [MIT License](LICENSE).
+MailStack is released under the MIT License. See [LICENSE](LICENSE).

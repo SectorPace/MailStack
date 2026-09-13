@@ -13,8 +13,8 @@ import {
   Sliders,
   Sun,
   Moon
-} from 'lucide-react';
-import { motion } from 'motion/react';
+} from '@/lib/icons';
+import { motion } from '@/lib/motion';
 
 interface Props {
   onClose: () => void;

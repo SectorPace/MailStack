@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
-import { X, Upload, Check, Sparkles, User, Image, Trash2, Camera } from 'lucide-react';
-import { motion } from 'motion/react';
+import { X, Upload, Check, Sparkles, User, Image, Trash2, Camera } from '@/lib/icons';
+import { motion } from '@/lib/motion';
 import { useApp } from '../../context/AppContext';
 
 interface Props {

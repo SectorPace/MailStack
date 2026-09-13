@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# 安装器只校验 `command -v python3`，解释器可能不在 /usr/bin（如 /usr/local 前缀）。
+# 优先使用确定路径，缺失时回退 PATH 解析，都找不到才失败。
+PY=/usr/bin/python3
+if [[ ! -x "$PY" ]]; then
+  PY=$(command -v python3 || true)
+fi
+if [[ -z "${PY}" ]]; then
+  echo 'mailstack-privileged: python3 interpreter not found' >&2
+  exit 1
+fi
+
+# B4：无参数调用 = 一次性 RPC 请求，走 --rw-forward——优先经变更面
+# socket (/run/mailstack/helper.sock, 0600 root:root) 转发给 helper daemon
+# （daemon 单元有独立命名空间与 /etc 写权限；mailstack-web 单元在 B4 后
+# 是 ProtectSystem=strict，本包装器自身命名空间不再需要可写 /etc）。
+# socket 不可用时由 mailstackctl.py 自行回退本进程直跑（与历史一次性
+# sudo 行为一致；控制台调用不受 web 单元收窄影响）。
+# 带参数调用（如 audit-verify 子命令）原样透传。
+if [[ "$#" -eq 0 ]]; then
+  exec "$PY" /opt/mailstack/backend/mailstackctl.py --rw-forward
+fi
+exec "$PY" /opt/mailstack/backend/mailstackctl.py "$@"

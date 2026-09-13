@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
-import { Sparkles, Bot, Stethoscope, MessageSquareCode, ShieldCheck, Zap } from 'lucide-react';
+import { Sparkles, Bot, Stethoscope, MessageSquareCode, ShieldCheck, Zap } from '@/lib/icons';
 import { LiquidGlass } from '../common/LiquidGlass';
 import { AiDiagnosticView } from './AiDiagnosticView';
 import { AiAssistantView } from './AiAssistantView';

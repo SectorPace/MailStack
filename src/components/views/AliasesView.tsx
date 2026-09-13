@@ -1,16 +1,20 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useApp } from '../../context/AppContext';
-import { AtSign, Plus, Search, Trash2, ArrowRight, X, Mail } from 'lucide-react';
-import { motion } from 'motion/react';
+import { AtSign, Plus, Search, Trash2, ArrowRight, X, Mail } from '@/lib/icons';
+import { motion } from '@/lib/motion';
 
 export const AliasesView: React.FC = () => {
-  const { aliases, domains, addAlias, deleteAlias, language } = useApp();
+  const { aliases, domains, addAlias, deleteAlias, language, showToast } = useApp();
   const [searchQuery, setSearchQuery] = useState('');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [source, setSource] = useState('');
   const [destinationStr, setDestinationStr] = useState('');
   const [description, setDescription] = useState('');
-  const [domain, setDomain] = useState(domains[0]?.name || 'example.com');
+  const [domain, setDomain] = useState(domains[0]?.name || '');
+
+  useEffect(() => {
+    if (!domain && domains[0]?.name) setDomain(domains[0].name);
+  }, [domain, domains]);
 
   const filteredAliases = aliases.filter((a) =>
     a.source.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -19,12 +23,24 @@ export const AliasesView: React.FC = () => {
 
   const handleCreate = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!source.trim()) return;
     const dests = destinationStr.split(/[,;\n]/).map(s => s.trim()).filter(Boolean);
+    const emailPattern = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+    const sourceValue = source.trim().toLowerCase();
+    const sourceDomain = sourceValue.includes('@') ? sourceValue.split('@').pop() || '' : domain;
+    const sourceAddress = sourceValue.includes('@') ? sourceValue : `${sourceValue}@${sourceDomain}`;
+    const managedDomain = domains.some((item) => item.name === sourceDomain);
+    if (!sourceValue || !managedDomain || !emailPattern.test(sourceAddress.replace(/^\*@/, 'catchall@')) || !dests.length || dests.some((address) => !emailPattern.test(address))) {
+      showToast(
+        'warning',
+        language === 'zh' ? '别名信息不完整' : 'Alias details are incomplete',
+        language === 'zh' ? '请选择受管域名并填写有效的转发目标邮箱。' : 'Select a managed domain and provide valid destination addresses.',
+      );
+      return;
+    }
     addAlias({
-      source: source.includes('@') ? source.trim() : `${source.trim()}@${domain}`,
-      domain,
-      destinations: dests.length > 0 ? dests : ['admin@example.com'],
+      source: sourceAddress,
+      domain: sourceDomain,
+      destinations: dests,
       description: description.trim() || 'Mail forwarding alias',
     });
     setIsModalOpen(false);

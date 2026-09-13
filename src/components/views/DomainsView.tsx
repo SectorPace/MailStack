@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useApp } from '../../context/AppContext';
 import { DomainItem } from '../../types';
 import {
@@ -14,13 +14,15 @@ import {
   ShieldCheck,
   RefreshCw,
   SlidersHorizontal
-} from 'lucide-react';
+} from '@/lib/icons';
 import { AddDomainModal } from '../modals/AddDomainModal';
 import { DnsCheckModal } from '../modals/DnsCheckModal';
 import { LiquidGlass } from '../common/LiquidGlass';
+import { api } from '../../api';
+import { getErrorMessage } from '../../utils/errors';
 
 export const DomainsView: React.FC = () => {
-  const { domains, deleteDomain, language, themeMode, showToast } = useApp();
+  const { domains, deleteDomain, language, themeMode, showToast, refreshSnapshot } = useApp();
   const [searchQuery, setSearchQuery] = useState('');
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [inspectDomain, setInspectDomain] = useState<DomainItem | null>(null);
@@ -31,19 +33,64 @@ export const DomainsView: React.FC = () => {
 
   const totalMailboxes = domains.reduce((acc, d) => acc + d.mailboxesCount, 0);
 
-  const handleBatchDnsCheck = () => {
+  const overallHealthScore = useMemo(() => {
+    if (!domains.length) return 100;
+    let totalChecks = domains.length * 4;
+    let passedChecks = 0;
+    for (const d of domains) {
+      if (d.mxStatus === 'ok') passedChecks++;
+      if (d.spfStatus === 'ok') passedChecks++;
+      if (d.dkimStatus === 'ok') passedChecks++;
+      if (d.dmarcStatus === 'ok') passedChecks++;
+    }
+    return Math.round((passedChecks / totalChecks) * 100);
+  }, [domains]);
+
+  const handleBatchDnsCheck = async () => {
+    if (!domains.length) {
+      showToast('info', language === 'zh' ? '暂无托管域名' : 'No Domains', language === 'zh' ? '请先添加域名后再执行 DNS 验证' : 'Add domains first.');
+      return;
+    }
     showToast(
       'info',
       language === 'zh' ? '正在执行全局 DNS 扫描' : 'Batch DNS Check',
-      language === 'zh' ? '正在请求权威 DNS 解析服务器...' : 'Querying authoritative nameservers...'
+      language === 'zh' ? `正在为 ${domains.length} 个域名请求权威 DNS 解析...` : `Querying DNS for ${domains.length} domain(s)...`
     );
-    setTimeout(() => {
+    try {
+      let verifiedCount = 0;
+      const failures: string[] = [];
+      const serverIp = window.location.hostname;
+      for (const d of domains) {
+        try {
+          const expectedSpf = 'v=spf1 mx ~all';
+          const res = await api<{ verified: boolean }>('/api/setup/dns/verify', {
+            method: 'POST',
+            body: JSON.stringify({
+              domain: d.name,
+              mailHost: `mail.${d.name}`,
+              serverIp,
+              dkimSelector: d.dkimSelector || 'mail',
+              expectedSpf,
+              selectedRelay: 'direct',
+            })
+          });
+          if (res.verified) verifiedCount++;
+          else failures.push(d.name);
+        } catch (error: unknown) {
+          failures.push(`${d.name}: ${getErrorMessage(error)}`);
+        }
+      }
+      await refreshSnapshot();
       showToast(
-        'success',
+        failures.length ? 'warning' : 'success',
         language === 'zh' ? 'DNS 批量重测完成' : 'DNS Re-check Completed',
-        language === 'zh' ? '除 corp-internal.net 待修复 SPF 外其余域名全绿' : 'All domains verified except corp-internal.net'
+        language === 'zh'
+          ? `通过 ${verifiedCount}/${domains.length}${failures.length ? `；未通过：${failures.join(', ')}` : ''}`
+          : `${verifiedCount}/${domains.length} verified${failures.length ? `; failed: ${failures.join(', ')}` : ''}`
       );
-    }, 1000);
+    } catch (e: unknown) {
+      showToast('error', language === 'zh' ? 'DNS 扫描失败' : 'DNS Check Failed', getErrorMessage(e));
+    }
   };
 
   return (
@@ -77,7 +124,7 @@ export const DomainsView: React.FC = () => {
           <div className="flex items-baseline gap-2">
             <span className={`text-3xl font-black font-mono ${
               themeMode === 'light' ? 'text-emerald-600' : 'text-emerald-400'
-            }`}>92%</span>
+            }`}>{overallHealthScore}%</span>
             <span className={`text-xs font-mono ${
               themeMode === 'light' ? 'text-slate-500' : 'text-slate-400'
             }`}>MX / SPF / DKIM</span>

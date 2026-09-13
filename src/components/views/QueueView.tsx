@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
-import { Mail, RefreshCw, Trash2, Play, AlertTriangle, Inbox, CheckCircle2, Clock } from 'lucide-react';
+import { Mail, RefreshCw, Trash2, Play, AlertTriangle, Inbox, CheckCircle2, Clock } from '@/lib/icons';
 
 export const QueueView: React.FC = () => {
   const { queues, flushQueue, deleteQueueItem, retryQueueItem, language, showToast, themeMode } = useApp();

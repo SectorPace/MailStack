@@ -1,9 +1,12 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
-import { Cpu, RefreshCw, CheckCircle2, ShieldCheck, Activity, Terminal } from 'lucide-react';
+import { Cpu, RefreshCw, CheckCircle2, ShieldCheck, Activity, Terminal, Maximize2 } from '@/lib/icons';
+import { SystemTelemetryModal } from '../modals/SystemTelemetryModal';
 
 export const ServicesView: React.FC = () => {
   const { services, restartService, language, themeMode } = useApp();
+  const [telemetryModalOpen, setTelemetryModalOpen] = useState(false);
+  const isLight = themeMode === 'light';
 
   const getServiceStatusBadge = (status: string) => {
     if (status === 'RUNNING') {
@@ -34,10 +37,21 @@ export const ServicesView: React.FC = () => {
           </div>
         </div>
 
-        <span className="px-3.5 py-1 rounded-full bg-emerald-950/80 border border-emerald-500/40 text-emerald-400 text-xs font-mono font-bold flex items-center gap-1.5">
-          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-          6/6 SERVICES HEALTHY
-        </span>
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => setTelemetryModalOpen(true)}
+            className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-cyan-500/30 hover:border-cyan-400 bg-cyan-500/10 hover:bg-cyan-500/20 text-xs font-semibold text-cyan-300 transition-all cursor-pointer shadow-sm"
+          >
+            <Maximize2 className="w-3.5 h-3.5" />
+            <span>{language === 'zh' ? '打开系统监测工具' : 'Open Inspector'}</span>
+          </button>
+
+          <span className="px-3.5 py-1 rounded-full bg-emerald-950/80 border border-emerald-500/40 text-emerald-400 text-xs font-mono font-bold flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            {services.filter(s => s.status === 'ACTIVE').length}/{services.length} {language === 'zh' ? '项服务正常运行' : 'SERVICES ACTIVE'}
+          </span>
+        </div>
       </div>
 
       {/* Services Grid */}
@@ -100,6 +114,15 @@ export const ServicesView: React.FC = () => {
           </div>
         ))}
       </div>
+
+      {/* Deep System Telemetry Inspector Modal */}
+      <SystemTelemetryModal
+        isOpen={telemetryModalOpen}
+        onClose={() => setTelemetryModalOpen(false)}
+        language={language}
+        isLight={isLight}
+        onRestartService={restartService}
+      />
     </div>
   );
 };

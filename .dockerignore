@@ -1,0 +1,25 @@
+# Docker 构建上下文排除清单。
+# 注意：不排除 dist —— 若其中存在通过 SHA256 manifest 校验的预构建产物，
+# 安装器会直接采用（更快）；否则自动执行 npm ci + npm run build:all。
+
+.git
+.gitattributes
+.github
+.workbuddy
+
+# 依赖与构建中间产物（安装器在镜像内自行 npm ci / 构建）
+node_modules
+__pycache__
+*.pyc
+
+# 发布产物与签名文件（镜像不需要）
+release
+
+# 日志与临时文件
+*.log
+npm-debug.log*
+
+# Docker 自身资产无需进上下文
+Dockerfile
+docker-compose.yml
+.dockerignore

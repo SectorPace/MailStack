@@ -12,7 +12,7 @@ import {
   Filter,
   ChevronDown,
   RefreshCw
-} from 'lucide-react';
+} from '@/lib/icons';
 
 export const LogsView: React.FC = () => {
   const {
@@ -218,7 +218,7 @@ export const LogsView: React.FC = () => {
           {/* Clear Buffer */}
           <button
             onClick={clearLogs}
-            title={language === 'zh' ? '清空控制台' : 'Clear Logs'}
+            title={language === 'zh' ? '清空控制台当前视图缓存 (不会删除服务端日志文件)' : 'Clear Log View Cache (does not delete server files)'}
             className={`w-9 h-9 flex items-center justify-center rounded-xl border transition-colors ${
               themeMode === 'light'
                 ? 'bg-white border-slate-200 text-slate-500 hover:text-rose-600 hover:bg-rose-50 hover:border-rose-300 shadow-sm'

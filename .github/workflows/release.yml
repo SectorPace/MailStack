@@ -1,0 +1,98 @@
+# 签名 Release 发布流水线：推送 v* tag 时构建可复现归档、用仓库外的
+# release 私钥（GitHub Actions secret）对 SHA256SUMS 做 ssh-keygen 签名，
+# 并以 `ms upgrade`（mailstack.sh L117）完全相同的命令复验后上传四资产。
+# 升级端只接受「tar.gz + SHA256SUMS + SHA256SUMS.sig」三件套，缺一即拒绝。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      # 与 ci.yml 的复现性门禁钉住同一个 epoch，保证归档逐字节可复现。
+      SOURCE_DATE_EPOCH: '1704067200'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      # 廉价断言先行：tag 去掉 v 前缀必须与 VERSION 完全一致，
+      # 防止打错 tag 导致资产命名与升级端期望的 MailStack-${tag}.tar.gz 错位。
+      - name: Tag must match VERSION
+        run: |
+          set -euo pipefail
+          expected="$(cat VERSION)"
+          if [ "${GITHUB_REF_NAME#v}" != "$expected" ]; then
+            echo "Refusing to release: tag ${GITHUB_REF_NAME} does not match VERSION ($expected)" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies and build
+        run: |
+          set -euo pipefail
+          npm ci --include=optional --no-audit --no-fund
+          npm run build:all
+
+      - name: Package and sign release assets
+        env:
+          MAILSTACK_RELEASE_KEY: ${{ secrets.MAILSTACK_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$MAILSTACK_RELEASE_KEY" ]; then
+            echo "secrets.MAILSTACK_SIGNING_KEY 未配置，拒绝产出未签名 Release" >&2
+            exit 1
+          fi
+          keyfile="$(mktemp)"
+          chmod 600 "$keyfile"
+          trap 'rm -f "$keyfile"' EXIT
+          printf '%s\n' "$MAILSTACK_RELEASE_KEY" > "$keyfile"
+          MAILSTACK_SIGNING_KEY="$keyfile" python3 scripts/package.py
+          # 用入库的信任锚再验一次，与升级端逐字一致（mailstack.sh L117）：
+          # 此处通过 => `ms upgrade` 在任何目标服务器上必然通过。
+          ssh-keygen -Y verify \
+            -f deploy/mailstack-release.allowed_signers \
+            -I mailstack-release -n file \
+            -s release/SHA256SUMS.sig < release/SHA256SUMS
+          (cd release && sha256sum -c SHA256SUMS)
+          # 用后即焚：步骤正常或异常退出都会删除私钥临时文件。
+          rm -f "$keyfile"
+          trap - EXIT
+
+      # 升级端（mailstack.sh L128-132）要求归档内有且只有一个顶层目录，
+      # 且顶层目录下存在 deploy/install.sh；在发布侧提前断言一次。
+      - name: Assert archive layout matches upgrade expectations
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          stage="$(mktemp -d)"
+          tar -xzf "release/MailStack-${tag}.tar.gz" -C "$stage"
+          count="$(find "$stage" -mindepth 1 -maxdepth 1 | wc -l)"
+          if [ "$count" != "1" ]; then
+            echo "Release 资产结构异常（顶层条目数: $count）" >&2
+            exit 1
+          fi
+          top="$stage/MailStack-${tag}"
+          [ -s "$top/deploy/install.sh" ] || { echo "资产缺少核心部署文件" >&2; exit 1; }
+          rm -rf "$stage"
+
+      # 项目风格最小化第三方 Action：用 runner 自带的 gh CLI 上传。
+      # 四个资产缺一不可：升级端没有 .sig 会直接拒绝该 Release。
+      - name: Create GitHub Release with signed assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          gh release create "$tag" --title "MailStack ${tag}" \
+            "release/MailStack-${tag}.tar.gz" \
+            "release/MailStack-${tag}.zip" \
+            release/SHA256SUMS \
+            release/SHA256SUMS.sig

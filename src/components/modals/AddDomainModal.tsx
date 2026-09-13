@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
-import { Globe, X, Plus, KeyRound, ShieldCheck } from 'lucide-react';
-import { motion } from 'motion/react';
+import { Globe, X, Plus, KeyRound, ShieldCheck } from '@/lib/icons';
+import { motion } from '@/lib/motion';
 
 interface Props {
   onClose: () => void;

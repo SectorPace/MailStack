@@ -1,0 +1,87 @@
+# MailStack 单容器编排（docker compose）。
+#
+# ⚠️ Windows 宿主机提示：家用/企业宽带出站 25 端口通常被运营商封锁，
+#    容器对外投递测试很可能失败；本地验证请以 587（提交）/143（IMAP）/
+#    8787（管理台）/18788（Webmail）为主。25 端口映射保留供入站接收使用。
+#
+# 首次启动口令：
+#   - 提供：MAILSTACK_ADMIN_PASSWORD="至少12位且含字母与数字" docker compose up -d
+#   - 不提供：entrypoint 生成随机口令并在日志中只打印一次（docker compose logs）。
+#     口令只写入数据卷，从不进入镜像层。
+
+services:
+  mailstack:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mailstack:local
+    container_name: mailstack
+    # postfix 的 myhostname/HELO 取容器主机名；对外提供服务时建议改为真实
+    # FQDN（如 mail.example.com），并确保其 A/AAAA 记录指向本机。
+    hostname: ${MAILSTACK_HOSTNAME:-mail.local}
+    restart: unless-stopped
+    environment:
+      # 留空 = 首次启动生成随机口令并打印一次
+      MAILSTACK_ADMIN_PASSWORD: ${MAILSTACK_ADMIN_PASSWORD:-}
+      MAILSTACK_ADMIN_USER: ${MAILSTACK_ADMIN_USER:-admin}
+      # 前置反代终结 TLS 时置 1（或依赖 x-forwarded-proto 自动判定）
+      MAILSTACK_COOKIE_SECURE: ${MAILSTACK_COOKIE_SECURE:-0}
+      # A6 管理口双旗标：容器内进程必须监听 0.0.0.0，docker 的 -p 映射才能经容器
+      # eth0 触达（绑容器内回环则映射不可达）。因此这里显式声明发布意图：
+      #   MAILSTACK_LISTEN_HOST=0.0.0.0  —— 容器内监听地址（非回环，触发 entrypoint 门控）
+      #   MAILSTACK_I_PUBLISH_ADMIN=1    —— 运维确认：知晓此举把面板发布到容器网络外
+      # 二者缺一，entrypoint 的 gate_listen_host 会拒绝启动。真正对外的暴露面由下方
+      # ports 的宿主侧绑定 ${MAILSTACK_BIND:-127.0.0.1} 收敛——默认只绑宿主回环，
+      # 远程访问仍建议走 SSH 隧道或前置 TLS 反代。
+      MAILSTACK_LISTEN_HOST: 0.0.0.0
+      MAILSTACK_I_PUBLISH_ADMIN: 1
+    ports:
+      # 管理控制台 / Webmail（默认仅绑宿主回环，远程访问建议走 SSH 隧道或反代）
+      - "${MAILSTACK_BIND:-127.0.0.1}:8787:8787"
+      - "${MAILSTACK_BIND:-127.0.0.1}:18788:18788"
+      # SMTP：25 入站接收 / 465 SMTPS / 587 Submission（SASL + TLS）
+      - "25:25"
+      - "465:465"
+      - "587:587"
+      # IMAP / POP3
+      - "143:143"
+      - "993:993"
+      - "110:110"
+      - "995:995"
+    volumes:
+      # 管理面配置与管理员凭证哈希（0750）
+      - mailstack-etc:/etc/mailstack
+      # 邮箱注册表等非敏感状态（供 webmail 读取）
+      - mailstack-lib:/var/lib/mailstack
+      # 邮件家目录：邮箱用户由 useradd -m 创建，Maildir 位于 /home/<user>/Maildir
+      - mailstack-home:/home
+      # postfix 队列与 spool 结构
+      - mailstack-spool:/var/spool/postfix
+      # 预安装备份（ms backup / 安装器回滚副本）
+      - mailstack-backups:/var/backups/mailstack
+      # MTA/IMAP/DKIM 配置、引导证书与 DKIM 密钥（跨重建保留）
+      - mailstack-postfix-etc:/etc/postfix
+      - mailstack-dovecot-etc:/etc/dovecot
+      - mailstack-opendkim-etc:/etc/opendkim
+    healthcheck:
+      # 与安装器健康自检相同的两个端点
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS http://127.0.0.1:8787/api/health | grep -q '"status":"ok"' &&
+          curl -fsS http://127.0.0.1:18788/api/webmail/health | grep -q '"status":"ok"'
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # 首次启动需等 6 进程全部拉起并通过健康自检
+      start_period: 60s
+
+volumes:
+  mailstack-etc:
+  mailstack-lib:
+  mailstack-home:
+  mailstack-spool:
+  mailstack-backups:
+  mailstack-postfix-etc:
+  mailstack-dovecot-etc:
+  mailstack-opendkim-etc:

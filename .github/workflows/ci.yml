@@ -1,0 +1,149 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy: { matrix: { node: [20, 22, 24] } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ matrix.node }}", cache: npm }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: npm ci --include=optional --no-audit --no-fund
+      - run: npm run lint
+
+      # The privileged helper is Python and runs as root; it is the part that
+      # can destroy a live mail server, so it gets behavioural tests rather than
+      # "does this string appear in the file" checks.
+      - name: Privileged helper unit tests
+        run: |
+          python3 -m compileall -q backend scripts
+          python3 scripts/test_actions_unit.py
+          python3 scripts/test_backup_e2e.py
+          python3 scripts/test_mail_path_e2e.py
+          python3 scripts/test_distro_matrix.py
+
+      - name: Node contract and integration tests
+        run: npm test
+
+      - name: Frontend unit tests
+        run: npm run test:frontend
+
+      - run: npm run build:all
+      - run: node --check dist/server.cjs
+      - run: node --check dist/webmail.cjs
+
+      # Has to run after the build: it checks dist/build-manifest.json, which
+      # does not exist on a clean checkout.
+      - name: Release version consistency
+        run: python3 scripts/verify_release_consistency.py
+
+      - name: Verify manifest artifact hashes
+        run: npm test -- --test-name-pattern="build-manifest"
+      - name: Verify Shell syntax and LF endings
+        run: |
+          find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+          if grep -rIl $'\r' --include='*.sh' .; then exit 1; fi
+          # 无 .sh 后缀但会被原样部署到 Linux 系统路径的文件也必须 LF：
+          # rc.3 的 mailstack.logrotate 带 CRLF 发布，cp 到 /etc/logrotate.d/ 后
+          # logrotate 把 \r 当作路径/选项的一部分而解析失败；mailstack-privileged
+          # 的 shebang 行带 \r 会直接 bad interpreter。二者均逃过上面的 *.sh 过滤。
+          for f in deploy/mailstack-privileged deploy/mailstack.logrotate; do
+            if grep -q $'\r' "$f"; then echo "$f must use LF line endings" >&2; exit 1; fi
+          done
+      - name: Verify reproducible release archives
+        if: matrix.node == 22
+        env:
+          SOURCE_DATE_EPOCH: '1704067200'
+        run: |
+          python3 scripts/package.py
+          python3 - <<'PY'
+          import pathlib, tarfile, zipfile
+          release = pathlib.Path('release')
+          tar_path = next(release.glob('*.tar.gz'))
+          zip_path = next(release.glob('*.zip'))
+          with tarfile.open(tar_path, 'r:gz') as archive:
+              names = archive.getnames()
+          with zipfile.ZipFile(zip_path) as archive:
+              names += archive.namelist()
+          forbidden = [name for name in names if pathlib.PurePosixPath(name).name == 'SHA256SUMS' or '/release/' in f'/{name}/']
+          if forbidden:
+              raise SystemExit(f'archive contains checksum/output self-reference: {forbidden}')
+          PY
+          cp release/SHA256SUMS /tmp/first.SHA256SUMS
+          rm -rf release
+          python3 scripts/package.py
+          diff -u /tmp/first.SHA256SUMS release/SHA256SUMS
+          (cd release && sha256sum -c SHA256SUMS)
+
+  # 发布脚本静态门禁：shellcheck（error 级）+ 未定义函数调用检测。
+  # 背景：install.sh 曾调用未定义的 warn()，set -e 下 caddy 降级场景安装必崩，
+  # 连续两个 RC 漏网 —— 静态检查本可在提交阶段拦截。
+  shell-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Undefined function call gate
+        run: bash deploy/verify-release-scripts.sh .
+      - name: Shellcheck (error severity)
+        run: |
+          sudo apt-get install -y shellcheck
+          # 只对 error 级问题设门禁；warning 级先输出不阻断（存量清理目标）
+          find mailstack.sh deploy -maxdepth 1 -type f \( -name '*.sh' -o -name 'mailstack-privileged' \) \
+            -print0 | xargs -0 shellcheck --severity=error
+
+  # 真实装机矩阵：在干净发行版容器里跑非交互安装并断言健康自检与权限模型。
+  # warn 类 bug 与目录属主问题只能在这里现形 —— 单元测试碰不到安装路径。
+  install-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { distro: 'ubuntu:24.04', bootstrap: 'apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl' }
+          - { distro: 'ubuntu:22.04', bootstrap: 'apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl' }
+          - { distro: 'debian:12', bootstrap: 'apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl' }
+          - { distro: 'rockylinux:9', bootstrap: 'dnf install -y --setopt=install_weak_deps=False ca-certificates curl' }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Malicious domain must never reach the Caddyfile (${{ matrix.distro }})
+        run: |
+          docker run --rm -v "$PWD:/src:ro" ${{ matrix.distro }} bash /src/scripts/ci_domain_injection_test.sh
+      - name: Install MailStack inside ${{ matrix.distro }} container
+        run: |
+          docker run --rm -v "$PWD:/src:ro" ${{ matrix.distro }} bash -c '
+            set -e
+            ${{ matrix.bootstrap }}
+            bash /src/deploy/install.sh --non-interactive --access-mode local --admin-password-stdin <<< "ci-msctl-root-9Kw7Qp"
+            sleep 3
+            bash /src/scripts/ci_install_assertions.sh
+            echo "ALL CHECKS PASSED on ${{ matrix.distro }}"
+          '
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci --include=optional --no-audit --no-fund
+
+      # Hard gate. This passed clean at v0.5.2-rc.1, so a failure here means a
+      # newly introduced problem rather than pre-existing noise, which is the
+      # only point at which an audit gate is worth having.
+      - name: Dependency audit
+        run: npm audit --audit-level=high --no-fund
+
+      # Also fail on moderate when a fix exists without a major bump. Kept
+      # separate so the high/critical gate above stays unambiguous.
+      - name: Dependency audit (moderate, fixable)
+        run: npm audit --audit-level=moderate --no-fund --omit=dev
+
+      - name: Generate SBOM
+        run: npm sbom --sbom-format=cyclonedx > sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json

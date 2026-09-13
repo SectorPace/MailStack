@@ -19,7 +19,7 @@ This package combines the generated React Liquid Glass console with an authentic
 
 ## Safety model
 
-The Node service runs as `mailstack-admin`. Only `/opt/mailstack/backend/mailstackctl.py` is allowed through sudo. The helper uses fixed argument arrays, identifier validation, atomic file writes, Postfix syntax checks and service reloads. SMTP credentials and private keys are not returned to the browser.
+The Node service runs as `mailstack-admin`. Sudoers grants only the root-owned `/usr/local/libexec/mailstack-privileged` entrypoint; it does not grant an argument wildcard. The helper uses a JSON action allowlist, identifier validation, atomic file writes, Postfix syntax checks and service reloads. SMTP credentials and private keys are not returned to the browser.
 
 ## Install
 
@@ -29,13 +29,7 @@ This is an integration preview. Test on a disposable server first.
 sudo bash deploy/install.sh
 ```
 
-The Web service listens on `127.0.0.1:8787`. Read the administration token with:
-
-```bash
-sudo cat /etc/mailstack/admin.token
-```
-
-Use an SSH tunnel, VPN, or HTTPS reverse proxy. Do not expose port 8787 directly to the public Internet.
+The Web service listens on `127.0.0.1:8787` by default. The administrator credential is created as a PBKDF2 record in `/etc/mailstack/admin.json`; plaintext passwords and token files are not generated. Use an SSH tunnel, VPN, or HTTPS reverse proxy. Do not expose port 8787 directly to the public Internet.
 
 ## Known incomplete UI connections
 

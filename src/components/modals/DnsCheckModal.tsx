@@ -12,8 +12,8 @@ import {
   ShieldCheck,
   Table,
   BookOpen
-} from 'lucide-react';
-import { motion } from 'motion/react';
+} from '@/lib/icons';
+import { motion } from '@/lib/motion';
 import { DnsGuideTable } from '../dns/DnsGuideTable';
 
 interface Props {
@@ -81,7 +81,7 @@ export const DnsCheckModal: React.FC<Props> = ({ domain, onClose }) => {
 
         {/* Content Body: Embedded DnsGuideTable */}
         <div className="p-4 sm:p-6 overflow-y-auto flex-1">
-          <DnsGuideTable domain={domain} serverIp="163.192.27.230" relayProvider="oracle" />
+          <DnsGuideTable domain={domain} relayProvider="oracle" />
         </div>
       </motion.div>
     </div>

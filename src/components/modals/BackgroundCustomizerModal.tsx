@@ -13,7 +13,7 @@ import {
   Palette,
   Eye,
   CheckCircle2
-} from 'lucide-react';
+} from '@/lib/icons';
 import { LiquidGlass } from '../common/LiquidGlass';
 
 export const BackgroundCustomizerModal: React.FC<{ onClose: () => void }> = ({ onClose }) => {

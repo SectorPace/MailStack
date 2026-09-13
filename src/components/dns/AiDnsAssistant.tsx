@@ -15,7 +15,7 @@ import {
   Server,
   Cloud,
   Mail
-} from 'lucide-react';
+} from '@/lib/icons';
 import ReactMarkdown from 'react-markdown';
 
 interface Props {
@@ -201,7 +201,7 @@ export const AiDnsAssistant: React.FC<Props> = ({
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
               </div>
               <div className="text-[10px] text-slate-400 font-mono">
-                Gemini 3.7 Flash &bull; Context: @{domainName}
+                MailStack AI 智能诊断引擎 &bull; Context: @{domainName}
               </div>
             </div>
           </div>

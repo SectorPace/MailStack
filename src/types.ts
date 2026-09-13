@@ -51,6 +51,7 @@ export interface DomainItem {
   aliasesCount: number;
   dkimSelector: string;
   dkimKeySize: number;
+  dkimPublicKey?: string;
 }
 
 export interface UserItem {
@@ -68,6 +69,7 @@ export interface UserItem {
   role: 'admin' | 'user' | 'manager';
   avatarUrl?: string;
   avatarColor?: string;
+  password?: string;
 }
 
 export interface AliasItem {
@@ -178,6 +180,7 @@ export interface SystemSettings {
   rateLimitPerHour: number;
   spamThreshold: number;
   colorTheme: 'cyan' | 'blue' | 'emerald' | 'purple';
+  relay?: string;
   customLogo?: string;
   logoStyle?: '3d_glass' | 'neon_cyber' | 'isometric_origami' | 'minimal_clean' | 'custom';
 }
@@ -188,3 +191,117 @@ export interface ToastMessage {
   title: string;
   message: string;
 }
+
+export type TelemetryTimeframe = '1m' | '5m' | '30m' | '1h' | '6h' | '24h' | '3d';
+
+export interface DaemonMetric {
+  id: string;
+  name: string;
+  pid: number;
+  memoryMb: number;
+  cpuPercent: number;
+  status: 'ACTIVE' | 'STOPPED';
+  uptime?: string;
+}
+
+export interface TelemetryPoint {
+  timestamp: string;
+  cpuPercent: number;
+  memoryMb: number; // total daemon memory MB
+  systemMemoryPercent: number;
+  systemMemoryUsedMb: number;
+  systemMemoryTotalMb: number;
+  load1: number;
+  load5: number;
+  load15: number;
+  queueTotal: number;
+  queueDeferred: number;
+  daemons: Record<string, { memoryMb: number; cpuPercent: number; status: string }>;
+}
+
+export interface TelemetrySummary {
+  avgCpu: number;
+  maxCpu: number;
+  currentCpu: number;
+  avgMemoryMb: number;
+  maxMemoryMb: number;
+  currentMemoryMb: number;
+  avgSystemMemPercent: number;
+  maxSystemMemPercent: number;
+  currentSystemMemPercent: number;
+  currentLoad: [number, number, number];
+}
+
+export interface TelemetryResponse {
+  timeframe: TelemetryTimeframe;
+  intervalMs: number;
+  samplingCount: number;
+  current: {
+    cpuPercent: number;
+    totalDaemonMemoryMb: number;
+    systemMemoryUsedMb: number;
+    systemMemoryTotalMb: number;
+    systemMemoryPercent: number;
+    loadAvg: [number, number, number];
+    uptimeSec: number;
+    daemons: DaemonMetric[];
+    cores: number;
+    hostname: string;
+    diskTotalGb?: number;
+    diskUsedGb?: number;
+    diskUsagePercent?: number;
+  };
+  summary: TelemetrySummary;
+  points: TelemetryPoint[];
+}
+
+export interface TwoFactorStatus {
+  enabled: boolean;
+  recoveryCodesRemaining: number;
+}
+
+export interface TwoFactorBeginResult {
+  secret: string;
+  uri: string;
+  enabled: false;
+  /** Present (true) when this begin was a re-enrollment over an enabled 2FA:
+   * every session has been revoked and the user must sign in again. */
+  reauthenticate?: boolean;
+}
+
+export interface TwoFactorEnableResult {
+  enabled: true;
+  recoveryCodes: string[];
+}
+
+export interface TwoFactorDisableResult {
+  enabled: false;
+  reauthenticate: boolean;
+}
+
+export interface SessionInfo {
+  id: string;
+  createdAt: string;
+  ip: string;
+  userAgent: string;
+  current: boolean;
+}
+
+export interface SystemRealtimeMetrics {
+  timestamp: string;
+  cpuPercent: number;
+  cores: number;
+  coreUsage?: number[];
+  systemMemoryUsedMb: number;
+  systemMemoryTotalMb: number;
+  systemMemoryPercent: number;
+  systemMemoryFreeMb: number;
+  systemMemoryCachedMb: number;
+  loadAvg: [number, number, number];
+  uptimeSec: number;
+  daemons: DaemonMetric[];
+  diskTotalGb: number;
+  diskUsedGb: number;
+  diskUsagePercent: number;
+}
+

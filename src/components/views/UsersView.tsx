@@ -16,11 +16,13 @@ import {
   Camera,
   Sparkles,
   ShieldAlert
-} from 'lucide-react';
+} from '@/lib/icons';
 import { AddUserModal } from '../modals/AddUserModal';
 import { AvatarCustomizerModal } from '../modals/AvatarCustomizerModal';
 import { UserItem } from '../../types';
 import { LiquidGlass } from '../common/LiquidGlass';
+import { api } from '../../api';
+import { getErrorMessage } from '../../utils/errors';
 
 export const UsersView: React.FC = () => {
   const { users, domains, deleteUser, toggleUserStatus, updateUserAvatar, language, showToast, themeMode } = useApp();
@@ -28,6 +30,10 @@ export const UsersView: React.FC = () => {
   const [selectedDomain, setSelectedDomain] = useState('all');
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [editingAvatarUser, setEditingAvatarUser] = useState<UserItem | null>(null);
+  const [resettingUser, setResettingUser] = useState<UserItem | null>(null);
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [isResetting, setIsResetting] = useState(false);
 
   const filteredUsers = users.filter((u) => {
     if (selectedDomain !== 'all' && u.domain !== selectedDomain) return false;
@@ -42,15 +48,41 @@ export const UsersView: React.FC = () => {
     return true;
   });
 
-  const totalUsedStorage = users.reduce((acc, u) => acc + u.quotaUsedGb, 0).toFixed(2);
-  const totalMaxStorage = users.reduce((acc, u) => acc + u.quotaMaxGb, 0).toFixed(1);
+  const totalUsedStorageValue = users.reduce((acc, u) => acc + Math.max(0, u.quotaUsedGb || 0), 0);
+  const totalMaxStorageValue = users.reduce((acc, u) => acc + Math.max(0, u.quotaMaxGb || 0), 0);
+  const totalUsedStorage = totalUsedStorageValue.toFixed(2);
+  const totalMaxStorage = totalMaxStorageValue.toFixed(1);
+  const storagePercent = totalMaxStorageValue > 0
+    ? Math.min(100, Math.round((totalUsedStorageValue / totalMaxStorageValue) * 100))
+    : 0;
 
-  const handleResetPassword = (email: string) => {
-    showToast(
-      'info',
-      language === 'zh' ? '临时口令已生成' : 'Password Reset',
-      `${email} -> TempPass#${Math.random().toString(36).substring(2, 7)}!`
-    );
+  const handleResetPassword = (user: UserItem) => {
+    setResettingUser(user);
+    setNewPassword('');
+    setConfirmPassword('');
+  };
+
+  const submitResetPassword = async () => {
+    if (!resettingUser || newPassword.length < 12 || !/[a-zA-Z]/.test(newPassword) || !/\d/.test(newPassword) || newPassword !== confirmPassword) {
+      showToast('warning', language === 'zh' ? '密码无效' : 'Invalid Password', language === 'zh' ? '密码至少 12 位、需包含字母与数字且两次输入必须一致' : 'Password must be at least 12 characters, include letters and numbers, and both entries must match.');
+      return;
+    }
+    setIsResetting(true);
+    try {
+      const result = await api<{ updated: boolean }>('/api/users/password', {
+        method: 'POST',
+        body: JSON.stringify({ id: resettingUser.id, password: newPassword }),
+      });
+      if (!result.updated) throw new Error('Password update was not confirmed by the server');
+      showToast('success', language === 'zh' ? '邮箱密码已更新' : 'Mailbox Password Updated', resettingUser.email);
+      setResettingUser(null);
+      setNewPassword('');
+      setConfirmPassword('');
+    } catch (error: unknown) {
+      showToast('error', language === 'zh' ? '密码重置失败' : 'Password Reset Failed', getErrorMessage(error));
+    } finally {
+      setIsResetting(false);
+    }
   };
 
   return (
@@ -94,7 +126,7 @@ export const UsersView: React.FC = () => {
           <div className={`w-full h-1.5 rounded-full mt-2 overflow-hidden ${
             themeMode === 'light' ? 'bg-slate-200' : 'bg-slate-800'
           }`}>
-            <div className="bg-gradient-to-r from-cyan-500 to-sky-400 h-full w-[32%]" />
+            <div className="bg-gradient-to-r from-cyan-500 to-sky-400 h-full transition-all duration-500" style={{ width: `${storagePercent}%` }} />
           </div>
         </LiquidGlass>
 
@@ -190,7 +222,9 @@ export const UsersView: React.FC = () => {
               themeMode === 'light' ? 'divide-slate-200' : 'divide-slate-800/60'
             }`}>
               {filteredUsers.map((usr) => {
-                const percent = Math.min(100, Math.round((usr.quotaUsedGb / usr.quotaMaxGb) * 100));
+                const percent = usr.quotaMaxGb > 0
+                  ? Math.min(100, Math.round((Math.max(0, usr.quotaUsedGb) / usr.quotaMaxGb) * 100))
+                  : 0;
 
                 return (
                   <tr key={usr.id} className={`transition-colors group ${
@@ -338,7 +372,7 @@ export const UsersView: React.FC = () => {
                       </button>
 
                       <button
-                        onClick={() => handleResetPassword(usr.email)}
+                        onClick={() => handleResetPassword(usr)}
                         title={language === 'zh' ? '重置登录口令' : 'Reset Password'}
                         className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
                           themeMode === 'light'
@@ -394,6 +428,56 @@ export const UsersView: React.FC = () => {
           }}
           onClose={() => setEditingAvatarUser(null)}
         />
+      )}
+      {resettingUser && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
+          <div className={`w-full max-w-md rounded-2xl p-6 border shadow-2xl ${
+            themeMode === 'light' ? 'bg-white border-slate-200 text-slate-900' : 'bg-slate-900 border-slate-800 text-white'
+          }`}>
+            <h3 className="text-lg font-bold mb-2 flex items-center gap-2">
+              <KeyRound className="w-5 h-5 text-cyan-500" />
+              {language === 'zh' ? '重置邮箱密码' : 'Reset Mailbox Password'}
+            </h3>
+            <p className="text-xs text-slate-400 mb-4">
+              {language === 'zh' ? `为 ${resettingUser.email} 设置新密码（至少 12 位，需包含字母与数字）` : `Setting new password for ${resettingUser.email} (minimum 12 chars, letters and numbers)`}
+            </p>
+            <input
+              type="password"
+              autoComplete="new-password"
+              placeholder={language === 'zh' ? '新密码（至少 12 位，含字母与数字）' : 'New password (>= 12 chars, letters & numbers)'}
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              className={`w-full px-3 py-2 rounded-xl border text-sm mb-3 outline-hidden ${
+                themeMode === 'light' ? 'bg-slate-50 border-slate-300' : 'bg-slate-800 border-slate-700'
+              }`}
+            />
+            <input
+              type="password"
+              autoComplete="new-password"
+              placeholder={language === 'zh' ? '再次输入新密码' : 'Confirm new password'}
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              className={`w-full px-3 py-2 rounded-xl border text-sm mb-4 outline-hidden ${
+                themeMode === 'light' ? 'bg-slate-50 border-slate-300' : 'bg-slate-800 border-slate-700'
+              }`}
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setResettingUser(null)}
+                className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                {language === 'zh' ? '取消' : 'Cancel'}
+              </button>
+              <button
+                disabled={isResetting || newPassword.length < 12 || !/[a-zA-Z]/.test(newPassword) || !/\d/.test(newPassword) || newPassword !== confirmPassword}
+                onClick={submitResetPassword}
+                className="px-4 py-2 rounded-xl text-xs font-semibold bg-cyan-500 hover:bg-cyan-400 text-black transition-colors disabled:opacity-50 cursor-pointer"
+              >
+                {isResetting ? (language === 'zh' ? '正在更新...' : 'Resetting...') : (language === 'zh' ? '更新密码' : 'Update Password')}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

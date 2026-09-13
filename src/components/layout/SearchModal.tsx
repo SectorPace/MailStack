@@ -13,8 +13,8 @@ import {
   Settings,
   X,
   ArrowRight
-} from 'lucide-react';
-import { motion, AnimatePresence } from 'motion/react';
+} from '@/lib/icons';
+import { motion, AnimatePresence } from '@/lib/motion';
 
 export const SearchModal: React.FC = () => {
   const {

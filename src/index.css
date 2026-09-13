@@ -235,15 +235,7 @@
   --accent-cyan: #0284c7;
   --accent-blue: #2563eb;
   --accent-glow: rgba(2, 132, 199, 0.14);
-  background-color: #f4f6fb !important;
   color: #0f172a !important;
-}
-
-.theme-light {
-  background-image: 
-    radial-gradient(at 12% 12%, rgba(219, 234, 254, 0.6) 0px, transparent 45%),
-    radial-gradient(at 88% 10%, rgba(224, 242, 254, 0.5) 0px, transparent 45%),
-    radial-gradient(at 50% 92%, rgba(241, 245, 249, 0.7) 0px, transparent 50%);
 }
 
 .theme-light h1,

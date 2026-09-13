@@ -1,7 +1,7 @@
 import React from 'react';
 import { useApp } from '../../context/AppContext';
-import { CheckCircle2, AlertTriangle, AlertCircle, Info, X } from 'lucide-react';
-import { motion, AnimatePresence } from 'motion/react';
+import { CheckCircle2, AlertTriangle, AlertCircle, Info, X } from '@/lib/icons';
+import { motion, AnimatePresence } from '@/lib/motion';
 
 export const ToastContainer: React.FC = () => {
   const { toasts, removeToast, themeMode } = useApp();

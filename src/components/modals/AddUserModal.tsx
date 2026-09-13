@@ -1,7 +1,7 @@
-import React, { useState, useRef } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { useApp } from '../../context/AppContext';
-import { User, X, Plus, KeyRound, Mail, HardDrive, Camera, Upload, Check } from 'lucide-react';
-import { motion } from 'motion/react';
+import { User, X, Plus, KeyRound, Mail, HardDrive, Camera, Upload, Check } from '@/lib/icons';
+import { motion } from '@/lib/motion';
 
 interface Props {
   onClose: () => void;
@@ -11,8 +11,12 @@ export const AddUserModal: React.FC<Props> = ({ onClose }) => {
   const { domains, addUser, language, themeMode, showToast } = useApp();
   const [username, setUsername] = useState('');
   const [displayName, setDisplayName] = useState('');
-  const [selectedDomain, setSelectedDomain] = useState(domains[0]?.name || 'example.com');
+  const [selectedDomain, setSelectedDomain] = useState(domains[0]?.name || '');
   const [password, setPassword] = useState('');
+
+  useEffect(() => {
+    if (!selectedDomain && domains[0]?.name) setSelectedDomain(domains[0].name);
+  }, [selectedDomain, domains]);
   const [quotaMaxGb, setQuotaMaxGb] = useState(5.0);
   const [role, setRole] = useState<'admin' | 'user' | 'manager'>('user');
   const [avatarUrl, setAvatarUrl] = useState('');
@@ -36,7 +40,14 @@ export const AddUserModal: React.FC<Props> = ({ onClose }) => {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!username.trim()) return;
+    if (!username.trim() || !selectedDomain || !domains.some((item) => item.name === selectedDomain)) {
+      showToast('warning', language === 'zh' ? '无法创建邮箱' : 'Cannot create mailbox', language === 'zh' ? '请先选择一个真实的受管域名。' : 'Select a real managed domain first.');
+      return;
+    }
+    if (password.length < 12 || password.length > 256 || !/[a-zA-Z]/.test(password) || !/\d/.test(password)) {
+      showToast('error', language === 'zh' ? '口令不符合要求' : 'Password does not meet policy', language === 'zh' ? '密码长度必须为 12-256 个字符，且需包含字母与数字' : 'Password must be 12-256 characters long and include letters and numbers.');
+      return;
+    }
     addUser({
       username: username.toLowerCase().trim(),
       displayName: displayName.trim() || username.trim(),
@@ -45,6 +56,7 @@ export const AddUserModal: React.FC<Props> = ({ onClose }) => {
       quotaMaxGb,
       role,
       avatarUrl: avatarUrl || undefined,
+      password,
     });
     onClose();
   };
@@ -208,6 +220,8 @@ export const AddUserModal: React.FC<Props> = ({ onClose }) => {
             <input
               type="password"
               required
+              minLength={12}
+              maxLength={256}
               placeholder="••••••••••••"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
@@ -217,6 +231,9 @@ export const AddUserModal: React.FC<Props> = ({ onClose }) => {
                   : 'bg-slate-950 border-slate-800 text-white focus:border-cyan-400'
               }`}
             />
+            <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
+              {language === 'zh' ? '至少 12 个字符，需包含字母与数字' : 'At least 12 characters, including letters and numbers'}
+            </p>
           </div>
 
           <div className="grid grid-cols-2 gap-3">

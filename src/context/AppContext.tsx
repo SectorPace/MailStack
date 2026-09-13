@@ -1,5 +1,6 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, ReactNode } from 'react';
 import { api, session } from '../api';
+import { getErrorMessage } from '../utils/errors';
 import {
   NavSection,
   Language,
@@ -18,19 +19,7 @@ import {
   SystemSettings,
   ToastMessage
 } from '../types';
-import {
-  INITIAL_DOMAINS,
-  INITIAL_USERS,
-  INITIAL_ALIASES,
-  INITIAL_RELAY_ROUTES,
-  INITIAL_RELAY_PROVIDERS,
-  INITIAL_LOGS,
-  INITIAL_SERVICES,
-  INITIAL_QUEUES,
-  INITIAL_CERTS,
-  INITIAL_ANOMALIES,
-  DEFAULT_SETTINGS
-} from '../data/mockData';
+import { DEFAULT_SETTINGS } from '../config/defaults';
 
 interface AppContextType {
   currentSection: NavSection;
@@ -43,6 +32,8 @@ interface AppContextType {
   setThemeMode: (mode: ThemeMode) => void;
   settings: SystemSettings;
   updateSettings: (newSettings: Partial<SystemSettings>) => void;
+  saveSettings: (newSettings?: Partial<SystemSettings>) => Promise<void>;
+  logout: () => Promise<void>;
   
   // Data items
   domains: DomainItem[];
@@ -62,7 +53,6 @@ interface AppContextType {
   logRate: number;
   logBufferSize: string;
   totalLogLines: number;
-  addLogEntry: (entry: Omit<LogEntry, 'id'>) => void;
   clearLogs: () => void;
   
   // Actions
@@ -80,23 +70,19 @@ interface AppContextType {
   toggleUserStatus: (id: string) => void;
   addAlias: (alias: Partial<AliasItem>) => void;
   deleteAlias: (id: string) => void;
-  addRelayRoute: (route: Partial<SmtpRelayRoute>) => void;
-  deleteRelayRoute: (id: string) => void;
-  toggleRelayRoute: (id: string) => void;
-  promoteRelayProvider: (id: string) => void;
   restartService: (id: string) => void;
   flushQueue: () => void;
   deleteQueueItem: (id: string) => void;
   retryQueueItem: (id: string) => void;
   renewCert: (id: string) => void;
-  addCert: (cert: Partial<TlsCertificate>) => void;
   
   // Onboarding Wizard
   hasCompletedOnboarding: boolean;
   setHasCompletedOnboarding: (status: boolean) => void;
   isOnboardingModalOpen: boolean;
   setIsOnboardingModalOpen: (open: boolean) => void;
-  completeOnboarding: (data?: any) => void;
+  completeOnboarding: (data?: unknown) => Promise<void>;
+  refreshSnapshot: () => Promise<void>;
 
   // Modals & Search
   isSearchOpen: boolean;
@@ -153,6 +139,7 @@ const TRANSLATIONS: Record<string, { zh: string; en: string }> = {
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [currentSection, setCurrentSection] = useState<NavSection>('dashboard');
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
+  const logoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [language, setLanguage] = useState<Language>('zh');
   const [themeMode, setThemeModeState] = useState<ThemeMode>(() => {
     return (localStorage.getItem('mailstack_theme_mode') as ThemeMode) || 'dark';
@@ -190,38 +177,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     localStorage.setItem('mailstack_onboarding_completed', status ? 'true' : 'false');
   };
 
-  const completeOnboarding = (data?: any) => {
-    setHasCompletedOnboarding(true);
-    setIsOnboardingModalOpen(false);
-    if (data?.domainName) {
-      // Ensure domain exists
-      const exists = domains.some(d => d.name === data.domainName);
-      if (!exists) {
-        addDomain({
-          name: data.domainName,
-          status: 'active',
-          statusTextZh: '活跃 (已完成全套初始化)',
-          statusTextEn: 'Active (Initialized)',
-          mxStatus: 'ok',
-          spfStatus: 'ok',
-          dkimStatus: 'ok',
-          dmarcStatus: 'ok',
-          mailboxesCount: 1,
-          mailboxesMax: 50,
-          aliasesCount: 1,
-          dkimSelector: data.dkimSelector || 'mail',
-          dkimKeySize: 2048,
-        });
-      }
-    }
-    showToast(
-      'success',
-      language === 'zh' ? '🎉 邮件服务初始引导部署完成！' : '🎉 Setup Completed!',
-      language === 'zh'
-        ? 'DNS 策略、出站中继与安全证书均已生效，系统已进入企业级高可用发信状态。'
-        : 'All DNS, relay, and security settings are now active.'
-    );
-  };
   const [settings, setSettings] = useState<SystemSettings>(DEFAULT_SETTINGS);
   const [adminAvatar, setAdminAvatar] = useState<string>('');
   const [customLogo, setCustomLogoState] = useState<string>(() => {
@@ -298,22 +253,114 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [certs, setCerts] = useState<TlsCertificate[]>([]);
   const [anomalies, setAnomalies] = useState<SecurityEvent[]>([]);
 
-  const loadSnapshot = async () => {
-    const snap = await api('/api/snapshot');
-    setDomains(snap.domains || []); setUsers(snap.users || []); setAliases(snap.aliases || []);
-    setRelayRoutes(snap.relayRoutes || []); setRelayProviders(snap.relayProviders || []);
-    setLogs(snap.logs || []); setServices(snap.services || []); setQueues(snap.queues || []);
-    setCerts(snap.certs || []); setAnomalies(snap.anomalies || []);
-    if (snap.settings) setSettings((prev) => ({...prev, ...snap.settings}));
+  const refreshSnapshot = async () => {
+    try {
+      const snap = await api('/api/snapshot');
+      setDomains(snap.domains || []);
+      setUsers(snap.users || []);
+      setAliases(snap.aliases || []);
+      setRelayRoutes(snap.relayRoutes || []);
+      setRelayProviders(snap.relayProviders || []);
+      setLogs(snap.logs || []);
+      setServices(snap.services || []);
+      setQueues(snap.queues || []);
+      setCerts(snap.certs || []);
+      setAnomalies(snap.anomalies || []);
+      if (snap.settings) setSettings((prev) => ({ ...prev, ...snap.settings }));
+    } catch (e: unknown) {
+      console.error('Failed to load snapshot:', e);
+      throw e;
+    }
   };
-  useEffect(() => { session().then(ok => { setIsLoggedIn(ok); if (ok) loadSnapshot().catch(()=>setIsLoggedIn(false)); }); }, []);
-  useEffect(() => { if (isLoggedIn) loadSnapshot().catch(e => showToast('error','Backend unavailable',String(e.message||e))); }, [isLoggedIn]);
+
+  const completeOnboarding = async (_data?: unknown) => {
+    try {
+      const state = await api<{
+        identityConfigured?: boolean;
+        postfixActive?: boolean;
+        dovecotActive?: boolean;
+        dnsVerified?: boolean;
+        tlsInstalled?: boolean;
+        mailTestQueued?: boolean;
+        complete?: boolean;
+        pending?: string[];
+      }>('/api/setup/status');
+      const complete = typeof state.complete === 'boolean'
+        ? state.complete
+        : Boolean(
+          state.identityConfigured &&
+          state.postfixActive &&
+          state.dovecotActive &&
+          state.dnsVerified &&
+          state.tlsInstalled &&
+          state.mailTestQueued,
+        );
+      setHasCompletedOnboarding(complete);
+      if (complete) setIsOnboardingModalOpen(false);
+      await refreshSnapshot();
+      showToast(
+        complete ? 'success' : 'warning',
+        complete
+          ? (language === 'zh' ? '服务器验证步骤已完成' : 'Server-verified setup completed')
+          : (language === 'zh' ? '配置已保存，仍有待完成项' : 'Configuration saved with pending items'),
+        complete ? (language === 'zh' ? '所有必需检查均已通过' : 'All required checks passed') : (state.pending || []).join(', ') || (language === 'zh' ? '请完成剩余服务器检查' : 'Complete the remaining server checks'),
+      );
+    } catch (e: unknown) {
+      showToast('error', language === 'zh' ? '无法确认配置状态' : 'Unable to verify setup state', getErrorMessage(e));
+      throw e;
+    }
+  };
+
+  useEffect(() => {
+    session().then((ok) => {
+      setIsLoggedIn(ok);
+      if (ok) refreshSnapshot().catch(() => setIsLoggedIn(false));
+    });
+  }, []);
+
+  useEffect(() => {
+    const handleAuthRequired = () => {
+      if (logoutTimerRef.current) clearTimeout(logoutTimerRef.current);
+      logoutTimerRef.current = null;
+      setIsLoggedIn(false);
+      setIsOnboardingModalOpen(false);
+    };
+    window.addEventListener('mailstack:auth-required', handleAuthRequired);
+    return () => window.removeEventListener('mailstack:auth-required', handleAuthRequired);
+  }, []);
+
+  useEffect(() => {
+    if (logoutTimerRef.current) clearTimeout(logoutTimerRef.current);
+    logoutTimerRef.current = null;
+    if (isLoggedIn) {
+      logoutTimerRef.current = setTimeout(() => {
+        setIsLoggedIn(false);
+        setCurrentSection('dashboard');
+        window.dispatchEvent(new CustomEvent('mailstack:auth-required'));
+      }, 8 * 60 * 60 * 1000);
+    }
+    return () => {
+      if (logoutTimerRef.current) clearTimeout(logoutTimerRef.current);
+      logoutTimerRef.current = null;
+    };
+  }, [isLoggedIn]);
+
+  useEffect(() => {
+    if (isLoggedIn) {
+      refreshSnapshot().catch((e: unknown) => showToast('error', 'Backend unavailable', getErrorMessage(e)));
+      api('/api/setup/status').then((res: any) => {
+        if (res && typeof res.complete === 'boolean') {
+          setHasCompletedOnboarding(res.complete);
+        }
+      }).catch(() => {});
+    }
+  }, [isLoggedIn]);
 
   
   const [isLiveLogStreaming, setIsLiveLogStreaming] = useState<boolean>(true);
   const [logRate, setLogRate] = useState<number>(12);
-  const [logBufferSize, setLogBufferSize] = useState<string>('4.2 MB');
-  const [totalLogLines, setTotalLogLines] = useState<number>(10482);
+  const [logBufferSize, setLogBufferSize] = useState<string>('0 B');
+  const [totalLogLines, setTotalLogLines] = useState<number>(0);
   
   const [isSearchOpen, setIsSearchOpen] = useState<boolean>(false);
   const [activeModal, setActiveModal] = useState<string | null>(null);
@@ -349,6 +396,50 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setSettings((prev) => ({ ...prev, ...newSettings }));
   };
 
+  const saveSettings = async (newSettings?: Partial<SystemSettings>) => {
+    const toSave = newSettings ? { ...settings, ...newSettings } : settings;
+    const prevSettings = { ...settings };
+    setSettings(toSave);
+    try {
+      const payload = {
+        transparency: toSave.transparency,
+        backdropBlur: toSave.backdropBlur,
+        reducedMotion: toSave.reducedMotion,
+        autoUpdate: toSave.autoUpdate,
+        adminEmail: toSave.adminEmail,
+        maxMessageSizeMb: toSave.maxMessageSizeMb,
+        rateLimitPerHour: toSave.rateLimitPerHour,
+        spamThreshold: toSave.spamThreshold,
+        colorTheme: toSave.colorTheme,
+        hostname: toSave.hostname,
+        timezone: toSave.timezone,
+      };
+      const saved = await api<SystemSettings>('/api/settings', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+      setSettings((prev) => ({ ...prev, ...saved }));
+      showToast('success', language === 'zh' ? '设置已保存' : 'Settings Saved', language === 'zh' ? '系统配置已持久化' : 'System configuration persisted.');
+      await refreshSnapshot();
+    } catch (e: unknown) {
+      setSettings(prevSettings);
+      showToast('error', language === 'zh' ? '设置保存失败' : 'Failed to Save Settings', getErrorMessage(e));
+      throw e;
+    }
+  };
+
+  const logout = async () => {
+    try {
+      await api('/api/auth/logout', { method: 'POST' });
+    } finally {
+      if (logoutTimerRef.current) clearTimeout(logoutTimerRef.current);
+      logoutTimerRef.current = null;
+      setLogs([]);
+      setIsLoggedIn(false);
+      setCurrentSection('dashboard');
+    }
+  };
+
   // Keyboard shortcut for Cmd+K / Ctrl+K
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -361,26 +452,54 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  // Live logs are loaded from the authenticated backend.
-  useEffect(() => { if (!isLoggedIn || !isLiveLogStreaming) return; const timer=setInterval(()=>api('/api/logs').then(setLogs).catch(()=>{}),5000); return ()=>clearInterval(timer); }, [isLoggedIn,isLiveLogStreaming]);
-
-  const addLogEntry = (entry: Omit<LogEntry, 'id'>) => {
-    const newLog: LogEntry = {
-      id: 'log-' + Date.now(),
-      ...entry,
+  // Live logs are loaded from the authenticated backend with visibility awareness
+  useEffect(() => {
+    if (!isLoggedIn || !isLiveLogStreaming) return;
+    const poll = () => {
+      if (document.hidden) return;
+      api('/api/logs').then(setLogs).catch(() => {});
     };
-    setLogs((prev) => [newLog, ...prev]);
-    setTotalLogLines((prev) => prev + 1);
-  };
+    const timer = setInterval(poll, 5000);
+    const handleVisibility = () => {
+      if (!document.hidden) poll();
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [isLoggedIn, isLiveLogStreaming]);
 
   const clearLogs = () => {
     setLogs([]);
-    showToast('info', language === 'zh' ? '日志已清除' : 'Logs Cleared', language === 'zh' ? '控制台缓冲区已清空' : 'Console buffer has been purged');
+    showToast('info', language === 'zh' ? '当前视图已清空' : 'Current View Cleared', language === 'zh' ? '仅清空浏览器中的当前日志列表，服务器 journal 未被删除' : 'Only the browser view was cleared; the server journal was not deleted');
   };
 
-  const addDomain = async (newDom: Partial<DomainItem>) => { try { const data=await api('/api/domains',{method:'POST',body:JSON.stringify(newDom)}); setDomains(data); showToast('success', language==='zh'?'域名添加成功':'Domain Added',newDom.name||''); } catch(e:any){ showToast('error','Operation failed',e.message); } };
+  const addDomain = async (newDom: Partial<DomainItem>) => {
+    try {
+      const data = await api('/api/domains', { method: 'POST', body: JSON.stringify(newDom) });
+      setDomains(data);
+      showToast('success', language === 'zh' ? '域名添加成功' : 'Domain Added', newDom.name || '');
+    } catch (e: unknown) {
+      showToast('error', 'Operation failed', getErrorMessage(e));
+    }
+  };
 
-  const deleteDomain = async (id: string) => { try { const data=await api('/api/domains/'+encodeURIComponent(id),{method:'DELETE'}); setDomains(data); showToast('success',language==='zh'?'域名已删除':'Domain deleted',id); } catch(e:any){showToast('error','Operation failed',e.message);} };
+  const deleteDomain = async (id: string) => {
+    try {
+      await api('/api/domains/' + encodeURIComponent(id), { method: 'DELETE', body: JSON.stringify({ confirm: true }) });
+      const snapshot = await api<{ domains?: DomainItem[] }>('/api/snapshot');
+      const serverDomains = snapshot.domains || [];
+      if (serverDomains.some((item) => item.id === id || item.name === id)) {
+        throw new Error(language === 'zh' ? '服务器仍返回该域名，删除未确认' : 'The server still reports this domain after deletion.');
+      }
+      setDomains(serverDomains);
+      showToast('success', language === 'zh' ? '域名已删除' : 'Domain deleted', id);
+    } catch (e: unknown) {
+      showToast('error', 'Operation failed', getErrorMessage(e));
+      await refreshSnapshot().catch(() => {});
+    }
+  };
 
   const updateUserAvatar = (userId: string, avatarUrl: string, avatarColor?: string) => {
     setUsers((prev) =>
@@ -393,96 +512,111 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     );
   };
 
-  const addUser = async (newUser: Partial<UserItem>) => { try { const data=await api('/api/users',{method:'POST',body:JSON.stringify(newUser)}); setUsers(data); showToast('success',language==='zh'?'用户已创建':'User created',newUser.username||''); } catch(e:any){showToast('error','Operation failed',e.message);} };
-
-  const deleteUser = async (id: string) => { try { const data=await api('/api/users/'+encodeURIComponent(id),{method:'DELETE'}); setUsers(data); } catch(e:any){showToast('error','Operation failed',e.message);} };
-
-  const toggleUserStatus = (id: string) => {
-    setUsers((prev) =>
-      prev.map((u) => {
-        if (u.id === id) {
-          const next = u.status === 'enabled' ? 'disabled' : 'enabled';
-          showToast('info', language === 'zh' ? '用户状态变更' : 'User Status Updated', `${u.email} -> ${next === 'enabled' ? '启用' : '禁用'}`);
-          return { ...u, status: next };
-        }
-        return u;
-      })
-    );
+  const addUser = async (newUser: Partial<UserItem>) => {
+    try {
+      const data = await api('/api/users', { method: 'POST', body: JSON.stringify(newUser) });
+      setUsers(data);
+      showToast('success', language === 'zh' ? '用户已创建' : 'User created', newUser.username || '');
+    } catch (e: unknown) {
+      showToast('error', 'Operation failed', getErrorMessage(e));
+    }
   };
 
-  const addAlias = async (newAlias: Partial<AliasItem>) => { try { const data=await api('/api/aliases',{method:'POST',body:JSON.stringify(newAlias)}); setAliases(data); } catch(e:any){showToast('error','Operation failed',e.message);} };
-
-  const deleteAlias = async (id: string) => { try { const data=await api('/api/aliases/'+encodeURIComponent(id),{method:'DELETE'}); setAliases(data); } catch(e:any){showToast('error','Operation failed',e.message);} };
-
-  const addRelayRoute = (newRoute: Partial<SmtpRelayRoute>) => {
-    const route: SmtpRelayRoute = {
-      id: 'rt-' + Date.now(),
-      sourceDomain: newRoute.sourceDomain || '*@example.com',
-      relayTarget: newRoute.relayTarget || 'smtp.sendgrid.net:587',
-      priority: newRoute.priority || 10,
-      action: newRoute.action || 'FORWARD',
-      status: 'active',
-      description: newRoute.description || 'Custom SMTP Relay Target',
-      tlsMode: newRoute.tlsMode || 'STARTTLS',
-      port: newRoute.port || 587,
-    };
-    setRelayRoutes((prev) => [route, ...prev]);
-    showToast('success', language === 'zh' ? '中继规则已生效' : 'Relay Route Added', `${route.sourceDomain} -> ${route.relayTarget}`);
+  const deleteUser = async (id: string) => {
+    try {
+      const data = await api('/api/users/' + encodeURIComponent(id), { method: 'DELETE', body: JSON.stringify({ confirm: true }) });
+      setUsers(data);
+    } catch (e: unknown) {
+      showToast('error', 'Operation failed', getErrorMessage(e));
+    }
   };
 
-  const deleteRelayRoute = (id: string) => {
-    setRelayRoutes((prev) => prev.filter((r) => r.id !== id));
-    showToast('info', language === 'zh' ? '中继规则已删除' : 'Relay Rule Deleted', language === 'zh' ? '已从 Postfix 路由表中注销' : 'Removed from Postfix table');
+  const toggleUserStatus = async (id: string) => {
+    const current = users.find(u => u.id === id);
+    if (!current) return;
+    try {
+      const data = await api('/api/users/status', { method: 'POST', body: JSON.stringify({ id, enabled: current.status !== 'enabled' }) });
+      setUsers(data);
+      showToast('success', language === 'zh' ? '邮箱状态已更新' : 'Mailbox status updated', id);
+    } catch (e: unknown) {
+      showToast('error', language === 'zh' ? '状态更新失败' : 'Status update failed', getErrorMessage(e));
+    }
   };
 
-  const toggleRelayRoute = (id: string) => {
-    setRelayRoutes((prev) =>
-      prev.map((r) => (r.id === id ? { ...r, status: r.status === 'active' ? 'disabled' : 'active' } : r))
-    );
+  const addAlias = async (newAlias: Partial<AliasItem>) => {
+    try {
+      const data = await api('/api/aliases', { method: 'POST', body: JSON.stringify(newAlias) });
+      setAliases(data);
+    } catch (e: unknown) {
+      showToast('error', 'Operation failed', getErrorMessage(e));
+    }
   };
 
-  const promoteRelayProvider = (id: string) => {
-    setRelayProviders((prev) =>
-      prev.map((p) => {
-        if (p.id === id) {
-          return { ...p, isPrimary: true, type: 'primary' };
-        }
-        return { ...p, isPrimary: false, type: p.type === 'primary' ? 'backup' : p.type };
-      })
-    );
-    showToast('success', language === 'zh' ? '主线路已切换' : 'Primary Relay Promoted', language === 'zh' ? 'Postfix 出站流量已热切换至新中继节点' : 'Outbound traffic hot-swapped to target node');
+  const deleteAlias = async (id: string) => {
+    try {
+      const data = await api('/api/aliases/' + encodeURIComponent(id), { method: 'DELETE', body: JSON.stringify({ confirm: true }) });
+      setAliases(data);
+    } catch (e: unknown) {
+      showToast('error', 'Operation failed', getErrorMessage(e));
+    }
   };
 
-  const restartService = async (id: string) => { try { const data=await api('/api/services/action',{method:'POST',body:JSON.stringify({id,verb:'restart'})}); setServices(data); showToast('success',language==='zh'?'服务重启完成':'Service restarted',id); } catch(e:any){showToast('error','Operation failed',e.message);} };
+  const restartService = async (id: string) => {
+    try {
+      const data = await api('/api/services/action', { method: 'POST', body: JSON.stringify({ id, verb: 'restart' }) });
+      setServices(data);
+      showToast('success', language === 'zh' ? '服务重启完成' : 'Service restarted', id);
+    } catch (e: unknown) {
+      showToast('error', 'Operation failed', getErrorMessage(e));
+    }
+  };
 
-  const flushQueue = async () => { try { const data=await api('/api/queue/action',{method:'POST',body:JSON.stringify({verb:'flush'})}); setQueues(data); } catch(e:any){showToast('error','Operation failed',e.message);} };
+  const flushQueue = async () => {
+    try {
+      const data = await api('/api/queue/action', { method: 'POST', body: JSON.stringify({ verb: 'flush' }) });
+      setQueues(data);
+    } catch (e: unknown) {
+      showToast('error', 'Operation failed', getErrorMessage(e));
+    }
+  };
 
-  const deleteQueueItem = async (id: string) => { try { const data=await api('/api/queue/action',{method:'POST',body:JSON.stringify({id,verb:'delete'})}); setQueues(data); } catch(e:any){showToast('error','Operation failed',e.message);} };
+  const deleteQueueItem = async (id: string) => {
+    try {
+      const data = await api('/api/queue/action', { method: 'POST', body: JSON.stringify({ id, verb: 'delete' }) });
+      setQueues(data);
+    } catch (e: unknown) {
+      showToast('error', 'Operation failed', getErrorMessage(e));
+    }
+  };
 
-  const retryQueueItem = async (id: string) => { try { const data=await api('/api/queue/action',{method:'POST',body:JSON.stringify({id,verb:'retry'})}); setQueues(data); } catch(e:any){showToast('error','Operation failed',e.message);} };
+  const retryQueueItem = async (id: string) => {
+    try {
+      const data = await api('/api/queue/action', { method: 'POST', body: JSON.stringify({ id, verb: 'retry' }) });
+      setQueues(data);
+    } catch (e: unknown) {
+      showToast('error', 'Operation failed', getErrorMessage(e));
+    }
+  };
 
-  const renewCert = async (_id: string) => { try { const data=await api('/api/certificates/renew',{method:'POST',body:'{}'}); setCerts(data); showToast('success',language==='zh'?'证书续期任务完成':'Certificate renewal completed','ACME'); } catch(e:any){showToast('error','Operation failed',e.message);} };
-
-  const addCert = (newCert: Partial<TlsCertificate>) => {
-    const validToDate = new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString().split('T')[0];
-    const cert: TlsCertificate = {
-      id: 'cert-' + Date.now(),
-      domain: newCert.domain || 'mail.example.com',
-      issuer: newCert.issuer || "Let's Encrypt Authority X3 (ACME)",
-      validFrom: new Date().toISOString().split('T')[0],
-      validTo: newCert.validTo || validToDate,
-      daysRemaining: 90,
-      autoRenew: newCert.autoRenew !== undefined ? newCert.autoRenew : true,
-      algorithm: newCert.algorithm || 'ECDSA P-256',
-      keySize: newCert.keySize || 256,
-      status: 'valid',
-    };
-    setCerts((prev) => [cert, ...prev.filter((c) => c.domain !== cert.domain)]);
-    showToast(
-      'success',
-      language === 'zh' ? 'TLS 证书注册与签发成功' : 'TLS Certificate Issued',
-      `${cert.domain} ${language === 'zh' ? '已自动挂载至 Postfix (SMTP 465/587) 与 Dovecot (IMAP 993)' : 'bound to Postfix and Dovecot'}`
-    );
+  const renewCert = async (id: string) => {
+    try {
+      const targets = id === 'all'
+        ? [...new Set(certs.map((cert) => cert.domain).filter(Boolean))]
+        : certs.filter((cert) => cert.id === id || cert.domain === id).map((cert) => cert.domain);
+      if (!targets.length) throw new Error(language === 'zh' ? '没有可续期的证书域名' : 'No certificate domain is available for renewal');
+      for (const domain of targets) {
+        const result = await api<{ status?: string; error?: string }>('/api/certificates/renew', {
+          method: 'POST',
+          body: JSON.stringify({ domain })
+        });
+        if (result.status !== 'ok') throw new Error(result.error || `Certificate renewal failed: ${domain}`);
+      }
+      const updated = await api<TlsCertificate[]>('/api/certificates');
+      setCerts(updated);
+      showToast('success', language === 'zh' ? '证书续期任务完成' : 'Certificate renewal completed', targets.join(', '));
+    } catch (e: unknown) {
+      showToast('error', 'Operation failed', getErrorMessage(e));
+    }
   };
 
   return (
@@ -498,6 +632,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setThemeMode,
         settings,
         updateSettings,
+    saveSettings,
+    logout,
         domains,
         users,
         aliases,
@@ -513,7 +649,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         logRate,
         logBufferSize,
         totalLogLines,
-        addLogEntry,
         clearLogs,
         addDomain,
         deleteDomain,
@@ -529,21 +664,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         toggleUserStatus,
         addAlias,
         deleteAlias,
-        addRelayRoute,
-        deleteRelayRoute,
-        toggleRelayRoute,
-        promoteRelayProvider,
         restartService,
         flushQueue,
         deleteQueueItem,
         retryQueueItem,
         renewCert,
-        addCert,
         hasCompletedOnboarding,
         setHasCompletedOnboarding,
         isOnboardingModalOpen,
         setIsOnboardingModalOpen,
         completeOnboarding,
+        refreshSnapshot,
         isSearchOpen,
         setIsSearchOpen,
         activeModal,

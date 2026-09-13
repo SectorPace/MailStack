@@ -2,42 +2,28 @@ import React, { useState, useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
 import { DomainItem } from '../../types';
 import {
-  Globe,
-  Copy,
-  Check,
-  AlertTriangle,
-  CheckCircle2,
-  ExternalLink,
-  ShieldCheck,
-  RefreshCw,
-  Cloud,
-  ChevronDown,
-  ChevronUp,
-  Info,
-  Server,
-  KeyRound,
-  FileText,
-  SlidersHorizontal,
-  Download,
-  Terminal,
-  Zap,
-  HelpCircle,
-  XCircle,
   Layers,
-  ArrowRight,
+  Zap,
   Sparkles,
   Bot,
+  Cloud,
   Edit3,
-  Trash2,
-  PlusCircle,
-  FileCode,
   Save,
-  RotateCcw
-} from 'lucide-react';
-import confetti from 'canvas-confetti';
+  CheckCircle2,
+  Copy,
+  Check,
+  Trash2,
+  Plus,
+  AlertCircle,
+  HelpCircle,
+} from '@/lib/icons';
+import { api } from '../../api';
+import { getErrorMessage } from '../../utils/errors';
 import { DnsSetupWizard } from './DnsSetupWizard';
 import { AiDnsDiagnostic } from './AiDnsDiagnostic';
 import { AiDnsAssistant } from './AiDnsAssistant';
+import { DnsToolbar } from './DnsToolbar';
+import { DnsRecordRowComponent } from './DnsRecordRowComponent';
 
 export interface DnsRecordRow {
   id: string;
@@ -65,25 +51,20 @@ interface Props {
 
 export const DnsGuideTable: React.FC<Props> = ({
   domain,
-  serverIp: initialServerIp = '163.192.27.230',
+  serverIp: initialServerIp = '',
   relayProvider: initialRelayProvider = 'oracle',
-  compact = false,
 }) => {
   const { domains, language, themeMode, showToast } = useApp();
 
-  // Dynamic customization states
-  const initialDomainName = domain?.name || domains[0]?.name || 'sectorpace.com';
+  const initialDomainName = domain?.name || domains[0]?.name || '';
   const [selectedDomainName, setSelectedDomainName] = useState<string>(initialDomainName);
   const [customServerIp, setCustomServerIp] = useState<string>(initialServerIp);
-  const [customDkimSelector, setCustomDkimSelector] = useState<string>(domain?.dkimSelector || 's20260809795');
-  const [selectedRelay, setSelectedRelay] = useState<'oracle' | 'ses' | 'sendgrid' | 'direct' | 'mailgun' | 'brevo' | 'resend'>(initialRelayProvider);
+  const [customDkimSelector, setCustomDkimSelector] = useState<string>(domain?.dkimSelector || 'mail');
+  const [selectedRelay, setSelectedRelay] = useState<string>(initialRelayProvider);
   const [dmarcPolicy, setDmarcPolicy] = useState<'none' | 'quarantine' | 'reject'>('none');
-  const [ruaEmail, setRuaEmail] = useState<string>(`admin@${initialDomainName}`);
+  const ruaEmail = selectedDomainName ? `postmaster@${selectedDomainName}` : '';
 
-  // Navigation tab state
-  const [activeTab, setActiveTab] = useState<'table' | 'wizard' | 'ai_diagnostic' | 'ai_assistant'>('table');
-
-  // Interactive editing and table states
+  const [activeTab, setActiveTab] = useState<'table' | 'wizard'>('table');
   const [editingRecordId, setEditingRecordId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<Partial<DnsRecordRow>>({});
   const [customRecordsOverride, setCustomRecordsOverride] = useState<DnsRecordRow[] | null>(null);
@@ -91,97 +72,44 @@ export const DnsGuideTable: React.FC<Props> = ({
   const [isVerifyingDns, setIsVerifyingDns] = useState(false);
   const [verifiedMap, setVerifiedMap] = useState<Record<string, boolean>>({});
 
-  // Generate dynamic base DNS records based on inputs
   const defaultRecords = useMemo((): DnsRecordRow[] => {
-    const dom = selectedDomainName.trim() || 'yourdomain.com';
-    const ip = customServerIp.trim() || '163.192.27.230';
-    const selector = customDkimSelector.trim() || 's20260809795';
+    const dom = selectedDomainName.trim();
+    if (!dom) return [];
+    const ip = customServerIp.trim();
+    const selector = customDkimSelector.trim() || 'mail';
     const rua = ruaEmail.trim() || `admin@${dom}`;
+    const selectedDomain = domains.find((item) => item.name === dom);
+    const dkimPublicKey = selectedDomain?.dkimPublicKey?.trim();
 
     let spfContent = `"v=spf1 mx ~all"`;
-    let relayRecord: DnsRecordRow | null = null;
 
-    if (selectedRelay === 'oracle') {
-      spfContent = `"v=spf1 mx include:spf.us-sanjose-1.oci.oraclecloud.com ~all"`;
-      relayRecord = {
-        id: 'rec-relay-dkim',
-        name: `dkim._domainkey.${dom}`,
-        nameDisplay: `dkim._domainkey.${dom}`,
-        type: 'CNAME',
-        content: `dkim.${dom}.dkim.sjc1.oracleemaildelivery.com`,
-        proxyStatus: 'dns_only',
-        ttl: '自动',
-        category: 'relay',
-        categoryLabelZh: 'Oracle 邮件投递 CNAME DKIM',
-        categoryLabelEn: 'Oracle Email Delivery DKIM CNAME',
-        comment: 'Oracle Cloud OCI SJC1 DKIM 托管域名 CNAME 解析',
-      };
-    } else if (selectedRelay === 'ses') {
+    if (selectedRelay === 'ses') {
       spfContent = `"v=spf1 mx include:amazonses.com ~all"`;
-      relayRecord = {
-        id: 'rec-relay-ses',
-        name: `ses._domainkey.${dom}`,
-        nameDisplay: `ses._domainkey.${dom}`,
-        type: 'CNAME',
-        content: `${selector}.dkim.amazonses.com`,
-        proxyStatus: 'dns_only',
-        ttl: '自动',
-        category: 'relay',
-        categoryLabelZh: 'Amazon SES Easy DKIM',
-        categoryLabelEn: 'Amazon SES Easy DKIM CNAME',
-        comment: 'AWS SES 自动化 DKIM 签名托管解析',
-      };
     } else if (selectedRelay === 'sendgrid') {
       spfContent = `"v=spf1 mx include:sendgrid.net ~all"`;
-      relayRecord = {
-        id: 'rec-relay-sg',
-        name: `em.${dom}`,
-        nameDisplay: `em.${dom}`,
-        type: 'CNAME',
-        content: `sendgrid.net`,
-        proxyStatus: 'dns_only',
-        ttl: '自动',
-        category: 'relay',
-        categoryLabelZh: 'SendGrid 域名白标别名',
-        categoryLabelEn: 'SendGrid White-label CNAME',
-        comment: 'SendGrid 出站投递白标验证解析',
-      };
     } else if (selectedRelay === 'mailgun') {
       spfContent = `"v=spf1 mx include:mailgun.org ~all"`;
     } else if (selectedRelay === 'brevo') {
       spfContent = `"v=spf1 mx include:spf.sendinblue.com ~all"`;
     } else if (selectedRelay === 'resend') {
+      // Resend DKIM values are account-specific; never invent a publishable key.
       spfContent = `"v=spf1 mx include:resend.com ~all"`;
-      relayRecord = {
-        id: 'rec-relay-resend',
-        name: `resend._domainkey.${dom}`,
-        nameDisplay: `resend._domainkey.${dom}`,
-        type: 'TXT',
-        content: `"p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC3resend..."`,
-        proxyStatus: 'dns_only',
-        ttl: '自动',
-        category: 'relay',
-        categoryLabelZh: 'Resend DKIM 签名',
-        categoryLabelEn: 'Resend DKIM TXT',
-        comment: 'Resend API 发信域名 DKIM 签名公钥',
-      };
     }
 
     const base: DnsRecordRow[] = [
-      {
+      ...(ip ? [{
         id: 'rec-1',
         name: `mail.${dom}`,
         nameDisplay: `mail.${dom}`,
-        type: 'A',
+        type: 'A' as const,
         content: ip,
-        proxyStatus: 'dns_only',
+        proxyStatus: 'dns_only' as const,
         ttl: '自动',
-        category: 'core',
+        category: 'core' as const,
         categoryLabelZh: '邮件主机 A 记录',
         categoryLabelEn: 'Mail Host A Record',
         comment: '自建 MailStack 邮件服务器公网 IPv4 地址',
-      },
-      ...(relayRecord ? [relayRecord] : []),
+      }] : []),
       {
         id: 'rec-3',
         name: `imap.${dom}`,
@@ -248,19 +176,19 @@ export const DnsGuideTable: React.FC<Props> = ({
         categoryLabelEn: 'DMARC Security Policy',
         comment: 'SPF/DKIM 对齐验证规则与聚合反馈报告接收邮箱',
       },
-      {
+      ...(dkimPublicKey ? [{
         id: 'rec-8',
         name: `${selector}._domainkey`,
         nameDisplay: `${selector}._domainkey.${dom}`,
-        type: 'TXT',
-        content: `"k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0w9B7q2rXw1A4J7d8L2m5n9k8o7p6q5r4s3t2u1v0w9x8y7z6a5b4c3d2e1f0g9h8i7j6k5l4m3n2o1p0q9r8s7t6u5v4w3x2y1z0a9b8c7d6e5f4g3h2i1j0k9l8m7n6o5p4q3r2s1t0u9v8w7x6y5z4a3b2c1d0e9f8g7h6i5j4k3l2m1n0o9p8q7r6s5t4u3v2w1x0y9z8a7b6c5d4e3f2g1h0i9j8k7l6m5n4o3p2q1r0s9t8u7v6w5x4y3z2a1b0c9d8e7f6g5h4i3j2k1l0m9n8o7p6q5r4s3t2u1v0w9x8y7z6a5b4c3d2e1f0g9h8i7j6k5l4m3n2o1p0q9r8s7t6u5v4w3x2y1z0DAQAB"`,
-        proxyStatus: 'dns_only',
+        type: 'TXT' as const,
+        content: `"v=DKIM1; k=rsa; p=${dkimPublicKey.replace(/^v=DKIM1;\s*k=rsa;\s*p=/i, '').replace(/\s+/g, '')}"`,
+        proxyStatus: 'dns_only' as const,
         ttl: '自动',
-        category: 'auth',
-        categoryLabelZh: '2048 位 OpenDKIM 数字签名',
-        categoryLabelEn: 'OpenDKIM 2048-bit RSA Public Key',
-        comment: '本地邮件服务器生成的 2048 位 RSA 签名公钥',
-      },
+        category: 'auth' as const,
+        categoryLabelZh: 'OpenDKIM 数字签名',
+        categoryLabelEn: 'OpenDKIM Public Key',
+        comment: '从服务器读取的 DKIM 公钥',
+      }] : []),
       {
         id: 'rec-9',
         name: dom,
@@ -277,9 +205,8 @@ export const DnsGuideTable: React.FC<Props> = ({
     ];
 
     return base;
-  }, [selectedDomainName, customServerIp, customDkimSelector, selectedRelay, dmarcPolicy, ruaEmail]);
+  }, [selectedDomainName, customServerIp, customDkimSelector, selectedRelay, dmarcPolicy, ruaEmail, domains]);
 
-  // Current active records (either custom edited or dynamically generated)
   const currentRecords = customRecordsOverride || defaultRecords;
 
   const copyText = (text: string, key: string, label?: string) => {
@@ -324,26 +251,64 @@ export const DnsGuideTable: React.FC<Props> = ({
   const handleCopyCloudflareCsv = () => {
     const csvHeader = 'Type,Name,Content,TTL,Proxy status\n';
     const csvRows = currentRecords.map(r => {
-      let content = r.content.replace(/^"|"$/g, '');
+      const content = r.content.replace(/^"|"$/g, '');
       return `${r.type},${r.name},"${content}",Auto,DNS only`;
     }).join('\n');
 
     copyText(csvHeader + csvRows, 'all_csv', language === 'zh' ? 'Cloudflare CSV' : 'Cloudflare CSV');
   };
 
-  const handleSimulateVerify = () => {
+  const handleDnsVerify = async () => {
+    if (!selectedDomainName || !customServerIp) {
+      showToast(
+        'warning',
+        language === 'zh' ? 'DNS 验证条件不完整' : 'DNS verification is not ready',
+        language === 'zh' ? '请选择真实域名并填写服务器公网 IP。' : 'Select a real domain and provide the public server IP.',
+      );
+      return;
+    }
     setIsVerifyingDns(true);
-    setTimeout(() => {
+    try {
+      const expectedSpf = currentRecords.find(r => r.type === 'TXT' && r.content.includes('v=spf1'))?.content.replace(/^"|"$/g, '') || '';
+      const result: any = await api('/api/setup/dns/verify', {
+        method: 'POST',
+        body: JSON.stringify({
+          domain: selectedDomainName,
+          mailHost: `mail.${selectedDomainName}`,
+          serverIp: customServerIp,
+          dkimSelector: customDkimSelector,
+          expectedSpf,
+          selectedRelay,
+        }),
+      });
+      const map: Record<string, boolean> = {};
+      currentRecords.forEach(r => {
+        map[r.id] = r.type === 'A'
+          ? !!result.checks?.a
+          : r.type === 'MX'
+          ? !!result.checks?.mx
+          : r.content.includes('v=spf1')
+          ? !!result.checks?.spfSingle && !!result.checks?.spfExpected
+          : r.name.includes('._domainkey.')
+          ? !!result.checks?.dkim
+          : r.name.startsWith('_dmarc.')
+          ? !!result.checks?.dmarc
+          : false;
+      });
+      setVerifiedMap(map);
+      showToast(
+        result.verified ? 'success' : 'warning',
+        result.verified ? (language === 'zh' ? '权威 DNS 验证通过' : 'DNS verified') : (language === 'zh' ? 'DNS 验证未完成' : 'DNS incomplete'),
+        JSON.stringify(result.checks)
+      );
+    } catch (e: unknown) {
+      setVerifiedMap({});
+      showToast('error', language === 'zh' ? 'DNS 查询失败' : 'DNS query failed', getErrorMessage(e));
+    } finally {
       setIsVerifyingDns(false);
-      const newMap: Record<string, boolean> = {};
-      currentRecords.forEach(r => { newMap[r.id] = true; });
-      setVerifiedMap(newMap);
-      confetti({ particleCount: 50, spread: 60, origin: { y: 0.5 } });
-      showToast('success', language === 'zh' ? '权威 DNS 解析验证通过' : 'DNS Records Verified', language === 'zh' ? `所有 ${currentRecords.length} 条记录均已通过全球权威校验！` : 'All DNS records successfully verified.');
-    }, 900);
+    }
   };
 
-  // Inline Record Editing Handlers
   const handleStartEdit = (record: DnsRecordRow) => {
     setEditingRecordId(record.id);
     setEditForm({ ...record });
@@ -376,170 +341,27 @@ export const DnsGuideTable: React.FC<Props> = ({
   };
 
   return (
-    <div className="space-y-6">
-      {/* 1. Dynamic Domain & Parameter Customizer Bar */}
-      <div className={`p-5 rounded-2xl border backdrop-blur-md transition-all ${
-        themeMode === 'light' ? 'bg-white/95 border-slate-200 shadow-sm' : 'bg-slate-900/90 border-slate-800'
-      }`}>
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-200 dark:border-slate-800">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-cyan-400 to-blue-600 flex items-center justify-center text-slate-950 font-bold shadow-[0_0_15px_rgba(0,242,195,0.25)]">
-              <Globe className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h2 className={`text-base font-bold tracking-tight ${themeMode === 'light' ? 'text-slate-900' : 'text-white'}`}>
-                  {language === 'zh' ? '动态 DNS 解析与权威配置中心' : 'Dynamic DNS Records & Configuration Center'}
-                </h2>
-                <span className={`px-2 py-0.5 rounded-full text-[11px] font-mono font-bold border ${
-                  themeMode === 'light' ? 'bg-cyan-50 text-cyan-800 border-cyan-300' : 'bg-cyan-950 text-cyan-300 border-cyan-800'
-                }`}>
-                  Live Wizard
-                </span>
-              </div>
-              <p className={`text-xs mt-0.5 ${themeMode === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>
-                {language === 'zh'
-                  ? '支持自定义任意域名、公网 IP、DKIM 密钥与出站中继，实时动态计算全部 9 大 DNS 标准记录与 AI 诊断。'
-                  : 'Customize domain, server IP, DKIM selectors, and relays. Dynamically generates full DNS records & AI diagnostics.'}
-              </p>
-            </div>
-          </div>
+<div className="space-y-6">
+      <DnsToolbar
+        themeMode={themeMode}
+        language={language}
+        selectedDomainName={selectedDomainName}
+        setSelectedDomainName={setSelectedDomainName}
+        customServerIp={customServerIp}
+        setCustomServerIp={setCustomServerIp}
+        selectedRelay={selectedRelay}
+        setSelectedRelay={setSelectedRelay}
+        customDkimSelector={customDkimSelector}
+        setCustomDkimSelector={setCustomDkimSelector}
+        dmarcPolicy={dmarcPolicy}
+        setDmarcPolicy={setDmarcPolicy}
+        isVerifyingDns={isVerifyingDns}
+        onVerify={handleDnsVerify}
+        onCopyCsv={handleCopyCloudflareCsv}
+        onCopyZone={handleCopyAllZone}
+        onReset={handleResetToDefaults}
+      />
 
-          {/* Quick Actions */}
-          <div className="flex items-center flex-wrap gap-2">
-            <button
-              onClick={handleSimulateVerify}
-              disabled={isVerifyingDns}
-              className={`h-9 px-3 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
-                themeMode === 'light'
-                  ? 'bg-slate-100 hover:bg-slate-200 border-slate-300 text-slate-700'
-                  : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
-              }`}
-              title="模拟全球权威 DNS 查询"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${isVerifyingDns ? 'animate-spin text-cyan-500' : ''}`} />
-              <span>{isVerifyingDns ? (language === 'zh' ? '全球探测中...' : 'Probing...') : (language === 'zh' ? '连通性验证' : 'Verify Records')}</span>
-            </button>
-
-            <button
-              onClick={handleCopyCloudflareCsv}
-              className={`h-9 px-3 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
-                themeMode === 'light'
-                  ? 'bg-amber-50 hover:bg-amber-100 border-amber-300 text-amber-900'
-                  : 'bg-amber-950/40 hover:bg-amber-900/60 border-amber-500/40 text-amber-300'
-              }`}
-              title="导出 Cloudflare DNS 一键导入 CSV"
-            >
-              <Download className="w-3.5 h-3.5" />
-              <span>{language === 'zh' ? '导出 Cloudflare CSV' : 'Cloudflare CSV'}</span>
-            </button>
-
-            <button
-              onClick={handleCopyAllZone}
-              className="h-9 px-3.5 rounded-xl bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition-all shadow-[0_0_15px_rgba(0,242,195,0.2)] cursor-pointer"
-              title="复制完整 BIND Zone 记录"
-            >
-              <FileCode className="w-3.5 h-3.5" />
-              <span>{language === 'zh' ? '复制 BIND Zone' : 'Copy BIND Zone'}</span>
-            </button>
-          </div>
-        </div>
-
-        {/* Dynamic Controls Grid */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 pt-4 font-mono text-xs">
-          {/* Target Domain Input / Selector */}
-          <div className="space-y-1">
-            <label className={`text-[11px] font-bold uppercase tracking-wider ${themeMode === 'light' ? 'text-slate-700' : 'text-slate-300'}`}>
-              1. {language === 'zh' ? '当前域名 (Domain)' : 'Domain Name'}
-            </label>
-            <div className="relative">
-              <input
-                type="text"
-                value={selectedDomainName}
-                onChange={(e) => setSelectedDomainName(e.target.value)}
-                placeholder="sectorpace.com"
-                className={`w-full h-9 px-3 rounded-xl border text-xs font-bold focus:outline-none focus:ring-1 focus:ring-cyan-500 ${
-                  themeMode === 'light' ? 'bg-slate-50 border-slate-300 text-slate-900' : 'bg-slate-950 border-slate-800 text-white'
-                }`}
-              />
-            </div>
-          </div>
-
-          {/* Server IP */}
-          <div className="space-y-1">
-            <label className={`text-[11px] font-bold uppercase tracking-wider ${themeMode === 'light' ? 'text-slate-700' : 'text-slate-300'}`}>
-              2. {language === 'zh' ? '服务器公网 IP' : 'Server IP'}
-            </label>
-            <input
-              type="text"
-              value={customServerIp}
-              onChange={(e) => setCustomServerIp(e.target.value)}
-              placeholder="163.192.27.230"
-              className={`w-full h-9 px-3 rounded-xl border text-xs font-mono focus:outline-none focus:ring-1 focus:ring-cyan-500 ${
-                themeMode === 'light' ? 'bg-slate-50 border-slate-300 text-slate-900' : 'bg-slate-950 border-slate-800 text-cyan-300'
-              }`}
-            />
-          </div>
-
-          {/* Outbound Relay Mode */}
-          <div className="space-y-1">
-            <label className={`text-[11px] font-bold uppercase tracking-wider ${themeMode === 'light' ? 'text-slate-700' : 'text-slate-300'}`}>
-              3. {language === 'zh' ? '出站中继 (Relay)' : 'Relay Provider'}
-            </label>
-            <select
-              value={selectedRelay}
-              onChange={(e) => setSelectedRelay(e.target.value as any)}
-              className={`w-full h-9 px-3 rounded-xl border text-xs font-bold focus:outline-none focus:ring-1 focus:ring-cyan-500 cursor-pointer ${
-                themeMode === 'light' ? 'bg-slate-50 border-slate-300 text-slate-900' : 'bg-slate-950 border-slate-800 text-white'
-              }`}
-            >
-              <option value="oracle">Oracle Cloud (OCI SJC1)</option>
-              <option value="direct">自建服务器直发 (Direct MX)</option>
-              <option value="ses">Amazon SES</option>
-              <option value="sendgrid">SendGrid</option>
-              <option value="mailgun">Mailgun</option>
-              <option value="brevo">Brevo (Sendinblue)</option>
-              <option value="resend">Resend</option>
-            </select>
-          </div>
-
-          {/* DKIM Selector */}
-          <div className="space-y-1">
-            <label className={`text-[11px] font-bold uppercase tracking-wider ${themeMode === 'light' ? 'text-slate-700' : 'text-slate-300'}`}>
-              4. {language === 'zh' ? 'DKIM Selector' : 'DKIM Selector'}
-            </label>
-            <input
-              type="text"
-              value={customDkimSelector}
-              onChange={(e) => setCustomDkimSelector(e.target.value)}
-              placeholder="s20260809795"
-              className={`w-full h-9 px-3 rounded-xl border text-xs font-mono focus:outline-none focus:ring-1 focus:ring-cyan-500 ${
-                themeMode === 'light' ? 'bg-slate-50 border-slate-300 text-slate-900' : 'bg-slate-950 border-slate-800 text-white'
-              }`}
-            />
-          </div>
-
-          {/* DMARC Policy */}
-          <div className="space-y-1">
-            <label className={`text-[11px] font-bold uppercase tracking-wider ${themeMode === 'light' ? 'text-slate-700' : 'text-slate-300'}`}>
-              5. {language === 'zh' ? 'DMARC 策略' : 'DMARC Policy'}
-            </label>
-            <select
-              value={dmarcPolicy}
-              onChange={(e) => setDmarcPolicy(e.target.value as any)}
-              className={`w-full h-9 px-3 rounded-xl border text-xs font-bold focus:outline-none focus:ring-1 focus:ring-cyan-500 cursor-pointer ${
-                themeMode === 'light' ? 'bg-slate-50 border-slate-300 text-slate-900' : 'bg-slate-950 border-slate-800 text-white'
-              }`}
-            >
-              <option value="none">p=none (监控观察模式)</option>
-              <option value="quarantine">p=quarantine (疑似垃圾隔离)</option>
-              <option value="reject">p=reject (严格拒收拦截)</option>
-            </select>
-          </div>
-        </div>
-      </div>
-
-      {/* 2. Top Level Navigation Tabs */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div className={`p-1.5 rounded-2xl border flex items-center gap-1.5 backdrop-blur-md ${
           themeMode === 'light' ? 'bg-white/90 border-slate-200 shadow-sm' : 'bg-slate-900/80 border-slate-800'
@@ -566,193 +388,171 @@ export const DnsGuideTable: React.FC<Props> = ({
             }`}
           >
             <Zap className="w-4 h-4 text-amber-500" />
-            <span>{language === 'zh' ? '分步设置向导' : 'Setup Wizard'}</span>
-          </button>
-
-          <button
-            onClick={() => setActiveTab('ai_diagnostic')}
-            className={`px-4 py-2 rounded-xl text-xs font-bold font-mono flex items-center gap-2 transition-all cursor-pointer ${
-              activeTab === 'ai_diagnostic'
-                ? 'bg-cyan-400 text-slate-950 shadow-sm'
-                : themeMode === 'light' ? 'text-slate-600 hover:bg-slate-100' : 'text-slate-400 hover:bg-slate-800'
-            }`}
-          >
-            <Sparkles className="w-4 h-4 text-purple-400" />
-            <span>{language === 'zh' ? 'AI 智能诊断与体检' : 'AI Health Diagnostic'}</span>
-          </button>
-
-          <button
-            onClick={() => setActiveTab('ai_assistant')}
-            className={`px-4 py-2 rounded-xl text-xs font-bold font-mono flex items-center gap-2 transition-all cursor-pointer ${
-              activeTab === 'ai_assistant'
-                ? 'bg-cyan-400 text-slate-950 shadow-sm'
-                : themeMode === 'light' ? 'text-slate-600 hover:bg-slate-100' : 'text-slate-400 hover:bg-slate-800'
-            }`}
-          >
-            <Bot className="w-4 h-4 text-cyan-500" />
-            <span>{language === 'zh' ? 'AI 邮件顾问助手' : 'AI Assistant'}</span>
+            <span>{language === 'zh' ? '分步解析指引' : 'Setup Steps'}</span>
           </button>
         </div>
-
-        {customRecordsOverride && (
-          <button
-            onClick={handleResetToDefaults}
-            className={`px-3 py-1.5 rounded-xl border text-xs font-mono flex items-center gap-1.5 cursor-pointer ${
-              themeMode === 'light' ? 'bg-slate-100 hover:bg-slate-200 border-slate-300 text-slate-700' : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
-            }`}
-          >
-            <RotateCcw className="w-3.5 h-3.5 text-amber-500" />
-            <span>{language === 'zh' ? '恢复系统推荐值' : 'Reset Table'}</span>
-          </button>
-        )}
       </div>
 
-      {/* TAB 1: Authoritative Cloudflare-style Records Table */}
       {activeTab === 'table' && (
-        <div className="space-y-4 animate-in fade-in duration-200">
-          {/* Cloudflare Grey Cloud Notice Bar */}
-          <div className={`p-4 rounded-2xl border flex items-start sm:items-center justify-between gap-3 text-xs ${
-            themeMode === 'light'
-              ? 'bg-gradient-to-r from-amber-500/10 via-amber-50 to-white border-amber-300 text-amber-950'
-              : 'bg-gradient-to-r from-amber-950/40 via-slate-900 to-slate-900 border-amber-500/40 text-amber-200'
+        <div className="space-y-4">
+          <div className={`p-4 rounded-2xl border backdrop-blur-md flex flex-wrap items-center justify-between gap-4 ${
+            themeMode === 'light' ? 'bg-white/70 border-slate-200 shadow-sm' : 'bg-slate-900/40 border-slate-800'
           }`}>
-            <div className="flex items-center gap-2.5">
-              <Cloud className="w-4 h-4 text-amber-500 shrink-0" />
-              <div>
-                <span className="font-bold font-mono">[Cloudflare 核心防坑警示]：</span>
-                <span>
-                  {language === 'zh'
-                    ? '所有邮件相关主机名 (mail, smtp, imap, pop) 在 Cloudflare 控制台中必须设置为【仅 DNS (灰云)】，严禁开启橙云 CDN 代理（避免拦截 25/587 端口）。'
-                    : 'All mail hosts in Cloudflare MUST be set to "DNS Only" (Grey Cloud). Orange cloud breaks SMTP/IMAP ports.'}
-                </span>
-              </div>
+            <div className="flex items-center gap-3">
+              <span className={`w-3 h-3 rounded-full ${themeMode === 'light' ? 'bg-cyan-500' : 'bg-cyan-400'} animate-pulse`} />
+              <span className={`text-xs font-mono font-semibold ${themeMode === 'light' ? 'text-slate-700' : 'text-slate-200'}`}>
+                {language === 'zh' ? '当前配置域名:' : 'Active Domain:'} <span className="text-cyan-400 font-bold">{selectedDomainName || (language === 'zh' ? '未选择' : 'Not selected')}</span>
+              </span>
+              <span className={`text-xs font-mono ${themeMode === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>
+                ({customRecordsOverride ? (language === 'zh' ? '包含手动自定义覆盖记录' : 'Custom overrides active') : (language === 'zh' ? '系统推荐配置' : 'Standard recommended configuration')})
+              </span>
             </div>
-
-            <span className="hidden md:inline-flex px-2.5 py-1 rounded-lg bg-amber-500/20 text-amber-400 font-mono text-[11px] font-bold uppercase shrink-0">
-              DNS Only ☁️
-            </span>
+            
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => {}}
+                className={`px-3.5 py-2 rounded-xl border text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                  themeMode === 'light'
+                    ? 'bg-cyan-500/10 border-cyan-300 text-cyan-800 hover:bg-cyan-500/20'
+                    : 'bg-cyan-500/10 border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/20'
+                }`}
+              >
+                <Plus className="w-4 h-4" />
+                <span>{language === 'zh' ? '添加自定义记录' : 'Add Custom Record'}</span>
+              </button>
+            </div>
           </div>
 
-          {/* Table Container */}
-          <div className={`rounded-2xl border backdrop-blur-md overflow-hidden ${
-            themeMode === 'light' ? 'bg-white/95 border-slate-200 shadow-sm' : 'bg-slate-900/90 border-slate-800'
+          {(!selectedDomainName || !customServerIp || !domains.find((item) => item.name === selectedDomainName)?.dkimPublicKey) && (
+            <div className={`p-3 rounded-xl border text-xs flex items-start gap-2 ${
+              themeMode === 'light' ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-amber-500/10 border-amber-500/30 text-amber-200'
+            }`} role="status">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>
+                {!selectedDomainName
+                  ? (language === 'zh' ? '请先添加一个真实域名。' : 'Add a real domain before generating DNS records.')
+                  : !customServerIp
+                    ? (language === 'zh' ? '尚未取得服务器公网 IP，A 记录不会生成。' : 'No public server IP is available; the A record is omitted.')
+                    : (language === 'zh' ? '尚未从服务器取得 DKIM 公钥，DKIM 记录不会生成。' : 'No server DKIM public key is available; the DKIM record is omitted.')}
+              </span>
+            </div>
+          )}
+
+          <div className={`rounded-2xl border overflow-hidden backdrop-blur-md ${
+            themeMode === 'light' ? 'bg-white/80 border-slate-200 shadow-sm' : 'bg-slate-950/60 border-slate-800'
           }`}>
             <div className="overflow-x-auto">
-              <table className="w-full text-left font-mono text-xs">
+              <table className="w-full text-left text-xs border-collapse">
                 <thead>
-                  <tr className={`border-b ${
-                    themeMode === 'light' ? 'bg-slate-100/80 border-slate-200 text-slate-600' : 'bg-slate-950/80 border-slate-800 text-slate-400'
+                  <tr className={`border-b font-mono ${
+                    themeMode === 'light' ? 'bg-slate-50/90 text-slate-600 border-slate-200' : 'bg-slate-900/60 text-slate-400 border-slate-800'
                   }`}>
-                    <th className="py-3.5 px-4 font-bold uppercase text-[11px]">#</th>
-                    <th className="py-3.5 px-4 font-bold uppercase text-[11px]">类型 (Type)</th>
-                    <th className="py-3.5 px-4 font-bold uppercase text-[11px]">名称 (Name / Host)</th>
-                    <th className="py-3.5 px-4 font-bold uppercase text-[11px]">内容 (Content / Target)</th>
-                    <th className="py-3.5 px-4 font-bold uppercase text-[11px]">代理状态 (Proxy)</th>
-                    <th className="py-3.5 px-4 font-bold uppercase text-[11px]">TTL</th>
-                    <th className="py-3.5 px-4 font-bold uppercase text-[11px] text-right">操作</th>
+                    <th className="p-3.5 pl-4">{language === 'zh' ? '记录类型' : 'Type'}</th>
+                    <th className="p-3.5">{language === 'zh' ? '主机记录 / 名称 (Name)' : 'Host / Name'}</th>
+                    <th className="p-3.5 min-w-[320px]">{language === 'zh' ? '记录值 / 内容 (Value/Content)' : 'Value / Content'}</th>
+                    <th className="p-3.5">{language === 'zh' ? '代理 / TTL' : 'Proxy / TTL'}</th>
+                    <th className="p-3.5">{language === 'zh' ? '作用说明' : 'Purpose'}</th>
+                    <th className="p-3.5">{language === 'zh' ? '状态' : 'Status'}</th>
+                    <th className="p-3.5 pr-4 text-right">{language === 'zh' ? '操作' : 'Actions'}</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-200/60 dark:divide-slate-800/60">
-                  {currentRecords.map((row, idx) => {
-                    const isEditing = editingRecordId === row.id;
-                    const isVerified = verifiedMap[row.id];
+                <tbody className="divide-y divide-slate-800/40">
+                  {!currentRecords.length && (
+                    <tr>
+                      <td colSpan={7} className="p-8 text-center text-sm text-slate-500">
+                        {language === 'zh' ? '没有可发布的 DNS 记录' : 'No publishable DNS records'}
+                      </td>
+                    </tr>
+                  )}
+                  {currentRecords.map((r) => {
+                    const isEditing = editingRecordId === r.id;
+                    const isVerified = verifiedMap[r.id];
 
                     return (
-                      <React.Fragment key={row.id}>
-                        <tr className={`transition-colors ${
-                          isEditing
-                            ? themeMode === 'light' ? 'bg-cyan-50/70' : 'bg-cyan-950/30'
-                            : themeMode === 'light' ? 'hover:bg-slate-50/80' : 'hover:bg-slate-800/40'
-                        }`}>
-                          {/* Index / Status */}
-                          <td className="py-3 px-4 text-slate-400">
+                      <React.Fragment key={r.id}>
+                        <tr className={`transition-colors font-mono ${
+                          themeMode === 'light' ? 'hover:bg-cyan-50/50' : 'hover:bg-cyan-950/10'
+                        } ${isEditing ? (themeMode === 'light' ? 'bg-cyan-50/80' : 'bg-cyan-950/30') : ''}`}>
+                          <td className="p-3.5 pl-4">
+                            <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${
+                              r.type === 'A' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/30' :
+                              r.type === 'MX' ? 'bg-purple-500/10 text-purple-400 border border-purple-500/30' :
+                              r.type === 'TXT' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30' :
+                              'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30'
+                            }`}>
+                              {r.type}
+                            </span>
+                          </td>
+                          <td className="p-3.5">
+                            <div className="flex items-center gap-1.5 group">
+                              <span className={`font-semibold ${themeMode === 'light' ? 'text-slate-900' : 'text-slate-100'}`}>
+                                {r.nameDisplay}
+                              </span>
+                              <button
+                                onClick={() => copyText(r.nameDisplay, `name-${r.id}`)}
+                                title={language === 'zh' ? '复制主机记录' : 'Copy Host'}
+                                className="opacity-0 group-hover:opacity-100 p-1 hover:text-cyan-400 transition-opacity cursor-pointer"
+                              >
+                                {copiedField === `name-${r.id}` ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5 text-slate-400" />}
+                              </button>
+                            </div>
+                          </td>
+                          <td className="p-3.5 max-w-md">
+                            <div className="flex items-center gap-1.5 group">
+                              <span className={`font-mono text-xs break-all ${themeMode === 'light' ? 'text-slate-700' : 'text-slate-300'}`}>
+                                {r.content}
+                              </span>
+                              <button
+                                onClick={() => copyText(r.content, `content-${r.id}`)}
+                                title={language === 'zh' ? '复制记录值' : 'Copy Content'}
+                                className="opacity-0 group-hover:opacity-100 p-1 hover:text-cyan-400 transition-opacity cursor-pointer shrink-0"
+                              >
+                                {copiedField === `content-${r.id}` ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5 text-slate-400" />}
+                              </button>
+                            </div>
+                          </td>
+                          <td className="p-3.5">
+                            <div className="flex flex-col gap-1">
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-slate-500/10 text-slate-400 border border-slate-500/20">
+                                <AlertCircle className="w-3 h-3" /> 仅 DNS (灰云)
+                              </span>
+                              <span className="text-[10px] text-slate-500">TTL: {r.ttl}</span>
+                            </div>
+                          </td>
+                          <td className="p-3.5">
+                            <div className="flex flex-col gap-0.5">
+                              <span className={`text-xs font-medium ${themeMode === 'light' ? 'text-slate-900' : 'text-slate-200'}`}>
+                                {language === 'zh' ? r.categoryLabelZh : r.categoryLabelEn}
+                              </span>
+                              <span className="text-[11px] text-slate-500 line-clamp-1">{r.comment}</span>
+                            </div>
+                          </td>
+                          <td className="p-3.5">
                             {isVerified ? (
-                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                                <CheckCircle2 className="w-3 h-3" /> {language === 'zh' ? '解析正常' : 'Active'}
+                              </span>
                             ) : (
-                              <span>{idx + 1}</span>
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-500/10 text-slate-400 border border-slate-500/20">
+                                <HelpCircle className="w-3 h-3" /> {language === 'zh' ? '未体检' : 'Untested'}
+                              </span>
                             )}
                           </td>
-
-                          {/* Type */}
-                          <td className="py-3 px-4">
-                            <span className={`px-2 py-0.5 rounded text-[11px] font-bold border ${
-                              row.type === 'A'
-                                ? 'bg-blue-500/10 text-blue-400 border-blue-500/30'
-                                : row.type === 'MX'
-                                ? 'bg-purple-500/10 text-purple-400 border-purple-500/30'
-                                : row.type === 'TXT'
-                                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                                : 'bg-cyan-500/10 text-cyan-400 border-cyan-500/30'
-                            }`}>
-                              {row.type}
-                            </span>
-                          </td>
-
-                          {/* Name */}
-                          <td className="py-3 px-4">
-                            <div className="flex items-center gap-1.5">
-                              <span className={`font-bold ${themeMode === 'light' ? 'text-slate-900' : 'text-white'}`}>
-                                {row.name}
-                              </span>
-                              <button
-                                onClick={() => copyText(row.name, `name-${row.id}`, 'Name')}
-                                className="p-1 rounded hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-400 hover:text-cyan-500 cursor-pointer"
-                                title="复制名称"
-                              >
-                                {copiedField === `name-${row.id}` ? <Check className="w-3 h-3 text-emerald-500" /> : <Copy className="w-3 h-3" />}
-                              </button>
-                            </div>
-                            <div className="text-[10px] text-slate-500 font-sans">{language === 'zh' ? row.categoryLabelZh : row.categoryLabelEn}</div>
-                          </td>
-
-                          {/* Content */}
-                          <td className="py-3 px-4 max-w-md">
-                            <div className="flex items-center justify-between gap-2">
-                              <span className={`break-all ${themeMode === 'light' ? 'text-slate-800' : 'text-slate-300'}`}>
-                                {row.priority ? <strong className="text-purple-400 mr-1.5">[10]</strong> : null}
-                                {row.content}
-                              </span>
-                              <button
-                                onClick={() => copyText(row.content, `content-${row.id}`, 'Content')}
-                                className="p-1 rounded hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-400 hover:text-cyan-500 cursor-pointer shrink-0"
-                                title="复制记录值"
-                              >
-                                {copiedField === `content-${row.id}` ? <Check className="w-3 h-3 text-emerald-500" /> : <Copy className="w-3 h-3" />}
-                              </button>
-                            </div>
-                          </td>
-
-                          {/* Proxy */}
-                          <td className="py-3 px-4">
-                            <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold border ${
-                              themeMode === 'light'
-                                ? 'bg-slate-100 text-slate-700 border-slate-300'
-                                : 'bg-slate-800 text-slate-300 border-slate-700'
-                            }`}>
-                              <Cloud className="w-3 h-3 text-slate-400" />
-                              <span>仅 DNS (灰云)</span>
-                            </span>
-                          </td>
-
-                          {/* TTL */}
-                          <td className="py-3 px-4 text-slate-400">
-                            {row.ttl || '自动'}
-                          </td>
-
-                          {/* Actions */}
-                          <td className="py-3 px-4 text-right">
+                          <td className="p-3.5 pr-4 text-right">
                             <div className="flex items-center justify-end gap-1">
                               <button
-                                onClick={() => handleStartEdit(row)}
-                                className="p-1.5 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-400 hover:text-cyan-400 transition-colors cursor-pointer"
-                                title="编辑该记录"
+                                onClick={() => handleStartEdit(r)}
+                                className={`p-1.5 rounded-lg border text-xs cursor-pointer ${
+                                  themeMode === 'light' ? 'hover:bg-slate-100 text-slate-600 border-slate-300' : 'hover:bg-slate-800 text-slate-300 border-slate-700'
+                                }`}
+                                title={language === 'zh' ? '编辑记录' : 'Edit'}
                               >
                                 <Edit3 className="w-3.5 h-3.5" />
                               </button>
                               <button
-                                onClick={() => handleDeleteRecord(row.id)}
-                                className="p-1.5 rounded-lg hover:bg-rose-500/10 text-slate-400 hover:text-rose-400 transition-colors cursor-pointer"
-                                title="删除该记录"
+                                onClick={() => handleDeleteRecord(r.id)}
+                                className="p-1.5 rounded-lg border border-red-500/30 text-red-400 hover:bg-red-500/10 text-xs cursor-pointer"
+                                title={language === 'zh' ? '删除记录' : 'Delete'}
                               >
                                 <Trash2 className="w-3.5 h-3.5" />
                               </button>
@@ -760,58 +560,45 @@ export const DnsGuideTable: React.FC<Props> = ({
                           </td>
                         </tr>
 
-                        {/* Expandable Inline Edit Form */}
                         {isEditing && (
-                          <tr className={themeMode === 'light' ? 'bg-cyan-50/90' : 'bg-cyan-950/40'}>
+                          <tr className={themeMode === 'light' ? 'bg-cyan-50/90' : 'bg-slate-900/90'}>
                             <td colSpan={7} className="p-4 border-b border-cyan-500/30">
-                              <div className="space-y-3 font-mono text-xs">
+                              <div className="space-y-3 font-sans">
                                 <div className="flex items-center justify-between">
-                                  <span className="font-bold text-cyan-500 flex items-center gap-1.5">
+                                  <h4 className="text-xs font-bold text-cyan-400 flex items-center gap-1.5">
                                     <Edit3 className="w-3.5 h-3.5" />
-                                    <span>编辑 DNS 记录参数 (Cloudflare 风格)</span>
-                                  </span>
-                                  <span className="text-[10px] text-slate-400">ID: {row.id}</span>
+                                    <span>编辑记录: {r.type} {r.nameDisplay}</span>
+                                  </h4>
                                 </div>
-
-                                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
                                   <div>
-                                    <label className="text-[10px] text-slate-500 uppercase">类型 (Type)</label>
+                                    <label className="block mb-1 text-slate-400">记录类型 (Type)</label>
                                     <select
-                                      value={editForm.type}
-                                      onChange={(e) => setEditForm(prev => ({ ...prev, type: e.target.value as any }))}
-                                      className={`w-full h-8 px-2 rounded-lg border text-xs mt-1 ${
-                                        themeMode === 'light' ? 'bg-white border-slate-300' : 'bg-slate-900 border-slate-700'
-                                      }`}
+                                      value={editForm.type || 'TXT'}
+                                      onChange={(e) => setEditForm({ ...editForm, type: e.target.value as any })}
+                                      className="w-full px-3 py-1.5 rounded-lg border bg-slate-950 border-slate-700 text-white font-mono"
                                     >
-                                      <option value="A">A</option>
-                                      <option value="CNAME">CNAME</option>
-                                      <option value="MX">MX</option>
-                                      <option value="TXT">TXT</option>
-                                      <option value="AAAA">AAAA</option>
+                                      {['TXT', 'MX', 'A', 'AAAA', 'CNAME', 'PTR'].map((t) => (
+                                        <option key={t} value={t}>{t}</option>
+                                      ))}
                                     </select>
                                   </div>
-
                                   <div>
-                                    <label className="text-[10px] text-slate-500 uppercase">名称 (Name)</label>
+                                    <label className="block mb-1 text-slate-400">主机记录 (Host / Name)</label>
                                     <input
                                       type="text"
-                                      value={editForm.name}
-                                      onChange={(e) => setEditForm(prev => ({ ...prev, name: e.target.value }))}
-                                      className={`w-full h-8 px-2 rounded-lg border text-xs mt-1 ${
-                                        themeMode === 'light' ? 'bg-white border-slate-300' : 'bg-slate-900 border-slate-700'
-                                      }`}
+                                      value={editForm.nameDisplay || ''}
+                                      onChange={(e) => setEditForm({ ...editForm, nameDisplay: e.target.value, name: e.target.value })}
+                                      className="w-full px-3 py-1.5 rounded-lg border bg-slate-950 border-slate-700 text-white font-mono"
                                     />
                                   </div>
-
-                                  <div className="lg:col-span-2">
-                                    <label className="text-[10px] text-slate-500 uppercase">内容 (Content / Value)</label>
+                                  <div>
+                                    <label className="block mb-1 text-slate-400">记录值 / 内容 (Content)</label>
                                     <input
                                       type="text"
-                                      value={editForm.content}
-                                      onChange={(e) => setEditForm(prev => ({ ...prev, content: e.target.value }))}
-                                      className={`w-full h-8 px-2 rounded-lg border text-xs mt-1 ${
-                                        themeMode === 'light' ? 'bg-white border-slate-300' : 'bg-slate-900 border-slate-700'
-                                      }`}
+                                      value={editForm.content || ''}
+                                      onChange={(e) => setEditForm({ ...editForm, content: e.target.value })}
+                                      className="w-full px-3 py-1.5 rounded-lg border bg-slate-950 border-slate-700 text-white font-mono"
                                     />
                                   </div>
                                 </div>
@@ -847,40 +634,18 @@ export const DnsGuideTable: React.FC<Props> = ({
         </div>
       )}
 
-      {/* TAB 2: Step-by-Step DNS Wizard */}
       {activeTab === 'wizard' && (
         <DnsSetupWizard
           domainName={selectedDomainName}
           serverIp={customServerIp}
           dkimSelector={customDkimSelector}
+          dkimPublicKey={domains.find((item) => item.name === selectedDomainName)?.dkimPublicKey || ''}
           relayProvider={selectedRelay}
           dmarcPolicy={dmarcPolicy}
           ruaEmail={ruaEmail}
           onJumpToTab={(tab) => {
             if (tab === 'table') setActiveTab('table');
-            if (tab === 'diagnostic') setActiveTab('ai_diagnostic');
-            if (tab === 'assistant') setActiveTab('ai_assistant');
           }}
-        />
-      )}
-
-      {/* TAB 3: AI Comprehensive Health Diagnostic */}
-      {activeTab === 'ai_diagnostic' && (
-        <AiDnsDiagnostic
-          domainName={selectedDomainName}
-          serverIp={customServerIp}
-          relayProvider={selectedRelay}
-          records={currentRecords}
-        />
-      )}
-
-      {/* TAB 4: AI DNS Assistant Interactive Chat */}
-      {activeTab === 'ai_assistant' && (
-        <AiDnsAssistant
-          domainName={selectedDomainName}
-          serverIp={customServerIp}
-          relayProvider={selectedRelay}
-          records={currentRecords}
         />
       )}
     </div>

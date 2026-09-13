@@ -20,7 +20,7 @@ import {
   Cpu,
   Check,
   Send
-} from 'lucide-react';
+} from '@/lib/icons';
 import confetti from 'canvas-confetti';
 
 interface Props {
@@ -133,7 +133,7 @@ export const AiDnsDiagnostic: React.FC<Props> = ({
               <Sparkles className="w-5 h-5 animate-pulse" />
             </span>
             <h3 className={`text-base font-bold ${themeMode === 'light' ? 'text-slate-900' : 'text-white'}`}>
-              {language === 'zh' ? 'Gemini AI 智能 DNS 深度体检与邮件送达率诊断' : 'Gemini AI DNS Health & Deliverability Diagnostic'}
+              {language === 'zh' ? 'AI 智能 DNS 深度体检与邮件送达率诊断' : 'AI DNS Health & Deliverability Diagnostic'}
             </h3>
           </div>
           <p className={`text-xs leading-relaxed ${themeMode === 'light' ? 'text-slate-600' : 'text-slate-300'}`}>

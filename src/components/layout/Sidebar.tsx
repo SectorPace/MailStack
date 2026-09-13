@@ -24,10 +24,10 @@ import {
   Bot,
   Compass,
   Zap
-} from 'lucide-react';
+} from '@/lib/icons';
 
 export const Sidebar: React.FC = () => {
-  const { currentSection, setCurrentSection, language, queues, setIsLoggedIn, t, adminAvatar, setAdminAvatar, hasCompletedOnboarding } = useApp();
+  const { currentSection, setCurrentSection, language, queues, logout, t, adminAvatar, setAdminAvatar, hasCompletedOnboarding } = useApp();
   const [isAvatarModalOpen, setIsAvatarModalOpen] = useState(false);
   const [isLogoModalOpen, setIsLogoModalOpen] = useState(false);
 
@@ -38,17 +38,6 @@ export const Sidebar: React.FC = () => {
       labelEn: 'Dashboard',
       icon: <LayoutGrid className="w-4 h-4" />,
     },
-    ...(!hasCompletedOnboarding
-      ? [
-          {
-            id: 'setup_guide' as NavSection,
-            labelZh: '首次配置引导',
-            labelEn: 'Setup Wizard',
-            icon: <Compass className="w-4 h-4 text-amber-400" />,
-            highlight: true,
-          },
-        ]
-      : []),
     {
       id: 'ai_suite',
       labelZh: 'AI 智能中心',
@@ -234,7 +223,7 @@ export const Sidebar: React.FC = () => {
           </div>
 
           <button
-            onClick={() => setIsLoggedIn(false)}
+            onClick={logout}
             title={language === 'zh' ? '退出并返回登录页' : 'Sign out to Login Screen'}
             className="w-7 h-7 rounded-xl flex items-center justify-center text-slate-500 dark:text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 hover:bg-rose-500/10 transition-all shrink-0 ml-1 cursor-pointer"
           >
