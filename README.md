@@ -246,22 +246,30 @@ Tier 表来自 [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md)（以随版本�
 
 ### 一行式安装（推荐）
 
-拉取官方安装脚本并以 root 执行：
+以 root 身份执行（`sudo -i` 或 `su -`）：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh)
+```
+
+`curl -fsSL` 可换成 `wget -qO-`（引导段本身依赖 curl，最小化系统请先装 curl）。不想先切 root 就用等价的 `bash -c` 写法，同样是一行：
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh)"
+```
+
+> **别写成 `sudo bash <(curl …)`**：sudo 会关闭 3 号以上的文件描述符，bash 取不到 `/dev/fd/63`——实测 sudo 1.9.15 报 `bash: /dev/fd/63: No such file or directory`，退出码 127。进程替换必须由**将要执行脚本的那个 shell** 自己完成。
+
+进程替换只是把脚本正文挂在一个 fd 上，**stdin 仍然是终端**：交互式问答、管理员口令输入、`--admin-password-stdin` 全都正常。这正是它优于 `curl … | sudo bash` 的地方——管道形态下 stdin 就是脚本正文，安装器的 `read` 只会拿到 EOF（脚本会把 stdin 接回 `/dev/tty` 兜底，确实没有控制终端时则明确失败而不是挂死）。
+
+`deploy/install.sh` 不含任何源码与安装逻辑，它能单文件运行是因为按与 `ms upgrade` 完全相同的信任模型自举：从 GitHub Release 取 `MailStack-<tag>.tar.gz` + `SHA256SUMS` + `SHA256SUMS.sig` 三件套，先 `ssh-keygen -Y verify` 做分离签名验签、再 `sha256sum -c`，全部通过后才解压到 `/opt/mailstack-source` 并 `exec` 真正的安装器——**引导段本身不执行任何未经签名验证的远程内容**。
+
+`sh`/`dash`/`csh` 等没有进程替换的 shell 用等价的两步写法：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh -o /tmp/mailstack-install.sh
 sudo bash /tmp/mailstack-install.sh
 ```
-
-等价的管道写法（更短）：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh | sudo bash
-```
-
-管道形态下 stdin 就是脚本正文，安装器的交互式问答读不到真实输入（脚本会把 stdin 接回 `/dev/tty`；确实没有控制终端时会明确失败而不是挂死）。因此需要**交互式输入管理员口令**、或要使用 `--admin-password-stdin` 时，请用上面的「先落盘再执行」写法。
-
-`deploy/install.sh` 不含任何源码与安装逻辑，它能单文件运行是因为按与 `ms upgrade` 完全相同的信任模型自举：从 GitHub Release 取 `MailStack-<tag>.tar.gz` + `SHA256SUMS` + `SHA256SUMS.sig` 三件套，先 `ssh-keygen -Y verify` 做分离签名验签、再 `sha256sum -c`，全部通过后才解压到 `/opt/mailstack-source` 并 `exec` 真正的安装器——**引导段本身不执行任何未经签名验证的远程内容**。
 
 ### 从源码安装（贡献者）
 
@@ -314,7 +322,7 @@ ssh -L 8787:127.0.0.1:8787 -L 18788:127.0.0.1:18788 root@服务器IP
 
 ## 非交互安装
 
-密码通过标准输入传递（进程内转环境变量并立即 `unsetenv`），不出现在 Shell 历史或 `/proc/<pid>/cmdline`。注意 `--admin-password-stdin` 必须走下面的「先落盘再执行」写法——管道形态下 stdin 已被脚本正文占用，口令没有送达的通道：
+密码通过标准输入传递（进程内转环境变量并立即 `unsetenv`），不出现在 Shell 历史或 `/proc/<pid>/cmdline`。下面用「先落盘再执行」是因为带一长串参数时最好读、也最便于写进配置管理脚本；以 root 直接一行跑 `printf '%s\n' '口令' | bash <(curl -fsSL …) --non-interactive …` 同样可行（进程替换不占用 stdin）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh -o /tmp/mailstack-install.sh
@@ -421,7 +429,7 @@ printf '%s\n' 'YourStrongPass123' | sudo bash /tmp/mailstack-install.sh \
 
 | 命令 | 说明 |
 |---|---|
-| `curl -fsSL .../deploy/install.sh \| sudo bash` | 一行式安装（见[快速开始](#快速开始)）；单文件运行，自动从签名 Release 取回源码 |
+| `bash <(curl -fsSL .../deploy/install.sh)` | 一行式安装（见[快速开始](#快速开始)）；单文件运行，自动从签名 Release 取回源码 |
 | `sudo bash mailstack.sh install [选项]` | 从源码树安装（参数与上者相同） |
 | `ms upgrade [版本标签]` | 从官方**签名 Release 三件套**（tar.gz + SHA256SUMS + SHA256SUMS.sig）升级；缺 `.sig` 直接拒绝；可指定标签钉扎版本 |
 | `ms upgrade --allow-downgrade` | 显式放行降级（默认拒绝降级到低于已安装的版本，放行会写 `downgrade_allowed` 审计） |

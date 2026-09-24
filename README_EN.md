@@ -246,22 +246,30 @@ Platform capability notes (see SUPPORT_MATRIX for details):
 
 ### One-liner installation (recommended)
 
-Fetch the official installer and run it as root:
+Run as root (`sudo -i` or `su -`):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh)
+```
+
+`curl -fsSL` can be swapped for `wget -qO-` (the bootstrap itself still needs curl, so install curl first on minimal systems). If you would rather not switch to root first, this `bash -c` form is an equivalent one-liner:
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh)"
+```
+
+> **Do not write `sudo bash <(curl …)`**: sudo closes file descriptors above 3, so bash cannot reach `/dev/fd/63` — measured on sudo 1.9.15 it fails with `bash: /dev/fd/63: No such file or directory`, exit code 127. Process substitution has to be performed by **the shell that will execute the script**.
+
+Process substitution only hangs the script body off one fd, so **stdin stays the terminal**: interactive prompts, admin password entry and `--admin-password-stdin` all work. That is exactly why it beats `curl … | sudo bash`, where stdin *is* the script body and the installer's `read` only sees EOF (the script reattaches stdin to `/dev/tty` as a fallback, and fails loudly instead of hanging when there is genuinely no controlling terminal).
+
+`deploy/install.sh` contains no source code and no installation logic. It runs standalone because it bootstraps with exactly the same trust model as `ms upgrade`: it pulls the `MailStack-<tag>.tar.gz` + `SHA256SUMS` + `SHA256SUMS.sig` trio from the GitHub Release, verifies the detached signature with `ssh-keygen -Y verify`, checks `sha256sum -c`, and only then extracts to `/opt/mailstack-source` and `exec`s the real installer — **the bootstrap itself never runs unverified remote content**.
+
+Shells without process substitution (`sh`/`dash`/`csh`) use the equivalent two-step form:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh -o /tmp/mailstack-install.sh
 sudo bash /tmp/mailstack-install.sh
 ```
-
-The equivalent piped form (shorter):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh | sudo bash
-```
-
-In the piped form stdin *is* the script body, so the installer's interactive prompts cannot read real input (the script reattaches stdin to `/dev/tty`; when there is genuinely no controlling terminal it fails loudly instead of hanging). Use the download-then-run form above whenever you need **interactive admin password entry** or `--admin-password-stdin`.
-
-`deploy/install.sh` contains no source code and no installation logic. It runs standalone because it bootstraps with exactly the same trust model as `ms upgrade`: it pulls the `MailStack-<tag>.tar.gz` + `SHA256SUMS` + `SHA256SUMS.sig` trio from the GitHub Release, verifies the detached signature with `ssh-keygen -Y verify`, checks `sha256sum -c`, and only then extracts to `/opt/mailstack-source` and `exec`s the real installer — **the bootstrap itself never runs unverified remote content**.
 
 ### Installing from source (contributors)
 
@@ -314,7 +322,7 @@ Then open `http://127.0.0.1:8787` locally. In `caddy` mode the installer configu
 
 ## Non-Interactive Installation
 
-The password travels via stdin (then into an environment variable and immediately `unsetenv`), never into shell history or `/proc/<pid>/cmdline`. Note that `--admin-password-stdin` requires the download-then-run form below: in the piped form stdin is already taken by the script body, so there is no channel left to deliver the password:
+The password travels via stdin (then into an environment variable and immediately `unsetenv`), never into shell history or `/proc/<pid>/cmdline`. The download-then-run form below is used because long flag lists read better and scripting it into config management is easier; running it as a one-liner from root, `printf '%s\n' 'pass' | bash <(curl -fsSL …) --non-interactive …`, works just as well (process substitution does not claim stdin):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh -o /tmp/mailstack-install.sh
@@ -421,7 +429,7 @@ After installation `/usr/local/bin/ms` is linked. Run `ms` anywhere on the serve
 
 | Command | Description |
 |---|---|
-| `curl -fsSL .../deploy/install.sh \| sudo bash` | One-liner install (see [Quick Start](#quick-start)); runs as a single file and fetches the source from the signed release |
+| `bash <(curl -fsSL .../deploy/install.sh)` | One-liner install (see [Quick Start](#quick-start)); runs as a single file and fetches the source from the signed release |
 | `sudo bash mailstack.sh install [flags]` | Install from a source checkout (identical flags) |
 | `ms upgrade [tag]` | Upgrade from the official **signed release trio** (tar.gz + SHA256SUMS + SHA256SUMS.sig); a missing `.sig` is an instant refusal; pin a specific tag |
 | `ms upgrade --allow-downgrade` | Explicitly allow downgrading (refused by default; the allowance is audited as `downgrade_allowed`) |

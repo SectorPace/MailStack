@@ -9,13 +9,21 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-[[ ${EUID:-$(id -u)} -eq 0 ]] || { echo '请使用 root 运行'; exit 1; }
+# 引导脚本地址基址：下方 bootstrap 用它取信任锚，也在 root 检查的提示文案里给出可复制的一行。
+MAILSTACK_RAW_BASE="${MAILSTACK_RAW_BASE:-https://raw.githubusercontent.com/SectorPace/MailStack/main}"
+# 提示必须给出可直接复制的下一步：一行式安装最常见的就是「以普通用户直接跑 bash <(curl …)」，
+# 只回一句「请使用 root 运行」等于让用户自己猜。注意 sudo bash <(curl …) 不可用（sudo 关闭
+# 3 号以上 fd，进程替换取不到 /dev/fd/63），所以这里给的是 sudo -i 与 bash -c 两种写法。
+[[ ${EUID:-$(id -u)} -eq 0 ]] || {
+  printf '请使用 root 运行。任选其一：\n  sudo -i   然后重跑刚才的命令\n  sudo bash -c "$(curl -fsSL %s/deploy/install.sh)"\n' "$MAILSTACK_RAW_BASE" >&2
+  exit 1
+}
 BASE=$(cd "$(dirname "$0")/.." && pwd)
 
 # --- 引导模式：脱离源码树的一行式安装 ---------------------------------------
-# README「快速开始」提供两种一行式形态：
-#   curl -fsSL <raw>/deploy/install.sh -o /tmp/mailstack-install.sh && sudo bash /tmp/mailstack-install.sh
-#   curl -fsSL <raw>/deploy/install.sh | sudo bash
+# README「快速开始」提供两种一行式形态（进程替换 / bash -c），二者 stdin 都仍是终端：
+#   bash <(curl -fsSL <raw>/deploy/install.sh)              # 已以 root 身份
+#   sudo bash -c "$(curl -fsSL <raw>/deploy/install.sh)"     # 普通用户一行跑
 # 这两种形态下脚本不在源码树内：$BASE 下既没有 deploy/install-mail-stack.sh，也没有
 # 安装器必须拷贝的 src/ backend/ dist/ 等目录（见下方「部署 MailStack 管理与 Web 控制台」）。
 # 此时按与 `ms upgrade` 完全相同的信任模型自举：只从 GitHub Release 取
@@ -23,7 +31,6 @@ BASE=$(cd "$(dirname "$0")/.." && pwd)
 # 验签、再 sha256sum -c，全部通过后才解压到 /opt/mailstack-source 并 exec 真正的安装器。
 # 引导段自身绝不执行任何未经签名验证的远程内容：它只做下载、验签、解压、转交。
 # 本段必须定义在使用它的代码之前，且只能用 printf —— say/fail/warn 尚未定义。
-MAILSTACK_RAW_BASE="${MAILSTACK_RAW_BASE:-https://raw.githubusercontent.com/SectorPace/MailStack/main}"
 MAILSTACK_RELEASE_API="${MAILSTACK_RELEASE_API:-https://api.github.com/repos/SectorPace/MailStack}"
 MAILSTACK_RELEASE_BASE="${MAILSTACK_RELEASE_BASE:-https://github.com/SectorPace/MailStack/releases/download}"
 
