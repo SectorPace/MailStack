@@ -70,7 +70,7 @@ MailStack 把在一台 Linux 服务器（或 Docker 容器）上自建邮件系�
 
 设计目标：
 
-- **一键可用**：从 `git clone` 到三服务健康自检通过，一条命令完成；Node.js 等依赖钉版本自动装配；或直接 `docker compose up`。
+- **一键可用**：从一行 `curl`（或 `git clone`）到三服务健康自检通过，一条命令完成；Node.js 等依赖钉版本自动装配；或直接 `docker compose up`。
 - **默认安全**：Web 服务默认只监听 `127.0.0.1`；公网模式强制 2FA、强制加密备份、默认关闭 AI 出站；特权操作走双通道白名单助手，升级只接受签名验证过的 Release 资产。
 - **可运维**：健康体检（含 Fail2ban 实弹探针）、邮件闭环投递验证、配置备份 / 还原 / 回滚、审计链校验，全部内置。
 - **可审计**：特权 RPC 全量审计 + prev_hash 哈希链防篡改 + syslog AUTHPRIV 外送；发布产物 SHA256 清单 + ssh-keygen 签名；依赖下载钉扎。
@@ -237,14 +237,33 @@ Tier 表来自 [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md)（以随版本�
 | Shell | Bash |
 | Node.js | **20 – 24**（`engines: >=20 <25`）；不满足时安装器自动安装钉 SHA256 的官方构建 |
 | Python | **≥ 3.10（硬门禁）**（特权助手与运维工具，仅用标准库） |
-| 其他命令 | `python3`、`sudo`、`rsync`、`tar`；`git`（仅开发者 git 升级通道需要） |
+| 其他命令 | `python3`、`sudo`、`rsync`、`tar`；`git`（仅开发者 git 升级通道需要）；`curl` + `ssh-keygen`（仅一行式安装与 `ms upgrade` 的签名 Release 通道需要，OpenSSH ≥ 8.0） |
 | 可选组件 | `gpg`（备份加密；公网模式为必需）、`fail2ban`（安全中心与 doctor 探针） |
 | 端口 | 25（SMTP 收信）；管理 8787 与 Webmail 18788 默认仅监听本机回环 |
 | DNS | `caddy` 公网模式需要域名 A/AAAA 指向服务器公网 IP（80/443 空闲供 Caddy 签发证书） |
 
 ## 快速开始
 
-### 交互式安装
+### 一行式安装（推荐）
+
+拉取官方安装脚本并以 root 执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh -o /tmp/mailstack-install.sh
+sudo bash /tmp/mailstack-install.sh
+```
+
+等价的管道写法（更短）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh | sudo bash
+```
+
+管道形态下 stdin 就是脚本正文，安装器的交互式问答读不到真实输入（脚本会把 stdin 接回 `/dev/tty`；确实没有控制终端时会明确失败而不是挂死）。因此需要**交互式输入管理员口令**、或要使用 `--admin-password-stdin` 时，请用上面的「先落盘再执行」写法。
+
+`deploy/install.sh` 不含任何源码与安装逻辑，它能单文件运行是因为按与 `ms upgrade` 完全相同的信任模型自举：从 GitHub Release 取 `MailStack-<tag>.tar.gz` + `SHA256SUMS` + `SHA256SUMS.sig` 三件套，先 `ssh-keygen -Y verify` 做分离签名验签、再 `sha256sum -c`，全部通过后才解压到 `/opt/mailstack-source` 并 `exec` 真正的安装器——**引导段本身不执行任何未经签名验证的远程内容**。
+
+### 从源码安装（贡献者）
 
 ```bash
 git clone https://github.com/SectorPace/MailStack.git
@@ -295,10 +314,11 @@ ssh -L 8787:127.0.0.1:8787 -L 18788:127.0.0.1:18788 root@服务器IP
 
 ## 非交互安装
 
-密码通过标准输入传递（进程内转环境变量并立即 `unsetenv`），不出现在 Shell 历史或 `/proc/<pid>/cmdline`：
+密码通过标准输入传递（进程内转环境变量并立即 `unsetenv`），不出现在 Shell 历史或 `/proc/<pid>/cmdline`。注意 `--admin-password-stdin` 必须走下面的「先落盘再执行」写法——管道形态下 stdin 已被脚本正文占用，口令没有送达的通道：
 
 ```bash
-printf '%s\n' 'YourStrongPass123' | sudo bash ./mailstack.sh install \
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh -o /tmp/mailstack-install.sh
+printf '%s\n' 'YourStrongPass123' | sudo bash /tmp/mailstack-install.sh \
   --access-mode caddy \
   --domain mail.example.com \
   --webmail-domain webmail.example.com \
@@ -309,6 +329,8 @@ printf '%s\n' 'YourStrongPass123' | sudo bash ./mailstack.sh install \
   --admin-password-stdin \
   --non-interactive
 ```
+
+从源码安装时把命令换成 `sudo bash ./mailstack.sh install`，参数完全相同。
 
 全部安装参数：
 
@@ -399,7 +421,8 @@ printf '%s\n' 'YourStrongPass123' | sudo bash ./mailstack.sh install \
 
 | 命令 | 说明 |
 |---|---|
-| `sudo bash mailstack.sh install [选项]` | 安装（见[快速开始](#快速开始)） |
+| `curl -fsSL .../deploy/install.sh \| sudo bash` | 一行式安装（见[快速开始](#快速开始)）；单文件运行，自动从签名 Release 取回源码 |
+| `sudo bash mailstack.sh install [选项]` | 从源码树安装（参数与上者相同） |
 | `ms upgrade [版本标签]` | 从官方**签名 Release 三件套**（tar.gz + SHA256SUMS + SHA256SUMS.sig）升级；缺 `.sig` 直接拒绝；可指定标签钉扎版本 |
 | `ms upgrade --allow-downgrade` | 显式放行降级（默认拒绝降级到低于已安装的版本，放行会写 `downgrade_allowed` 审计） |
 | `ms uninstall --dry-run` | 卸载预演：列出将要停止的服务、删除的文件、保留的数据 |
@@ -513,6 +536,7 @@ sudo bash ./mailstack.sh uninstall --purge     # 连管理配置一起删除
 ### 供应链与发布
 
 - **Node.js**：发行版包优先；回退官方 tarball 并比对 SHA256 常量（musl 自动切 `linux-x64-musl` 渠道）；NodeSource `curl | bash` 已移除
+- **安装引导**：`deploy/install.sh` 可脱离源码树单文件运行（自行从签名 Release 取回源码），但引导段只做「下载 → `ssh-keygen -Y verify` 验签 → `sha256sum -c` → 解压 → 转交安装器」，不含任何安装逻辑；验签或校验和不通过即中止，绝不执行未经验证的远程内容
 - **Caddy**：回退 Cloudsmith 源前先验 GPG 指纹；**acme.sh**：钉版本 3.1.4 tarball + SHA256；**fail2ban** pip 兜底：钉 1.1.0 tarball SHA256
 - **发布签名**：`scripts/package.py` 门控签名（`MAILSTACK_SIGNING_KEY`），`release.yml` 在 CI 内用仓库外私钥签名并复验；升级端逐字节一致的验签逻辑
 - 预构建产物 `build-manifest.json` 逐文件 SHA256；可复现打包（固定 `SOURCE_DATE_EPOCH`，两次打包哈希一致）；CI `npm audit` 高危硬门禁 + CycloneDX SBOM

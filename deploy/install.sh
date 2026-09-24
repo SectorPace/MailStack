@@ -11,6 +11,112 @@ set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo '请使用 root 运行'; exit 1; }
 BASE=$(cd "$(dirname "$0")/.." && pwd)
+
+# --- 引导模式：脱离源码树的一行式安装 ---------------------------------------
+# README「快速开始」提供两种一行式形态：
+#   curl -fsSL <raw>/deploy/install.sh -o /tmp/mailstack-install.sh && sudo bash /tmp/mailstack-install.sh
+#   curl -fsSL <raw>/deploy/install.sh | sudo bash
+# 这两种形态下脚本不在源码树内：$BASE 下既没有 deploy/install-mail-stack.sh，也没有
+# 安装器必须拷贝的 src/ backend/ dist/ 等目录（见下方「部署 MailStack 管理与 Web 控制台」）。
+# 此时按与 `ms upgrade` 完全相同的信任模型自举：只从 GitHub Release 取
+# 「tar.gz + SHA256SUMS + SHA256SUMS.sig」三件套，先用仓内公钥做 ssh-keygen 分离签名
+# 验签、再 sha256sum -c，全部通过后才解压到 /opt/mailstack-source 并 exec 真正的安装器。
+# 引导段自身绝不执行任何未经签名验证的远程内容：它只做下载、验签、解压、转交。
+# 本段必须定义在使用它的代码之前，且只能用 printf —— say/fail/warn 尚未定义。
+MAILSTACK_RAW_BASE="${MAILSTACK_RAW_BASE:-https://raw.githubusercontent.com/SectorPace/MailStack/main}"
+MAILSTACK_RELEASE_API="${MAILSTACK_RELEASE_API:-https://api.github.com/repos/SectorPace/MailStack}"
+MAILSTACK_RELEASE_BASE="${MAILSTACK_RELEASE_BASE:-https://github.com/SectorPace/MailStack/releases/download}"
+
+boot_fail(){ printf '\n安装失败: %s\n' "$*" >&2; exit 1; }
+
+bootstrap_from_signed_release(){
+  local c tag tmp asset top_count top_dir staged arg attach_tty
+  for c in curl tar sha256sum ssh-keygen find; do
+    command -v "$c" >/dev/null 2>&1 || boot_fail "引导安装需要 $c，请先用发行版包管理器安装后重试"
+  done
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' RETURN
+
+  printf '\n==> 引导模式：未检测到源码树，正在获取最新签名 Release...\n'
+  # 末尾的 || true 是必要的：set -o pipefail 下 curl 的失败会让整条管道（进而赋值语句）
+  # 以 curl 的退出码直接终止脚本，用户只看到 curl 报错而看不到下面这条指路的提示。
+  tag=$(curl -fsSL "$MAILSTACK_RELEASE_API/releases/latest" \
+    | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1 || true)
+  [[ "$tag" =~ ^v[0-9][A-Za-z0-9.+-]{0,63}$ ]] \
+    || boot_fail '无法从 GitHub API 解析最新 Release 标签（检查网络与 api.github.com 可达性）'
+
+  asset="MailStack-${tag}.tar.gz"
+  curl -fsSL "$MAILSTACK_RELEASE_BASE/$tag/SHA256SUMS" -o "$tmp/SHA256SUMS" \
+    || boot_fail "下载 SHA256SUMS 失败（$tag 可能没有发布校验文件）"
+  curl -fsSL "$MAILSTACK_RELEASE_BASE/$tag/SHA256SUMS.sig" -o "$tmp/SHA256SUMS.sig" \
+    || boot_fail "下载 SHA256SUMS.sig 失败（$tag 未携带签名，拒绝继续）"
+  curl -fsSL "$MAILSTACK_RELEASE_BASE/$tag/$asset" -o "$tmp/$asset" \
+    || boot_fail "下载 $asset 失败"
+  # 信任锚：与引导脚本同源（raw.githubusercontent.com 同一仓库）的公开文件，是公钥
+  # 而非秘密。它只回答「这份 SHA256SUMS 是否由 MailStack 发布密钥签发」；真正的防篡改
+  # 控制是紧随其后的分离签名校验——没有它，同源的引导脚本本身也不可信。
+  curl -fsSL "$MAILSTACK_RAW_BASE/deploy/mailstack-release.allowed_signers" -o "$tmp/allowed_signers" \
+    || boot_fail '下载发布签名信任锚 (allowed_signers) 失败'
+
+  printf '==> 正在验证 SHA256SUMS 的 ssh-keygen 签名...\n'
+  ssh-keygen -Y verify -f "$tmp/allowed_signers" -I mailstack-release -n file \
+    -s "$tmp/SHA256SUMS.sig" <"$tmp/SHA256SUMS" >/dev/null 2>&1 \
+    || boot_fail 'Release 签名验证失败！资产可能被篡改，已中止，未执行任何安装脚本'
+  printf '==> 签名验证通过 (identity: mailstack-release, namespace: file)\n'
+
+  (cd "$tmp" && grep -- " $asset\$" SHA256SUMS > .check && sha256sum -c .check >/dev/null) \
+    || boot_fail "$asset 的 SHA256 校验失败，已中止"
+  printf '==> 校验和验证通过 (%s)\n' "$tag"
+
+  mkdir -p "$tmp/extract"
+  tar -xzf "$tmp/$asset" -C "$tmp/extract" || boot_fail '解压 Release 资产失败'
+  # 资产内有且只有一个顶层目录 (MailStack-<tag>/)；多顶层条目属于异常资产（与 ms upgrade 同门禁）。
+  top_count=$(find "$tmp/extract" -mindepth 1 -maxdepth 1 | wc -l)
+  [[ "$top_count" == "1" ]] || boot_fail "Release 资产结构异常（顶层条目数: $top_count）"
+  top_dir=$(find "$tmp/extract" -mindepth 1 -maxdepth 1 -type d | head -n1)
+  [[ -s "$top_dir/deploy/install.sh" ]] || boot_fail 'Release 资产缺少核心部署文件 deploy/install.sh'
+
+  staged=/opt/mailstack-source
+  rm -rf "$staged"
+  mkdir -p "$staged"
+  tar -C "$top_dir" --exclude=.git --exclude=node_modules -cf - . | tar -C "$staged" -xf -
+  printf '==> 已就位 %s，转交安装器\n' "$tag"
+
+  # 管道形态（`curl ... | sudo bash`）下 stdin 就是脚本正文：安装器随后的 read 会立即
+  # 拿到 EOF，交互式问答退化成空值，密码校验失败后还会在重试循环里空转。故有控制终端时
+  # 把 stdin 接回 /dev/tty 恢复交互；显式声明了非交互参数（含 --admin-password-stdin，
+  # 其口令必须继续从原 stdin 读）时保持原样；两者都不成立则明确失败而不是挂死。
+  attach_tty=0
+  if [[ ! -t 0 ]]; then
+    attach_tty=1
+    for arg in "$@"; do
+      case "$arg" in
+        --admin-password-stdin|--non-interactive|--reuse-admin) attach_tty=0;;
+      esac
+    done
+    if ((attach_tty)) && ! : </dev/tty 2>/dev/null; then
+      boot_fail '当前标准输入不是终端且无可用 /dev/tty，无法进行交互式问答。请改用「先落盘再执行」写法：curl -fsSL <脚本地址> -o /tmp/mailstack-install.sh && sudo bash /tmp/mailstack-install.sh；或显式追加 --non-interactive 并提供全部安装参数。'
+    fi
+  fi
+  rm -rf "$tmp"
+  if ((attach_tty)); then
+    exec bash "$staged/deploy/install.sh" "$@" </dev/tty
+  fi
+  exec bash "$staged/deploy/install.sh" "$@"
+}
+
+# 仅当源码树缺失时才自举。-h/--help 不需要源码树，也不该为打印用法去下载一整个
+# Release：留在下面的本地路径里打印即可（usage 在参数解析段定义）。
+if [[ ! -s "$BASE/deploy/install-mail-stack.sh" ]]; then
+  _boot_help=0
+  for _boot_arg in "$@"; do
+    case "$_boot_arg" in -h|--help) _boot_help=1;; esac
+  done
+  if ((_boot_help == 0)); then
+    bootstrap_from_signed_release "$@"
+  fi
+fi
+
 ADMIN_USER='admin'; ADMIN_PASS=''; ADMIN_PORT='8787'; ADMIN_HOST='127.0.0.1'; WEBMAIL_PORT='18788'; WEBMAIL_HOST='127.0.0.1'; NONINTERACTIVE=0; REUSE_ADMIN=0
 ACCESS_MODE=''
 MAIL_DOMAIN=''

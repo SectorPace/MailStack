@@ -70,7 +70,7 @@ MailStack bundles everything needed to run your own mail system on a Linux serve
 
 Design goals:
 
-- **One-command readiness**: from `git clone` to all three services passing health checks in one command; dependencies such as Node.js are pinned and installed automatically — or just `docker compose up`.
+- **One-command readiness**: from one `curl` line (or `git clone`) to all three services passing health checks in one command; dependencies such as Node.js are pinned and installed automatically — or just `docker compose up`.
 - **Secure by default**: web services listen on `127.0.0.1` only; public mode enforces 2FA and encrypted backups and disables AI outbound by default; privileged operations go through a dual-channel allowlisted helper; upgrades only accept signature-verified release assets.
 - **Operable**: health checks (with live Fail2ban probes), roundtrip mail delivery verification, config backup / restore / rollback, and audit-chain verification are all built in.
 - **Auditable**: every privileged RPC is audited with a prev_hash tamper-evident chain mirrored to syslog AUTHPRIV; release artifacts carry SHA256 manifests plus ssh-keygen signatures; dependency downloads are pinned.
@@ -237,14 +237,33 @@ Platform capability notes (see SUPPORT_MATRIX for details):
 | Shell | Bash |
 | Node.js | **20 – 24** (`engines: >=20 <25`); auto-installed pinned official builds when unmet |
 | Python | **≥ 3.10 (hard gate)** (privileged helper and ops tooling, stdlib only) |
-| Other commands | `python3`, `sudo`, `rsync`, `tar`; `git` (developer git upgrade channel only) |
+| Other commands | `python3`, `sudo`, `rsync`, `tar`; `git` (developer git upgrade channel only); `curl` + `ssh-keygen` (one-liner install and the `ms upgrade` signed-release channel only, OpenSSH ≥ 8.0) |
 | Optional | `gpg` (backup encryption; required in public mode), `fail2ban` (security center and doctor probes) |
 | Ports | 25 (SMTP inbound); admin 8787 and webmail 18788 listen on loopback only by default |
 | DNS | For `caddy` public mode, domain A/AAAA must point at the server's public IP (80/443 free for certificate issuance) |
 
 ## Quick Start
 
-### Interactive installation
+### One-liner installation (recommended)
+
+Fetch the official installer and run it as root:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh -o /tmp/mailstack-install.sh
+sudo bash /tmp/mailstack-install.sh
+```
+
+The equivalent piped form (shorter):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh | sudo bash
+```
+
+In the piped form stdin *is* the script body, so the installer's interactive prompts cannot read real input (the script reattaches stdin to `/dev/tty`; when there is genuinely no controlling terminal it fails loudly instead of hanging). Use the download-then-run form above whenever you need **interactive admin password entry** or `--admin-password-stdin`.
+
+`deploy/install.sh` contains no source code and no installation logic. It runs standalone because it bootstraps with exactly the same trust model as `ms upgrade`: it pulls the `MailStack-<tag>.tar.gz` + `SHA256SUMS` + `SHA256SUMS.sig` trio from the GitHub Release, verifies the detached signature with `ssh-keygen -Y verify`, checks `sha256sum -c`, and only then extracts to `/opt/mailstack-source` and `exec`s the real installer — **the bootstrap itself never runs unverified remote content**.
+
+### Installing from source (contributors)
 
 ```bash
 git clone https://github.com/SectorPace/MailStack.git
@@ -295,10 +314,11 @@ Then open `http://127.0.0.1:8787` locally. In `caddy` mode the installer configu
 
 ## Non-Interactive Installation
 
-The password travels via stdin (then into an environment variable and immediately `unsetenv`), never into shell history or `/proc/<pid>/cmdline`:
+The password travels via stdin (then into an environment variable and immediately `unsetenv`), never into shell history or `/proc/<pid>/cmdline`. Note that `--admin-password-stdin` requires the download-then-run form below: in the piped form stdin is already taken by the script body, so there is no channel left to deliver the password:
 
 ```bash
-printf '%s\n' 'YourStrongPass123' | sudo bash ./mailstack.sh install \
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh -o /tmp/mailstack-install.sh
+printf '%s\n' 'YourStrongPass123' | sudo bash /tmp/mailstack-install.sh \
   --access-mode caddy \
   --domain mail.example.com \
   --webmail-domain webmail.example.com \
@@ -309,6 +329,8 @@ printf '%s\n' 'YourStrongPass123' | sudo bash ./mailstack.sh install \
   --admin-password-stdin \
   --non-interactive
 ```
+
+When installing from a source checkout, replace the command with `sudo bash ./mailstack.sh install`; the flags are identical.
 
 All installer flags:
 
@@ -399,7 +421,8 @@ After installation `/usr/local/bin/ms` is linked. Run `ms` anywhere on the serve
 
 | Command | Description |
 |---|---|
-| `sudo bash mailstack.sh install [flags]` | Install (see [Quick Start](#quick-start)) |
+| `curl -fsSL .../deploy/install.sh \| sudo bash` | One-liner install (see [Quick Start](#quick-start)); runs as a single file and fetches the source from the signed release |
+| `sudo bash mailstack.sh install [flags]` | Install from a source checkout (identical flags) |
 | `ms upgrade [tag]` | Upgrade from the official **signed release trio** (tar.gz + SHA256SUMS + SHA256SUMS.sig); a missing `.sig` is an instant refusal; pin a specific tag |
 | `ms upgrade --allow-downgrade` | Explicitly allow downgrading (refused by default; the allowance is audited as `downgrade_allowed`) |
 | `ms uninstall --dry-run` | Uninstall dry-run: lists services to stop, files to delete, data to keep |
@@ -513,6 +536,7 @@ Environment variables can go into `.env` (template in [.env.example](.env.exampl
 ### Supply chain and releases
 
 - **Node.js**: distro packages first; fallback to official tarballs verified against SHA256 constants (musl automatically switches to the `linux-x64-musl` channel); NodeSource `curl | bash` is gone
+- **Install bootstrap**: `deploy/install.sh` runs standalone (it fetches the source from the signed release), but the bootstrap only does "download → `ssh-keygen -Y verify` → `sha256sum -c` → extract → hand off to the installer" and contains no installation logic; a failed signature or checksum aborts before anything is executed — unverified remote content is never run
 - **Caddy**: Cloudsmith fallback verifies the GPG fingerprint first; **acme.sh**: pinned 3.1.4 tarball + SHA256; **fail2ban** pip fallback: pinned 1.1.0 tarball SHA256
 - **Release signing**: `scripts/package.py` gated signing (`MAILSTACK_SIGNING_KEY`); `release.yml` signs in CI with an out-of-repo key and re-verifies; the upgrade side verifies byte-for-byte identically
 - Prebuilt artifacts carry `build-manifest.json` with per-file SHA256; reproducible packaging (fixed `SOURCE_DATE_EPOCH`, two builds must hash identically); CI `npm audit` hard gate on high + CycloneDX SBOM

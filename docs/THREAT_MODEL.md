@@ -49,9 +49,10 @@
 | 2FA 状态文件 | 并发恢复码“双花” | `admin.totp.*` 全部动作在 `locked(ADMIN_CONFIG)` 文件锁内完成 读-改-写，消费即从哈希列表删除；`atomic()` 写盘 | `backend/mailstackctl/totp.py`（`_consume_recovery`）、`backend/mailstackctl/core.py`（`locked`、`atomic`） |
 | 供应链安装器 | “下载即执行”被投毒 | Node.js 官方 tarball 以 SHA256 常量钉扎；Caddy 仓库先验 GPG 指纹；acme.sh 钉版本 3.1.4 tarball + SHA256；任何不匹配 fail-closed | `deploy/install.sh` |
 | 升级资产 | Release 资产被篡改 | 先验 `SHA256SUMS.sig` 分离签名，再对归档做 `sha256sum -c`；资产结构异常（非单顶层目录、缺 `deploy/install.sh`）即中止 | `mailstack.sh` |
+| 引导安装脚本 | `curl` 单文件获取的 `deploy/install.sh` 被替换，或经中间人投递 | 引导段不含任何安装逻辑，只做「取回官方 Release 三件套 → `ssh-keygen -Y verify` 分离签名 → `sha256sum -c` → 解压到 `/opt/mailstack-source` → `exec` 真正安装器」；验签或校验和不通过即中止，未验签内容绝不执行。管道形态（`curl \| sudo bash`）下有控制终端时把 stdin 接回 `/dev/tty`，无终端则明确失败，避免 `read` 退化为空值后在密码重试循环里空转 | `deploy/install.sh`（`bootstrap_from_signed_release`） |
 | 管理员配置 | 部分写入导致损坏 | `admin.json`/`settings.json` 等一律经 `atomic()` 临时文件+rename 写入 | `backend/mailstackctl/core.py` |
 
-**残余风险**：已持有主机 root 者当然可改一切（非目标）；归档内容本身（邮件正文）在允许前缀内可被备份/恢复流程覆盖——这正是恢复前自动生成快照（见 `docs/DISASTER_RECOVERY.md`）的原因。
+**残余风险**：已持有主机 root 者当然可改一切（非目标）；归档内容本身（邮件正文）在允许前缀内可被备份/恢复流程覆盖——这正是恢复前自动生成快照（见 `docs/DISASTER_RECOVERY.md`）的原因。引导安装脚本与它的信任锚取自同一 HTTPS 来源（`raw.githubusercontent.com` 同一仓库），因此该来源本身不可作为信任依据——防篡改控制落在 Release 资产的分离签名上（锚是公钥，签名由仓库外的发布私钥产生）；能篡改 `raw.githubusercontent.com` 内容的攻击者同时也能替换引导脚本，这一层退化为与「直接下载 tar.gz」等价。
 
 ---
 
