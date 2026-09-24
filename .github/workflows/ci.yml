@@ -35,18 +35,20 @@ jobs:
       - run: node --check dist/server.cjs
       - run: node --check dist/webmail.cjs
 
-      # prebuilt-smoke 在 dist/ 尚不存在时会自动跳过（见该文件顶部注释），
-      # 构建完成后在此复跑一次，否则这两个用例等于零覆盖。
-      - name: Standalone prebuilt bundle smoke tests
-        run: npm test -- --test-name-pattern="Standalone prebuilt"
+      # dist/ 是 build:all 的产物：manifest-integrity 与 prebuilt-smoke 里的产物
+      # 断言在构建前会自动跳过（见两个测试文件顶部注释），构建完成后在这里
+      # 单独跑这两个文件把覆盖补回来。直接给文件路径而不是 --test-name-pattern：
+      # npm 会吃掉引号、把带空格的 pattern 拆成两个参数，而该 flag 放在文件参数
+      # 之后又会被 node 静默忽略 —— 两种坑都会让这一步变成空转。
+      - name: Artifact-dependent tests (build manifest + prebuilt bundles)
+        run: |
+          node --test tests/manifest-integrity.test.mjs
+          node --test tests/prebuilt-smoke.test.mjs
 
       # Has to run after the build: it checks dist/build-manifest.json, which
       # does not exist on a clean checkout.
       - name: Release version consistency
         run: python3 scripts/verify_release_consistency.py
-
-      - name: Verify manifest artifact hashes
-        run: npm test -- --test-name-pattern="build-manifest"
       - name: Verify Shell syntax and LF endings
         run: |
           find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n

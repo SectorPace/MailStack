@@ -10,7 +10,7 @@ import { readPackageVersion, rootDir } from "./_source.mjs";
 
 // dist/server.cjs 与 dist/webmail.cjs 是 `npm run build:all` 的产物，干净检出上不
 // 存在，而 CI 里 `npm test` 跑在构建之前。缺失时跳过而不是失败；构建完成后 ci.yml
-// 的 “Standalone prebuilt bundle smoke tests” 步骤会复跑这两个用例。
+// 的 “Artifact-dependent tests” 步骤会直接跑本文件，这两个用例仍有真实覆盖。
 const SERVER_DIST = path.resolve("dist/server.cjs");
 const WEBMAIL_DIST = path.resolve("dist/webmail.cjs");
 

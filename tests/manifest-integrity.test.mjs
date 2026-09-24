@@ -10,8 +10,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // dist/ 是 `npm run build:all` 的产物，干净检出上不存在，而 CI 里 `npm test` 跑在
 // 构建之前。此处必须跳过而不是断言失败；构建完成后 ci.yml 的
-// “Verify manifest artifact hashes” 步骤会用 --test-name-pattern 再跑一遍，
-// 真实覆盖不会因此丢失。
+// “Artifact-dependent tests” 步骤会直接跑本文件，真实覆盖不会因此丢失。
 const manifestPath = path.join(rootDir, "dist", "build-manifest.json");
 const distBuilt = fs.existsSync(manifestPath);
 
