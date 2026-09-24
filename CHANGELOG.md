@@ -2,6 +2,63 @@
 
 All notable changes to the MailStack project are documented in this file.
 
+## [v0.8.0-beta.10] - 2026-09-25
+
+> 0.8.0-beta.10 补上 beta.9 留下的两个缺口：一行式安装的引导链此前没有任何门禁覆盖，
+> 仓库文件树里则积压了一批只能追溯到「整体同步源码树」那一次导入的死文件。本版把前者
+> 纳入 CI、把后者清掉，并顺手修复了两处陈旧引用（版本徽章与发布清单）。
+> 无接口与数据格式变更。
+
+### 🔒 一行式安装纳入 CI 门禁（新）
+- **`bootstrap-smoke` job**: `deploy/install.sh` 可以脱离源码树被 `bash <(curl -fsSL …)`
+  一行式执行，但此前无人测试这条路径——装机矩阵走的是源码树安装（`$BASE` 下有
+  `install-mail-stack.sh`，引导段根本不进入），release 流水线只断言资产可复现、布局
+  合规、四件套齐备，二者都不执行引导代码。而它恰恰是 README「快速开始」主推的形态，
+  一旦被改坏，用户侧的表现就是「下载完直接执行了未经签名验证的内容」。
+  新增 `scripts/ci_bootstrap_smoke_test.sh`：用临时 ed25519 密钥签一份 `file://` 伪
+  Release（`releases/latest`、`SHA256SUMS`、`SHA256SUMS.sig`、归档四件齐备），把引导段
+  的三个基址（`MAILSTACK_RELEASE_API` / `MAILSTACK_RELEASE_BASE` / `MAILSTACK_RAW_BASE`）
+  全部改指本地，再以进程替换形态执行**真实**的 `deploy/install.sh`；资产内装的是 stub
+  安装器，故只覆盖引导段，不会在 CI 机器上真装邮件栈。全程不出网、不装任何包，
+  5 秒跑完，因此进每次 push 的常规门禁。断言覆盖：验签 → 校验和 → 解压 → 铺开 → 转交
+  全链与参数透传；`--help` 必须离线可用而不回落到引导段；**缺签名 / 签名与信任锚不匹配 /
+  归档字节被篡改 / 资产顶层多于一个 / 资产缺 `deploy/install.sh`** 五种情形必须在
+  「铺开任何源码之前」非零退出，且不得写入 `/opt/mailstack-source`。
+- **顺带记录一个签名陷阱**: `ssh-keygen -Y sign` 在 `<file>.sig` 已存在时会问
+  `Overwrite (y/n)?`，无终端时读到 EOF 即按「不覆盖」处理，**而且退出码仍是 0** ——
+  旧签名会被静静留在原地，签名用例因此会假通过。`scripts/package.py` 的
+  `sign_checksum_manifest` 一直是先 `unlink` 再签，门禁现在同样如此。
+
+### 🧹 仓库文件树清理
+- **引用审计**: 对全部入库文件逐一在「其他所有入库文件的正文」里检索其文件名、仓库
+  相对路径与末两段路径（代码文件额外检索无扩展名的 import 形式），再人工排除「靠 glob
+  或约定生效」的假阳性（`tests/*.test.mjs`、`tests/frontend/**`、`vitest.config.ts`、
+  `src/vite-env.d.ts`、`src/api.ts` 等）。
+- **删除 13 个无人引用的文件**: 8 份陈旧文档（`README_v0.8-beta.6.md`、`Release.md`、
+  `RELEASE_NOTES_v0.5.0-beta.2.md`、`GITHUB_RELEASE.md`、`GITHUB_UPLOAD_WINDOWS.md`、
+  `FULL_STACK_BUILD.md`、`README_INTEGRATION.md`、`docs/HANDOVER_rc5.md`）、调试残片
+  `_p.mjs`、未被任何引用指向的 117 KB Logo（`assets/mailstack-logo-light.png`），以及
+  3 个无人调用的手工 harness（其中 `tests/live_telemetry_test.py` 与
+  `tests/run_live_telemetry.py` 互为逐字节相同的重复文件）。
+- **`.gitignore` 补齐**: 新增 `__pycache__/`、`*.pyc`、`release/`，与 `package.py` 的
+  `EXCLUDED_DIRS` / `EXCLUDED_TOP_LEVEL_DIRS` 及 `.dockerignore` 对齐；此前只忽略
+  `*.zip` / `*.tar.gz`，导致每跑一次本地测试或打包，`git status` 都会挂上三个
+  `__pycache__` 与 `release/` 的未跟踪噪音。
+
+### 🔧 陈旧引用修复
+- **版本徽章**: 两份 README 的 shields.io 徽章仍写着 `v0.8.0-beta.8`——徽章值里的
+  `v0.8.0--beta.N` 是双连字符转义，历次 bump 的批量替换都恰好绕过了它。
+- **`docs/RELEASE_CHECKLIST.md` 刷新**: 标题与内容此前停在 v0.5.2-rc.5。改为常驻清单
+  （版本以 `VERSION` 为准，不再随版本号漂移），并把两次踩过的坑写进清单：版本号 bump
+  后必须重跑 `build:all`（`dist/build-manifest.json` 内嵌版本号）、手工签名前必须先删
+  旧 `.sig`（同上面的 ssh-keygen 覆盖陷阱）；同时补上本版新增的一行式引导链门禁。
+
+### ✅ 验证 (Verification)
+- CI run 36026441942：10/10 job 全绿（含新增 `bootstrap-smoke`，5 秒）。
+- 本地：`npm test` 86/86、vitest 12/12、`tsc --noEmit` 零错、Python 助手 106（skip=9）、
+  备份 E2E 通过、`verify_release_consistency` 100%、`bash -n` / LF / 未定义函数 /
+  `shellcheck -S warning` 全部零告警。
+
 ## [v0.8.0-beta.9] - 2026-09-24
 
 > 0.8.0-beta.9 是 beta.8 的「构建与测试可复现性」修复版，两处缺陷都不影响运行产物，

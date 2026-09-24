@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.8.0--beta.8-2476ff">
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.8.0--beta.10-2476ff">
   <img alt="Status" src="https://img.shields.io/badge/status-public%20beta-f0a53a">
   <img alt="Security" src="https://img.shields.io/badge/security-hardened-27b36a">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-27b36a">
@@ -26,7 +26,7 @@
   <img alt="Node.js" src="https://img.shields.io/badge/Node.js-20%20%7C%2022%20%7C%2024-3c873a">
 </p>
 
-> **Release status: v0.8.0-beta.9 (public beta).** This release fixes build and test reproducibility left over from beta.8. First, `scripts/generate_manifest.mjs` used to fall back to wall-clock time for `builtAt` (it was pinned only when `SOURCE_DATE_EPOCH` was exported before the build), so two build+package runs from identical sources produced different `build-manifest.json` files — and therefore different archive hashes — directly contradicting the "identical hashes across two packagings" promise made in the README and RELEASE_CHECKLIST; it now falls back to the same constant `1704067200` used by `scripts/package.py`, independent of whether the caller exports the variable. Second, it fixes a startup race in `tests/public-mode-gate.test.mjs` (T-2FA-1a): the child's startup banner and the TCP readiness signal travel over two unsynchronised channels, so `waitForReady()` returning only proves the port is bound — not that the parent has received the banner — and roughly 1.3% of runs lost it; the test now polls until the expected log line lands and awaits the banner before both negative assertions. No interface or data-format changes.
+> **Release status: v0.8.0-beta.10 (public beta).** This release puts the one-liner install path behind a CI gate and tidies the repository tree. First, a new `bootstrap-smoke` job signs a `file://` fake release with a throwaway ed25519 key and drives the real `deploy/install.sh` through the documented `bash <(curl -fsSL …)` shape, covering verify signature → checksum → extract → lay down → hand off, and asserts that a missing signature, a signature from an unknown key, a tampered archive, more than one top-level entry and a missing `deploy/install.sh` are each refused before any source is laid down (see `scripts/ci_bootstrap_smoke_test.sh`). That path had no coverage at all: the install matrix uses the source tree (so the bootstrap branch never runs) and the release pipeline only asserts the assets themselves — yet a regression there means a user executes unverified content. Second, a reference audit removed 13 files nothing references (eight stale documents, one debug leftover, an unreferenced 117 KB logo variant and three manual harnesses nothing invokes), and `.gitignore` now covers `__pycache__/`, `*.pyc` and `release/`, matching the exclusions `package.py` and `.dockerignore` already apply. No interface or data-format changes.
 >
 > **Important disclaimer: MailStack does not guarantee inbox placement.** Actual deliverability depends on IP and domain reputation, DNS authentication (MX / SPF / DKIM / DMARC / PTR), message content, bounce and complaint rates, relay provider policies, and recipient-side rules.
 
@@ -441,7 +441,7 @@ After installation `/usr/local/bin/ms` is linked. Run `ms` anywhere on the serve
 
 ```bash
 ms upgrade              # upgrade to the latest signed release
-ms upgrade v0.8.0-beta.9  # pin to a specific version
+ms upgrade v0.8.0-beta.10  # pin to a specific version
 ```
 
 Channel design:
@@ -652,7 +652,7 @@ mailstack.sh                      Unified entry: install / update(upgrade) / doc
 │   └── verification/             Ubuntu 24.04 / Debian 12 real-machine records, mail delivery E2E
 ├── .github/workflows/ci.yml / release.yml
 ├── .env.example
-└── CHANGELOG.md                  v0.1.0-beta.1 → v0.8.0-beta.9 full changelog
+└── CHANGELOG.md                  v0.1.0-beta.1 → v0.8.0-beta.10 full changelog
 ```
 
 ## Development Guide
@@ -719,7 +719,7 @@ Do **not** disclose vulnerabilities in public issues. Use GitHub Private Vulnera
 
 | Document | Content |
 |---|---|
-| [CHANGELOG.md](CHANGELOG.md) | v0.1.0-beta.1 → v0.8.0-beta.9 per-version changes, with the full background of every security fix |
+| [CHANGELOG.md](CHANGELOG.md) | v0.1.0-beta.1 → v0.8.0-beta.10 per-version changes, with the full background of every security fix |
 | [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) | Distribution support matrix and capability notes |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment: port model, volume layout, first-start password |
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | STRIDE threat model (asset tiers, trust boundaries, non-goals) |

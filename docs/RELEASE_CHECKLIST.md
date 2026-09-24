@@ -1,8 +1,11 @@
-# MailStack v0.5.2-rc.5 Release Checklist
+# MailStack Release Checklist
+
+本清单是常驻发布流程，不随版本号更新；当前待发布版本以 `VERSION` 为准。
 
 ## Version and source
 
-- [ ] `VERSION`, `package.json`, lockfile, `mailstack.sh` VERSION, README and release notes use `0.5.2-rc.5`.
+- [ ] `VERSION`、`package.json`、`package-lock.json`、`backend/mailstackctl/version.py`、`mailstack.sh` 的 VERSION、`deploy/verify-source-build.sh`、两份 README（含 shields.io 版本徽章）与 `CHANGELOG.md` 全部指向同一个版本号 —— `python3 scripts/verify_release_consistency.py` 会逐处比对。徽章写作 `v0.8.0--beta.N`（双连字符是 shields.io 的转义），批量替换时最容易漏掉这一处。
+- [ ] 版本号 bump 之后重跑过 `npm run build:all`：`dist/build-manifest.json` 内嵌版本号，没重建则上面的门禁必红。
 - [ ] No debug password, host-specific absolute path, cache, bytecode, source map or previous archive is included.
 - [ ] Every `*.sh` file is UTF-8 with LF endings and passes `bash -n`; `deploy/mailstack-privileged` and `deploy/mailstack.logrotate` are LF-only.
 - [ ] Original source and release staging trees are kept separate during packaging.
@@ -33,6 +36,7 @@
 - [ ] Standalone smoke tests pass without `node_modules`.
 - [ ] Dependency audit and privacy scan pass.
 - [ ] Install-matrix passes on Ubuntu 24.04/22.04, Debian 12, Rocky 9 — including the privilege-escalation probe, sudoers-single-rule assertion, fail2ban jail presence, and the `ms test-mail` loopback delivery.
+- [ ] One-liner install bootstrap gate passes: `sudo bash scripts/ci_bootstrap_smoke_test.sh` (throwaway key + a `file://` fake release; asserts the signature / checksum / layout / hand-off path and that a missing signature, a wrong-key signature, a tampered archive and a malformed asset are all refused before anything is laid down).
 
 ## Reproducible and signed archives
 
@@ -40,7 +44,11 @@
 export SOURCE_DATE_EPOCH=1704067200
 python3 scripts/package.py
 (cd release && sha256sum -c SHA256SUMS)
-# Sign the checksum manifest with the release key (kept OUTSIDE the repo):
+# Sign the checksum manifest with the release key (kept OUTSIDE the repo).
+# 先删掉旧签名：ssh-keygen -Y sign 在 <file>.sig 已存在时会问「Overwrite (y/n)?」，
+# 无终端时读到 EOF 即按「不覆盖」处理，而且仍然以 0 退出 —— 旧签名被静静留在原地，
+# 看起来像「已经签过了」。（scripts/package.py 的 sign_checksum_manifest 同样是先 unlink 再签。）
+rm -f release/SHA256SUMS.sig
 ssh-keygen -Y sign -f <release-private-key> -n file release/SHA256SUMS
 # Verify exactly what a server running `ms upgrade` will verify:
 ssh-keygen -Y verify -f deploy/mailstack-release.allowed_signers -I mailstack-release -n file -s release/SHA256SUMS.sig < release/SHA256SUMS
