@@ -1,11 +1,18 @@
 node_modules/
 dist/
+# Python 字节码：与 package.py / .dockerignore 的排除清单保持一致，
+# 否则每次跑完本地测试，git status 都会挂上三个 __pycache__ 目录。
+__pycache__/
+*.pyc
 .env
 .env.*
 !.env.example
 *.log
 *.zip
 *.tar.gz
+# 打包产物目录：package.py 的 EXCLUDED_TOP_LEVEL_DIRS 与 .dockerignore
+# 都已把它当生成物排除，只忽略 *.zip/*.tar.gz 会漏掉 SHA256SUMS 及其签名。
+release/
 .DS_Store
 coverage/
 .vscode/
