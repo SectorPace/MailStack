@@ -8,8 +8,16 @@ import { fileURLToPath } from "node:url";
 import { readPackageVersion, rootDir } from "./_source.mjs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-test("build-manifest.json has correct structure and valid SHA256 sums", () => {
-  const manifestPath = path.join(rootDir, "dist", "build-manifest.json");
+// dist/ 是 `npm run build:all` 的产物，干净检出上不存在，而 CI 里 `npm test` 跑在
+// 构建之前。此处必须跳过而不是断言失败；构建完成后 ci.yml 的
+// “Verify manifest artifact hashes” 步骤会用 --test-name-pattern 再跑一遍，
+// 真实覆盖不会因此丢失。
+const manifestPath = path.join(rootDir, "dist", "build-manifest.json");
+const distBuilt = fs.existsSync(manifestPath);
+
+test("build-manifest.json has correct structure and valid SHA256 sums", {
+  skip: distBuilt ? false : "dist/build-manifest.json not built yet",
+}, () => {
   assert.ok(fs.existsSync(manifestPath), "dist/build-manifest.json must exist");
 
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));

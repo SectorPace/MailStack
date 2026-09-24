@@ -35,6 +35,11 @@ jobs:
       - run: node --check dist/server.cjs
       - run: node --check dist/webmail.cjs
 
+      # prebuilt-smoke 在 dist/ 尚不存在时会自动跳过（见该文件顶部注释），
+      # 构建完成后在此复跑一次，否则这两个用例等于零覆盖。
+      - name: Standalone prebuilt bundle smoke tests
+        run: npm test -- --test-name-pattern="Standalone prebuilt"
+
       # Has to run after the build: it checks dist/build-manifest.json, which
       # does not exist on a clean checkout.
       - name: Release version consistency

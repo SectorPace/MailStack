@@ -118,11 +118,10 @@ def setup_cert_issue(data):
     method = str(data.get('method', 'standalone')).strip().lower()
     if not DOMAIN_RE.fullmatch(domain):
         raise ValueError('invalid certificate domain')
-    out_dir = ETC / 'tls' / domain
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fullchain = out_dir / 'fullchain.pem'
-    privkey = out_dir / 'privkey.pem'
 
+    # 入参校验必须先于任何文件系统副作用完成。原先 mkdir 在校验之前，被拒的请求
+    # 会留下空的 tls/<domain> 目录；更糟的是非 root 环境下 mkdir 先抛
+    # Permission denied，把真正的入参错误整个盖掉（CI 上就是这样）。
     if method == 'custom':
         cert_pem = str(data.get('certPem') or data.get('customCertPem') or '').strip()
         key_pem = str(data.get('keyPem') or data.get('customKeyPem') or '').strip()
@@ -131,25 +130,34 @@ def setup_cert_issue(data):
         if not key_pem or 'PRIVATE KEY' not in key_pem:
             raise ValueError('Invalid private key PEM format (missing PRIVATE KEY)')
         _validate_custom_certificate(cert_pem, key_pem, domain)
-        atomic(fullchain, cert_pem + '\n', 0o644)
-        atomic(privkey, key_pem + '\n', 0o600)
     else:
         email = str(data.get('email', '')).strip()
         if not email or '@' not in email:
             raise ValueError('invalid certificate email for ACME')
-        acme = pathlib.Path('/root/.acme.sh/acme.sh')
-        if not acme.is_file():
-            raise RuntimeError('acme.sh is not installed')
-        issue = [str(acme), '--issue', '-d', domain, '--accountemail', email, '--server', 'letsencrypt', '--keylength', 'ec-256', '--home', '/root/.acme.sh']
         if method == 'webroot':
             webroot = str(data.get('webroot', '')).strip()
             if not webroot.startswith('/') or not pathlib.Path(webroot).is_dir():
                 raise ValueError('invalid ACME webroot')
-            issue.extend(['--webroot', webroot])
-        elif method == 'standalone':
-            issue.append('--standalone')
-        else:
+        elif method != 'standalone':
             raise ValueError(f'unsupported ACME method: {method}')
+        acme = pathlib.Path('/root/.acme.sh/acme.sh')
+        if not acme.is_file():
+            raise RuntimeError('acme.sh is not installed')
+
+    out_dir = ETC / 'tls' / domain
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fullchain = out_dir / 'fullchain.pem'
+    privkey = out_dir / 'privkey.pem'
+
+    if method == 'custom':
+        atomic(fullchain, cert_pem + '\n', 0o644)
+        atomic(privkey, key_pem + '\n', 0o600)
+    else:
+        issue = [str(acme), '--issue', '-d', domain, '--accountemail', email, '--server', 'letsencrypt', '--keylength', 'ec-256', '--home', '/root/.acme.sh']
+        if method == 'webroot':
+            issue.extend(['--webroot', webroot])
+        else:
+            issue.append('--standalone')
         result = run(issue, check=False, timeout=300)
         if result.returncode != 0:
             raise RuntimeError('ACME certificate issue failed')

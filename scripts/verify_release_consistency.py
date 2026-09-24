@@ -33,7 +33,14 @@ SCAN_SKIP_PARTS = {"node_modules", "dist", "release", "__pycache__", ".git"}
 
 # Matches this product's version family. Built from fragments so that this file,
 # which has to talk about stale versions, does not match its own sweep.
-VERSION_RE = re.compile(r"\b0\.5\." + r"\d+(?:-[0-9A-Za-z.\-]+)?\b")
+# 必须随产品线更新：写死 "0.5." 时 0.8.x 的残留版本字面量一个都扫不到，
+# 整个 sweep 变成空转。用显式家族前缀而不是泛化的 0.x.y，否则 127.0.0.1
+# 之类的 IP 与第三方软件的版本号会全部误报（实测 140 条）。
+VERSION_FAMILIES = ("0.5.", "0.8.")
+VERSION_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(family) for family in VERSION_FAMILIES) + r")"
+    + r"\d+(?:-[0-9A-Za-z.\-]+)?\b"
+)
 
 # Files allowed to mention old versions because their job is to talk about them.
 SCAN_SKIP_FILES = {"verify_release_consistency.py"}

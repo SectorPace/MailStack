@@ -7,6 +7,13 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 
 import { readPackageVersion, rootDir } from "./_source.mjs";
+
+// dist/server.cjs 与 dist/webmail.cjs 是 `npm run build:all` 的产物，干净检出上不
+// 存在，而 CI 里 `npm test` 跑在构建之前。缺失时跳过而不是失败；构建完成后 ci.yml
+// 的 “Standalone prebuilt bundle smoke tests” 步骤会复跑这两个用例。
+const SERVER_DIST = path.resolve("dist/server.cjs");
+const WEBMAIL_DIST = path.resolve("dist/webmail.cjs");
+
 function httpGet(url) {
   return new Promise((resolve, reject) => {
     http.get(url, (res) => {
@@ -39,13 +46,14 @@ async function waitForHealth(url, timeoutMs = 8000) {
   throw new Error(`Timed out waiting for ${url} to report healthy`);
 }
 
-test("Standalone prebuilt server.cjs starts and responds in clean environment with zero node_modules", async () => {
+test("Standalone prebuilt server.cjs starts and responds in clean environment with zero node_modules", {
+  skip: fs.existsSync(SERVER_DIST) ? false : "dist/server.cjs not built yet",
+}, async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mailstack-prebuilt-test-"));
-  const serverDist = path.resolve("dist/server.cjs");
   const indexDist = path.resolve("dist/index.html");
 
-  assert.ok(fs.existsSync(serverDist), "dist/server.cjs must exist");
-  fs.copyFileSync(serverDist, path.join(tmpDir, "server.cjs"));
+  assert.ok(fs.existsSync(SERVER_DIST), "dist/server.cjs must exist");
+  fs.copyFileSync(SERVER_DIST, path.join(tmpDir, "server.cjs"));
   if (fs.existsSync(indexDist)) {
     fs.copyFileSync(indexDist, path.join(tmpDir, "index.html"));
   }
@@ -76,12 +84,13 @@ test("Standalone prebuilt server.cjs starts and responds in clean environment wi
   }
 });
 
-test("Standalone prebuilt webmail.cjs starts and responds in clean environment with zero node_modules", async () => {
+test("Standalone prebuilt webmail.cjs starts and responds in clean environment with zero node_modules", {
+  skip: fs.existsSync(WEBMAIL_DIST) ? false : "dist/webmail.cjs not built yet",
+}, async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mailstack-webmail-prebuilt-test-"));
-  const webmailDist = path.resolve("dist/webmail.cjs");
 
-  assert.ok(fs.existsSync(webmailDist), "dist/webmail.cjs must exist");
-  fs.copyFileSync(webmailDist, path.join(tmpDir, "webmail.cjs"));
+  assert.ok(fs.existsSync(WEBMAIL_DIST), "dist/webmail.cjs must exist");
+  fs.copyFileSync(WEBMAIL_DIST, path.join(tmpDir, "webmail.cjs"));
 
   // Ensure absolutely no node_modules exists in the sandbox
   assert.equal(fs.existsSync(path.join(tmpDir, "node_modules")), false);
