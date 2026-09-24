@@ -26,7 +26,7 @@
   <img alt="Node.js" src="https://img.shields.io/badge/Node.js-20%20%7C%2022%20%7C%2024-3c873a">
 </p>
 
-> **版本状态：v0.8.0-beta.8（公开测试）。** 本版本为安装器加入「单文件自举」：`deploy/install.sh` 现在可脱离源码树被一行式获取并执行（`bash <(curl -fsSL …)`，非 root 用 `sudo bash -c "$(curl -fsSL …)"`）。源码树缺失时，引导段只取官方 Release 的 tar.gz / SHA256SUMS / SHA256SUMS.sig 三件套，先验分离签名再比对校验和，全部通过才解压并转交真正的安装器，自身不含任何安装逻辑，信任模型与 `ms upgrade` 完全一致。注意 `sudo bash <(curl …)` 不可用（sudo 关闭 3 号以上 fd，测得的退出码为 127）。无接口与数据格式变更。
+> **版本状态：v0.8.0-beta.9（公开测试）。** 本版本是 beta.8 的「构建与测试可复现性」修复。其一，`scripts/generate_manifest.mjs` 的 `builtAt` 此前会退回墙上时间（只有在「构建」前导出 `SOURCE_DATE_EPOCH` 才被固定），于是同一份源码两次 build+package 得到的 `build-manifest.json` 不一致、归档哈希随之变化，与 README 及 RELEASE_CHECKLIST 承诺的「两次打包哈希一致」直接矛盾；现改为回落到与 `scripts/package.py` 相同的常量 `1704067200`，不再依赖调用方是否导出环境变量。其二，修复 `tests/public-mode-gate.test.mjs` 中 T-2FA-1a 的启动竞态：子进程的启动 banner 与 TCP 连通分属两条无同步的通道，`waitForReady()` 返回只证明端口已绑定、并不保证父进程已收到 banner，实测约 1.3% 的运行会丢；现改为轮询等待目标日志落地，并在两处否定断言前先等 banner 到达。无接口与数据格式变更。
 >
 > **重要声明：MailStack 不保证邮件进入收件箱。** 实际送达结果受 IP 与域名信誉、DNS 身份认证（MX / SPF / DKIM / DMARC / PTR）、邮件内容、退信与投诉率、Relay 服务商策略以及接收方规则影响。
 
@@ -441,7 +441,7 @@ printf '%s\n' 'YourStrongPass123' | sudo bash /tmp/mailstack-install.sh \
 
 ```bash
 ms upgrade              # 升级到最新签名 Release
-ms upgrade v0.8.0-beta.8  # 钉扎到指定版本
+ms upgrade v0.8.0-beta.9  # 钉扎到指定版本
 ```
 
 升级通道设计：
@@ -651,7 +651,7 @@ mailstack.sh                      统一入口：install / update(upgrade) / doc
 │   └── verification/             Ubuntu 24.04 / Debian 12 真机记录、邮件投递 E2E
 ├── .github/workflows/ci.yml / release.yml
 ├── .env.example
-└── CHANGELOG.md                  v0.1.0-beta.1 → v0.8.0-beta.8 全量变更
+└── CHANGELOG.md                  v0.1.0-beta.1 → v0.8.0-beta.9 全量变更
 ```
 
 ## 开发指南
@@ -718,7 +718,7 @@ npm test             # Node 测试
 
 | 文档 | 内容 |
 |---|---|
-| [CHANGELOG.md](CHANGELOG.md) | v0.1.0-beta.1 → v0.8.0-beta.8 逐版本变更，含每个安全修复的完整背景 |
+| [CHANGELOG.md](CHANGELOG.md) | v0.1.0-beta.1 → v0.8.0-beta.9 逐版本变更，含每个安全修复的完整背景 |
 | [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) | 发行版支持矩阵与平台能力注记 |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署：端口模型、卷布局、首启口令 |
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | STRIDE 威胁模型（资产分级、信任边界、非目标） |

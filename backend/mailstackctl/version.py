@@ -4,4 +4,4 @@
 # imports backup/telemetry, which need the version. Importing it back from the
 # package root at that point hits a partially initialised module.
 
-__version__ = "0.8.0-beta.8"
+__version__ = "0.8.0-beta.9"

@@ -8,7 +8,12 @@ const distDir = path.join(rootDir, 'dist');
 const manifestPath = path.join(distDir, 'build-manifest.json');
 const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8'));
 const version = fs.readFileSync(path.join(rootDir, 'VERSION'), 'utf8').trim();
-const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH;
+// 与 scripts/package.py 的默认值保持同一个常量：归档的 mtime 由 package.py
+// 固定，而 manifest 的 builtAt 是在「构建」这一步烙进去的。若这里退回墙上时间，
+// 同源码重建一次就会得到不同的 build-manifest.json —— 归档哈希随之变化，
+// RELEASE_CHECKLIST 的「第二次打包哈希一致」也就不再成立（release.yml 之所以
+// 没暴露这个问题，只是因为它的 SOURCE_DATE_EPOCH 是 job 级 env）。
+const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH ?? '1704067200';
 
 if (!fs.existsSync(distDir)) throw new Error('dist directory does not exist');
 if (pkg.version !== version) throw new Error(`package.json version ${pkg.version} does not match VERSION ${version}`);
@@ -59,7 +64,7 @@ const manifest = {
   schemaVersion: 1,
   name: pkg.name,
   version,
-  builtAt: sourceDateEpoch ? new Date(Number(sourceDateEpoch) * 1000).toISOString() : new Date().toISOString(),
+  builtAt: new Date(Number(sourceDateEpoch) * 1000).toISOString(),
   nodeEngine: pkg.engines.node,
   buildTarget: 'standalone-inlined',
   sourceTreeHash: sourceHasher.digest('hex'),

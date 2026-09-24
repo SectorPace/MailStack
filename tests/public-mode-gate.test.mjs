@@ -87,6 +87,29 @@ async function waitForReady(port, timeoutMs = 10000) {
   throw new Error(`server never became ready on 127.0.0.1:${port}`);
 }
 
+/**
+ * Wait for a line to appear on the child's stdout.
+ *
+ * The startup banner is written from inside the `listen` callback
+ * (server.production.ts L1568), and it crosses a pipe, so a successful TCP
+ * connect does NOT mean the parent has already received it: `waitForReady`
+ * resolving only proves the socket is bound. Reading `srv.stdout` immediately
+ * afterwards is a race with no synchronisation, and it does lose under a busy
+ * event loop (seen on Windows under a full parallel `node --test` run). Poll
+ * for the expected output instead of assuming it has landed; on timeout, dump
+ * both streams so the failure is diagnosable.
+ */
+async function waitForLog(srv, pattern, message, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pattern.test(srv.stdout)) return;
+    await sleep(25);
+  }
+  throw new Error(
+    `${message}; stdout=${JSON.stringify(srv.stdout)} stderr=${JSON.stringify(srv.stderr)}`,
+  );
+}
+
 /** A minimal, already-configured administrator account (no totp). */
 function adminJsonNoTotp(password) {
   const salt = crypto.randomBytes(16).toString("hex");
@@ -159,8 +182,8 @@ test("T-2FA-1a: public mode without 2FA serves only the enroll window (GET /api/
   await waitForReady(port);
 
   // The startup log must show it bound loopback-only inside the enroll window.
-  assert.match(srv.stdout, /MailStack API on 127\.0\.0\.1:/, "must bind 127.0.0.1 in the enroll window");
-  assert.match(srv.stdout, /\[ENROLL WINDOW\]/, "must announce the enroll window");
+  await waitForLog(srv, /MailStack API on 127\.0\.0\.1:/, "must bind 127.0.0.1 in the enroll window");
+  await waitForLog(srv, /\[ENROLL WINDOW\]/, "must announce the enroll window");
 
   const res = await fetch(`${srv.baseUrl}/api/domains`);
   assert.equal(res.status, 403, "GET /api/domains must be forbidden during the enroll window");
@@ -222,6 +245,9 @@ test("A1: local mode is never gated (no enroll window, normal auth applies)", as
   const srv = startGateServer({ port, accessMode: "local", windowMs: 20000, adminJson: adminJsonNoTotp(PASSWORD) });
   t.after(() => srv.stop());
   await waitForReady(port);
+  // Await the banner before the negative assertion: on a still-empty stdout it
+  // would pass for the wrong reason.
+  await waitForLog(srv, /MailStack API on /, "local mode must log its bind address");
 
   assert.doesNotMatch(srv.stdout, /\[ENROLL WINDOW\]/, "local mode must not enter the enroll window");
   const res = await fetch(`${srv.baseUrl}/api/domains`);
@@ -236,6 +262,8 @@ test("A1: public mode WITH 2FA enabled starts normally (no enroll window)", asyn
   const srv = startGateServer({ port, accessMode: "caddy", windowMs: 20000, adminJson: adminJsonTotpEnabled(PASSWORD) });
   t.after(() => srv.stop());
   await waitForReady(port);
+  // Same reason as above: the banner must have landed before asserting absence.
+  await waitForLog(srv, /MailStack API on /, "2FA-enabled public mode must log its bind address");
 
   assert.doesNotMatch(srv.stdout, /\[ENROLL WINDOW\]/, "2FA-enabled public mode must not enter the enroll window");
   const res = await fetch(`${srv.baseUrl}/api/domains`);

@@ -2,6 +2,37 @@
 
 All notable changes to the MailStack project are documented in this file.
 
+## [v0.8.0-beta.9] - 2026-09-24
+
+> 0.8.0-beta.9 是 beta.8 的「构建与测试可复现性」修复版，两处缺陷都不影响运行产物，
+> 但都让「同一份源码必然得到同一份产物 / 同一条结论」这一承诺在本地失守：一处使
+> build+package 不可复现（归档哈希随打包时刻漂移），一处让公网 2FA 门禁测试存在约
+> 1.3% 的偶发假失败。均已在本地复现、修复并回归。无接口与数据格式变更。
+
+### 🐛 修复 (Fixes)
+- **manifest 的 `builtAt` 退回墙上时间，归档不可复现**: `scripts/generate_manifest.mjs`
+  此前取 `process.env.SOURCE_DATE_EPOCH`，未设置时回落 `new Date()`。归档内的文件 mtime
+  由 `scripts/package.py` 用常量 `1704067200` 固定，但 `dist/build-manifest.json` 的
+  `builtAt` 是在「构建」阶段烙进去的——不显式导出该变量时同一份源码重建一次即得到不同的
+  manifest，归档哈希随之改变，`RELEASE_CHECKLIST` 的「第二次打包哈希一致」与 README 的
+  承诺同时失效。`release.yml` 之所以从未暴露，只是因为它的 `SOURCE_DATE_EPOCH` 写在 job
+  级 `env`，构建步骤天然继承。现改为 `process.env.SOURCE_DATE_EPOCH ?? '1704067200'`，
+  与 `package.py` 共用一个默认常量，不再依赖调用方是否导出环境变量。
+- **T-2FA-1a 启动竞态导致偶发假失败**: 子进程的启动 banner 在 `listen` 回调内打印
+  （`backend/server.production.ts` 约 L1568），经 pipe 传给父进程；而 `waitForReady()`
+  判定的是 TCP 可连通，仅证明端口已绑定，两条通道之间没有任何同步。父进程在
+  `waitForReady()` 返回后立刻读 `srv.stdout` 就是在赌 banner 已经到达——Windows 上并行
+  `node --test` 实测约 1.3% 的运行会输掉这个赌局。新增 `waitForLog()` 轮询 helper 等待
+  目标行落地（超时同时打印 stdout/stderr 便于定位），并用于 T-2FA-1a 的两条正向断言；
+  另在两处**否定**断言（A1 local 不进 enroll window、公网已启用 2FA 不进 enroll window）
+  前先等 banner 出现，避免在空 stdout 上「因为什么都没读到」而误判通过。
+
+### ✅ 验证 (Verification)
+- 修复后本地 build+package 连续两次，`release/` 四件套（tar.gz / zip / SHA256SUMS /
+  SHA256SUMS.sig）哈希稳定，不再随打包时刻变化。
+- `npm test` 86/86 通过（含 `public-mode-gate.test.mjs` 全量用例）；
+  `verify_release_consistency.py` 100%。
+
 ## [v0.8.0-beta.8] - 2026-09-24
 
 > 0.8.0-beta.8 给安装器加了「单文件自举」：`deploy/install.sh` 现在可以脱离源码树被

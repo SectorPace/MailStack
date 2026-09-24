@@ -152,7 +152,7 @@ try:
     
     # 1. Admin API Health Check
     admin_data = fetch_json("http://127.0.0.1:19787/api/health")
-    if not admin_data or admin_data.get("status") != "ok" or admin_data.get("version") != "0.8.0-beta.8":
+    if not admin_data or admin_data.get("status") != "ok" or admin_data.get("version") != "0.8.0-beta.9":
         print("Admin API health check failed:", admin_data)
         sys.exit(1)
     print("  -> Admin API Health: 200 OK (version: " + str(admin_data.get("version")) + ", builtAt: " + str(admin_data.get("builtAt")) + ")")
