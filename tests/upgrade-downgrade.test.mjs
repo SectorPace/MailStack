@@ -6,7 +6,7 @@
  * dispatch, root escalation, network access or the real installer. We source it in
  * a throwaway bash and drive assert_no_downgrade() / _semver_lt() directly:
  *
- *   installed-version = v0.8.0-beta.7 (canonical), target v0.5.3-rc.1  -> rejected (rc 1)
+ *   installed-version = v0.8.0-beta.8 (canonical), target v0.5.3-rc.1  -> rejected (rc 1)
  *   same, with ALLOW_DOWNGRADE=1 (--allow-downgrade)               -> allowed  (rc 0)
  *   equal / newer targets                                          -> allowed  (rc 0)
  *   missing installed-version file -> falls back to script VERSION, older target still rejected
@@ -50,7 +50,7 @@ run_tests(){
 source ./mailstack.sh   # source guard returns before command dispatch
 set +e                  # mailstack.sh turns -e on; we capture return codes instead
 
-CUR=v0.8.0-beta.7   # canonical, matches package.json / VERSION
+CUR=v0.8.0-beta.8   # canonical, matches package.json / VERSION
 OLDER=v0.5.3-rc.1
 NEWER=v0.9.0
 
@@ -79,7 +79,7 @@ emit newer_allowed      "$(rc_of assert_no_downgrade "$NEWER")"           # expe
 # Bare (v-less) target exercises the leading-v strip inside assert_no_downgrade.
 emit bare_older_reject  "$(rc_of assert_no_downgrade "\${OLDER#v}")"      # expect 1
 
-# Missing installed-version file -> fall back to script VERSION (0.8.0-beta.7);
+# Missing installed-version file -> fall back to script VERSION (0.8.0-beta.8);
 # an older target is still rejected, and old installs are never blocked on a
 # equal/newer target.
 rm -f "$MAILSTACK_INSTALLED_VERSION_FILE"

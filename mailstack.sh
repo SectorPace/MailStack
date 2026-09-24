@@ -8,7 +8,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   fi
 fi
 set -Eeuo pipefail
-VERSION="v0.8.0-beta.7"
+VERSION="v0.8.0-beta.8"
 REPO_URL="${MAILSTACK_REPO_URL:-https://github.com/SectorPace/MailStack.git}"
 INSTALL_DIR="/opt/mailstack-source"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"

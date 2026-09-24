@@ -2,6 +2,33 @@
 
 All notable changes to the MailStack project are documented in this file.
 
+## [v0.8.0-beta.8] - 2026-09-24
+
+> 0.8.0-beta.8 给安装器加了「单文件自举」：`deploy/install.sh` 现在可以脱离源码树被
+> 一行式获取并执行（`bash <(curl -fsSL …)` / `sudo bash -c "$(curl -fsSL …)"`）。
+> 引导段沿用与 `ms upgrade` 完全相同的信任模型——只取官方 Release 的
+> tar.gz + SHA256SUMS + SHA256SUMS.sig 三件套，先验分离签名再比对校验和，全部通过
+> 才解压到 /opt/mailstack-source 并转交真正的安装器，自身不含任何安装逻辑。
+> 无接口与数据格式变更。
+
+### ✨ 一行式安装（新）
+- **install.sh 单文件自举**: 此前 `BASE=$(cd "$(dirname "$0")/.." && pwd)` 强依赖源码树
+  （安装器要拷 src/backend/dist 等目录），单文件获取后执行必失败。新增
+  `bootstrap_from_signed_release`：源码树缺失时取回签名 Release、`ssh-keygen -Y verify`
+  验签、`sha256sum -c` 比对校验和、校验资产为单一顶层目录且含 `deploy/install.sh`，
+  之后才解压到 `/opt/mailstack-source` 并 `exec` 安装器（`ms` 正指向该目录，后续
+  `ms upgrade` 通道不受影响）。验签或校验和不通过即在解压前中止，不执行任何未验签内容。
+- **进程替换形态优先**: README 主推 `bash <(curl -fsSL …)`。进程替换只是把脚本正文挂在
+  一个 fd 上，stdin 仍是终端，交互问答与 `--admin-password-stdin` 均正常；而
+  `curl … | sudo bash` 的 stdin 就是脚本正文，安装器的 read 只会拿到 EOF（保留
+  `</dev/tty` 回接兜底，确实无控制终端时明确失败，而不是在口令重试循环里空转）。
+- **明示 `sudo bash <(curl …)` 不可用**: sudo 关闭 3 号以上的文件描述符，bash 取不到
+  `/dev/fd/63`（sudo 1.9.15 实测 `No such file or directory`，退出码 127）。非 root
+  运行 install.sh 时直接打印 `sudo -i` 与 `sudo bash -c "$(curl …)"` 两条可复制命令，
+  不再只回一句「请使用 root 运行」。
+- **威胁模型同步**: `docs/THREAT_MODEL.md` 新增「引导安装脚本」信任边界条目，并在残余
+  风险里写明引导脚本与信任锚同源、防篡改控制落在 Release 分离签名上。
+
 ## [v0.8.0-beta.7] - 2026-09-13
 
 > 0.8.0-beta.7 是 v0.8-beta.6 的 CI / 安装器修复版：自 fb0df337 起 CI 连续全红
