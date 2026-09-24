@@ -602,6 +602,7 @@ Behavioral assertion system (T-*): public-mode 2FA gate (T-2FA-1a/1b/2), SO_PEER
 | **build** | Node 20 / 22 / 24 matrix: type check, Python helper tests, Node contract and integration, frontend tests, `build:all`, artifact checks, version consistency, reproducible packaging |
 | **shell-gate** | shellcheck (error-level hard gate + zero-warning target) + undefined-function scan of release scripts |
 | **install-matrix** | Real non-interactive installs in clean ubuntu:24.04 / ubuntu:22.04 / debian:12 / rockylinux:9 containers + health assertions + privilege probes + single-sudoers + jail presence + trust anchor + loopback send (`scripts/ci_install_assertions.sh`) + **malicious domain Caddyfile injection gate** (`scripts/ci_domain_injection_test.sh`) |
+| **bootstrap-smoke** | **One-liner install bootstrap gate**: signs a `file://` fake release with a throwaway ed25519 key and drives the real `deploy/install.sh` bootstrap through the documented `bash <(curl -fsSL …)` shape (verify signature → checksum → extract → lay down → hand off), asserting that a missing signature, a mismatched signature, a tampered archive, more than one top-level entry, and a missing `deploy/install.sh` are all refused before any source is laid down. Fully offline (`scripts/ci_bootstrap_smoke_test.sh`) |
 | **supply-chain** | `npm audit` high-severity hard gate + fixable-moderate gate + CycloneDX SBOM |
 | **release** (tag-triggered) | tag must match VERSION → build → gated signing → re-verify → archive layout assertion → upload tar.gz / zip / SHA256SUMS / SHA256SUMS.sig |
 

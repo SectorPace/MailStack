@@ -602,6 +602,7 @@ sudo bash ./mailstack.sh uninstall --purge     # 连管理配置一起删除
 | **build** | Node 20 / 22 / 24 矩阵：类型检查、Python 助手测试、Node 契约与集成、前端测试、`build:all`、产物校验、版本一致性、可复现打包 |
 | **shell-gate** | shellcheck（error 硬门禁 + warning 零告警目标）+ 发布脚本未定义函数调用扫描 |
 | **install-matrix** | ubuntu:24.04 / ubuntu:22.04 / debian:12 / rockylinux:9 干净容器真实安装 + 健康断言 + 提权探针 + sudoers 单条 + jail 存在 + 信任锚 + 环回发信（`scripts/ci_install_assertions.sh`）+ **恶意域名注入 Caddyfile 门禁**（`scripts/ci_domain_injection_test.sh`） |
+| **bootstrap-smoke** | **一行式安装引导链门禁**：用临时 ed25519 密钥签一份 `file://` 伪 Release，以 README 主推的 `bash <(curl -fsSL …)` 形态跑真实 `deploy/install.sh` 的引导段（验签 → 校验和 → 解压 → 铺开 → 转交），并逐条断言 缺签名 / 签名不匹配 / 归档被篡改 / 资产顶层多于一个 / 缺少 `deploy/install.sh` 均在铺开源码之前拒绝。全程不出网（`scripts/ci_bootstrap_smoke_test.sh`） |
 | **supply-chain** | `npm audit` 高危硬门禁 + 可修复中危门禁 + CycloneDX SBOM |
 | **release**（tag 触发） | tag 必须与 VERSION 一致 → 构建 → 门控签名 → 复验 → 归档布局断言 → 上传 tar.gz / zip / SHA256SUMS / SHA256SUMS.sig 四资产 |
 

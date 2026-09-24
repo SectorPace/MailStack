@@ -129,6 +129,19 @@ jobs:
             echo "ALL CHECKS PASSED on ${{ matrix.distro }}"
           '
 
+  # 一行式安装（deploy/install.sh 脱离源码树自举）此前完全没有门禁覆盖：install-matrix
+  # 走的是源码树路径（$BASE 下有 install-mail-stack.sh，引导段根本不进入），release.yml
+  # 只断言资产可复现与布局合规，两者都不执行引导代码 —— 而那正是 README 主推、且一旦
+  # 改坏就等于「下载完直接执行未验签内容」的那一段。本 job 用临时密钥 + file:// 伪
+  # Release 把整条引导链连同失败路径跑一遍，全程不出网、不装任何包（ssh-keygen / curl /
+  # tar 都在 runner 镜像里），因此可以进每次 push 的常规门禁。
+  bootstrap-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: One-liner install bootstrap (signature / checksum / layout / handoff)
+        run: sudo bash scripts/ci_bootstrap_smoke_test.sh
+
   supply-chain:
     runs-on: ubuntu-latest
     steps:
