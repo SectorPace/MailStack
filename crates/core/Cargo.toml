@@ -1,0 +1,43 @@
+[package]
+name = "mailstack-core"
+description = "MailStack 领域核心：配置 schema、口令策略、审计哈希链、文件原语"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+fs2.workspace = true
+tracing.workspace = true
+time.workspace = true
+aes-gcm = "0.10"
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+# 证书到期时间的解析（`certs.list`）。刻意 `default-features = false`：
+# `verify` 会启用 ring 的证书路径校验，而链校验是 rustls 在握手时的职责，
+# 这里只需要读出 notBefore/notAfter。依赖链全部是纯 Rust（nom / asn1-rs）。
+x509-parser = { version = "0.16", default-features = false }
+# 备份归档。刻意在**进程内**读写 tar 而不是 shell 出 `tar -czf`：
+# 恢复前必须逐个读出成员的**元数据**（是否符号链接 / 硬链接 / 设备 / setuid 位），
+# 才能把「归档里夹带的东西」挡在落地之前。解析 `tar -tvzf` 的文本输出做这件事
+# 是不可靠的 —— 那是把一条安全边界建在人类可读格式上。
+tar = { version = "0.4", default-features = false }
+# gzip 只用纯 Rust 后端（miniz_oxide），不引入任何 C 依赖（§3.4）。
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# 测试里现场签一张自签证书，好让「解析出的到期时间」与「生成时声明的时间」
+# 能做逐字比对，而不是只断言字段非空。
+rcgen = "0.13"

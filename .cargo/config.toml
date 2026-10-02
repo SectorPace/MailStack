@@ -1,0 +1,20 @@
+# 供应链配置（规格书 §7）
+#
+# 默认构建走 crates.io。离线可复现构建时执行：
+#     cargo vendor vendor
+# 然后取消下面 [source] 段的注释，即可在无网络环境下 `cargo build --locked`。
+#
+# 禁止 git 依赖：所有依赖必须来自 crates.io 并有 Cargo.lock 锁定。
+
+[net]
+retry = 3
+
+[build]
+# Linux 为目标平台；Windows 开发机仅用于 `cargo check --target` 与单元测试。
+target-dir = "target"
+
+# [source.crates-io]
+# replace-with = "vendored-sources"
+#
+# [source.vendored-sources]
+# directory = "vendor"

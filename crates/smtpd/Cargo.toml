@@ -1,0 +1,31 @@
+[package]
+name = "mailstack-smtpd"
+description = "MailStack 入站 SMTP 服务端：会话状态机、反中继、入站认证与收信入队（替代 Postfix smtpd）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mailstack-core.workspace = true
+# 反中继策略（INV-17）：复用出站侧同一份 RelayPolicy，避免两处实现出现语义漂移。
+mailstack-smtp.workspace = true
+# 入站认证：SPF / DKIM / DMARC / ARC 与 Authentication-Results 头。
+mailstack-auth.workspace = true
+# 收信入队 —— 本服务端不自己投递，投递全部交给队列（单一出站路径）。
+mailstack-queue.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# 入站 TLS 全链路 rustls（与出站同一套 provider：ring，避免 C 依赖链，§3.4）。
+rustls.workspace = true
+tokio-rustls.workspace = true
+# 证书 / 私钥的 PEM 解析（`CertificateDer::pem_file_iter`、`PrivateKeyDer::from_pem_file`）。
+rustls-pki-types.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"
+tempfile = "3"

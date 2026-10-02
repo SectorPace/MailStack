@@ -1,0 +1,44 @@
+[package]
+name = "mailstack-priv"
+description = "MailStack 特权边界：动作分派门、审计、Unix socket RPC 服务端"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mailstack-core.workspace = true
+# 处理器注册表按阶段逐步纳入已落地的动作实现（Phase 4 起包含数据层与签名层）。
+# 这只是**编译期**依赖：唯一的生产消费者 `mailstackd` 本来就已经链接它们，
+# 守护进程的体量与攻击面不变。
+mailstack-store.workspace = true
+mailstack-auth.workspace = true
+# 只读聚合面要用到：出站端口探测（`network.check_port`）与封禁表往返探针
+# （`system.doctor`）。仍然是编译期依赖 —— 唯一的生产消费者 `mailstackd`
+# 本来就已经链接它们。
+mailstack-smtp.workspace = true
+mailstack-smtpd.workspace = true
+# 队列的只读摘要（`snapshot` 的积压量与出站结论）。
+mailstack-queue.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+time.workspace = true
+tokio = { workspace = true }
+# 环路自检的一次性 token 需要不可预测的随机量（`ms-loopback-<24 hex>`）。
+# 工作区已在用同一版本（`mailstack-core` 的口令盐），故不是新增外部依赖。
+rand.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+# 只读聚合面的测试要真的签一张证书，才能断言「即将到期」这条路径。
+rcgen = "0.13"
+# 备份测试要直接读回归档，断言「没要求含机密时 admin.json 真的不在里面」——
+# 只断言响应字段等于相信实现自己的话。两个都是纯 Rust。
+tar = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

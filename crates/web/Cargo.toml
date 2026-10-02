@@ -1,0 +1,28 @@
+[package]
+name = "mailstack-web"
+description = "MailStack 管理 API：Axum 路由、会话/CSRF/限速中间件、特权通道调用"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mailstack-core.workspace = true
+mailstack-priv.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"

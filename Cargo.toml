@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/priv",
+    "crates/web",
+    "crates/smtp",
+    "crates/queue",
+    "crates/store",
+    "crates/auth",
+    "crates/smtpd",
+    "bin/mailstackd",
+    "bin/mailstackctl",
+]
+# 后续加入（按规格书 §6 迁移路线逐 Phase 解锁）：
+#   "crates/webmail"
+
+[workspace.package]
+version = "0.8.1-beta1"
+edition = "2021"
+rust-version = "1.85"
+license = "SEE LICENSE IN LICENSE"
+repository = "https://github.com/SectorPace/MailStack"
+authors = ["SectorPace"]
+
+[workspace.dependencies]
+mailstack-core = { path = "crates/core" }
+mailstack-priv = { path = "crates/priv" }
+mailstack-web = { path = "crates/web" }
+mailstack-smtp = { path = "crates/smtp" }
+mailstack-queue = { path = "crates/queue" }
+mailstack-store = { path = "crates/store" }
+mailstack-auth = { path = "crates/auth" }
+mailstack-smtpd = { path = "crates/smtpd" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+regex = "1"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+fs2 = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "limit"] }
+time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
+clap = { version = "4", features = ["derive"] }
+
+# TLS：全链路 rustls。刻意用 ring 作为 crypto provider 而不是 aws-lc-rs，
+# 因为后者需要 cmake/nasm，会让「构建可离线复现且无额外系统依赖」的要求落空（§3.4）。
+# 根证书用 webpki-roots（内置 Mozilla 根，纯 Rust，不依赖系统 CA 存储）。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

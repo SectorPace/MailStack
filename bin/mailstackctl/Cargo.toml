@@ -1,0 +1,16 @@
+[package]
+name = "mailstackctl"
+description = "MailStack CLI：向特权 RPC 面调用已登记的动作"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mailstack-core.workspace = true
+mailstack-priv.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

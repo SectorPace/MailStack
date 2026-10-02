@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# 追查 C 依赖链（规格书 §3.4 禁止）是从哪条路径进来的，并看能否用 feature 剪掉。
+set -u
+
+SRC_DIR="/mnt/e/MailStack/mailstack-rust"
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR="$HOME/.cache/mailstack-target"
+cd "$SRC_DIR" || exit 1
+
+echo "=== 反向依赖：zstd-sys ==="
+cargo tree -i zstd-sys -p mailstack-auth 2>&1 | head -20
+echo
+echo "=== 反向依赖：xz2 ==="
+cargo tree -i xz2 -p mailstack-auth 2>&1 | head -20
+echo
+echo "=== 反向依赖：zip ==="
+cargo tree -i zip -p mailstack-auth 2>&1 | head -20
+echo
+echo "=== 反向依赖：hickory-resolver ==="
+cargo tree -i hickory-resolver -p mailstack-auth 2>&1 | head -20
+echo
+echo "=== mail-auth 自身的 features ==="
+cargo tree -p mailstack-auth -e features 2>&1 | head -30

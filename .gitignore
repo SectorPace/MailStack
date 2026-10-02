@@ -1,0 +1,16 @@
+/target
+/vendor
+**/*.rs.bk
+*.pdb
+
+# 发布产物
+/dist
+/release
+*.tar.gz
+*.zip
+SHA256SUMS
+SHA256SUMS.sig
+
+# 本地运行时状态
+/tmp
+/.env

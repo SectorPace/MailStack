@@ -1,0 +1,33 @@
+[package]
+name = "mailstack-smtp"
+description = "MailStack SMTP 核心：IP 固定拨号器、中继校验、会话状态机、反中继策略"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mailstack-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+time.workspace = true
+
+# MX 查询（直投按 RFC 5321 §5.1 逐域解析）。
+#
+# 特性刻意收紧：**不开** `tls-*` / `dnssec-*` —— 那两个族里带 `aws-lc-rs` 的变体需要
+# cmake/nasm，直接违反 §3.4 的「禁止 C 依赖链」。我们只要 UDP/TCP 上的普通查询，
+# `tokio` + `system-config`（读 /etc/resolv.conf）就够了。
+# 注：`mailstack-auth` 经 mail-auth 已经拉入同一版本的 hickory-resolver，这里不新增 crate。
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
+
+[dev-dependencies]
+rcgen = "0.13"
+tempfile = "3"

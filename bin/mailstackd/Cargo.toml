@@ -1,0 +1,29 @@
+[package]
+name = "mailstackd"
+description = "MailStack 守护进程：入站 SMTP（25/465/587）与出站队列调度的组装的入口"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mailstack-core.workspace = true
+# 特权 RPC 面（RO/RW Unix socket）：守护进程按 §3.3 承载它，而不是另起一个进程。
+mailstack-priv.workspace = true
+mailstack-smtp.workspace = true
+mailstack-queue.workspace = true
+mailstack-store.workspace = true
+mailstack-smtpd.workspace = true
+clap.workspace = true
+# RPC 请求/应答与测试夹具都以 JSON 表达。
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+# `TlsAcceptor` 的类型别名出现在 `listeners::build_server` 的签名里。
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

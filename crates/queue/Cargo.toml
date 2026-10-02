@@ -1,0 +1,26 @@
+[package]
+name = "mailstack-queue"
+description = "MailStack 出站队列：持久化、指数退避、DSN 退信、并发限流与经中继投递"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mailstack-core.workspace = true
+# 出站路径必须对每封外发邮件做 DKIM 签名决策（见 src/signing.rs）。
+mailstack-auth.workspace = true
+mailstack-smtp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"
+tempfile = "3"
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true

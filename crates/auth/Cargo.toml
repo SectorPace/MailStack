@@ -1,0 +1,39 @@
+[package]
+name = "mailstack-auth"
+description = "MailStack 认证与签名：DKIM 签名/验签、SPF、DMARC、ARC（替代 OpenDKIM）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mailstack-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+# 私钥 PEM 的解析（`PrivatePkcs1KeyDer::from_pem_slice`）与 DER 视图。
+rustls-pki-types.workspace = true
+
+# 规格书 §3.4 推荐用 mail-auth 替代 OpenDKIM。但**必须**按下面这组特性引入，
+# 否则会违反 §3.4 的另一条硬约束（禁止 C 依赖链）：
+#
+# * `default-features = false`：默认特性是 ["aws-lc-rs", "report", "dns-hickory"]。
+#   - `aws-lc-rs` 需要 cmake/nasm 构建 C —— 本仓库全链路刻意用 ring 正是为了避开它
+#     （见根 Cargo.toml 的 rustls 注释）。
+#   - `report` 会启用 `zip`，而 `zip` 的默认特性含 zstd / xz / bzip2，
+#     会分别拉入 `zstd-sys`、`xz2`、`bzip2-sys` —— **三个都要编译 C**。
+# * 改选 `ring`：它自带 `dns-hickory`（SPF/DKIM/DMARC 需要真实 DNS 查询），
+#   且用的是 ring 而非 aws-lc-rs。
+# * `arc`：ARC 封印/验签（规格书 §3.3 要求 ARC）。
+# * `generate`：原生生成 RSA 密钥（`DkimKeyPair::generate_rsa`）。它只拉入纯 Rust 的
+#   `rsa` + `rand`，**不含 C 依赖链**；没有它就拿不到密钥生成入口，只能退回调用
+#   `opendkim-genkey` —— 那正是重写要移除的外部二进制。
+#
+# 已实测：0.6.x 的 `zip` 是**非可选**依赖，无法通过特性规避（即 0.6.x 不可用）；
+# 0.9 起 `zip` 才变为可选且 `default-features = false`。
+mail-auth = { version = "0.13", default-features = false, features = ["ring", "arc", "generate"] }
+
+[dev-dependencies]
+tempfile = "3"
