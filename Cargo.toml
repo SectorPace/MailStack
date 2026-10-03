@@ -11,6 +11,9 @@ members = [
     "crates/smtpd",
     "bin/mailstackd",
     "bin/mailstackctl",
+    # 管理控制台服务：把 crates/web 的 API 与前端产物组装成一个可运行的进程。
+    # 在此之前 `crates/web` 只有 `build_router`，没有任何二进制在跑它。
+    "bin/mailstack-web",
 ]
 # 后续加入（按规格书 §6 迁移路线逐 Phase 解锁）：
 #   "crates/webmail"

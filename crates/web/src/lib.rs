@@ -19,6 +19,7 @@ pub mod error;
 pub mod ratelimit;
 pub mod routes;
 pub mod session;
+pub mod telemetry;
 
 /// 时间格式化：直接复用 core 的实现，避免两侧各自定义格式串。
 pub mod time_fmt {
@@ -60,6 +61,9 @@ pub struct AppInner {
     pub public_mode: bool,
     /// 构建标识（INV-22：`/api/health` 的 `node` 字段不可缺）。
     pub runtime_id: String,
+    /// 时序遥测采集器。契约里 `/api/metrics/telemetry` 的 `action` 是 `None`，
+    /// 采样只能在本进程内做（动作白名单已冻结，不能为它新增动作）。
+    pub telemetry: Arc<telemetry::TelemetryCollector>,
 }
 
 impl AppState {
@@ -72,9 +76,17 @@ impl AppState {
                 client: PrivilegedClient::new(public_mode),
                 public_mode,
                 runtime_id: format!("mailstackd/{} (rust)", mailstack_core::VERSION),
+                telemetry: Arc::new(telemetry::TelemetryCollector::system()),
                 paths,
             }),
         }
+    }
+
+    /// 覆盖遥测采集器（测试用；生产用 [`telemetry::TelemetryCollector::system`]）。
+    pub fn with_telemetry(mut self, collector: Arc<telemetry::TelemetryCollector>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner).expect("AppState 尚未克隆");
+        inner.telemetry = collector;
+        self
     }
 
     /// 覆盖运行标识（测试用）。
@@ -180,6 +192,10 @@ pub struct AuthenticatedUser {
 pub async fn health(State(state): State<AppState>) -> Response {
     let uptime = 0u64; // Phase 1：进程启动时刻尚未接线到遥测模块
     Json(serde_json::json!({
+        // 管理前端的 `probe()` 用 `body.ok === true` 判定能否进入 live 模式，
+        // 判 false 会**静默**降级到内置 mock —— 界面看起来完全正常，但全是演示数据。
+        // 所以这个成功标志必须给，它不是可选的装饰字段。
+        "ok": true,
         "status": "ok",
         "version": mailstack_core::VERSION,
         "service": "mailstack",
@@ -212,10 +228,16 @@ pub async fn auth_logout(
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
-/// 组装路由。
+/// 组装**只含 `/api` 面**的路由：不含兜底、不含安全响应头。
 ///
 /// 认证层挂在**业务路由**上，而 `/api/health` 与 `/api/auth/login` 显式挂在认证层之前。
-pub fn build_router(state: AppState) -> Router {
+///
+/// 拆出这一层是为了让宿主决定「未匹配的路径怎么办」。纯 API 宿主用 [`build_router`]
+/// （`/api/*` 兜底回 JSON 404）；同时托管前端产物的宿主则必须让**非** `/api` 的
+/// 路径落到 SPA，否则用户在界面上刷新一下就会看到 JSON 的「no such API endpoint」。
+///
+/// 安全响应头由调用方在**最后**统一加一次 —— 放在这里会让后加的兜底路由拿不到它。
+pub fn build_api_router(state: AppState) -> Router {
     // ── 免认证路由（必须在认证层之前） ──
     let public = Router::new()
         .route("/api/health", get(health))
@@ -234,21 +256,50 @@ pub fn build_router(state: AppState) -> Router {
             "/api/auth/sessions",
             delete(crate::routes::revoke_other_sessions),
         )
+        // RPC 桥（管理前端的兜底传输层）。**动作名来自请求体**，因此它自带一道
+        // 「只放行已有路由的动作」的校验，见 `contract::is_exposed_action`。
+        .route("/api/rpc", post(crate::routes::rpc_bridge))
         // 资源路由：动作在**编译期**静态绑定（见 routes::action_handlers!）。
         .route(
             "/api/domains",
             get(crate::routes::domains_list).post(crate::routes::domains_add),
         )
         .route("/api/domains/:id", delete(crate::routes::domains_delete))
-        .route("/api/aliases", post(crate::routes::aliases_add))
+        // 邮箱用户（`users.*`）。`DELETE /api/users/:id` 是破坏性动作，
+        // `confirm: true` 由助手侧的 `ActionGate` 强制 —— web 层不得放行任何东西。
+        .route(
+            "/api/users",
+            get(crate::routes::users_list).post(crate::routes::users_add),
+        )
+        .route("/api/users/status", post(crate::routes::users_status))
+        .route("/api/users/password", post(crate::routes::users_password))
+        .route("/api/users/:id", delete(crate::routes::users_delete))
+        .route(
+            "/api/aliases",
+            get(crate::routes::aliases_list).post(crate::routes::aliases_add),
+        )
         .route("/api/aliases/:id", delete(crate::routes::aliases_delete))
         .route("/api/dkim/rotate", post(crate::routes::dkim_rotate))
+        // DKIM 密钥清单（只读 stat，不导出私钥）。
+        .route("/api/dkim/keys", get(crate::routes::dkim_keys))
+        // DNS 记录清单（出站解析 A/MX/TXT）。
+        .route("/api/dns/records", get(crate::routes::dns_records))
+        // 审计活动流（只读审计日志尾部）。
+        .route("/api/activity", get(crate::routes::activity_list))
         .route("/api/snapshot", get(crate::routes::snapshot_get))
         .route("/api/status", get(crate::routes::snapshot_get))
         .route("/api/logs", get(crate::routes::logs_list))
         .route(
             "/api/metrics/realtime",
             get(crate::routes::metrics_realtime),
+        )
+        // `/api/metrics/system` 与 `/api/metrics/realtime` 是**不同形状**的两个端点：
+        // 前者是给仪表盘资源环形图用的三格百分比，后者是完整的运行读数。
+        .route("/api/metrics/system", get(crate::routes::metrics_system))
+        // 遥测是**进程内**路由（契约里 action 为 None）：采样器就在本进程。
+        .route(
+            "/api/metrics/telemetry",
+            get(crate::routes::metrics_telemetry),
         )
         .route("/api/network/check-port", post(crate::routes::check_port))
         .route(
@@ -267,20 +318,81 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/doctor", get(crate::routes::system_doctor))
         .route("/api/system/doctor", get(crate::routes::system_doctor))
         .route("/api/setup/status", get(crate::routes::setup_status))
-        .route("/api/ai/config", get(crate::routes::ai_config_get))
+        // AI 子系统：`GET /api/ai/config` 是只读公开配置；其余 9 条写/出站路由中，
+        // `/api/ai/dns-chat`、`/api/ai/diagnose-dns`、`/api/ai/parse-dns-raw` 与
+        // 各自的「非 dns」路由映射到**同一个动作**（契约如此，不新增动作）。
+        .route(
+            "/api/ai/config",
+            get(crate::routes::ai_config_get).post(crate::routes::ai_config_set),
+        )
+        .route(
+            "/api/ai/models",
+            get(crate::routes::ai_models_list).post(crate::routes::ai_models_list),
+        )
+        .route("/api/ai/test", post(crate::routes::ai_test))
+        .route("/api/ai/chat", post(crate::routes::ai_chat))
+        .route("/api/ai/dns-chat", post(crate::routes::ai_chat))
+        .route("/api/ai/diagnose", post(crate::routes::ai_diagnose))
+        .route("/api/ai/diagnose-dns", post(crate::routes::ai_diagnose))
+        .route("/api/ai/parse", post(crate::routes::ai_parse))
+        .route("/api/ai/parse-dns-raw", post(crate::routes::ai_parse))
         .route("/api/queue/action", post(crate::routes::queue_action))
+        .route("/api/queue", get(crate::routes::queue_list))
         .route("/api/services/action", post(crate::routes::services_action))
+        .route("/api/services", get(crate::routes::services_list))
         .route("/api/security/scan", post(crate::routes::security_scan))
-        .route("/api/backups", get(crate::routes::backup_list))
+        .route("/api/security/ban", post(crate::routes::security_ban))
+        .route("/api/security/unban", post(crate::routes::security_unban))
+        // 备份：`/api/backups/restore` 与 `/api/backups/:name` 是同层级的
+        // 「静态段 vs 命名参数」。matchit 0.7 允许二者共存且**静态段优先**，
+        // 因此 `restore` 不会被 `:name` 抢走（这条依赖有回归测试兜底）。
+        .route(
+            "/api/backups",
+            get(crate::routes::backup_list).post(crate::routes::backup_create),
+        )
+        .route("/api/backups/restore", post(crate::routes::backup_restore))
+        .route("/api/backups/:name", delete(crate::routes::backup_delete))
         .route("/api/certificates", get(crate::routes::certs_list))
+        .route("/api/certificates/renew", post(crate::routes::certs_renew))
+        // setup 向导的写动作（§5.2 初始化分组）。
+        .route("/api/setup/identity", post(crate::routes::setup_identity))
+        .route(
+            "/api/setup/dns/verify",
+            post(crate::routes::setup_dns_verify),
+        )
+        .route(
+            "/api/setup/relay/test",
+            post(crate::routes::setup_relay_test),
+        )
+        .route(
+            "/api/setup/relay/apply",
+            post(crate::routes::setup_relay_apply),
+        )
+        .route(
+            "/api/setup/cert/issue",
+            post(crate::routes::setup_cert_issue),
+        )
+        .route("/api/setup/mail/test", post(crate::routes::setup_mail_test))
+        .route(
+            "/api/mail/test-loopback",
+            post(crate::routes::mail_test_loopback),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
         .merge(public)
         .merge(protected)
+        .with_state(state)
+}
+
+/// 完整 API 路由：未匹配的路径回 **JSON** 404（不是 SPA 的 index.html）。
+///
+/// `/api` 兜底**必须**是 JSON（规格书 §5.1）—— 前端把非 2xx 当错误处理，回一段
+/// HTML 会让它解析失败，最终显示一个毫无信息量的报错。
+pub fn build_router(state: AppState) -> Router {
+    build_api_router(state)
         .fallback(crate::routes::api_fallback)
         .layer(middleware::from_fn(security_headers))
-        .with_state(state)
 }
 
 #[cfg(test)]
@@ -551,6 +663,106 @@ mod tests {
             let body = body_json(response).await;
             assert_eq!(body["error"]["code"], "CSRF_INVALID");
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn every_implemented_action_route_is_wired_and_behind_auth() {
+        // 防的是两类回归：
+        //   1. 「动作已实现、路由却没接线」—— 界面拿到 404，功能静默缺失；
+        //   2. 「动作路由被误挂到免认证面」—— 特权动作可在无会话下触达。
+        //
+        // 真相源是助手侧的注册表（`Registry`），而不是本文件里的路由清单：
+        // 路由清单正是被测对象，用它给自己打分等于同义反复。
+        let (root, state) = test_state("wiring");
+        let paths = Paths::rooted(&root);
+        let registry = mailstack_priv::handlers::Registry::with_core_actions(paths.clone())
+            .with_readers(std::sync::Arc::new(mailstack_priv::Readers::system(paths)));
+
+        let app = build_router(state);
+
+        for spec in ROUTES {
+            let Some(action) = spec.action else { continue };
+            if !registry.is_implemented(action) {
+                continue;
+            }
+
+            // 把 `:id` / `:name` 具体化成一个普通段。
+            let uri = spec
+                .path
+                .split('/')
+                .map(|seg| if seg.starts_with(':') { "sample" } else { seg })
+                .collect::<Vec<_>>()
+                .join("/");
+
+            // 不带会话发请求：已接线且受认证保护 → 401；未接线 → `/api` 兜底 404。
+            // 认证层先于业务执行，因此请求**不会**到达特权助手
+            // （本机可能装着真实 helper，跑 `system.doctor` 会有真实副作用）。
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(spec.method)
+                        .uri(&uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{} {}（动作 {action}）必须已接线且受认证保护；得到 {} 说明路由缺失或落在了免认证面",
+                spec.method,
+                spec.path,
+                response.status()
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn telemetry_is_served_in_process_and_returns_the_raw_object() {
+        // 遥测的 `action` 是 `None`，因此不在「动作×路由」守卫的覆盖范围里，
+        // 这条测试单独把它钉住：受认证保护、且响应是遥测对象本身（不套 `{ok,data}`）。
+        let (root, state) = test_state("telemetry");
+        // 注入一个不读 `/proc`、不跑 `df`/`postqueue` 的采集器：
+        // 这条测试关心的是接线与认证，不该在开发机上产生真实副作用。
+        let state = state.with_telemetry(std::sync::Arc::new(crate::telemetry::inert_collector(
+            root.join("proc"),
+        )));
+        let sid = state.inner.sessions.create("admin");
+        let app = build_router(state);
+
+        let unauth = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/metrics/telemetry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/metrics/telemetry?range=5m")
+                    .header(header::COOKIE, format!("{SESSION_COOKIE}={sid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["timeframe"], "5m");
+        assert_eq!(body["intervalMs"], 5_000);
+        assert!(body.get("points").is_some(), "必须是遥测对象本身");
+        assert!(body.get("ok").is_none(), "不得套 {{ok,data}} 外壳");
         std::fs::remove_dir_all(&root).ok();
     }
 

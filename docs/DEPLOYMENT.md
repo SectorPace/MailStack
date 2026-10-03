@@ -9,6 +9,7 @@
 |---|---|
 | `mailstackd` | 主服务二进制：**入站 SMTP（25/465/587）+ 出站队列调度 + 特权 RPC 的两个 Unix socket**。尚未承载 webmail |
 | `mailstackctl` | CLI：`mailstackctl <action> [JSON] [--confirm]`。只读动作直连 RO socket，变更动作经 `sudo` 包装器（见 §3.5） |
+| `mailstack-web` | 管理控制台服务：管理 API 的全部路由 + 前端产物托管 + 遥测后台采样（见 §3.7）。**可选**：不给 `--dist` 就只提供 API |
 | `dist/SHA256SUMS` | 全部产物校验和 |
 | `dist/sbom.spdx.json` | SBOM（依赖清单） |
 
@@ -16,6 +17,11 @@
 > （把 `/etc/mailstack` 视作 `<DIR>/etc/mailstack`，供测试与旁路部署）、`--log <LEVEL>`
 > （`RUST_LOG` 优先）。**启动是 fail-closed 的**：缺少 `setup.json`、域名表为空、
 > 证书缺失、`relay.json` 损坏或中继未启用加密，都会拒绝启动而不是带病运行。
+>
+> `mailstack-web` 的参数：`--bind <ADDR>`（缺省 `127.0.0.1:8443`，**只绑回环**）、
+> `--dist <DIR>`（前端产物目录）、`--sample-interval <SECS>`（遥测采样周期，缺省 2）、
+> `--config-dir <DIR>`、`--log <LEVEL>`。前端产物是**外部输入**，构建方式见
+> `README.md` 的「前端」一节。
 
 供应链约束（规格书 §7）：
 - 一律 `cargo build --locked`（`Cargo.lock` 已提交）
@@ -201,15 +207,54 @@ CLI **没有**「强制走某个通道」的开关：通道由动作唯一判定
 * **两个自检动作都走本机提交端点**（`sendmail` 已随 Postfix 一起移除）。因此它们要求
   `mailstackd` 正在监听 25；提交被 `250` 接受即表示环路通了。`maildirDelivered: false`
   只说明没在 Maildir 里找到那封信（权威布局尚未定死），**不是**投递失败。
-  `setup.mail.test` 的 `mailboxChecksSkipped: true` 表示邮箱存在性/锁定未检查
-  （`users.*` 未移植），出现在响应里是为了不让人误以为查过了。
+`setup.mail.test` 恢复基线的**四步校验**（域名/发件人格式 → 口令格式回放 → 发件人必须对应一个受管邮箱 → 邮箱未锁定），
+不再有 `mailboxChecksSkipped` 这类「跳过检查」的标记 —— 检查全部真实执行。
 
-`setup.cert.issue`（ACME 签发）**尚未实现**（需要先定 ACME 依赖），见 TEST_REPORT §5。
+`setup.cert.issue`（ACME 签发）与 `certs.renew` 均已实现：**调外部 `/root/.acme.sh/acme.sh`**，
+证书落 `/etc/mailstack/tls/<domain>/`（见 TEST_REPORT §3.8）。注意 `certs.renew` 的失败是**数据**
+（`{status:"failed", error}`）而不是异常，只有域名非法才抛错。
+
+### 3.7 管理控制台服务（`mailstack-web`）
+
+```ini
+# /etc/systemd/system/mailstack-web.service
+[Unit]
+Description=MailStack admin console (API + frontend bundle)
+After=network.target mailstackd.service
+# 特权通道由 mailstackd 建立；它没起来时管理台会以 503 如实报错，而不是
+# 降级成无特权执行（INV-8）。
+Requires=mailstackd.service
+
+[Service]
+Type=simple
+# 只绑回环：对外暴露交给反向代理或 SSH 隧道，TLS 终止不在本进程内做。
+ExecStart=/usr/local/bin/mailstack-web --bind 127.0.0.1:8443 --dist /usr/share/mailstack/admin
+User=mailstack-admin
+Group=mailstack-admin
+Restart=on-failure
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mailstack
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+要点：
+
+* **`--dist` 省略即只提供 API**。省略后页面请求回 **503**（而不是空白 200 或 404）——
+  「这台机器还没部署前端」是服务不可用，不是「用户要的页面不存在」。
+* **`/api` 的兜底永远是 JSON 404**，绝不会回 `index.html`。否则前端打到不存在的接口时
+  会拿到一段 HTML 并报「解析失败」，把「接口不存在」伪装成「服务端坏了」。
+* 静态响应同样携带安全响应头（`nosniff` / `frame-options` / CSP）。这个进程返回的
+  绝大多数响应都是静态文件，漏掉它们等于没加。
+* 服务会启动**遥测后台采样**（2 秒一次）。没有它，`/api/metrics/telemetry` 只有
+  「按需采样」兜底 —— `current` 有值但 `points` 永远不会自己增长，仪表盘曲线是平的。
 
 ## 4. 回滚
 
-`mailstackd` 仍是旁路进程：停止并移除 unit 即可，原有 Postfix 与 mailstack-web 未被改动。
-审计链未被改写（本二进制不含 `audit()` 调用点）。
+`mailstackd` 与 `mailstack-web` 都是旁路进程：停止并移除 unit 即可，原有 Postfix 与旧
+mailstack-web 未被改动。审计链未被改写（这两个二进制均不含 `audit()` 调用点）。
 
 三点必须注意：
 
@@ -225,11 +270,11 @@ CLI **没有**「强制走某个通道」的开关：通道由动作唯一判定
 
 | Phase | 状态 | 说明 |
 |---|---|---|
-| Phase 0 契约冻结 | ✅ 基础 | 路由表 `crates/web/src/contract.rs`（62 条）、动作三集 `crates/core/src/actions.rs`、口令/审计/原语移植 |
+| Phase 0 契约冻结 | ✅ 基础 | 路由表 `crates/web/src/contract.rs`（Phase 0 冻结 62 条，Phase 3 起 72 条）、动作三集 `crates/core/src/actions.rs`、口令/审计/原语移植 |
 | Phase 1 只读面 | ✅ 完成 | `mailstack-core`（87 测试）+ `mailstack-priv`（38 测试）+ `mailstack-web`（76 测试），共 **203 测试**，clippy/rustfmt 全绿 |
 | Phase 2 SMTP 核心 | 🟡 机制层完成，进程已可运行 | 自研 SMTP / 队列 / DKIM / TLS（1.2 起）/ 连接限速 / IP 封禁 / **提交端口 SASL（Dovecot auth socket）** / **直投（MX 解析，逐域按优先级）** / 入站认证（SPF+DKIM+DMARC）/ **ARC 校验与封印** 全部落地并有测试；`mailstackd` 已能收信、投递（本地 LMTP 或中继/直投）、承载 RO/RW 特权 RPC 与优雅停机。**尚未**：Maildir 只读、对真实 Dovecot auth socket / 真实公网 MX 验证、直投的机会式 TLS（见 TEST_REPORT §5）。风险项「中继 IP 固定」已按 §5.9.3 用真实握手验证 |
-| Phase 3 前端切换 | ⏳ 待办 | 管理台 htmx + Askama；webmail 取舍 |
-| Phase 4 写面切换 | 🟡 进行中 | **已完成**：2FA 全生命周期（AES-256-GCM 信封 + RFC 6238 + 恢复码持锁消费，INV-5/29/32）；写面动作 `admin.set`、`settings.set`、域名/别名表写入、`dkim.rotate`；**只读聚合面** `snapshot`、`logs.list`、`metrics.realtime`、`certs.list`、`network.check_port`、`system.doctor`、`security.scan`、`backup.list`（读不到的子项一律显式上报，不静默省略）；控制台写面 `services.action`、`queue.action`、`security.ban/unban`；备份 `backup.create/restore/delete`；**初始化向导** `setup.identity.apply`、`setup.dns.verify`、`setup.relay.test`、`setup.relay.apply`、`setup.mail.test`、`mail.test_loopback`（见 §3.6）。50 条白名单动作中已实现 **38** 条（只读面只剩 `ai.models.list`）；62 条契约路由中**已注册 35 条**，其余落 `/api` 兜底 —— 未注册的 27 条里有 **11 条对应的动作已实现但尚未挂路由**（`security.ban/unban`、`backup.create/restore/delete`、`setup.identity.apply`/`dns.verify`/`relay.test`/`relay.apply`、`setup.mail.test`、`mail.test_loopback`），随前端接入一并补。**未完成**：`users.*`、`certs.renew`、`setup.cert.issue`、`ai.*` 等动作族（各自需要独立子系统，见 TEST_REPORT §5），以及审计链的**真实升级演练** |
+| Phase 3 前端切换 | ✅ 已接入 | **与规格书原计划的偏离**：原计划是「htmx + Askama 服务端渲染」，实际接入的是用户提供的前端产物（Vite + React 19 的单页应用，hash 路由）。新增服务入口 `bin/mailstack-web`（`mailstack-web` 此前**只有 `build_router`，没有任何二进制在跑它**）：`--dist <DIR>` 托管产物、SPA 回退、`/api/*` 兜底保持 JSON 404、并启动遥测后台采样（2 秒）。为对接前端新增 8 个只读动作与 10 条路由（含 RPC 桥 `POST /api/rpc`），并把成功响应改回**裸对象**。webmail 仍按原计划不在本期范围 |
+| Phase 4 写面切换 | ✅ 动作面完成 | **已完成**：2FA 全生命周期（AES-256-GCM 信封 + RFC 6238 + 恢复码持锁消费，INV-5/29/32）；写面动作 `admin.set`、`settings.set`、域名/别名表写入、`dkim.rotate`；**只读聚合面** `snapshot`、`logs.list`、`metrics.realtime`、`certs.list`、`network.check_port`、`system.doctor`、`security.scan`、`backup.list`（读不到的子项一律显式上报，不静默省略）；控制台写面 `services.action`、`queue.action`、`security.ban/unban`；备份 `backup.create/restore/delete`；**初始化向导** `setup.identity.apply`、`setup.dns.verify`、`setup.relay.test`、`setup.relay.apply`、`setup.mail.test`、`mail.test_loopback`（见 §3.6）。白名单动作**已全部实现（58/58，RO 22/22 + RW 36/36）**；契约路由**已全部注册（72/72）**，**没有任何路由落到 `/api` 兜底**，由 `every_implemented_action_route_is_wired_and_behind_auth` 守门。最后补齐的动作族：ACME 证书（`setup.cert.issue` / `certs.renew`，调 `acme.sh`，见 TEST_REPORT §3.8）、AI 出站（`ai.*`，含 SSRF / DNS-rebinding 防护，见 §3.9）、以及为前端新增的 8 个只读列表动作（见 §3.10）—— **三者均零新依赖**。**未完成**：真实环境验证与审计链的**真实升级演练** |
 | Phase 5 组件下线 | ⏳ 待办 | 停用 Postfix/OpenDKIM/fail2ban/Node |
 
 ## 6. 已知环境事实（开发机）

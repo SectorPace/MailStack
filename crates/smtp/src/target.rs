@@ -12,7 +12,7 @@
 //! —— 这比「记得别用域名」可靠，因为退化后代码照样能跑、测试照样绿，
 //! 防护却是静默消失的。
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::error::SmtpError;
 
@@ -57,6 +57,15 @@ impl AddressPolicy {
 
     /// 该地址是否被策略接受。
     pub fn accepts(&self, ip: IpAddr) -> bool {
+        // IPv6 里可能**内嵌**着一个 IPv4（mapped / 6to4 / Teredo）。内嵌地址不被接受时
+        // 整体就不接受 —— 否则 `::ffff:127.0.0.1` 会绕过下面全部 v4 规则打到本机。
+        // 递归调用只可能落在 `IpAddr::V4` 分支上（V4 没有内嵌），不会无限递归。
+        if let IpAddr::V6(v6) = ip {
+            let embedded = embedded_ipv4_candidates(v6);
+            if !embedded.is_empty() {
+                return embedded.iter().all(|v4| self.accepts(IpAddr::V4(*v4)));
+            }
+        }
         if self.allow_private {
             // 即便允许私网，也仍然拒绝「无意义/危险」的几类地址：
             // 未指定地址会连到本机、多播/广播没有意义。
@@ -86,8 +95,12 @@ fn is_special_use(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
-            // 192.0.0.0/24 —— IETF 协议分配（含 192.0.0.0/29 等）
-            (o[0] == 192 && o[1] == 0 && o[2] == 0)
+            // 0.0.0.0/8 —— 「本网络」（RFC 1122）。`is_unspecified` 只覆盖 0.0.0.0，
+            // 但 0.0.0.1 之类同样不可路由；Teredo 拆出的内嵌 v4 会落到这一段，
+            // 必须挡住，否则「连到本机/本网」这一类会绕过筛选。
+            (o[0] == 0)
+                // 192.0.0.0/24 —— IETF 协议分配（含 192.0.0.0/29 等）
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
                 // 198.18.0.0/15 —— 基准测试（也是透明代理 fake-IP 的常用段）
                 || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
                 // 100.64.0.0/10 —— 运营商级 NAT（RFC 6598）
@@ -105,6 +118,39 @@ fn is_special_use(ip: IpAddr) -> bool {
             seg[0] == 0x2001 && seg[1] == 0x0db8
         }
     }
+}
+
+/// 拆出 IPv6 里**内嵌的 IPv4**（IPv4-mapped / 6to4 / Teredo）。
+///
+/// **为什么必须拆**：这些形式里嵌着一个 IPv4 地址，而 IPv6 的属性判定**看不见它**。
+/// `::ffff:127.0.0.1` 既不等于 `::1`（v6 的 loopback），`is_private()` 也是 false，
+/// 于是它会一路穿过全部 v4 规则、被当成「公网地址」接受 —— 而对它发起连接，
+/// 打的就是**本机**。基线在 `ai.py::is_ip_restricted` 里明确写了这件事（逐个尝试
+/// `ipv4_mapped` / `sixtofour` / `teredo` 并拆出内嵌地址），Rust 侧此前漏掉了这一步。
+///
+/// 返回**全部**内嵌候选：Teredo 有**两个**（隧道的服务端与客户端），调用方必须让
+/// 每一个都通过筛选。基线在 Teredo 上其实是崩的 —— 它把 Python 返回的二元组直接
+/// 赋给 `ip` 再调 `ip.is_private`，会抛 `AttributeError`；这里按 RFC 4380 的编码
+/// 正确取出两个地址，属于对基线的**修正**而非照抄。
+pub fn embedded_ipv4_candidates(ip: Ipv6Addr) -> Vec<Ipv4Addr> {
+    let seg = ip.segments();
+    let split = |high: u16, low: u16| {
+        Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8)
+    };
+
+    // ::ffff:0:0/96 —— IPv4-mapped
+    if seg[..5].iter().all(|s| *s == 0) && seg[5] == 0xffff {
+        return vec![split(seg[6], seg[7])];
+    }
+    // 2002::/16 —— 6to4：紧随其后的 32 位就是内嵌的 v4
+    if seg[0] == 0x2002 {
+        return vec![split(seg[1], seg[2])];
+    }
+    // 2001:0000::/32 —— Teredo：`seg[2..4]` 是服务端 v4，末 32 位**取反**后是客户端 v4
+    if seg[0] == 0x2001 && seg[1] == 0x0000 {
+        return vec![split(seg[2], seg[3]), split(!seg[6], !seg[7])];
+    }
+    Vec::new()
 }
 
 fn is_unspecified(ip: IpAddr) -> bool {
@@ -234,6 +280,45 @@ mod tests {
         for allowed in ["8.8.8.8", "203.0.114.1", "2606:4700::1111"] {
             assert!(policy.accepts(ip(allowed)), "{allowed} 应被接受");
         }
+    }
+
+    #[test]
+    fn an_ipv4_mapped_address_is_screened_as_the_address_it_embeds() {
+        // `::ffff:127.0.0.1` 既不等于 `::1`（v6 loopback），`is_private()` 也是 false；
+        // 不拆内嵌 v4 的话它会穿过全部 v4 规则、被当成公网地址接受 —— 连接打的是本机。
+        let policy = AddressPolicy::public_only();
+        for rejected in [
+            "::ffff:127.0.0.1",
+            "::ffff:192.168.1.5",
+            "::ffff:100.64.0.1",
+            "::ffff:0.0.0.0",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(!policy.accepts(ip(rejected)), "{rejected} 必须被拒绝");
+        }
+        assert!(
+            policy.accepts(ip("::ffff:8.8.8.8")),
+            "映射后的公网地址仍应被接受"
+        );
+    }
+
+    #[test]
+    fn six_to_four_and_teredo_addresses_are_screened_through_their_embedded_ipv4() {
+        let policy = AddressPolicy::public_only();
+        // 2002:7f00:0001:: 内嵌 127.0.0.1
+        assert!(
+            !policy.accepts(ip("2002:7f00:0001::")),
+            "6to4 内嵌 loopback"
+        );
+        // Teredo：服务端 65.54.227.120（公网），客户端 (末 32 位取反) = 10.0.0.1（私网）
+        assert!(
+            !policy.accepts(ip("2001:0000:4136:e378:8000:63bf:f5ff:fffe")),
+            "Teredo 的客户端地址是私网，整体必须拒绝"
+        );
+        // 两个内嵌地址都是公网时不受影响：服务端 65.54.227.120、客户端 8.8.8.8
+        assert!(policy.accepts(ip("2001:0000:4136:e378:8000:63bf:f7f7:f7f7")));
+        // Teredo 客户端解出来是 unspecified（0.0.0.1）时仍要拒 —— 那是「连到本机」那一类
+        assert!(!policy.accepts(ip("2001:0000:4136:e378:8000:63bf:ffff:fffe")));
     }
 
     #[test]

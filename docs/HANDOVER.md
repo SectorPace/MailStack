@@ -1,4 +1,4 @@
-# MailStack Rust 重写 —— 项目移交报告（检查点 `0.8.1-beta1`）
+﻿# MailStack Rust 重写 —— 项目移交报告（检查点 `0.8.1-beta1`）
 
 - 版本：`0.8.1-beta1`（`VERSION` / `Cargo.toml` 一致）
 - 报告生成日期：**2026-10-03**
@@ -39,14 +39,15 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 | 安全性质**结构性**成立 | 用类型与模块边界表达（如拨号 API 只接受已固定的 IP），而不是靠约定 |
 | 失效**响亮** | 读不到就报「读不到」，探测失败给出明确结论，绝不静默降级 |
 | 磁盘契约不变 | `/etc/mailstack/*`、`/etc/postfix/mailstack_*`、`/var/vmail` 等布局与基线逐字一致 |
-| 对外契约冻结 | 62 条 HTTP 路由、50 条特权动作、响应形状对齐基线（前端无需改写） |
+| 对外契约冻结 | 72 条 HTTP 路由、58 条特权动作、响应形状对齐基线（前端无需改写） |
 | 可离线复现构建 | 无 C 依赖工具链（TLS 用 `ring` 而非 `aws-lc-rs`），锁定 `Cargo.lock` |
 
 ### 1.3 一句话现状
 
 **机制层已完整可用**：`mailstackd` 能收信、按策略投递（本地 LMTP / 中继 / 直投）、承载特权 RPC 双通道、
-优雅停机；管理台的写面动作已实现 38/50。**未完成**的是 `users.*`（用户模型）、ACME 签发、
-AI 出站子系统，以及 11 条「动作已实现但尚未挂路由」的注册工作。
+优雅停机；**58 条白名单动作已全部实现，72 条契约路由已全部接线**；
+管理控制台服务入口 `mailstack-web` 已落地（API + 前端产物托管 + 遥测采样宿主）。
+**未完成**的是真实环境验证（真实 `mailstackd` 环路、Dovecot auth socket、公网 MX、审计链升级演练）。
 
 ---
 
@@ -56,51 +57,56 @@ AI 出站子系统，以及 11 条「动作已实现但尚未挂路由」的注�
 
 | 维度 | 数值 | 说明 |
 |---|---|---|
-| 测试 | **906 passed / 0 failed** | `cargo test`；另有 6 个需真实 Postfix 的集成测试（容器内跑） |
-| 不变量门禁 | **257 / 257 存在** | `deploy/verify-invariant-gate.sh`（从 `ci.yml` 动态取名单） |
+| 测试 | **1018 passed / 0 failed** | `cargo test`；含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
+| 不变量门禁 | **277 / 277 存在** | `deploy/verify-invariant-gate.sh`（从 `ci.yml` 动态取名单） |
 | 质量门禁 | `QUALITY_GATE=PASS` | rustfmt + clippy(`-D warnings`) + 全量测试 |
 | 交付物门禁 | `DELIVERABLES_OK` | `deploy/verify-deliverables.sh` |
-| 特权动作 | **38 / 50** 已实现 | 只读面 13/14；变更面 25/36 |
-| HTTP 路由 | **35 / 62 已注册** | 其中 8 条由 Web 进程内应答；27 条未注册 |
-| 规格书 Phase | 0 ✅ / 1 ✅ / 2 🟡机制完成 / 3 ⏳ / 4 🟡进行中 / 5 ⏳ | 见 §2.4 |
+| 特权动作 | **58 / 58** 已实现 | 只读面 22/22；变更面 36/36 |
+| HTTP 路由 | **72 / 72 已注册** | 无任何路径落到 `/api` 兜底 |
+| 规格书 Phase | 0 ✅ / 1 ✅ / 2 🟡机制完成 / 3 ✅ / 4 ✅动作面 / 5 ⏳ | 见 §2.4 |
 
 ### 2.2 完成百分比（分口径，避免一句话误导）
 
 | 口径 | 完成度 | 计算依据 |
 |---|---|---|
-| 特权动作 | **76%** | 38 / 50 |
-| 对外路由 | **56%** | 35 / 62 已注册 |
+| 特权动作 | **100%** | 58 / 58 |
+| 对外路由 | **100%** | 72 / 72 已注册 |
 | SMTP 传输机制（Phase 2 范围） | **≈90%** | 收发/签名/认证/限速/封禁/队列/直投均已落地，缺「机会式 TLS」与真实环境验证 |
-| 整体（含前端接入与组件下线） | **≈70%** | Phase 0/1 完成、Phase 2 机制完成、Phase 4 过半、Phase 3/5 未启动 |
+| 整体（含真实环境验证与组件下线） | **≈85%** | Phase 0/1/3 完成、Phase 2 机制完成、Phase 4 动作面完成；剩真实环境验证与 Phase 5 组件下线 |
 
-> 三个口径差异很大是**刻意呈现**的：动作写完 ≠ 前端点得到 ≠ 生产验证过。
+> 几个口径差异很大是**刻意呈现**的：动作写完 ≠ 前端点得到 ≠ 生产验证过。
 > 只看其中一个数字都会误判项目状态。
+>
+> **Phase 3 是本轮从「⏳ 未启动」推进到「✅ 已接入」的**：新增服务入口与静态托管、
+> 为前端补 8 个只读动作与 RPC 桥、修掉两处会静默做错事的参数错配（详见 §4.1）。
+> 前端侧也做了最小适配（CSRF 头、2FA 错误形状、动作名、口令字段、字段名对齐）。
 
 ### 2.3 各 crate 规模与职责
 
 | crate | 测试数 | 职责 |
 |---|---:|---|
-| `mailstack-core` | 187 | 动作三集/通道推导、原子写与锁、审计哈希链、配置 schema、口令策略、TOTP、证书解析、`/proc` 采样、权限体检、备份归档、手工封禁、命令原语与 `service_ctl` 降级链、部署模式与 AI 总闸 |
-| `mailstack-priv` | 143 | 动作门控（`ActionGate`）、RPC 帧、RO/RW socket 服务端、**全部已落地的动作处理器**、只读聚合面、初始化向导、邮件环路自检、失败分类与 fallback 规则 |
-| `mailstack-smtp` | 136 (+7 真机 TLS) | IP 固定拨号、中继校验、分阶段中继测试、出站探测、MX 解析与直投目标、先测后写/回读/回滚、配置载体、DNS 查询 |
+| `mailstack-core` | 188 | 动作三集/通道推导、原子写与锁、审计哈希链、配置 schema、口令策略、TOTP、证书解析、`/proc` 采样、权限体检、备份归档、手工封禁、命令原语与 `service_ctl` 降级链、部署模式与 AI 总闸 |
+| `mailstack-priv` | 228 | 动作门控（`ActionGate`）、RPC 帧、RO/RW socket 服务端、**全部 58 个动作的处理器**（含 ACME 证书、邮箱用户 `users.*`、AI 出站子系统、**为管理前端新增的 8 个只读列表动作**）、初始化向导、邮件环路自检、失败分类与 fallback 规则 |
+| `mailstack-smtp` | 138 (+7 真机 TLS) | IP 固定拨号、中继校验、分阶段中继测试、出站探测、MX 解析与直投目标、先测后写/回读/回滚、配置载体、DNS 查询、`AddressPolicy`（SSRF 地址筛选，含 IPv6 内嵌 IPv4 拆解） |
 | `mailstack-smtpd` | 139 (+11 真机 TCP/TLS) | 入站 SMTP 会话与命令、DATA 字节流（走私防护）、TLS 1.2 起、连接限速、IP 自动封禁、提交端口 SASL（Dovecot auth socket）、SPF/DKIM/DMARC 判定与入队 |
 | `mailstack-queue` | 80 | 队列持久化与原子性、指数退避与去共振、DSN 退信、出站必签 DKIM、并发上限、快速失败与出站结论 |
 | `mailstack-store` | 31 (+10 真机 LMTP) | Postfix 风格表文件（域名/别名）与 `postmap` 序列、LMTP 客户端 |
 | `mailstack-auth` | 43 | DKIM 密钥（原生 RSA-2048 / SPKI 记录 / 0640 加固）、签名与自验、SPF、DMARC、ARC 校验与封印、离线 TXT 缓存 |
-| `mailstack-web` | 78 | 契约路由表、会话与 CSRF、登录限流、错误模型、特权通道、Axum 装配 |
+| `mailstack-web` | 93 | 契约路由表、会话与 CSRF、登录限流、错误模型、特权通道、Axum 装配、动作×路由一致性守卫、时序遥测采集器、**RPC 桥（动作允许集由契约表推导）** |
+| `mailstack-web-bin` | 9 | **管理控制台服务入口**（`bin/mailstack-web`）：API + 前端产物托管、SPA 回退、`/api` 兜底保持 JSON、路径穿越拒绝、遥测后台采样宿主 |
 | `mailstackd` | 28 | 进程入口：fail-closed 装配、监听集中绑定、RPC 双通道、停机扇出、队列调度、封禁热重载 |
 | `mailstackctl` | 7 | CLI：参数→特权调用的翻译、退出码映射 |
-| **合计** | **900 + 6** | 6 = 真实 Postfix 集成测试（需显式开启） |
+| **合计** | **1018** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 
 ### 2.4 Phase 进度明细
 
 | Phase | 状态 | 说明 |
 |---|---|---|
-| 0 契约冻结 | ✅ | `crates/web/src/contract.rs` 62 条路由、`crates/core/src/actions.rs` 动作三集、口令/审计/原子写原语 |
+| 0 契约冻结 | ✅ | `crates/web/src/contract.rs` 路由表（Phase 0 冻结 62 条，Phase 3 起 72 条，见 §2.4）、`crates/core/src/actions.rs` 动作三集、口令/审计/原子写原语 |
 | 1 只读面 | ✅ | 只读聚合面 + 特权 RPC 协议与门控 |
 | 2 SMTP 核心 | 🟡 **机制层完成** | 自研 SMTP / 队列 / DKIM / TLS / 限速 / 封禁 / SASL / 直投 / ARC 全部有测试；**尚未**：机会式 TLS、真实 Dovecot auth socket 与真实公网 MX 验证 |
-| 3 前端切换 | ⏳ 未启动 | 新前端（用户自有、非 Rust 版）的 `dist/` 静态资源 + SPA fallback 尚未接入 |
-| 4 写面切换 | 🟡 进行中 | 2FA、设置、域名/别名、DKIM、服务与队列、封禁、备份、初始化向导、环路自检已完成；剩 `users.*`、ACME、AI |
+| 3 前端切换 | ✅ **已接入** | 新增 `bin/mailstack-web` 服务入口（此前 `crates/web` 只有 `build_router`，**没有任何二进制在跑它**）：`--dist` 托管前端产物 + SPA 回退 + `/api` 兜底保持 JSON + 启动遥测后台采样（2 秒）。为对接前端新增 **8 个只读动作 / 10 条路由**（`users.list` `aliases.list` `queue.list` `services.list` `dkim.keys` `dns.records` `metrics.system` `activity.list`）与 **RPC 桥 `POST /api/rpc`**；成功响应改回**裸对象**（见 §4.2）。仍缺：真实环境验证（§4.3） |
+| 4 写面切换 | ✅ **动作面完成** | **58/58 动作已实现、72/72 契约路由已接线**：2FA、设置、域名/别名、邮箱用户 `users.*`、DKIM、服务与队列、封禁、备份、初始化向导、环路自检、ACME 证书（`setup.cert.issue` / `certs.renew`）、AI 出站（`ai.*`，含 SSRF / DNS-rebinding 防护）、进程内时序遥测、**为管理前端新增的 8 个只读列表动作与 RPC 桥**（见 TEST_REPORT §3.6–§3.10）。**仍缺**：真实环境验证 |
 | 5 组件下线 | ⏳ 未启动 | 停用 Postfix / OpenDKIM / fail2ban / Node |
 
 ---
@@ -111,7 +117,7 @@ AI 出站子系统，以及 11 条「动作已实现但尚未挂路由」的注�
 
 | 功能点 | 实现细节 | 关键不变量 |
 |---|---|---|
-| 动作三集与通道推导 | `ALLOWED_ACTIONS_RO` 14 / `ALLOWED_ACTIONS_RW` 36 / `DESTRUCTIVE_ACTIONS` 3；**未登记动作默认归只读面** | INV-24 |
+| 动作三集与通道推导 | `ALLOWED_ACTIONS_RO` 22 / `ALLOWED_ACTIONS_RW` 36 / `DESTRUCTIVE_ACTIONS` 3；**未登记动作默认归只读面** | INV-24 |
 | 原子写 | 临时文件 → `chmod` → `fsync` → `rename`；**先设权限再改名**，中间态不比目标更宽松 | INV-33 |
 | 进程间锁 | `locked()`：基于 sidecar 文件；**sidecar 名不与任何数据文件名碰撞** | INV-31 / INV-32 |
 | 审计哈希链 | 规范化 JSON 哈希链 + 锚文件；支持 logrotate 截断检测（锚与尾行不一致即报） | INV-4 |
@@ -198,19 +204,56 @@ AI 出站子系统，以及 11 条「动作已实现但尚未挂路由」的注�
 
 ### 4.1 优先做（零新依赖、立刻让已有能力可见）
 
+> **已完成（本轮）**：
+> 1. 11 条「动作已实现但尚未挂路由」的 Axum 路由已全部注册
+>    （`security.ban` / `security.unban` / `backup.create` / `backup.restore` /
+>    `backup.delete` / `setup.identity.apply` / `setup.dns.verify` / `setup.relay.test` /
+>    `setup.relay.apply` / `setup.mail.test` / `mail.test_loopback`），
+>    由 `every_implemented_action_route_is_wired_and_behind_auth`（已进 `ci.yml` 名单）守门；
+> 2. `GET /api/metrics/telemetry` 的**进程内采集器**已落地
+>    （`crates/web/src/telemetry.rs`：7 档环形缓冲 + `/proc` 差分采样 + `df`/`postqueue`，
+>    见 TEST_REPORT §3.6），路由已接线。
+>
+> 3. **`users.*`（4 个动作 + 4 条路由）**已落地：基线给出的答案是
+>    **系统账号 + `~/Maildir` + `chpasswd`/`passwd -l|-u`**（不是 `/var/vmail`，也不写
+>    Dovecot passwd-file），见 TEST_REPORT §3.7。
+>
+> 4. `setup.cert.issue` + `certs.renew`（ACME）：基线同样已回答依赖选择 —— 调外部
+>    `acme.sh`，**零新依赖**（见 TEST_REPORT §3.8）；
+> 5. `ai.*`（6 个动作 + 9 条路由）：出站 HTTP 复用 `smtp` 的 `AddressPolicy` 与
+>    `PinnedDialer`（固定 IP 后拨号 = DNS-rebinding 防护），**零新依赖**（见 §3.9）。
+>
+> 契约路由已注册数从 35 升到 **72（全部）**；**58 个动作全部可点**。
+>
+> 6. **管理前端接入（Phase 3）已完成**。要点与两处**有意偏离基线**：
+>    * 成功响应改回**裸对象**（`res.json(result)` 的等价形态）。此前套了 `{ok,data}`，
+>      而前端对非列表动作直接读 `body.<field>` —— `snapshot` / `settings.get` /
+>      `users.status` 会**一个字段都读不到**，界面上却看不出异常（列表动作因前端
+>      `pickList` 的 `data ?? o` 兜底而"侥幸能用"，把问题掩盖了）。
+>    * 新增 **RPC 桥 `POST /api/rpc`**：这是全仓**唯一**从请求体读动作名的地方，
+>      与本项目「动作名编译期静态绑定」的纪律冲突。开这个口子的原因是前端把它当作
+>      兜底传输层；安全性靠「允许集 = 契约里已有路由的动作」这一**真子集**约束
+>      （`contract::is_exposed_action`），只被登录流程内部使用的 `admin.totp.verify`
+>      与 `admin.totp.consume_recovery` 因此不会暴露到 HTTP 面。
+>    * 新增 8 个**只读**动作（RO 从 14 扩到 22），全部经 `every_added_list_action_is_pure_read`
+>      确认未落进变更面。
+>    * 顺手修掉两处会**静默做错事**的参数错配：`queue.action` 不认前端的 `op` 字段时，
+>      `op:"delete"` 会落到默认的 `retry` —— **删除队列邮件变成把邮件重新投递**，
+>      两边都不报错；`users.delete/status/password` 不认 `address` 时回的是
+>      「不是受管用户」，看起来像权限问题而非参数问题。
+
 | 任务 | 规模 | 前置决策 | 说明 |
 |---|---|---|---|
-| 注册 11 条已有动作的路由 | **S** | 无 | `security.ban`、`security.unban`、`backup.create`、`backup.restore`、`backup.delete`、`setup.identity.apply`、`setup.dns.verify`、`setup.relay.test`、`setup.relay.apply`、`setup.mail.test`、`mail.test_loopback` 的 Axum 路由尚未注册；动作本身已实现并有测试 |
-| 前端接入 | **M** | **需提供新前端产物** | 挂 `dist/` 静态资源 + SPA fallback；同时补上面 11 条路由 |
-| `GET /api/metrics/telemetry` | **S** | 无 | 进程内路由，尚未注册 |
+| 前端接入 | ✅ **已完成** | 前端产物已提供 | `bin/mailstack-web --dist <DIR>` 托管 `dist/`：SPA 回退、按扩展名的内容类型、路径穿越拒绝、`/api/*` 底线保持 JSON 404。前端侧做了最小适配（RPC 桥补 CSRF 头、2FA 错误按嵌套读、`relay.apply`→`setup.relay.apply`、建号/改密补口令字段、证书字段名对齐后端真实字段） |
+| Web 服务入口 | ✅ **已完成** | 无 | 新增 `bin/mailstack-web`：`build_api_router` + 静态兜底 + `TelemetryCollector::start_sampling(2s)`。默认只绑 `127.0.0.1:8443`；TLS 终止留给反向代理（前端自己的安全提示也要求只经 HTTPS/VPN/隧道访问） |
 
 ### 4.2 需要先裁决的子系统
 
 | 任务 | 规模 | 必须先决定 |
 |---|---|---|
-| `users.add/status/password/delete` | **L** | **vmail 目录布局**（`<vmail>/<domain>/<user>` 还是带 `Maildir/` 层）与 **Dovecot 口令方案**（当前无用户模型，`backup.restore` 的家目录白名单不得不为空集） |
-| `setup.cert.issue` + `certs.renew` | **M** | **ACME 依赖选择**（如 `instant-acme`）+ challenge 策略（HTTP-01 / DNS-01）+ 证书落地路径是否沿用 `/etc/tls/<domain>/` |
-| `ai.config.set` / `ai.test` / `ai.chat` / `ai.diagnose` / `ai.parse` / `ai.models.list` | **L** | 出站 AI 客户端形态（是否复用 reqwest 类依赖、是否允许私网目标）、以及只读白名单最后一条 `ai.models.list` 的归属 |
+| `users.add/status/password/delete` | ✅ **已完成** | 基线已给出答案，无需裁决：**不用 `/var/vmail` 布局**，改用**系统账号**（`useradd -m` 建 `/home/<u>`，Maildir 即 `~/Maildir`）；**不写 Dovecot passwd-file**，口令走系统/PAM（`chpasswd`、锁定用 `passwd -l/-u`）。见 TEST_REPORT §3.7 |
+| `setup.cert.issue` + `certs.renew` | ✅ **已完成** | 基线已回答：**不引入 ACME crate，直接调 `acme.sh`**，证书落 `/etc/mailstack/tls/<domain>/`（见 TEST_REPORT §3.8）。唯一补齐项是给 `CommandRunner` 加了子进程超时 |
+| `ai.config.set` / `ai.test` / `ai.chat` / `ai.diagnose` / `ai.parse` / `ai.models.list` | ✅ **已完成** | 基线已回答：**不引入 HTTP 客户端 crate** —— 复用 `smtp` 的 `AddressPolicy` + `PinnedDialer`，自己拼 HTTP/1.1（见 TEST_REPORT §3.9）。私网访问仍由部署开关 `MAILSTACK_ALLOW_PRIVATE_AI` 控制 |
 
 ### 4.3 生产验证与收尾
 
@@ -238,8 +281,9 @@ AI 出站子系统，以及 11 条「动作已实现但尚未挂路由」的注�
 
 ```
                          ┌──────────────────────────────┐
-   浏览器/新前端  ──────▶ │  mailstack-web (Axum, 62 路由) │
+   浏览器/新前端  ──────▶ │ mailstack-web (Axum, 72 路由) │
                          │  会话/CSRF/登录限流/错误模型    │
+                         │  静态产物托管 + 遥测采样        │
                          └───────────┬──────────────────┘
                                      │ 动作名 + 载荷（不传通道，通道由动作唯一决定）
                      ┌───────────────┴────────────────┐
@@ -519,10 +563,10 @@ wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
 | **无版本控制** | 工作目录**不是 git 仓库** | 本次检查点内置了一次初始提交 + `git bundle`；**强烈建议立即 `git init` 并把它作为首个提交** |
 | **`core.autocrlf=true` 会破坏脚本** | 实测本机为 `true`：在 Windows 上 `git clone` / 检出会把 `deploy/*.sh` 转成 CRLF，脚本随即不可执行 | 建议补 `.gitattributes`（`*.sh text eol=lf`），或在 Windows 侧 `git config core.autocrlf false`；**tar 快照不受影响**（已验证 21/21 个脚本为 LF） |
 | 构建盘空间（9.8G） | 已因 debuginfo 触发过链接失败 | 铁律见 §8.1；`deploy/wsl-reclaim-space.sh` |
-| `readers.rs` 职责膨胀 | 已容纳只读面 + 写面 + 向导 + 环路自检 | 在 `users.*` 落地前拆分 |
+| `readers.rs` 职责膨胀 | 已容纳只读面 + 写面 + 向导 + 环路自检 + 用户 + 证书 + AI（约 4700 行） | 已到该拆的体量：`mailtest.rs` / `dns_query.rs` / `users.rs` / `acme.rs` / `ai.rs` 已经拆出去了，`Readers` 自身仍偏大 —— 下次动它时按职责再拆一层 |
 | 邮件环路自检依赖 `mailstackd` 在 25 上监听 | 向导阶段可能尚未启动 | 失败时报明确错误；文档已写明前置条件 |
-| `mail.test_loopback` 的 Maildir 未命中 | 权威布局未定（`store/src/lib.rs` 已登记） | 只作证据返回 `false`，不当作故障；布局定死后收敛为一个候选 |
-| 契约与实现的漂移 | 11 条动作已实现但路由未注册 | 本轮已量化登记；建议加一条「动作×路由」一致性测试 |
+| `mail.test_loopback` 的 Maildir 未命中 | **权威布局已定**（`<系统用户家目录>/Maildir`，见 TEST_REPORT §3.7） | 只作证据返回 `false`，不当作故障；扫描仍并列保留两处历史候选 |
+| 契约与实现的漂移 | 曾有 11 条动作已实现但路由未注册（「点不到」） | **已消除**：现为 58/58 动作、72/72 路由，并由 `every_implemented_action_route_is_wired_and_behind_auth` 守卫 —— 以助手侧 `Registry` 为真相源，任何「已实现却没接线」或「动作路由被挂到免认证面」都会让 CI 变红 |
 
 ---
 
@@ -534,13 +578,13 @@ wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
 |---|---|
 | `README.md` | 仓库概览与快速上手 |
 | `TOOLCHAIN.md` | 工具链固定策略与为何不放 `rust-toolchain.toml` |
-| `docs/TEST_REPORT.md` | **最重要的文档**：规模、门禁结果、43 条不变量的覆盖映射、**§4 真实缺陷复盘（19 条）**、§5 未验证项与偏差登记 |
-| `docs/DEPLOYMENT.md` | 部署：systemd、SASL、出站两条路、目录与权限契约、初始化向导、回滚、已知环境事实 |
+| `docs/TEST_REPORT.md` | **最重要的文档**：规模、门禁结果、不变量的覆盖映射、**§4 真实缺陷复盘**、§5 未验证项与偏差登记 |
+| `docs/DEPLOYMENT.md` | 部署：systemd（`mailstackd` 与 `mailstack-web`）、SASL、出站两条路、目录与权限契约、初始化向导、回滚、已知环境事实 |
 | `docs/HANDOVER.md` | 本文件 |
-| `.github/workflows/ci.yml` | 三道 job：fmt+clippy+test / 供应链（audit+deny） / **不变量存在性（`required=(...)` 名单）** |
+| `.github/workflows/ci.yml` | 三道 job：fmt+clippy+test / 供应链（audit+deny） / **不变量存在性（`required=(...)` 名单，扫描范围含 `bin/`）** |
 | `deploy/*.sh` | 构建、质量门禁、不变量门禁、交付物门禁、容器 Postfix 测试、WSL 工具 |
-| `crates/web/src/contract.rs` | **路由唯一真相源**（62 条） |
-| `crates/core/src/actions.rs` | **动作白名单唯一真相源**（RO 14 / RW 36 / 破坏性 3） |
+| `crates/web/src/contract.rs` | **路由唯一真相源**（72 条）；RPC 桥的动作允许集也从它推导 |
+| `crates/core/src/actions.rs` | **动作白名单唯一真相源**（RO 22 / RW 36 / 破坏性 3） |
 
 ### 9.2 仓库外（对照用）
 
@@ -552,6 +596,14 @@ wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
 
 ### 9.3 建议的接续起点
 
-1. 先读 `docs/TEST_REPORT.md` §4（19 条缺陷复盘）——**项目的隐性知识几乎都在那里**。
+1. 先读 `docs/TEST_REPORT.md` §4（缺陷复盘）——**项目的隐性知识几乎都在那里**。
 2. 再读 §8.2 的偏离表，避免「把有意选择当成 bug 改回去」。
-3. 然后从 §4.1 的「注册 11 条已有动作的路由」开始（零新依赖、立刻可见）。
+3. **动作面与前端接入都已收口**（58/58 动作、72/72 路由、`bin/mailstack-web` 服务入口
+   与静态托管），§4.1 / §4.2 的条目都已做完。下一步是 §4.3 的**真实环境验证**：
+   ① 真实 `mailstackd` 上的完整环路（提交 → 入站认证 → 入队 → LMTP → Dovecot 写 Maildir → 扫描命中）；
+   ② 真实 Dovecot auth socket 联调；③ 真实公网 MX 直投 + 机会式 TLS（后者是独立的安全策略
+   决定，需单独登记与测试）；④ 审计链的真实升级演练；⑤ Phase 5 组件下线（Postfix /
+   OpenDKIM / fail2ban / Node）。
+4. **短期值得做的清理**：`crates/priv/src/readers.rs` 已膨胀到约 5000 行（只读面 + 写面 +
+   向导 + 环路自检 + 用户 + 证书 + AI + 8 个列表动作），下次动它时按职责再拆一层；
+   以及 §4.4 的「建立版本控制」（**当前工作目录仍不是 git 仓库**）。

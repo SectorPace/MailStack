@@ -1,11 +1,12 @@
-# MailStack v0.8.1-beta1 测试报告（Rust 重写）
+﻿# MailStack v0.8.1-beta1 测试报告（Rust 重写）
 
 - 版本：`0.8.1-beta1`
 - 规格书：`docs/REWRITE_TO_RUST.md` **v3**（本仓库外的源码包内）
 - 平台：WSL Ubuntu 24.04 / `x86_64-unknown-linux-gnu`（生产目标平台）
 - 工具链：rustc 1.98.1（`deploy/build.sh` 与 CI 双重固定）
-- 结论：**906 个测试全部通过**（含 `mailstackd` / `mailstackctl` 二进制与 4 组真实集成套件）；rustfmt 与 clippy(`-D warnings`) 全绿；257/257 不变量测试存在
-  - 另 6 个 Postfix 集成测试需在容器中对真实 Postfix 运行
+- 结论：**1018 个测试全部通过**（含 `mailstackd` / `mailstackctl` / `mailstack-web` 二进制与 4 组真实集成套件）；rustfmt 与 clippy(`-D warnings`) 全绿；277/277 不变量测试存在
+- 58 条白名单动作**已全部实现**，72 条契约路由**已全部接线**
+  - 另 34 个集成测试需真实环境（TLS 握手 / TCP / unix socket / 容器内 Postfix）
 
 复现命令：
 
@@ -18,18 +19,19 @@ deploy/verify-invariant-gate.sh   # 确认 CI 列出的不变量测试名都真�
 
 | crate | 测试数 | 职责 |
 |---|---:|---|
-| `mailstack-core` | 187 | 动作三集、口令策略、审计哈希链、`atomic`/`locked`、`warn`、**`exec`（命令原语 + postmap 序列 + `service_ctl` 降级链）**、配置 schema、部署模式、**`totp`（2FA：AES-256-GCM 信封、RFC 6238、恢复码持锁消费）**、**`certs`（证书到期解析）**、**`sysinfo`（`/proc` 只读采样）**、**`security`（敏感文件权限体检）**、**`backup`（归档打包/恢复：成员白名单、链接与设备拒绝、校验和先验）**、**`bans`（手工封禁文件）** |
-| `mailstack-priv` | 143 | 动作门控、RPC 帧、RO/RW socket 服务端、**内置动作处理器**（只读面、2FA 全生命周期、域名/别名/设置/管理员/DKIM 轮换、**只读聚合面**、服务与队列动作、手工封禁、备份、**初始化向导 `setup.*`**、**邮件环路自检**）、fallback 规则、**特权调用客户端**（通道推导 + 失败分类） |
-| `mailstack-smtp` | 136 + 7 | IP 固定拨号器、中继校验、分阶段测试、出站探测、反中继策略、落地与回滚、真实落盘载体、**MX 解析与直投目标选择**、**`dns_query`（A/MX/TXT 查询，TXT 分片拼接）**（7 个为真实 TLS 集成测试） |
+| `mailstack-core` | 188 | 动作三集、口令策略、审计哈希链、`atomic`/`locked`、`warn`、**`exec`（命令原语 + postmap 序列 + `service_ctl` 降级链）**、配置 schema、部署模式、**`totp`（2FA：AES-256-GCM 信封、RFC 6238、恢复码持锁消费）**、**`certs`（证书到期解析）**、**`sysinfo`（`/proc` 只读采样）**、**`security`（敏感文件权限体检）**、**`backup`（归档打包/恢复：成员白名单、链接与设备拒绝、校验和先验）**、**`bans`（手工封禁文件）** |
+| `mailstack-priv` | 228 | 动作门控、RPC 帧、RO/RW socket 服务端、**全部 58 个动作的处理器**（只读面、2FA 全生命周期、域名/别名/设置/管理员/DKIM 轮换、只读聚合面、服务与队列动作、手工封禁、备份、初始化向导 `setup.*`、**ACME 证书 `setup.cert.issue`/`certs.renew`**、邮件环路自检、邮箱用户 `users.*`、**AI 出站子系统 `ai.*`（SSRF/DNS-rebinding 防护）**、**为管理前端新增的 8 个只读列表动作**）、fallback 规则、**特权调用客户端**（通道推导 + 失败分类） |
+| `mailstack-smtp` | 138 + 7 | IP 固定拨号器、中继校验、分阶段测试、出站探测、反中继策略、落地与回滚、真实落盘载体、**MX 解析与直投目标选择**、**`dns_query`（A/MX/TXT 查询，TXT 分片拼接）**、**`AddressPolicy`（SSRF 地址筛选，含 IPv6 内嵌 IPv4 的拆解）**（7 个为真实 TLS 集成测试） |
 | `mailstack-queue` | 80 | 队列持久化与原子性、指数退避与去共振、DSN 退信、并发限流、快速失败与出站判据、**出站必签 DKIM**、**直投（逐域 MX，绝不回退中继）** |
 | `mailstack-store` | 31 + 10 | Postfix 表文件（域名/别名）、**LMTP 客户端**（10 个为真实 unix socket 端到端） |
 | `mailstack-auth` | 43 | DKIM 密钥（原生 RSA-2048、SPKI 记录、0640 加固）、签名与**自签自验**、SPF、DMARC、ARC **校验与封印**（自封自验、续封、篡改反例）、**离线 TXT 缓存** |
 | `mailstack-smtpd` | 139 + 11 | 入站 SMTP：命令解析、**DATA 字节流（SMTP 走私防护）**、会话状态机与反中继（INV-17）、会话驱动；**TCP 监听 + TLS 1.2 起（STARTTLS / 隐式 465）**、**连接限速**、**IP 自动封禁**、**提交端口 SASL（RFC 4954 + Dovecot auth socket）**、**入站认证（SPF/DKIM/DMARC）与入队**（11 个为真实 TCP/TLS/auth-socket 端到端） |
-| `mailstack-web` | 78 | 契约路由表、会话/CSRF、登录限流、错误模型、特权通道、Axum 装配、**2FA 路由** |
+| `mailstack-web` | 93 | 契约路由表、会话/CSRF、登录限流、错误模型、特权通道、Axum 装配、**2FA 路由**、**动作×路由一致性（全表接线守卫）**、**时序遥测采集器（`telemetry`：7 档环形缓冲 + `/proc` 差分采样 + `df`/`postqueue`）**、**RPC 桥（动作允许集由契约表推导，见 §3.10）** |
+| `mailstack-web-bin` | 9 | **管理控制台服务入口**（`bin/mailstack-web`）：API + 前端产物托管、SPA 回退、`/api` 兜底保持 JSON、路径穿越拒绝、内容类型、遥测后台采样宿主（详见 §3.10；端到端复验见 §4.24） |
 | `mailstackd` | 28 | **进程入口**：`Paths`→运行期配置的 fail-closed 装配、三端口共用准入状态、监听集中绑定、**特权 RPC 双通道绑定与门控**、停机信号扇出、出站队列调度（详见 §3.1.5） |
 | `mailstackctl` | 7 | **CLI**：参数→特权调用的翻译（`--confirm` 必须是真布尔）、退出码映射（详见 §3.1.6） |
 | `mailstack-smtp`（真实 Postfix） | 6 | 需显式开启；在一次性容器中对 Postfix 3.8.6 运行 |
-| **合计** | **900 + 6** | |
+| **合计** | **1018** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 
 ## 2. 门禁结果
 
@@ -37,10 +39,11 @@ deploy/verify-invariant-gate.sh   # 确认 CI 列出的不变量测试名都真�
 |---|---|---|
 | 格式 | `cargo fmt --all -- --check` | ✅ PASS |
 | Lint | `cargo clippy --all-targets -- -D warnings` | ✅ PASS（warnings 即失败） |
-| 单元/集成测试 | `cargo test` | ✅ 906 passed / 0 failed |
+| 单元/集成测试 | `cargo test` | ✅ 1018 passed / 0 failed |
 | 真实 Postfix 集成 | `deploy/test-relay-postfix-in-container.sh` | ✅ 6/6 passed（Postfix 3.8.6） |
-| 不变量存在性 | `verify-invariant-gate.sh` | ✅ 257/257 存在（扫描范围含 `bin/`） |
-| 二进制冒烟 | `mailstackd` + `mailstackctl` + 真实客户端 | ✅ 收信→入队→RPC 门控→CLI→SIGTERM 优雅停机（见 §3.1.5、§3.1.6） |
+| 不变量存在性 | `verify-invariant-gate.sh` | ✅ 277/277 存在（扫描范围含 `bin/`） |
+| 交付物 | `deploy/verify-deliverables.sh` | ✅ `DELIVERABLES_OK` |
+| 二进制冒烟 | `mailstackd` + `mailstackctl` + `mailstack-web` + 真实客户端 | ✅ 收信→入队→RPC 门控→CLI→SIGTERM 优雅停机（见 §3.1.5、§3.1.6）；`mailstack-web` 的托管与底线行为见 §3.10 |
 
 ## 3. 不变量覆盖：43 条中已覆盖 37 条
 
@@ -332,6 +335,7 @@ INV-1、2、3、4、6、7、8、10、12、22、23、24、25、26、27、28、30�
 | 基线缺陷守卫：目标不得逐字符展开 | `a_single_string_destination_is_never_expanded_into_characters`、`alias_add_rejects_a_non_string_destination` | 基线把裸字符串目标逐字符迭代，`"xy"` 静默变成两个目标 `x`、`y`。Rust 侧只接受字符串或字符串数组，数组里混入非字符串直接报错 |
 | 失败关闭：拒绝不产生副作用 | `write_actions_report_missing_fields_instead_of_guessing`、`dkim_rotate_validates_before_generating_anything` | 字段缺失/域名非法时明确报错，且**不留下任何文件**（尤其不得先建出密钥目录） |
 | 2FA 的 HTTP 面已接线 | `two_factor_state_is_served_in_process_and_the_write_routes_are_wired` | 读状态由 Web 进程直接应答（不带助手）；三条写路由必须被 CSRF 层拦下（`404` 表示路由没挂上） |
+| **动作路由全表已接线**（防「已实现却点不到」与「误挂到免认证面」） | `every_implemented_action_route_is_wired_and_behind_auth` | 真相源是**助手侧的注册表**（`Registry::with_core_actions` + `with_readers`），不是本文件的路由清单 —— 用被测量给自己打分等于同义反复。凡已实现的动作，其契约路由必须已挂进 `build_router`，且无会话时回 `401`（`404` = 未接线；`401` 缺失 = 被挂到了免认证面）。请求在认证层即被拦下，**不会**触达真实助手，故 `system.doctor` 的封禁探针不会产生副作用 |
 
 ### 3.5 Phase 4 只读聚合面（`snapshot` / `logs.list` / `metrics.realtime` / `certs.list` / `network.check_port` / `system.doctor`）
 
@@ -351,6 +355,161 @@ INV-1、2、3、4、6、7、8、10、12、22、23、24、25、26、27、28、30�
 | 边界夹取 | `network_check_port_rejects_out_of_range_ports`、`logs_lines_are_clamped_at_both_ends` | 端口必须在 `1..=65535`（非整数也拒绝）；日志行数默认 200、夹在 `1..=1000` —— 否则这条只读接口就是一个「把 journalctl 全量倒出来」的开关 |
 | 诊断**无副作用** | `system_doctor_probes_the_ban_list_and_leaves_no_trace` | 封禁往返探针跑在**新建的内存表**上，对 `192.0.2.1`（TEST-NET-1，不可路由）ban→查询命中→unban→查询不命中；连跑两次结果逐字相同，证明它没有累积状态 |
 | 诊断项覆盖与失败表达 | `system_doctor_reports_each_broken_precondition`、`system_doctor_passes_when_the_host_is_fully_configured` | 八项检查顺序固定：identity / admin_credentials / domain_table / relay_config / dkim_key / tls_certificate / audit_chain / ban_round_trip。空域名表必须点名 INV-17；**没有中继配置是合法状态**而不是故障 |
+
+### 3.6 Phase 4 进程内时序遥测（`GET /api/metrics/telemetry`）
+
+契约里这条路由的 `action` 是 `None`（**不经助手**），动作白名单又已冻结为 50 条，
+因此采样器落在 Web 进程内（`crates/web/src/telemetry.rs`，等价移植基线的
+`SystemMetricsCollector`）。它不在「动作×路由」守卫的覆盖范围里（那条守卫只扫
+`action` 非空的路由），所以另有一条接线与认证的测试单独钉住它。
+
+| 关注点 | 关键测试 | 验证方式 |
+|---|---|---|
+| 7 档时间窗与采样间隔 | `telemetry_uses_the_baseline_intervals_and_falls_back_to_one_hour` | 7 档的 `intervalMs` 逐档比对（2s/5s/30s/60s/5m/15m/1h）；非法 `range`（含路径穿越形态）一律回落 `1h` —— 档位值**不会被透传** |
+| CPU 是**差分**采样 | `cpu_is_differential_so_the_first_sample_has_nothing_to_compare_against` | 构造时基线 = 当前快照 ⇒ 第一次差分为 0；改夹具使 idle +200、总增量 +400 ⇒ 恰好 50.0%（口径见 §4.20） |
+| 环形的容量与节流 | `the_one_minute_ring_takes_every_cycle_and_the_others_are_time_gated` | t=1s 时只有 1m 档进点；t=1h 时各档按自己的间隔全部进点（容量上限见 `RANGES`） |
+| 空的环不能假装有历史 | `an_unsampled_collector_reports_zero_points_but_still_fills_current` | `samplingCount == 0` 且 `points == []`，但 `current` 仍由一次即时采样填充 |
+| 守护进程槽位**恒在** | `daemons_come_from_proc_comm_and_an_absent_one_stays_stopped` | 六个槽位固定顺序输出；`comm` 命中才置 `ACTIVE`，否则保持 `STOPPED`（界面据此区分「没在跑」与「没读到」）；`node` 这个通用名刻意不归属 |
+| 同一守护进程的多个进程相加 | `several_processes_of_one_daemon_are_summed` | 两个 `postfix` 进程（`qmgr` + `pickup`）内存相加；`pid` 取先看到的那个（顺序不定，故只断言非 0） |
+| 队列读数来自 `postqueue -j` | `queue_totals_come_from_postqueue_and_deferred_needs_a_delay_reason` | 非 JSON 行不算条目；只有收件人带 `delay_reason` 的条目才算延迟 |
+| 磁盘读数与刷新节流 | `disk_usage_is_parsed_from_df_and_refreshed_at_most_once_a_minute`、`an_unparseable_df_leaves_disk_at_zero_rather_than_guessing` | 一分钟内只跑一次 `df`；解析不出就不给数（不拿残缺行凑） |
+| 内存回退语义与 `core::sysinfo` **不同** | `missing_mem_available_falls_back_to_mem_free_instead_of_reporting_nothing` | 遥测的形状里没有「读不到」的位置，缺 `MemAvailable` 时退到 `MemFree`（基线即如此）；`core::sysinfo::read_meminfo` 仍保持 fail-loud —— 两种纪律不揉进同一个函数 |
+| 响应形状对齐前端类型 | `the_response_carries_every_field_the_frontend_type_declares` | 逐字段对照基线 `src/types.ts` 的 `TelemetryResponse` / `TelemetryPoint` / `TelemetrySummary` |
+| 接线与认证 | `telemetry_is_served_in_process_and_returns_the_raw_object` | 无会话回 401；带会话回 200 且是**遥测对象本身**（不套 `{ok,data}`） |
+
+> 这些测试全部注入假 `CommandRunner` 与固定时钟，**不会**在开发机上真的跑 `df` / `postqueue`。
+
+### 3.7 Phase 4 邮箱用户（`users.*`）
+
+`users.*` 长期挂在「**需先裁决**」下（HANDOVER 登记的前提是「vmail 布局未定、Dovecot
+口令方案未定」）。**基线其实已经给出答案**，本轮照抄即可：
+
+* **不用 `/var/vmail` 布局**：账号就是**系统账号**。`useradd -m` 建 `/home/<u>`，
+  Maildir 即 `~/Maildir`（`cur`/`new`/`tmp`）；Dovecot 侧配
+  `mail_location = maildir:~/Maildir`。
+* **不写 Dovecot passwd-file**：口令走系统 / PAM —— `chpasswd`（stdin 收
+  `user:password`）设口令，`passwd -l` / `passwd -u` 锁定与解锁，`passwd -S` 的
+  **第 2 个字段**（`L` / `LK`）判定是否锁定。
+
+| 关注点 | 关键测试 | 验证方式 |
+|---|---|---|
+| 校验**先于**任何副作用 | `unmanaged_domain_is_rejected_before_any_side_effect`、`duplicate_mailbox_is_rejected` | 未受管域名 / 重复邮箱在调 `useradd` 之前就被拒；断言假 runner 一次都没被调用、两份注册表都没被创建 |
+| 口令的上下文校验 | `password_is_checked_against_the_username_and_email_context` | `users.add` 的上下文是 `(username, email)`；口令里出现用户名或完整地址即拒。`users.password` 的上下文是**单个** `u`（与基线一致，刻意不统一） |
+| 建账号的降级链与 stdin | `useradd_falls_back_and_chpasswd_receives_the_secret_on_stdin` | `useradd -m -N -g <grp>` 失败后退回 `useradd -m`；口令经 `chpasswd` 的 **stdin** 下发（`CommandRunner::run_with_input`，默认实现会**响亮报错**，防「默默没喂输入」） |
+| Maildir 与权限 | `maildir_directories_and_modes_are_created` | `~/Maildir/{cur,new,tmp}` 被建出；家目录 `0750`、Maildir 目录 `0770`、文件 `0660`，属主改为该用户 |
+| 注册表 | `registries_are_written_atomically_with_0640_and_sorted` | `managed-users.json`（**排序**数组）与 `managed-mailboxes.json` 原子写、`0640`；后者 chown 到 `mailstack-webmail` —— 它必须能被 webmail 进程读到（**不含机密**，只有地址与账号名） |
+| 破坏性动作的护栏 | `delete_rejects_protected_and_system_accounts_but_removes_managed_ones` | 拒绝 `PROTECTED_USERS`（root/daemon/postfix/dovecot/…）、拒绝未托管、拒绝 `uid < 1000`；删除走 `userdel -r` → `userdel` → `deluser` |
+| 会话必须被踢掉 | `status_toggles_lock_and_bumps_the_session_epoch`、`password_change_uses_chpasswd_bumps_the_epoch_and_reports_updated` | 改密与锁定/解锁都会 bump `webmail-session-epoch.json` 里该用户的 epoch。**只挡住未来登录是不够的**：已经在线的 webmail 会话也必须失效 |
+| 拒绝面 | `status_rejects_protected_or_unmanaged_users` | 与 `users.delete` 同一条护栏，文案与基线一致 |
+| 幽灵条目 | `list_skips_accounts_that_no_longer_exist_on_the_system` | 注册表里有、系统里已不存在的账号在列表里被**跳过**（不是报错，也不静默返回一个假条目） |
+
+> 测试全部注入假 `CommandRunner`（含 stdin 捕获）、假 `/etc/passwd` 与 `/etc/group`、
+> 临时 `Paths`：**绝不**真的执行 `useradd` / `chpasswd` / `userdel` / `passwd`，
+> 也绝不读写真实的 `/etc`、`/var`。
+
+**顺带定死了两处此前悬置的前提**（见 §5 相应条目）：`mail_test_loopback` 与
+`setup.mail.test` 里「Maildir 权威布局未定」的前提现已解除 —— 权威布局就是
+`<系统用户家目录>/Maildir`。
+
+### 3.8 Phase 4 ACME 证书（`setup.cert.issue` / `certs.renew`）
+
+「ACME 依赖选择」这个悬置问题同样是**基线已回答**：它不引入任何 ACME crate，而是调用
+外部脚本 **`acme.sh`**（硬编码 `/root/.acme.sh/acme.sh`，`--home /root/.acme.sh`）。
+因此本子系统**零新依赖**。
+
+| 关注点 | 关键测试 | 验证方式 |
+|---|---|---|
+| 失败是**数据**不是错误（`certs.renew`） | `cert_renew_reports_a_missing_acme_sh_as_data_not_an_error`、`cert_renew_reports_a_failed_renewal_as_data` | `acme.sh` 缺失 / `--renew` 非 0 → 返回 `{status: failed, domain, error}`；只有域名非法才抛错（`invalid domain format`）。这个不对称是基线的真实行为，照抄 |
+| 命令行逐字正确 | `cert_renew_runs_the_exact_command_and_returns_the_certificate_list`、`acme_issue_succeeds_with_the_exact_command_and_reloads_the_services` | `--renew -d <d> --force --home /root/.acme.sh`；issue 侧含 `--accountemail` / `--server letsencrypt` / `--keylength ec-256` / `--home`，随后 `--install-cert … --ecc --key-file … --fullchain-file … --reloadcmd …` |
+| **自定义证书校验不落盘** | `custom_issue_validates_via_stdin_and_writes_with_the_right_modes` | **偏离基线**：基线把 cert/key 写成 0600 临时文件再让 openssl 读；这里把 PEM 从 **stdin** 喂给 `openssl`（`x509 -noout` / `-checkend 0` / `-checkhost` / `-pubkey`，`pkey -pubout`），**私钥根本不落盘**，也无需新增 `tempfile` 依赖。测试断言 runner 收到了 stdin、且 argv 里没有任何临时路径 |
+| 自定义证书的四条判据 | `custom_issue_requires_the_pem_markers`、`custom_issue_reports_a_san_mismatch`、`custom_issue_reports_a_key_that_does_not_match` | PEM 标记缺失 / SAN 不匹配 / 公私钥不配对，文案与基线逐字一致 |
+| **校验先于副作用** | `acme_issue_validates_before_creating_any_directory` | **偏离基线**：基线先 `mkdir -p /etc/tls/<domain>` 再校验 email/method，于是「邮箱非法」会留下一个空目录。这里全部校验通过才建目录（成功路径行为不变） |
+| ACME 分支的参数校验 | `acme_issue_rejects_an_invalid_webroot`、`acme_issue_reports_a_missing_acme_sh_as_an_error`、`acme_issue_reports_issue_and_install_failures` | `webroot` 必须存在且为绝对路径；`acme.sh` 缺失即报错；`--issue` / `--install-cert` 非 0 各有自己的文案 |
+| **子进程超时** | `acme_issue_treats_a_timed_out_child_as_a_failure`、`system_runner_kills_a_process_that_exceeds_its_timeout` | **对基线的补齐**：`CommandRunner` 原本没有超时，而 `acme.sh` 是可能挂在网络上的外部程序。新增 `run_with_timeout`（默认实现**明确报错**，防「默默没有超时」），`SystemCommandRunner` 实现为 `spawn` → 轮询 `try_wait` → 超时 `kill` 并回收。180/300/120 秒与基线一致 |
+| 落盘权限 | 同上 | `privkey.pem` 0600、`fullchain.pem` 0644 |
+| 配置与重载 | `issue_skips_postconf_when_it_is_not_installed` | 有 `postconf` 时写三条 `-e`（cert / key / `smtpd_tls_security_level = may`），随后 `service_ctl` 重载 postfix 与 dovecot（走既有降级链） |
+
+> `acme.sh` 与 reload 脚本路径是**硬编码常量**，绝不来自请求体 —— 否则这个动作就是一个
+> 任意脚本执行器。reload 脚本的写入走可注入的探测层，测试不会碰真实的 `/usr/local/sbin`。
+
+### 3.9 Phase 4 AI 出站子系统（`ai.*`）
+
+这是最后一个动作族，也是**攻击面最大**的一个：它把用户可控的 URL 拿到服务器上发起出站
+请求。基线的防护集中在 `ai.py`，逐条对齐如下。
+
+| 关注点 | 关键测试 | 验证方式 |
+|---|---|---|
+| URL 语法面 | `validate_endpoint_rejects_malformed_urls`、`url_without_scheme_is_rejected_as_http_or_https`、`resolution_failure_is_reported_with_the_host` | 长度上限 2048 / 空 / 非 http(s) / 无 hostname / 带用户名口令 / 带 fragment / `http` 且未允许私网 —— 各有与基线逐字一致的文案 |
+| **每一个解析结果都要筛** | `every_resolved_address_is_screened_for_ssrf`、`a_host_mixing_public_and_private_addresses_is_rejected` | 不是只筛第一个地址：只要有**任一**解析结果落在私网/环回/链路本地/云元数据/CGNAT/内嵌 IPv4，整条请求就被拒 —— 否则「A 记录里混一个私网地址」就能靠顺序绕过 |
+| **固定 IP 后再拨号**（DNS-rebinding） | `an_allowed_private_endpoint_pins_the_address` | 解析 → 筛选 → **固定第一个 IP**；连接只连这个 IP，但 SNI 与 Host 头仍用原域名。复用 `smtp::target::resolve_pinned` 与 `smtp::dial::PinnedDialer`，**不另写一份解析/拨号** |
+| 私网开关在**部署侧** | `private_access_requires_the_deployment_switch` | 请求写 `allowPrivateNetwork: true` 但部署没开 `MAILSTACK_ALLOW_PRIVATE_AI=1` → 明确报错；有效值等于部署开关本身，**请求无法自己提权** |
+| **TLS 校验不可关** | `insecure_tls_is_rejected_everywhere` | `ai.config.set` / `ai.chat` / `ai.test` / `ai.models.list` 任何一处传 `insecureTls` 都报同一句文案 |
+| 响应与重定向纪律 | `response_body_over_two_megabytes_is_rejected`、`chunked_responses_are_decoded`、`content_length_limits_the_body` | 2 MB 上限；`chunked` 与 `Content-Length` 两种都要解析对；重定向最多 3 次且**必须同源**（跨源直接拒），`303` 之后降级为 `GET` 且不带 body |
+| 配置写入 | `config_set_rejects_an_unknown_provider`、`config_set_reuses_the_previous_key_when_none_is_supplied` | provider 必须精确命中预设；写 `ai-provider.json` 0600 并镜像 `etc/ai.json`；**不传 key 时沿用旧 key** 而不是清空 |
+| 打码 | 同上 | 公开配置里的 key 只回前 4 位 + `****`（或 `****`），**明文绝不出现**；测试断言错误文案与 argv 里都不含 key |
+| 两种协议 | `chat_openai_shape_and_reply_parsing`、`chat_anthropic_extracts_system_and_parses_text_blocks`、`chat_reports_both_protocol_error_texts` | OpenAI 兼容协议与 Anthropic 协议各拼各的请求体与头（后者把 `system` 角色抽到顶层、带 `anthropic-version`）；两边错误文案不同，照抄 |
+| 取值顺序与降级 | `chat_requires_a_non_empty_message_list`、`chat_requires_an_api_key`、`chat_uses_the_fallback_when_the_primary_fails`、`an_explicit_provider_disables_the_fallback` | provider/key/baseUrl/model 一律「请求 → 已存配置 → 预设」；fallback **只在请求没显式指定 provider 时**生效 —— 否则会静默改掉调用方选定的供应商 |
+| prompt 拼接 | `diagnose_and_parse_build_the_exact_prompt` | `diagnose` / `parse` 的提示词逐字比对；它们把 `logs`/`text` 拼成新 dict **只带 `messages`**，不会把请求里的 provider 带进去 |
+| 出站总闸 | `crates/priv/src/dispatch.rs` 的既有测试 | `ai.test` / `ai.chat` / `ai.diagnose` / `ai.parse` / `ai.models.list` 受 `ai.conf` 总闸门控（公网默认关）；`ai.config.get` 纯读本地、不在闸内 |
+
+> 测试全部注入假 transport 与假解析器：**CI 完全离线可跑**，不会向任何真实供应商发请求。
+> `ai.config.set` 只写 JSON、不出网。
+
+### 3.10 Phase 3 管理前端接入（8 个只读动作 + RPC 桥 + 静态托管）
+
+前端（`mailstack-admin-frontend`，Vite + React 19 单页应用）是**用户提供的外部产物**，
+它的接口假设与基线 Node 后端并不一致。这一节记录为对接它而新增的后端面与相应测试。
+
+**新增动作与路由**
+
+| 关注点 | 关键测试 | 验证方式 |
+|---|---|---|
+| 8 个新动作确实已注册 | `the_frontend_list_actions_are_registered` | `users.list` / `aliases.list` / `queue.list` / `services.list` / `dkim.keys` / `dns.records` / `metrics.system` / `activity.list` 逐个查 `Registry::is_implemented` |
+| **每个都必须是纯读** | `every_added_list_action_is_pure_read` | 逐条断言落在 RO、**不在** RW、不是破坏性动作 —— 一旦误归 RW，Web 进程就得经 sudo 下发，等于给列表开了一条特权通道 |
+| 数量变更是有意为之 | `read_only_set_has_exactly_twenty_two_actions` | RO 由 14 增至 22 |
+| 契约路由数 | `route_count_is_stable` | 62 → 72（新增 10 条，**无改动/无删除**） |
+| 动作×路由全表接线 | `every_implemented_action_route_is_wired_and_behind_auth` | 真相源是助手侧 `Registry`，不是 web 自己的路由清单 |
+
+**列动作的诚实边界**（读不到的不编）：
+
+| 动作 | 关键测试 | 约定 |
+|---|---|---|
+| `users.list` | `users_list_maps_status_to_active_and_reports_the_absent_quota_as_zero`、`users_list_treats_a_locked_account_as_inactive` | `quotaUsed`/`quotaTotal` **恒 0**、`createdAt` 恒空 —— 配额与创建时间在本项目里**根本没有落盘**（基线 `mail.py:120` 同样硬编码 0）。这是「没有这个数据」，不是漏读 |
+| `aliases.list` | `aliases_list_exposes_the_first_target_and_keeps_every_destination`、`aliases_list_on_a_missing_table_is_empty_not_error` | `active` 恒 `true`（别名表没有禁用概念）；表文件缺失回**空数组**而非报错 |
+| `queue.list` | `queue_list_maps_only_the_two_real_states_and_derives_the_domain` | 本仓库队列只有 `active`/`deferred` 两态 → `sending`/`pending`；前端枚举里的 `delivered`/`failed`/`hold` **永不出现**，不为凑枚举造状态 |
+| `services.list` | `services_list_maps_active_status_to_running_and_reuses_the_service_items` | 复用 `service_items()` 的判定，**不做第二次独立探测**（两个真相源迟早分叉，界面会出现「服务页说在跑、总览说已停」） |
+| `dkim.keys` | `dkim_keys_lists_only_domains_with_a_private_key`、`dkim_keys_reports_unpublished_when_the_resolver_fails` | 只为**私钥确实存在**的域名产出条目；`keySize` 用编译期常量而不解析私钥；解析失败与未发布都表现为 `published:false`（列表不能因解析器抖动整体失败） |
+| `dns.records` | `dns_records_covers_a_mx_spf_dmarc_and_dkim`、`dns_records_reports_absent_records_as_not_ok_instead_of_failing` | `value` 是**期望值**、`ok` 是**实际观测**；`ttl` 是向导建议值（`DnsQuery` 只返回记录文本，拿不到权威 TTL）；没有身份配置时**不编造** A/MX |
+| `metrics.system` | `metrics_system_reports_cpu_memory_and_disk_percentages`、`metrics_system_reports_zero_when_proc_and_df_are_unavailable`、`read_cpu_counters_strips_the_core_index_before_splitting`、`cpu_busy_percent_is_the_non_idle_share_of_the_delta`、`parse_df_percent_skips_the_header_and_garbage` | CPU 两次差分采样（`idle = idle+iowait`，`total` 取前八项）；`df -kP /`（`-P` 防长设备名折行）；读不到回 0 |
+| `activity.list` | `read_activity_skips_unparseable_lines_and_orders_newest_first`、`activity_list_on_a_missing_log_is_empty_not_error` | 审计日志尾部，**跳过无法解析的行**（日志可能被截断）；文件不存在回空数组 |
+
+**RPC 桥与响应形状**
+
+| 关注点 | 关键测试 | 验证方式 |
+|---|---|---|
+| 桥只放行已有路由的动作 | `the_rpc_bridge_only_exposes_actions_that_already_have_a_route` | 断言 `admin.totp.verify` 与 `admin.totp.consume_recovery` 在助手白名单内**但**不在桥的允许集里 —— 它们是登录流程内部动作，不得从 HTTP 面可达 |
+| 两种响应形状**必须相反** | `success_body_is_the_bare_object_without_an_ok_wrapper`、`rpc_bridge_shapes_are_the_opposite_of_the_rest_routes` | REST 成功回**裸对象**（前端对非列表动作直接读 `body.<field>`）；桥回 `{ok,data}`（前端 `bridge()` 按此拆包，`error` 是**字符串**） |
+| 健康检查的成功标志 | `health_is_reachable_without_authentication` | `/api/health` 带 `ok: true` —— 前端 `probe()` 判 `body.ok === true`，判假会**静默**降级到内置 mock（界面看着完全正常，全是演示数据） |
+
+**静态托管与 `mailstack-web` 服务入口**
+
+| 关注点 | 关键测试 | 验证方式 |
+|---|---|---|
+| `/api` 兜底**永远**是 JSON | `an_unknown_api_path_is_json_404_and_never_the_spa`、`api_paths_are_never_served_as_spa` | 回 `index.html` 会让前端把「接口不存在」报成「解析失败 / 服务端坏了」 |
+| 路径穿越必须被拒 | `traversal_and_odd_segments_are_rejected` | `..` / 空段 / `.` / 反斜杠 / NUL 全部拒绝；另有真实路径前缀校验兜住符号链接 |
+| 「没部署前端」是 503 | `a_missing_bundle_reports_503_instead_of_a_blank_page` | 不是空白 200，也不是 404 —— 反向代理与监控应当把它当服务不可用 |
+| 深链接回落到入口 | `a_deep_link_falls_back_to_the_spa_entry` | 刷新任意深链接都回到 SPA 入口 |
+| 内容类型不被猜 | `content_types_cover_the_bundle_and_default_to_octet_stream` | 未知扩展名回 `application/octet-stream`，**猜错等于把静态文件变成可执行内容** |
+| 静态响应也带安全头 | `static_responses_still_carry_the_security_headers` | 这个进程返回的大多数响应都是静态文件，漏掉它们等于没加 |
+
+**参数名兼容**（前端与基线的字段名不一致，认不出会**静默做错事**）：
+
+| 关注点 | 关键测试 | 验证方式 |
+|---|---|---|
+| 队列动作认 `op` | `queue_action_accepts_the_frontend_field_names`、`queue_action_maps_deliver_to_retry_and_refuses_hold` | 少了 `op`，`op:"delete"` 会落到默认的 `retry` —— **删除队列邮件变成把邮件重新投递**，两边都不报错。`hold` 在本仓库没有对应状态，**显式报错**而不映射成「最接近」的动词 |
+| 服务动作认 `key`/`op` | `services_action_accepts_the_frontend_field_names` | — |
+| 用户动作认 `address`/`name`/`active` | `the_frontend_field_names_address_and_name_are_understood`、`add_accepts_the_frontend_address_field` | 认不出时回的是「不是受管用户」，**看起来像权限问题而不是参数问题**。`address` 取本地部分为用户名，依据是建号规则本身（`username = email.split('@')[0]`），不是猜测 |
+
 
 ## 4. 本阶段发现并修复的真实缺陷
 
@@ -629,34 +788,36 @@ MAIL FROM。于是只把 MAIL FROM 域的 SPF 记录注入缓存是不够的：H
   覆盖 `-n`/`-X` 语义、`postmap` 生成 hash 表、`postfix check`/`reload`、
   以及「移除 vs 设为空」对默认安全项的差异。
   该组测试**必须显式开启**（会修改系统配置），CI 中作为独立 job 用容器运行。
-- 契约表 62 条路由中 **35 条已注册进 Axum router**（`crates/web/src/lib.rs` 的
-  `build_router`；35 = 8 条进程内 + 27 条动作路由）；其余 27 条落到 `/api` 兜底返回
-  `API_NOT_FOUND`。未注册的 27 条拆开看：
-  - **15 条**对应的动作尚未实现（`users.*` 4、`certs.renew`、`setup.cert.issue`、`ai.*` 9）；
-  - **11 条**对应的动作**已经实现，只是还没挂路由**：`security.ban`、`security.unban`、
-    `backup.create`、`backup.restore`、`backup.delete`、`setup.identity.apply`、
-    `setup.dns.verify`、`setup.relay.test`、`setup.relay.apply`、`setup.mail.test`、
-    `mail.test_loopback`；
-  - **1 条**是进程内路由（`GET /api/metrics/telemetry`，由 Web 进程自己应答）。
-- 50 条白名单动作中已实现 **38 条**：
-  - RO（**13/14**）：`snapshot` / `system.doctor` / `setup.status` / `logs.list` /
+- 契约表 72 条路由**已全部注册进 Axum router**（`crates/web/src/lib.rs` 的
+  `build_api_router`；`build_router` 再补上 `/api` 兜底与安全响应头）。
+  **没有任何契约路由再落到 `/api` 兜底返回 `API_NOT_FOUND`**。（动作 58 条：`snapshot`、
+  `system.doctor`、`ai.chat`、`ai.diagnose`、`ai.parse` 各有两条契约路由指向同一动作；
+  另有 9 条进程内路由与 1 条 RPC 桥，`action` 为 `None`。）
+- **进程内遥测已接线**：`GET /api/metrics/telemetry` 由 Web 进程自己采样
+  （`crates/web/src/telemetry.rs`，见 §3.6）。**后台采样任务现在有宿主了** ——
+  `bin/mailstack-web` 在启动时调用 `TelemetryCollector::start_sampling(2s)`（见 §3.10）。
+- 58 条白名单动作**已全部实现（58/58）**：
+  - RO（**22/22**）：`snapshot` / `system.doctor` / `setup.status` / `logs.list` /
     `metrics.realtime` / `domains.list` / `certs.list` / `settings.get` /
-    `admin.get` / `ai.config.get` / `network.check_port` / `security.scan` / `backup.list`
-  - RW（25/36）：`admin.set` / `settings.set` / `domains.add` / `domains.delete` /
+    `admin.get` / `ai.config.get` / `ai.models.list` / `network.check_port` /
+    `security.scan` / `backup.list`，以及**为管理前端新增的 8 条**
+    `users.list` / `aliases.list` / `queue.list` / `services.list` / `dkim.keys` /
+    `dns.records` / `metrics.system` / `activity.list`（见 §3.10；由
+    `every_added_list_action_is_pure_read` 逐个确认无副作用）
+  - RW（**36/36**）：`admin.set` / `settings.set` / `domains.add` / `domains.delete` /
+    `users.add` / `users.status` / `users.password` / `users.delete` /
     `aliases.add` / `aliases.delete` / `dkim.rotate` / `admin.totp.*`（5 条）/
     `services.action` / `queue.action` / `security.ban` / `security.unban` /
     `backup.create` / `backup.restore` / `backup.delete` /
     `setup.identity.apply` / `setup.dns.verify` / `setup.relay.test` / `setup.relay.apply` /
-    `setup.mail.test` / `mail.test_loopback`
+    `setup.cert.issue` / `setup.mail.test` / `mail.test_loopback` / `certs.renew` /
+    `ai.config.set` / `ai.test` / `ai.chat` / `ai.diagnose` / `ai.parse`
   - 注意「已实现动作数」**不等于**「已注册路由数」：`admin.totp.consume_recovery` /
-    `admin.totp.verify` 按设计**没有 HTTP 路由**（登录路径在进程内直呼助手），
-    而上面那 11 条已实现动作的路径**尚未注册**（前端接入时一并补）。
-  其余动作仍会在助手侧返回 `NOT_IMPLEMENTED`，**这是刻意保留的显式失败**：
-  静默返回空数据会被界面渲染成「没有数据」，而真相是「该动作尚未移植」。
-  仍未移植的动作族（各自需要独立子系统）：
-  - RO：`ai.models.list`（需出站 AI 客户端）—— **只读白名单只剩这一条**
-  - RW：`users.*`（vmail 用户与 Dovecot 口令方案未定）、`certs.renew`（ACME）、
-    `setup.cert.issue`、`ai.config.set` / `ai.test` / `ai.chat` / `ai.diagnose` / `ai.parse`
+    `admin.totp.verify` 按设计**没有 HTTP 路由**（登录路径在进程内直呼助手）。
+  **白名单与实现现已一一对应**：助手侧不会再有任何动作返回 `NOT_IMPLEMENTED`。
+  路由侧的守卫是 `every_implemented_action_route_is_wired_and_behind_auth` ——
+  它以防「已实现却点不到」与「动作路由被挂到免认证面」两类回归，且仍会在将来
+  新增白名单动作时自动要求「实现即接线」。
 
 ### 4.17 手工封禁：文件持久化 + 守护进程热重载（Phase 4）
 
@@ -876,23 +1037,21 @@ SMTP 提交器**（SSRF 加发信能力外泄）。
 `LF → CRLF` 转换；用裸 LF 组装正文会被入站的走私防护直接拒收（那正是它该做的）。
 
 **`maildirDelivered` 是证据，不是成败**：提交被 `250` 接受就说明环路通了。Maildir 只是
-额外证据，而**权威布局尚未定死**（`crates/store/src/lib.rs` 已登记这一前提未决）。
-因此这里并列探测三处候选（系统用户的 `~/Maildir`、`<vmail>/<domain>/<user>`、
-`<vmail>/<domain>/<user>/Maildir`），任一命中即算命中；找不到时返回 `false` 而不是错误
+额外证据。**权威布局现已定死**（§3.7：系统账号 + `~/Maildir`），但扫描仍并列探测三处候选
+（系统用户的 `~/Maildir`、`<vmail>/<domain>/<user>`、`<vmail>/<domain>/<user>/Maildir`）——
+后两处是**历史候选**，留给仍按旧布局部署的主机。找不到时返回 `false` 而不是错误
 —— 把它渲染成「投递失败」会让人去查一个根本不存在的故障。扫描是**只读**的，
 读不到的文件按「没匹配」处理（Maildir 内容本来就在 churn）。
 
-**登记偏离：`users.*` 未移植带来的两处空白。**
-基线的 `setup.mail.test` 要求「sender 对应一个受管邮箱」且「账号未锁定」，
-`username`/`password` 只服务于这两条检查（口令本身不参与认证，只做格式校验）。
-本栈的用户模型尚未移植，因此：
+**基线的两条检查已恢复执行。** `setup.mail.test` 要求「sender 对应一个受管邮箱」且
+「账号未锁定」；`username`/`password` 只服务于这两条检查 —— 口令**不参与认证**，且只做
+**格式**校验（`validate_legacy_password_input`）而不是新口令策略：它是既有口令的**回放**，
+按新策略卡会让旧策略下建的邮箱永远跑不了连通性测试。
 
-* 这两条检查**没有执行** —— 响应里用 `mailboxChecksSkipped: true` 与原因字符串**明说**，
-  而不是让人以为查过了；
-* `username` / `password` **接受但忽略**。把「没做的事」说成做了，正是本项目最忌讳的
-  静默降级。
-
-替代防线仍是入站策略本身（外域收件人被拒），因此这个动作不构成开放中继。
+`users.*` 落地后（见 §3.7），这两条检查与 `username`/`password` 的校验都已按基线恢复，
+响应里不再有 `mailboxChecksSkipped`：**四条校验全部先于发信**。
+`setup_mail_test_submits_with_crlf_and_enforces_the_mailbox_checks` 与三条拒绝用例
+（不匹配的受管邮箱 / 已锁定 / 非法用户名）把这一点钉住，每条都断言提交器**一次都没被调用**。
 
 **已知未验证项**：真实 `mailstackd` 上的完整环路（提交 → 入站认证 → 入队 → LMTP →
 Dovecot 写 Maildir → 扫描命中）**未在 CI 中跑过** —— 需要一套完整部署，见 §5。
@@ -992,11 +1151,11 @@ Dovecot 写 Maildir → 扫描命中）**未在 CI 中跑过** —— 需要一�
     另：**直投不做机会式 TLS**，当前按 SMTP 默认行为走明文 25 端口（直投链路上没有
     凭证，与中继路径的 INV-13 不同）；机会式加密必须「加密但不校验证书」，那是一条
     独立的安全策略决定，已单独登记而非顺手塞进本次改动
-- **store 的 Maildir 只读访问尚未实现**：存在一个必须先定的前提 —— 权威布局。
-  基线是 Postfix 的 `local` 代理写系统用户的 `~/Maildir`，而 Dovecot 配的是
-  `mail_location = maildir:~/Maildir`；`mail.py` 的自检却同时探测 `/home/<u>/Maildir`
-  与 `/var/vmail/<domain>/<u>`。**在把权威布局定死之前写一个靠猜的路径解析，
-  比不写更糟**（会在生产上静默读错目录）。目前也没有消费者（webmail 未开始）
+- **store 的 Maildir 只读访问尚未实现**（但前提**已定**）：权威布局在实现 `users.*` 时
+  已经确定 —— 账号是系统账号，Maildir 就是 `<系统用户家目录>/Maildir`（即
+  `/home/<u>/Maildir`），Dovecot 配 `mail_location = maildir:~/Maildir`。
+  自检里并列探测的 `<vmail>/<domain>/<user>` 是**历史候选**，不是权威布局。
+  仍未实现的原因只是**没有消费者**（webmail 未开始），不再是「前提未决」
 - **store 的 Dovecot auth socket 尚未实现**（webmail 认证桥，§3.5 第二行），
   属 `mailstack-webmail` 范围。**与提交端口 SASL 是两回事**：后者已实现并有测试
   （见 §3.1.7），两者只是恰好都问 Dovecot 的同一个 auth 服务
@@ -1011,7 +1170,160 @@ Dovecot 写 Maildir → 扫描命中）**未在 CI 中跑过** —— 需要一�
 - 分阶段中继测试**未对真实中继端点**跑过端到端（仅验证了结构与前置校验路径）
 - `cargo-deny` / `cargo-audit` 在 CI 中暂为 `continue-on-error`
 - 未产出 SBOM（`cargo-sbom` 未安装，已退化为依赖清单）
-- 权威前端（htmx/Leptos）尚未开始
+- 权威前端（htmx/Leptos）**未按原计划做**：实际接入的是用户提供的前端产物
+  （Vite + React 19 单页应用）。这是与规格书 §6 Phase 3 的原计划偏离，详见 §5.3
+  与 `DEPLOYMENT.md` §5 的 Phase 3 行
+- ~~**遥测的后台采样任务还没有宿主进程**~~ → **已解决**：`bin/mailstack-web` 在启动时
+  调用 `TelemetryCollector::start_sampling`（2 秒一次），见 §3.10。若该进程以 API-only
+  模式短时运行再退出，`points` 不积累属于进程生命周期的正常结果，不是采集器故障
+- **`postqueue -j` 读不到时队列数是 0，与「队列为空」不可区分**：基线的形状里没有
+  「读不到」的位置（`queueTotal` / `queueDeferred` 都是必填数字）。这里刻意与基线一致
+  保留 `0`，并登记为已知限制 —— 装了 Postfix 的主机上 `postqueue` 恒在，风险主要在
+  「Postfix 已被下线」（Phase 5）之后。
+- **`/proc/<pid>/statm` 的 RSS 按 4 KiB 页换算**（基线同样硬编码 4096）：构建目标
+  `x86_64-unknown-linux-gnu` 即 4 KiB 页，故正确；换到 16/64 KiB 页的架构会低估内存。
+
+### 4.20 遥测 CPU 采样：漏剥核心序号导致整列错位（已修复）
+
+`/proc/stat` 的每核行形如 `cpu0 <user> <nice> <system> <idle> ...`。首版实现用
+`strip_prefix("cpu")` 之后直接按空白切分，于是**核心序号那个 `0` 占住了 `user` 的位置**，
+`idle` 实际取到了 `system` —— 所有列整体错位一格。
+
+症状是「能跑、数字看着也像那么回事」：两核夹具上算出的占用是 87.5%，而按夹具的增量
+应当是 50.0%。**这正是最难发现的一类缺陷** —— 没有报错、没有 panic，只有一条断言把它拦下。
+
+教训：解析内核文本格式时先确认**列的定义**再切片。修法是
+`trim_start_matches(|c: char| c.is_ascii_digit())` 把核心序号剥掉，并在原地留一行注释
+说明为什么。现在 `cpu_is_differential_so_the_first_sample_has_nothing_to_compare_against`
+用「idle +200 / 总增量 +400 ⇒ 恰好 50.0%」把这个口径钉死。
+
+### 4.21 地址策略漏拆 IPv6 里内嵌的 IPv4 —— `::ffff:127.0.0.1` 直达本机（已修复）
+
+准备 AI 出站子系统时逐条对照基线 `ai.py`，发现基线的 `is_ip_restricted` 里有一段
+**Rust 侧没有**的逻辑：它先把 IPv4-mapped（`::ffff:a.b.c.d`）、6to4（`2002::/16`）、
+Teredo（`2001:0::/32`）里**内嵌的 IPv4** 拆出来再筛选，并在原地留了注释说明为什么必须拆。
+
+Rust 的 `AddressPolicy::accepts` 对 IPv6 只查了 `::1` / `fc00::/7` / `2001:db8::/32`。
+后果是 `::ffff:127.0.0.1` **既不等于 `::1`，`is_private()` 也是 false**，于是它穿过全部
+v4 规则、被判定成「公网地址」接受；随后 `resolve_pinned` 把它固定为拨号目标，
+实际连的就是**本机**。
+
+**影响面不止 AI**：直投的 MX 筛选、中继主机筛选、出站端口探测走的是同一个策略 ——
+一个受控域名只要把 AAAA/MX 指到 `::ffff:127.0.0.1` 或 `::ffff:169.254.169.254`
+（云元数据地址），就能让服务器去连自己的 25 端口或云元数据服务。
+
+**修复**：新增 `smtp::target::embedded_ipv4_candidates`，`accepts` 先拆内嵌候选，
+**任一候选不被接受即整体拒绝**（fail-closed）。Teredo 按 RFC 4380 取**两个**地址
+（隧道服务端 + 末 32 位取反后的客户端），必须都通过。递归只落在 v4 分支上，
+不存在无限递归。
+
+这里**不是照抄基线**：基线的 Teredo 分支实际上会崩 —— 它把 Python 返回的二元组直接赋给
+`ip` 再调 `ip.is_private`，会抛 `AttributeError`。我们按编码正确取出两个地址，属于修正。
+
+安全落点（已登记进 `ci.yml`）：`an_ipv4_mapped_address_is_screened_as_the_address_it_embeds`、
+`six_to_four_and_teredo_addresses_are_screened_through_their_embedded_ipv4`。
+
+**追加**：实现 AI 子系统时又发现 `0.0.0.0/8`（RFC 1122 的 "this network"）也没被归入
+不可路由。Python 侧 `0.0.0.1` 会被 `is_private` 判为私网；Rust 侧此前只把**恰好**
+`0.0.0.0` 当 unspecified，于是 `0.0.0.1` 被接受 —— 与上面 Teredo 拆出来的客户端地址
+（0.0.0.1）组合起来就是一个可绕过的面。已把整个 `0.0.0.0/8` 归入不可路由。
+
+### 4.22 队列「删除」被静默降级成「重新投递」——一次删除变成一次发信（已修复）
+
+接入管理前端时逐条比对它的调用参数，发现**前端按 `{id, op}` 提交队列动作**，
+而 `readers.rs::queue_action` 只认 `verb` / `action`：
+
+```rust
+let verb = optional_str(data, "verb")
+    .or_else(|| optional_str(data, "action"))
+    .unwrap_or("retry");          // ← 两个候选都没命中时就落到这里
+```
+
+于是 `op: "delete"` 被**完全忽略**，落到默认值 `retry`。后果是：
+
+1. 运维在界面上点「删除这条队列邮件」；
+2. 后端执行的是 `retry` —— **清零重试预算并把 `next_attempt_unix` 提前到当下**；
+3. 下一次调度立刻把这封邮件**投递出去**；
+4. 两个方向都不报错：前端收到一个成功的列表，后端完成了一次「合法」的重试。
+
+也就是说，**一个删除操作被替换成了另一个有外部副作用的操作**（发信），而且没有任何
+一处日志或响应能把这件事显出来。这比「参数不认导致报错」严重得多 —— 报错至少能被发现。
+
+**修复**：把 `op` 加入候选名，并显式映射前端的动词（`deliver` → `retry`）。
+`hold` 在本仓库的队列模型里没有对应状态（条目只有「到期」与「未到期」两态），
+因此**显式报错**，而不是挑一个「最接近」的动词执行 —— 让界面看到失败，
+胜过让它以为挂起了、实际发生了别的事。
+
+同类问题一并处理：`services.action` 不认 `key`/`op`；`users.delete`/`status`/`password`
+不认 `address`。后者的表现是回「不是受管用户」，**看起来像权限问题而不是参数问题**，
+排查成本很高。
+
+安全落点（已登记进 `ci.yml`）：`queue_action_accepts_the_frontend_field_names`、
+`queue_action_maps_deliver_to_retry_and_refuses_hold`、
+`services_action_accepts_the_frontend_field_names`、
+`the_frontend_field_names_address_and_name_are_understood`。
+
+### 4.23 成功响应被套了 `{ok,data}` 外壳 —— 非列表动作一个字段都读不到（已修复）
+
+`ok_json` 此前把载荷包成 `{ ok: true, data: ... }`，而基线 `server.production.ts` 的业务
+路由是 `res.json(result)` —— **裸对象**。`lib.rs` 顶部声称本模块是对它的「等价移植」，
+但这一处并不等价。
+
+后果不是报错，而是**静默读空**：前端对非列表动作直接读 `body.<field>`
+（`snapshot` / `settings.get` / `admin.get` / `certs.list` 的详情字段…），外壳让这些
+读取全部得到 `undefined`，界面渲染成空白或 `NaN`。列表类动作之所以没暴露这个问题，
+是因为前端自己的 `pickList` 兜底了 `o.data ?? o`，把偏差掩盖了一部分。
+
+**修复**：`ok_json` 直接返回裸对象。错误外壳 `{ok:false,error:{code,message}}` 保持不变
+（前端确实按嵌套读）。**RPC 桥刻意相反**：`rpc_ok_json` 必须带外壳，因为前端 `bridge()`
+按 `body.ok` / `body.data` 拆包；两种形状并存是前端传输层设计的结果，不是不一致。
+
+安全落点：`success_body_is_the_bare_object_without_an_ok_wrapper`、
+`rpc_bridge_shapes_are_the_opposite_of_the_rest_routes`。
+
+### 4.24 控制台首页被当成二进制下载 —— 内容类型按 URL 而非文件名判定（已修复）
+
+**这条是端到端冒烟测出来的，不是单元测试测出来的** —— 值得单独记下来，因为它是本轮
+唯一一个「测试全绿但真实运行时界面打不开」的问题。
+
+`mailstack-web` 的静态托管原本这样推内容类型：
+
+```rust
+Some(file) => file_response(&file, path).await,   // ← path 是**请求的 URL**
+...
+let content_type = content_type_for(url_path);
+```
+
+首页的 URL 是 `/` —— **没有扩展名**，于是 `content_type_for` 落到兜底分支
+`application/octet-stream`，浏览器不会渲染 HTML 而是**弹出下载**。用户打开控制台看到的是
+一个下载框，而不是登录页。
+
+为什么单元测试没抓到：
+
+* 深链接（如 `/domains`）走的是 **SPA 回退分支**，那里硬编码了 `text/html`，所以是好的；
+* 而 `/` **恰好命中真实的 `index.html` 文件**，因此走的是 `file_response` 分支；
+* 现有测试 `a_real_asset_is_served_with_its_content_type` 用的是 `/assets/app-abc.js`，
+  URL 与文件名都带 `.js`，两条路径推出同一个类型 —— 掩盖了差异。
+
+只有「URL 无扩展名 + 命中真实文件」这个组合会暴露它，而**首页正是这个组合**，
+且它是用户打开控制台时请求的第一个路径。
+
+**修复**：内容类型改为按**解析后的真实文件名**（`file.to_string_lossy()`）判定。
+回归测试：`the_bundle_entry_is_served_as_html_not_octet_stream`（要求 `/` 回 `text/html`）。
+
+实测复验（真实进程 + 真实前端产物）：
+
+| 请求 | 结果 |
+|---|---|
+| `GET /` | `200 text/html; charset=utf-8` ✅ |
+| `GET /domains`（深链接） | `200 text/html; charset=utf-8` ✅ |
+| `GET /api/nope` | `404 application/json` + `API_NOT_FOUND` ✅（**不是** HTML） |
+| `GET /../../../../etc/passwd`（`--path-as-is`） | 回 SPA 的 HTML，**不是** `/etc/passwd` ✅ |
+| `GET /api/users` / `/api/queue` / `/api/ai/models` | 均 `401`（已接线且受认证保护）✅ |
+| `POST /api/rpc` | `401`（未带会话）✅ |
+| `GET /assets/index-*.js` | `200 text/javascript` + 530857 字节 ✅ |
+
+
 
 ## 5.1 与规格书的偏差（登记，待裁决）
 
@@ -1055,6 +1367,17 @@ base64，而 RFC 6376 的 `p=` 与生态里的既有记录都是 **SubjectPublic
 mail-auth 的验签侧有 `try_strip_rsa_prefix(...).unwrap_or(bytes)` 会**两种都容忍**，
 所以本地自检会通过，但别的收件方（Gmail/OpenDKIM）解析 PKCS#1 形态的 `p=` 会验签失败
 —— 属于「本地测试绿、生产静默失败」的典型。**发布 DNS 记录前必须自行做 SPKI 封装。**
+
+### 5.3 Phase 3 前端接入的已知限制（诚实披露）
+
+| 限制 | 说明 |
+|---|---|
+| **前端是外部产物，不在本仓库** | 静态资源由 `--dist <DIR>` 引入，本仓库不构建也不校验它。后端只保证「路径安全、内容类型正确、`/api` 底线是 JSON」。前端自身的构建产物哈希、体积、依赖安全不在本项目门禁覆盖范围 |
+| **前端对部分字段的假设与后端不符，已按后端真实字段对齐** | 例如证书页原先读 `daysLeft`/`keySize`/`autoRenew`，而后端只提供 `daysUntilExpiry`，且**不追踪** `keySize`/`autoRenew`。这类字段前端改为显示占位，**没有伪造数值** —— 后端确实没这个数据 |
+| **`setup.mail.test` 在向导里可能无法通过** | 该动作按基线恢复了四步校验（含「发件人必须对应一个受管邮箱」+ 口令格式回放），而向导的这一步只收集收件人地址。这是**前端功能缺失**，不是后端问题；后端不会为了让它过而放宽校验 |
+| **`network.check_port` 忽略请求里的 `host`** | 这是**有意的 SSRF 防护**：探测目标只能来自部署配置（`probe_targets`），不接受请求体指定主机。前端传的 `host` 会被忽略，实际探测的是配置中的目标 |
+| **遥测只有 2 秒采样的前台宿主** | 后台采样任务现在由 `mailstack-web` 启动。**若以 API-only 模式短时运行再退出**（例如只跑一次自检），`points` 不会积累 —— 那是进程生命周期的正常结果，不是采集器故障 |
+| **管理面默认只绑回环** | `--bind 127.0.0.1:8443`。TLS 终止与对外暴露交给反向代理或 SSH 隧道，**本进程不做 TLS**（规格书 §3.4 把 TLS 栈留给真正需要加解密的组件）。若有人把 `--bind` 改成 `0.0.0.0` 而无反代，管理面就是明文暴露 —— 部署时必须注意 |
 
 ## 6. 构建环境约束（影响后续推进）
 

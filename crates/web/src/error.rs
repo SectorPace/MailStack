@@ -124,11 +124,35 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// 成功响应形状：`{ ok: true, data: ... }`。
+/// 成功响应：**裸对象**，不套 `{ ok: true, data }`。
+///
+/// 为什么：基线 `backend/server.production.ts` 的业务路由是 `res.json(result)` ——
+/// 裸对象。管理前端（mailstack-admin-frontend）对非列表动作直接读 `body.<field>`，
+/// 套壳会让 `snapshot` / `settings.get` / `users.status` 这类动作**读不到任何字段**。
+/// 列表动作之所以没暴露这个问题，是它自己的 `pickList` 兜底了 `o.data ?? o`。
+///
+/// 错误响应形状不受影响，仍是 `{ ok: false, error: { code, message } }`。
 pub fn ok_json(data: serde_json::Value) -> Response {
+    Json(data).into_response()
+}
+
+/// RPC 桥（`POST /api/rpc`）的成功响应：`{ ok: true, data }`。
+///
+/// 与 [`ok_json`] **故意不同**：桥是前端唯一的 fallback 传输层，其返回值由前端
+/// `bridge()` 统一拆包（`body.ok` / `body.data`），不能裸对象 —— 前端会把整个
+/// 响应体当成 `data`。REST 路由与桥并存两套形状，是前端传输层设计的结果。
+pub fn rpc_ok_json(data: serde_json::Value) -> Response {
+    Json(serde_json::json!({ "ok": true, "data": data })).into_response()
+}
+
+/// RPC 桥的失败响应：`{ ok: false, error: "<可读消息>" }`。
+///
+/// `error` 是**字符串**而非对象：前端 `bridge()` 把它直接当 message 展示。
+/// 若沿用 [`ApiError`] 的嵌套形状，界面只会显示 `HTTP 5xx`，丢掉可读原因。
+pub fn rpc_err_json(status: StatusCode, message: impl Into<String>) -> Response {
     (
-        StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "data": data })),
+        status,
+        Json(serde_json::json!({ "ok": false, "error": message.into() })),
     )
         .into_response()
 }
@@ -196,12 +220,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn success_body_is_ok_true_with_data() {
+    async fn success_body_is_the_bare_object_without_an_ok_wrapper() {
+        // 套壳会让前端的非列表动作（snapshot / settings.get / users.status…）读空。
         let response = ok_json(serde_json::json!({ "name": "example.com" }));
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
-        assert_eq!(body["ok"], true);
-        assert_eq!(body["data"]["name"], "example.com");
+        assert_eq!(body["name"], "example.com");
+        assert!(body.get("ok").is_none(), "成功响应不得套 {{ok,data}} 外壳");
+        assert!(
+            body.get("data").is_none(),
+            "成功响应不得套 {{ok,data}} 外壳"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_bridge_shapes_are_the_opposite_of_the_rest_routes() {
+        // 桥的返回值由前端 bridge() 拆包，必须带外壳；error 必须是字符串。
+        let ok = body_json(rpc_ok_json(serde_json::json!({ "name": "x" }))).await;
+        assert_eq!(ok["ok"], true);
+        assert_eq!(ok["data"]["name"], "x");
+
+        let failed = rpc_err_json(StatusCode::BAD_REQUEST, "域名已存在");
+        assert_eq!(failed.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(failed).await;
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "域名已存在");
     }
 
     #[tokio::test]

@@ -57,6 +57,10 @@ pub const ROUTES: &[RouteSpec] = &[
     r("POST", "/api/auth/sessions/revoke", None, Required),
     r("DELETE", "/api/auth/sessions", None, Required),
     r("GET", "/api/health", None, Public),
+    // RPC 桥：动作名在**请求体**里（`{"action":..,"data":..}`），由 Web 进程转发给
+    // 助手。`action` 为 `None` —— 它按请求体分派，没有单一固定动作。
+    // 允许集见 [`is_exposed_action`]：必须严于助手白名单。
+    r("POST", "/api/rpc", None, Required),
     // ── 管理员与 2FA ──
     r("GET", "/api/admin", Some("admin.get"), Required),
     r("POST", "/api/admin", Some("admin.set"), Required),
@@ -90,6 +94,9 @@ pub const ROUTES: &[RouteSpec] = &[
         Some("domains.delete"),
         Required,
     ),
+    // `GET /api/users` 与 `POST /api/users` 同层级共存（静态段 + 方法区分）：
+    // 前端把「列用户」与「建用户」都挂在同一个路径上。
+    r("GET", "/api/users", Some("users.list"), Required),
     r("POST", "/api/users", Some("users.add"), Required),
     r("POST", "/api/users/status", Some("users.status"), Required),
     r(
@@ -99,6 +106,8 @@ pub const ROUTES: &[RouteSpec] = &[
         Required,
     ),
     r("DELETE", "/api/users/:id", Some("users.delete"), Required),
+    // 与 `/api/users` 同理：前端在同一个路径上分别用 GET / POST 取列表与新建。
+    r("GET", "/api/aliases", Some("aliases.list"), Required),
     r("POST", "/api/aliases", Some("aliases.add"), Required),
     r(
         "DELETE",
@@ -151,6 +160,22 @@ pub const ROUTES: &[RouteSpec] = &[
         Some("security.unban"),
         Required,
     ),
+    // ── 为管理前端新增的只读列表端点（基线 62 条契约里没有） ──
+    //
+    // 新前端（mailstack-admin-frontend）把每个列表页的数据源都做成一个独立动作。
+    // 单列这 6 条而不是让前端走 RPC 桥，是因为契约表是**路由的唯一真相源**：
+    // 桥的允许集由本表推导（见 [`is_exposed_action`]），不在这里声明就等于不可达。
+    r("GET", "/api/queue", Some("queue.list"), Required),
+    r("GET", "/api/services", Some("services.list"), Required),
+    r("GET", "/api/dkim/keys", Some("dkim.keys"), Required),
+    r("GET", "/api/dns/records", Some("dns.records"), Required),
+    r(
+        "GET",
+        "/api/metrics/system",
+        Some("metrics.system"),
+        Required,
+    ),
+    r("GET", "/api/activity", Some("activity.list"), Required),
     // ── 初始化流程 ──
     r("GET", "/api/setup/status", Some("setup.status"), Required),
     r(
@@ -219,6 +244,9 @@ pub const ROUTES: &[RouteSpec] = &[
     // ── AI 子系统 ──
     r("GET", "/api/ai/config", Some("ai.config.get"), Required),
     r("POST", "/api/ai/config", Some("ai.config.set"), Required),
+    // 同一路径两个方法映射到**同一个只读动作**：前端用 GET 取模型列表，
+    // 既有 POST 端点是规格书 §5.2 的原始声明，保持不变。
+    r("GET", "/api/ai/models", Some("ai.models.list"), Required),
     r("POST", "/api/ai/models", Some("ai.models.list"), Required),
     r("POST", "/api/ai/test", Some("ai.test"), Required),
     r("POST", "/api/ai/chat", Some("ai.chat"), Required),
@@ -265,6 +293,18 @@ pub fn is_public(method: &str, path: &str) -> bool {
     ROUTES
         .iter()
         .any(|s| s.method == method && s.path == path && s.auth == Public)
+}
+
+/// RPC 桥（`POST /api/rpc`）允许的动作集合 —— [`ROUTES`] 里声明过的全部动作。
+///
+/// 为什么这样取：动作名在桥里是**请求体字段**（由前端传输层决定），所以允许集
+/// 必须**严于** `mailstack_core::actions::ALLOWED_ACTIONS`。本集合是那个白名单的
+/// 真子集 —— 它只含已有专门 HTTP 路由的动作，于是只被登录流程内部使用的
+/// `admin.totp.verify` / `admin.totp.consume_recovery` 不会因为桥而暴露到 HTTP 面。
+///
+/// 破坏性动作的 `confirm: true` 仍由助手侧 `ActionGate` 强制，请求体绕不过去。
+pub fn is_exposed_action(action: &str) -> bool {
+    ROUTES.iter().any(|spec| spec.action == Some(action))
 }
 
 #[cfg(test)]
@@ -406,11 +446,39 @@ mod tests {
     #[test]
     fn route_count_is_stable() {
         // 数量变化必须是有意为之：契约是向后兼容承诺（§1.1 第 5 条）。
+        // 62 → 72：为管理前端新增 10 条 —— RPC 桥 `POST /api/rpc`、
+        // 三条它硬编码了方法与路径的只读端点（GET /api/users、GET /api/aliases、
+        // GET /api/ai/models），以及六条新的只读列表端点
+        // （GET /api/queue、/api/services、/api/dkim/keys、/api/dns/records、
+        // /api/metrics/system、/api/activity）。
+        // 十条都是**新增**，没有改动或删除任何既有条目。
         assert_eq!(
             ROUTES.len(),
-            62,
+            72,
             "路由数量变化需同步更新契约与 fixtures（实际 {}）",
             ROUTES.len()
         );
+    }
+
+    #[test]
+    fn the_rpc_bridge_only_exposes_actions_that_already_have_a_route() {
+        // 桥的允许集是白名单的真子集：只被登录流程内部使用的
+        // `admin.totp.verify` / `admin.totp.consume_recovery` 不得从 HTTP 面可达。
+        for action in ["admin.totp.verify", "admin.totp.consume_recovery"] {
+            assert!(
+                mailstack_core::actions::is_allowed(action),
+                "前提：该动作确实在助手白名单里 —— 否则这条断言没有意义"
+            );
+            assert!(
+                !is_exposed_action(action),
+                "{action} 没有对外路由，不得被 RPC 桥暴露"
+            );
+        }
+        // 反向：已有路由的动作必须都能过桥，否则前端 fallback 传输会 403。
+        for spec in ROUTES {
+            if let Some(action) = spec.action {
+                assert!(is_exposed_action(action), "{action} 应可过桥");
+            }
+        }
     }
 }

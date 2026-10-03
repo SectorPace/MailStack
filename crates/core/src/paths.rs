@@ -40,6 +40,16 @@ pub struct Paths {
     pub var_lib: PathBuf,
     /// `/var/lib/mailstack/manual-bans.json` —— 管理台手工封禁（0600 root:root）
     pub manual_bans: PathBuf,
+    /// `/etc/mailstack/managed-users.json` —— 受管 unix 账号名（JSON 数组，0640）
+    pub managed_users: PathBuf,
+    /// `/var/lib/mailstack/managed-mailboxes.json` —— 邮箱→unix账号注册表（0640 root:mailstack-webmail）
+    ///
+    /// 放在世界可遍历目录而非 `/etc/mailstack`：webmail 进程不在 mailstack-admin 组，
+    /// 放 `/etc/mailstack` 会让每次 webmail 登录都 fail-closed。该文件不含机密
+    /// （只有地址与账号名），故 `root:mailstack-webmail` 可读。
+    pub managed_mailboxes: PathBuf,
+    /// `/var/lib/mailstack/webmail-session-epoch.json` —— webmail 会话纪元（改密/锁定即 bump）
+    pub webmail_session_epoch: PathBuf,
     /// `/var/backups/mailstack`
     pub backups_dir: PathBuf,
     /// `/run/mailstack`
@@ -76,6 +86,9 @@ impl Paths {
             vmail: PathBuf::from("/var/vmail"),
             var_lib: PathBuf::from("/var/lib/mailstack"),
             manual_bans: PathBuf::from("/var/lib/mailstack/manual-bans.json"),
+            managed_users: etc.join("managed-users.json"),
+            managed_mailboxes: PathBuf::from("/var/lib/mailstack/managed-mailboxes.json"),
+            webmail_session_epoch: PathBuf::from("/var/lib/mailstack/webmail-session-epoch.json"),
             backups_dir: PathBuf::from("/var/backups/mailstack"),
             run_dir: PathBuf::from("/run/mailstack"),
             opendkim: PathBuf::from("/etc/opendkim"),
@@ -106,6 +119,9 @@ impl Paths {
             vmail: join("/var/vmail"),
             var_lib: join("/var/lib/mailstack"),
             manual_bans: join("/var/lib/mailstack/manual-bans.json"),
+            managed_users: join("/etc/mailstack/managed-users.json"),
+            managed_mailboxes: join("/var/lib/mailstack/managed-mailboxes.json"),
+            webmail_session_epoch: join("/var/lib/mailstack/webmail-session-epoch.json"),
             backups_dir: join("/var/backups/mailstack"),
             run_dir: join("/run/mailstack"),
             opendkim: join("/etc/opendkim"),

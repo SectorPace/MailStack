@@ -10,6 +10,8 @@
 //!
 //! 本模块只实现**协议与门控**；具体动作的副作用在 [`handlers`] 中按 Phase 逐步补齐。
 
+pub mod acme;
+pub mod ai;
 pub mod client;
 pub mod dispatch;
 pub mod framing;
@@ -18,7 +20,10 @@ pub mod mailtest;
 pub mod readers;
 pub mod resolve;
 pub mod server;
+pub mod users;
 
+pub use acme::{Acme, AcmeProbes};
+pub use ai::{Ai, AiEnv, AiTransport, HostResolver};
 pub use client::{CallError, PrivilegedCaller, DEFAULT_SUDO_WRAPPER};
 pub use dispatch::{ActionGate, GateDecision};
 pub use framing::{read_frame, write_frame, MAX_FRAME_BYTES};
@@ -30,6 +35,7 @@ pub use resolve::{
 pub use server::{
     RoServer, RoServerConfig, DEFAULT_RO_SOCKET, DEFAULT_RW_SOCKET, HELPER_TIMEOUT_MS_DEFAULT,
 };
+pub use users::{Users, UsersEnv};
 
 /// RPC 请求体（对应 `{action, data}`）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

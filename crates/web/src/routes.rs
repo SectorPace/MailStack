@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -61,8 +61,41 @@ action_handlers! {
     queue_action            => "queue.action",
     services_action         => "services.action",
     security_scan           => "security.scan",
+    security_ban            => "security.ban",
+    security_unban          => "security.unban",
     backup_list             => "backup.list",
+    backup_create           => "backup.create",
+    backup_restore          => "backup.restore",
+    backup_delete           => "backup.delete",
     certs_list              => "certs.list",
+    setup_identity          => "setup.identity.apply",
+    setup_dns_verify        => "setup.dns.verify",
+    setup_relay_test        => "setup.relay.test",
+    setup_relay_apply       => "setup.relay.apply",
+    setup_mail_test         => "setup.mail.test",
+    mail_test_loopback      => "mail.test_loopback",
+    users_add               => "users.add",
+    users_list              => "users.list",
+    users_status            => "users.status",
+    users_password          => "users.password",
+    users_delete            => "users.delete",
+    aliases_list            => "aliases.list",
+    certs_renew             => "certs.renew",
+    setup_cert_issue        => "setup.cert.issue",
+    ai_config_set           => "ai.config.set",
+    ai_models_list          => "ai.models.list",
+    ai_test                 => "ai.test",
+    ai_chat                 => "ai.chat",
+    ai_diagnose             => "ai.diagnose",
+    ai_parse                => "ai.parse",
+    // ── 为管理前端新增的只读列表动作（基线 50 条白名单里没有，属规格外扩展） ──
+    // 前端把这 8 个动作当作独立页面/面板的数据源，缺一个对应界面就空转。
+    queue_list              => "queue.list",
+    services_list           => "services.list",
+    dkim_keys               => "dkim.keys",
+    dns_records             => "dns.records",
+    metrics_system          => "metrics.system",
+    activity_list           => "activity.list",
 }
 
 async fn run_action(
@@ -88,6 +121,47 @@ async fn run_action(
     match state.inner.client.call(action, &data).await {
         Ok(value) => crate::error::ok_json(value),
         Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /api/rpc` —— 管理前端的 RPC 桥。
+///
+/// 请求体形状：`{ "action": "<动作名>", "data": { ... } }`。
+///
+/// **这是全仓唯一从请求体读动作名的地方**，与本文件顶部「动作名编译期静态绑定」
+/// 的纪律直接冲突。之所以仍要开这个口子：新前端把 RPC 桥当作**兜底传输层**
+/// （它的 `restCall` 未命中映射表时回退到这里），没有它前端有一批动作会直接 404。
+///
+/// 安全性由两点保证，缺一不可：
+/// 1. [`crate::contract::is_exposed_action`] —— 只放行**已有专门 HTTP 路由**的动作。
+///    该集合是助手白名单的**真子集**，因此只被登录流程内部使用的
+///    `admin.totp.verify` / `admin.totp.consume_recovery` 不会经此暴露到 HTTP 面。
+/// 2. 破坏性动作的 `confirm: true` 由助手侧 `ActionGate` 强制，请求体绕不过去。
+///
+/// 响应形状与 REST 路由**相反**：这里必须带 `{ok, data}` 外壳，因为前端 `bridge()`
+/// 按 `body.ok` / `body.data` 拆包（见 [`crate::error::rpc_ok_json`]）。
+pub async fn rpc_bridge(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    if !crate::contract::is_exposed_action(action) {
+        // 不区分「动作不存在」与「动作未暴露」—— 否则内部动作名会成为可探测信息。
+        return crate::error::rpc_err_json(StatusCode::BAD_REQUEST, "unknown action");
+    }
+
+    let data = body.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    let data = if data.is_null() {
+        serde_json::json!({})
+    } else {
+        data
+    };
+
+    match state.inner.client.call(action, &data).await {
+        Ok(value) => crate::error::rpc_ok_json(value),
+        // 桥的错误是**字符串**：前端把它直接当消息展示。若沿用 REST 的嵌套形状，
+        // 界面只会显示 "HTTP 5xx"，丢掉服务端给出的可读原因。
+        Err(e) => crate::error::rpc_err_json(e.status, e.message.clone()),
     }
 }
 
@@ -260,6 +334,19 @@ pub async fn admin_2fa(State(state): State<AppState>) -> Response {
         "period": mailstack_core::totp::TOTP_PERIOD_SECS,
     }))
     .into_response()
+}
+
+/// `GET /api/metrics/telemetry?range=...`。
+///
+/// 这条路由**不经助手**（契约里 `action` 为 `None`）：采样器就在 Web 进程内，
+/// 见 [`crate::telemetry`]。响应是遥测对象本身，**不套 `{ok,data}` 外壳** ——
+/// 与基线 `res.json(metricsCollector.getTelemetry(...))` 的形状一致。
+pub async fn metrics_telemetry(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let range = params.get("range").map(String::as_str);
+    Json(state.inner.telemetry.telemetry(range)).into_response()
 }
 
 /// `/api/*` 兜底：**必须**返回 JSON（规格书 §5.1）。

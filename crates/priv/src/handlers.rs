@@ -108,7 +108,13 @@ impl Registry {
         });
 
         let p = paths.clone();
-        registry.register("ai.config.get", move |_data| Ok(load_ai_public_config(&p)));
+        registry.register("ai.config.get", move |_data| {
+            // 与 `ai.config.set` 返回**同一份**公开配置（`crate::ai::ai_public_config`）。
+            Ok(crate::ai::ai_public_config(
+                &p,
+                crate::ai::private_network_enabled(),
+            ))
+        });
 
         // ── 2FA（§5.5）：secret 的信封与恢复码都只存在于助手侧 ──
         //
@@ -455,55 +461,6 @@ fn read_domain_table(paths: &Paths) -> Vec<Value> {
             Some(json!({ "name": name, "target": target }))
         })
         .collect()
-}
-
-/// 读取 AI 供应商配置的**公开**字段。
-///
-/// `ai-provider.json` 属机密文件（`backup.py:220` 的 `secret_names`），
-/// 故这里只返回 provider/baseUrl/model 之类的非机密字段，**绝不返回 apiKey**。
-fn load_ai_public_config(paths: &Paths) -> Value {
-    let Ok(text) = std::fs::read_to_string(&paths.ai_config) else {
-        return json!({
-            "configured": false,
-            "provider": "",
-            "baseUrl": "",
-            "model": "",
-        });
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        mailstack_core::warn::warn(&format!(
-            "parse ai provider config {}",
-            paths.ai_config.display()
-        ));
-        return json!({
-            "configured": false,
-            "provider": "",
-            "baseUrl": "",
-            "model": "",
-        });
-    };
-
-    // 只挑白名单字段，避免把 apiKey 之类的机密透传出去。
-    let pick = |key: &str| -> Value {
-        value
-            .get(key)
-            .cloned()
-            .unwrap_or(Value::String(String::new()))
-    };
-    json!({
-        "configured": true,
-        "provider": pick("provider"),
-        "baseUrl": pick("baseUrl"),
-        "model": pick("model"),
-        "allowPrivateNetwork": value
-            .get("allowPrivateNetwork")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        "insecureTls": value
-            .get("insecureTls")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-    })
 }
 
 #[cfg(test)]

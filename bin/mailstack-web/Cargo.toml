@@ -1,0 +1,28 @@
+[package]
+name = "mailstack-web-bin"
+description = "MailStack 管理控制台服务：对外提供管理 API 并托管前端产物"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mailstack-web"
+path = "src/main.rs"
+
+[dependencies]
+mailstack-core.workspace = true
+# 管理 API 的 Axum 装配与中间件。
+mailstack-web.workspace = true
+axum.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"

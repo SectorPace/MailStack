@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-/// 只读动作（14 项）。这些动作可直连 `/run/mailstack/helper-ro.sock`。
+/// 只读动作（22 项）。这些动作可直连 `/run/mailstack/helper-ro.sock`。
 pub const ALLOWED_ACTIONS_RO: &[&str] = &[
     // 纯读聚合：status() 汇总 domains/users/aliases/queue/certs/logs 的只读列表。
     "snapshot",
@@ -38,6 +38,25 @@ pub const ALLOWED_ACTIONS_RO: &[&str] = &[
     "ai.models.list",
     // 仅出站 TCP 端口探测，不写本机状态。
     "network.check_port",
+    // ── 以下 8 项为管理前端（mailstack-admin-frontend）新增 ──
+    // 基线 50 条白名单里**没有**这些动作，是为了支持前端的列表页而扩展的。
+    // 全部是纯读：不写文件、不改服务状态、不发信，故按归类纪律（「纯读者入 RO」）入 RO。
+    // 读两份用户注册表（managed-users.json / managed-mailboxes.json）。
+    "users.list",
+    // 读别名表。
+    "aliases.list",
+    // 读本机邮件队列。
+    "queue.list",
+    // 读 postfix/dovecot 等服务活性。
+    "services.list",
+    // 列举 opendkim 密钥目录（只读 stat，不导出私钥）。
+    "dkim.keys",
+    // 出站解析 A/MX/TXT，不写本机状态。
+    "dns.records",
+    // 读 /proc 的资源占用快照。
+    "metrics.system",
+    // 读审计日志尾部（只读）。
+    "activity.list",
 ];
 
 /// 变更动作。恒经 sudo 包装器下发，Web 进程无法直连变更 socket。
@@ -200,9 +219,32 @@ mod tests {
     }
 
     #[test]
-    fn read_only_set_has_exactly_fourteen_actions() {
+    fn read_only_set_has_exactly_twenty_two_actions() {
         // 规格书 §5.4.1 明示 RO 为 14 项；数量漂移意味着归类纪律被破坏。
-        assert_eq!(ALLOWED_ACTIONS_RO.len(), 14);
+        // 14 → 22：为管理前端扩展了 8 个纯读列表动作（users.list / aliases.list /
+        // queue.list / services.list / dkim.keys / dns.records / metrics.system /
+        // activity.list）。它们全部无副作用，符合「纯读者入 RO」的纪律。
+        assert_eq!(ALLOWED_ACTIONS_RO.len(), 22);
+    }
+
+    #[test]
+    fn every_added_list_action_is_pure_read() {
+        // 这 8 项是规格外扩展，必须逐个确认没有被误归到变更面 ——
+        // 一旦落进 RW，Web 进程就得经 sudo 下发，等于给只读列表开了特权通道。
+        for action in [
+            "users.list",
+            "aliases.list",
+            "queue.list",
+            "services.list",
+            "dkim.keys",
+            "dns.records",
+            "metrics.system",
+            "activity.list",
+        ] {
+            assert!(is_ro(action), "{action} 必须是只读");
+            assert!(!is_rw(action), "{action} 不得落在变更面");
+            assert!(!is_destructive(action), "{action} 不得是破坏性动作");
+        }
     }
 
     #[test]

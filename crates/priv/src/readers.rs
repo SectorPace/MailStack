@@ -34,7 +34,10 @@ use mailstack_smtp::{
 };
 use serde_json::{json, Value};
 
+use crate::acme::{Acme, AcmeProbes};
+use crate::ai::{Ai, AiEnv};
 use crate::handlers::{HandlerError, Registry};
+use crate::users::{Users, UsersEnv};
 
 /// 迁移期受管的服务单元。
 ///
@@ -288,6 +291,18 @@ pub struct Readers {
     relay: Arc<dyn RelayProbe>,
     /// 环路自检的运行参数（家目录根 / 提交器）。
     mailtest: MailTestEnv,
+    /// 系统账号邮箱动作（`users.*`）。
+    ///
+    /// 与 `runner` / `clock` 共享同一份注入：用户名解析、`passwd` 调用与 epoch
+    /// bump 都要在测试里可控，不能各自去读真实的 `/etc` 或系统时间。
+    users: Users,
+    /// 证书签发 / 续期（`certs.renew` / `setup.cert.issue`）。
+    ///
+    /// 同样共享 `runner` / `clock` / 服务探测；`acme.sh` 与 `openssl` 的存在性
+    /// 走独立的 `AcmeProbes`，测试据此替换掉真实的 `/root/.acme.sh`。
+    acme: Acme,
+    /// AI 子系统（`ai.*`）：出站 HTTP 与 DNS 解析都经 [`AiEnv`] 注入。
+    ai: Ai,
 }
 
 /// 备份动作的运行参数。
@@ -376,17 +391,37 @@ impl Readers {
                 })
             }
         };
+        let clock: Clock = Arc::new(|| time::OffsetDateTime::now_utc().unix_timestamp());
+        let service_env: Arc<dyn ServiceEnv> = Arc::new(SystemServiceEnv);
+        let runner: Arc<dyn CommandRunner> = Arc::new(SystemCommandRunner);
+        let users = Users::new(
+            paths.clone(),
+            UsersEnv::default(),
+            Arc::clone(&runner),
+            Arc::clone(&clock),
+        );
+        let acme = Acme::new(
+            paths.clone(),
+            Arc::new(crate::acme::SystemAcmeProbes),
+            Arc::clone(&service_env),
+            Arc::clone(&runner),
+            Arc::clone(&clock),
+        );
+        let ai = Ai::system(paths.clone());
         Self {
             paths,
-            env: Arc::new(SystemServiceEnv),
-            runner: Arc::new(SystemCommandRunner),
+            env: service_env,
+            runner,
             proc_root: mailstack_core::sysinfo::system_proc_root(),
-            clock: Arc::new(|| time::OffsetDateTime::now_utc().unix_timestamp()),
+            clock,
             probe_targets: mailstack_smtp::probe::probe_targets_from_env(),
             backups: BackupEnv::default(),
             dns,
             relay: Arc::new(SystemRelayProbe::new()),
             mailtest: MailTestEnv::default(),
+            users,
+            acme,
+            ai,
         }
     }
 
@@ -399,6 +434,24 @@ impl Readers {
         clock: Clock,
         probe_targets: Vec<String>,
     ) -> Self {
+        // `users.*` 与只读面共用同一份注入运行器与时钟；用户名解析的假根由
+        // [`Readers::with_users_env`] 单独覆盖（默认仍是生产 `/etc`，测试必须显式注入）。
+        let users = Users::new(
+            paths.clone(),
+            UsersEnv::default(),
+            Arc::clone(&runner),
+            Arc::clone(&clock),
+        );
+        // 证书动作同样共享注入；`acme.sh` / `openssl` 探测由
+        // [`Readers::with_acme_probes`] 覆盖，默认是真实探测（测试必须显式替换）。
+        let acme = Acme::new(
+            paths.clone(),
+            Arc::new(crate::acme::SystemAcmeProbes),
+            Arc::clone(&env),
+            Arc::clone(&runner),
+            Arc::clone(&clock),
+        );
+        let ai = Ai::system(paths.clone());
         Self {
             paths,
             env,
@@ -420,7 +473,28 @@ impl Readers {
                 home_root: PathBuf::from("/"),
                 submitter: Arc::new(NoSubmitter),
             },
+            users,
+            acme,
+            ai,
         }
+    }
+
+    /// 覆盖用户动作的运行环境（测试用；生产保持 [`UsersEnv::default`]）。
+    pub fn with_users_env(mut self, env: UsersEnv) -> Self {
+        self.users = self.users.with_env(env);
+        self
+    }
+
+    /// 覆盖 AI 子系统的出站环境（测试用；生产保持 [`AiEnv::default`]）。
+    pub fn with_ai_env(mut self, env: AiEnv) -> Self {
+        self.ai = self.ai.with_env(env);
+        self
+    }
+
+    /// 覆盖证书动作的文件/程序探测（测试用）。
+    pub fn with_acme_probes(mut self, probes: Arc<dyn AcmeProbes>) -> Self {
+        self.acme = self.acme.with_probes(probes);
+        self
     }
 
     /// 覆盖备份动作的运行参数（测试用；生产保持 [`BackupEnv::default`]）。
@@ -1454,9 +1528,12 @@ impl Readers {
     ///   停掉它之后没有任何途径再把它拉起来，只能上控制台。重启是允许的
     ///   （systemd 会拉回，不构成自锁）。
     pub fn services_action(&self, data: &Value) -> Result<Value, HandlerError> {
-        let ident = crate::handlers::first_str(data, &["id", "name", "service"])?;
+        // `key` / `op` 是管理前端的字段名（它按 `{key, op}` 提交）；
+        // 下面的 `id`/`name`/`service` 与 `verb`/`action` 是基线与控制台的字段名。
+        let ident = crate::handlers::first_str(data, &["id", "name", "service", "key"])?;
         let verb = crate::handlers::optional_str(data, "verb")
             .or_else(|| crate::handlers::optional_str(data, "action"))
+            .or_else(|| crate::handlers::optional_str(data, "op"))
             .unwrap_or("restart")
             .trim()
             .to_ascii_lowercase();
@@ -1558,11 +1635,27 @@ impl Readers {
     /// * `flush` 只提前「尚未到期」的条目，已到期的条目不动（不做无谓写盘）。
     pub fn queue_action(&self, data: &Value) -> Result<Value, HandlerError> {
         let store = self.queue();
+        // 第三个候选 `op` 是给管理前端的：它按 `{id, op}` 提交。
+        //
+        // 这一条**不是**可有可无的兼容装饰 —— 少了它，前端点「删除」时参数会被
+        // 静默忽略、落到下面的 `unwrap_or("retry")`，于是**队列里的邮件被重新投递
+        // 而不是被删除**。默认值让一个破坏性操作变成了另一种破坏性操作，且两边
+        // 都不报错，是这套参数解析里最危险的一处。
         let verb = crate::handlers::optional_str(data, "verb")
             .or_else(|| crate::handlers::optional_str(data, "action"))
+            .or_else(|| crate::handlers::optional_str(data, "op"))
             .unwrap_or("retry")
             .trim()
             .to_ascii_lowercase();
+        // 前端把「立即投递」叫 `deliver`；本仓库对应的动作是「清零重试预算让它
+        // 马上再试一轮」，即 `retry`。
+        let verb = match verb.as_str() {
+            "deliver" => "retry".to_string(),
+            // `hold` 在本仓库的队列模型里**不存在**（条目只有「到期」与「未到期」
+            // 两态，没有挂起位）。这里显式报错而不是映射成最接近的动词：前端会
+            // 因此看到失败并提示，而不是以为邮件被挂起了、实际却发生了别的事。
+            other => other.to_string(),
+        };
         let now = self.now();
 
         match verb.as_str() {
@@ -1832,20 +1925,44 @@ impl Readers {
     /// SMTP 提交 —— 那是 `mailstackd` 自己的入站面。目标是常量而非请求体字段，
     /// 否则这个动作就是一个「任意主机的 SMTP 提交器」。
     ///
-    /// ## 两处登记偏离（都源于 `users.*` 尚未移植）
+    /// ## 已恢复基线的两条检查（`users.*` 移植后）
     ///
-    /// * 基线的「sender 必须对应一个受管邮箱」与「账号未锁定」两条检查**没有执行**
-    ///   —— 用户模型不存在。响应里用 `mailboxChecksSkipped` **明说**，而不是让人
-    ///   以为查过了。
-    /// * `username` / `password` 因此被**接受但忽略**：它们原本只服务于上面两条检查
-    ///   （基线的口令只做格式校验，也不参与认证）。把「没做的事」说成做了，正是
-    ///   本项目最忌讳的静默降级。
+    /// * **「sender 必须对应一个受管邮箱」**：`username` + `sender` 必须精确命中
+    ///   `managed-mailboxes.json` 里的一条记录，否则拒绝。
+    /// * **「账号未锁定」**：命中后还要确认该账号未被锁定，否则拒绝。
+    ///
+    /// 这两条检查都在**任何提交动作之前**完成，因此被拒的请求不会发出任何邮件。
+    ///
+    /// `username` / `password` 仍**不参与认证**：它们是既有口令的**回放**，
+    /// 口令只做格式校验（`validate_legacy_password_input`）—— 这是基线的真实语义，
+    /// 不是本栈的简化。
     ///
     /// 替代防线是**入站策略本身**（INV-17）：未认证会话不得投给外域收件人，
     /// 因此这里不需要再写一遍域名判断 —— 写两遍迟早出现「这里放行、那边拒收」。
     pub async fn setup_mail_test(&self, data: &Value) -> Result<Value, HandlerError> {
         let sender = setup_address(data, &["sender"])?;
         let recipient = setup_address(data, &["recipient"])?;
+
+        // 四条校验全部先于发信，顺序与基线一致。
+        // `username` 用 USER_RE 单独校验（`setup_address` 只处理地址）；
+        // 基线取字段时缺省为空串，故缺失会在这里以同一文案被拒。
+        let username = crate::handlers::optional_str(data, "username").unwrap_or("");
+        if !mailstack_core::validate::USER_RE.is_match(username) {
+            return Err(HandlerError::new("invalid mailbox or sender"));
+        }
+        // 既有口令的回放：只做格式校验，绝不参与认证。
+        let password = crate::handlers::optional_str(data, "password").unwrap_or("");
+        mailstack_core::password::validate_legacy_password_input(password)
+            .map_err(|error| HandlerError::new(error.to_string()))?;
+
+        if !self.users.managed_mailbox_matches(username, &sender) {
+            return Err(HandlerError::new(
+                "mail test requires an explicit managed mailbox matching sender",
+            ));
+        }
+        if self.users.is_locked(username) {
+            return Err(HandlerError::new("mailbox is disabled"));
+        }
 
         // 正文用 CRLF：裸 LF 会被入站的走私防护拒收（详见 `mailtest` 模块说明）。
         let body = format!(
@@ -1870,8 +1987,6 @@ impl Readers {
             "recipient": recipient,
             // 入站 MTA 的应答码：250 表示已接受并落盘，而不是「命令发出去了」。
             "code": report.code,
-            "mailboxChecksSkipped": true,
-            "mailboxChecksSkippedReason": "the mailbox registry (users.*) is not ported yet; sender/mailbox existence and lock state were not checked",
         }))
     }
 
@@ -2003,6 +2118,350 @@ impl Readers {
     fn relay_private_network_enabled(&self) -> bool {
         !mailstack_core::mode::is_public_mode(&self.paths)
     }
+
+    // ─────────── 管理前端新增的 8 个只读列表动作（基线白名单之外的扩展） ───────────
+    //
+    // 这 8 个动作是前端列表页/面板的数据源，全部只读；它们复用上面既有的注入
+    // （`runner` / `proc_root` / `clock` / `dns` / `users`），不引入新的接缝。
+    // 字段名是**冻结契约**：前端 TS 类型直接对着它写，改字段等于改契约。
+
+    /// `users.list`：受管邮箱列表（前端 `UserAccount`）。
+    ///
+    /// `quotaUsed` / `quotaTotal` **恒为 0**：本项目的配额根本没有落盘 —— 基线
+    /// `mailstackctl/mail.py:120` 也是硬编码 `quotaUsedGb: 0, quotaMaxGb: 0`。
+    /// 这不是漏读，是「没有这个数据」；为了凑一个非零数字去估算配额才是真正的错误。
+    /// `createdAt` 同理恒为 `""`：注册表里没有创建时间字段。
+    pub fn users_list(&self, _data: &Value) -> Result<Value, HandlerError> {
+        let items: Vec<Value> = self
+            .users
+            .list()
+            .iter()
+            .map(|user| {
+                json!({
+                    "address": user.get("email").cloned().unwrap_or_else(|| json!("")),
+                    "name": user.get("displayName").cloned().unwrap_or_else(|| json!("")),
+                    // 只有 enabled 算启用；disabled 与「读不到状态」都按未启用处理（fail-closed）。
+                    "active": user.get("status").and_then(Value::as_str) == Some("enabled"),
+                    "quotaUsed": 0,
+                    "quotaTotal": 0,
+                    "createdAt": "",
+                })
+            })
+            .collect();
+        Ok(Value::Array(items))
+    }
+
+    /// `aliases.list`：别名表（前端 `AliasEntry`）。
+    ///
+    /// `active` 恒为 `true`：别名表没有「禁用」概念 —— 写进表里就是生效的，
+    /// 故不存在「禁用中的别名」，不要为凑 UI 枚举去编一个状态。
+    /// `target` 取第一个目标（基线也只取第一个），但仍把 `destinations` 全量带出，
+    /// 否则「这条别名还有另外两个目标」在前端完全看不见。
+    pub fn aliases_list(&self, _data: &Value) -> Result<Value, HandlerError> {
+        let items: Vec<Value> = self
+            .tables()
+            .aliases()
+            .into_iter()
+            .map(|entry| {
+                let target = entry.destinations.first().cloned().unwrap_or_default();
+                json!({
+                    "source": entry.source,
+                    "target": target,
+                    "destinations": entry.destinations,
+                    "active": true,
+                    "createdAt": "",
+                })
+            })
+            .collect();
+        Ok(Value::Array(items))
+    }
+
+    /// `queue.list`：邮件队列（前端 `QueueItem`）。
+    ///
+    /// 状态映射：本仓库队列只有两态 —— `active`（到期该投了）与 `deferred`
+    /// （等下次重试），分别映射为 `sending` / `pending`。前端枚举里的
+    /// `delivered` / `failed` / `hold` **永远不会出现**：已投递的条目会离开队列、
+    /// 本仓库没有 hold 概念、永久失败也没有单独状态。不要为了凑枚举去编状态。
+    pub fn queue_list(&self, _data: &Value) -> Result<Value, HandlerError> {
+        let items: Vec<Value> = self
+            .queue_items()
+            .iter()
+            .map(|item| {
+                let recipient = item
+                    .get("recipient")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let domain = recipient.rsplit_once('@').map(|(_, d)| d).unwrap_or("");
+                let status = match item.get("status").and_then(Value::as_str) {
+                    Some("active") => "sending",
+                    // deferred 与「无法识别的状态」都归入等待：上游只产出这两态。
+                    _ => "pending",
+                };
+                json!({
+                    "id": item.get("id").cloned().unwrap_or(Value::Null),
+                    "sender": item.get("sender").cloned().unwrap_or(Value::Null),
+                    "recipient": recipient,
+                    "domain": domain,
+                    "status": status,
+                    "retry": item.get("retryCount").cloned().unwrap_or_else(|| json!(0)),
+                    "time": item.get("arrivalDate").cloned().unwrap_or(Value::Null),
+                    "service": item.get("kind").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect();
+        Ok(Value::Array(items))
+    }
+
+    /// `services.list`：受管服务活性（前端 `ServiceStatus`）。
+    ///
+    /// 直接复用 [`Readers::service_items`] 的判定（`systemctl show`，失败再退到逐级探测），
+    /// 只把形状收成前端要的三字段。刻意**不做第二次独立探测** —— 两个真相源迟早会分叉，
+    /// 界面上就会出现「服务页说在跑、总览说已停」。
+    pub fn services_list(&self, _data: &Value) -> Result<Value, HandlerError> {
+        let items: Vec<Value> = self
+            .service_items()
+            .iter()
+            .map(|item| {
+                json!({
+                    "key": item.get("id").cloned().unwrap_or(Value::Null),
+                    "running": item.get("status").and_then(Value::as_str) == Some("ACTIVE"),
+                    "detail": item.get("name").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect();
+        Ok(Value::Array(items))
+    }
+
+    /// `dkim.keys`：受管域名中**已生成密钥**的 DKIM 记录（前端 `DkimKey`）。
+    ///
+    /// 只为「私钥确实存在」的域名产出条目：没有密钥的域名本来就没得轮换，
+    /// 为它编一条 `keySize: 2048` 的空记录只会误导运维。
+    ///
+    /// `keySize` 用编译期常量 [`mailstack_auth::keys::DKIM_KEY_BITS`]，**不去解析私钥** ——
+    /// 解析一份可能已损坏或权限不可读的私钥来「确认」位数，既有风险又无收益。
+    pub async fn dkim_keys(&self, _data: &Value) -> Result<Value, HandlerError> {
+        let selector = self.setup_dkim_selector();
+        let mut items: Vec<Value> = Vec::new();
+        for domain in self.managed_domains() {
+            let private = mailstack_auth::keys::private_key_path(&self.paths, &domain, &selector);
+            let Ok(meta) = std::fs::metadata(&private) else {
+                // 没有密钥文件 —— 跳过该域名，而不是产出空条目。
+                continue;
+            };
+            let last_rotated = meta
+                .modified()
+                .ok()
+                .map(|t| format_utc_stamp(time::OffsetDateTime::from(t)))
+                .unwrap_or_default();
+            let published = match self
+                .dns
+                .lookup_txt(&dkim_record_name(&selector, &domain))
+                .await
+            {
+                // 「查得到任何 TXT」即视为已发布。解析失败与未发布都表现为 false：
+                // 这是刻意的降级 —— 列表动作不能因解析器抖动整体失败，代价是无法
+                // 区分「没发布」与「查询失败」（两者都值得运维去看一眼 DNS）。
+                Ok(records) => !records.is_empty(),
+                Err(_) => false,
+            };
+            items.push(json!({
+                "domain": domain,
+                "selector": selector,
+                "keySize": mailstack_auth::keys::DKIM_KEY_BITS,
+                "lastRotated": last_rotated,
+                "published": published,
+            }));
+        }
+        Ok(Value::Array(items))
+    }
+
+    /// `dns.records`：按向导口径列出应发布的 DNS 记录与观测结果（前端 `DnsRecord`）。
+    ///
+    /// `value` 是**期望发布的值**，`ok` 是实际查询是否匹配。`ttl` 恒为 [`DNS_TTL`]：
+    /// 本仓库的 `DnsQuery` 只返回记录文本、拿不到权威 TTL，所以那是**向导建议值**，
+    /// 不是实查值 —— 界面把它当「建议 TTL」展示即可。
+    ///
+    /// `required` 恒 `true`：这些记录缺一条都会直接影响收信或发信。
+    ///
+    /// 解析失败（`Err`）按「未匹配」（`ok: false`）处理，不让整条列表失败。
+    pub async fn dns_records(&self, _data: &Value) -> Result<Value, HandlerError> {
+        let setup = mailstack_core::config::read_setup_config(&self.paths);
+        let selector = self.setup_dkim_selector();
+        let mut items: Vec<Value> = Vec::new();
+
+        // A 依赖向导登记的主机名与服务器 IP；没有身份时**不编造**，
+        // 只列出那些不依赖身份的记录（SPF / DMARC / DKIM）。
+        if let Some(setup) = &setup {
+            let ok = match self.dns.lookup_a(&setup.mail_host).await {
+                Ok(ips) => ips.iter().any(|ip| ip == &setup.server_ip),
+                Err(_) => false,
+            };
+            items.push(json!({
+                "type": "A", "name": setup.mail_host, "value": setup.server_ip,
+                "ttl": DNS_TTL, "required": true, "ok": ok,
+            }));
+        }
+
+        for domain in self.managed_domains() {
+            // 该域名的邮件主机：优先用向导登记的主机（仅当它属于本域），否则按惯例 `mail.<domain>`。
+            let host = setup
+                .as_ref()
+                .map(|s| s.mail_host.as_str())
+                .filter(|host| *host == domain || host.ends_with(&format!(".{domain}")))
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("mail.{domain}"));
+
+            // MX：观测值里出现目标主机即算匹配（`lookup_mx_records` 的形态带优先级前缀）。
+            let mx_ok = self
+                .dns
+                .lookup_mx_records(&domain)
+                .await
+                .map(|records| records.iter().any(|r| r.contains(&host)))
+                .unwrap_or(false);
+            items.push(json!({
+                "type": "MX", "name": domain, "value": host,
+                "ttl": DNS_TTL, "required": true, "ok": mx_ok,
+            }));
+
+            // SPF：期望值与向导一致（`setup.json` 的 `expectedSpf`，缺省 `v=spf1 mx -all`）。
+            let spf_value = setup
+                .as_ref()
+                .and_then(|s| s.expected_spf.clone())
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "v=spf1 mx -all".to_string());
+            let spf_ok = self
+                .dns
+                .lookup_txt(&domain)
+                .await
+                .map(|records| records.iter().any(|r| r.trim() == spf_value))
+                .unwrap_or(false);
+            items.push(json!({
+                "type": "TXT", "name": domain, "value": spf_value,
+                "ttl": DNS_TTL, "required": true, "ok": spf_ok,
+            }));
+
+            // DMARC：`rua` 地址因部署而异，故只要求观测到 DMARC1 版本标签，
+            // 与 `setup_dns_verify` 的 dmarc 判据同口径。
+            let dmarc_name = format!("_dmarc.{domain}");
+            let dmarc_ok = self
+                .dns
+                .lookup_txt(&dmarc_name)
+                .await
+                .map(|records| records.iter().any(|r| r.starts_with("v=DMARC1")))
+                .unwrap_or(false);
+            items.push(json!({
+                "type": "TXT", "name": dmarc_name,
+                "value": format!("v=DMARC1; rua=mailto:dmarc@{domain}"),
+                "ttl": DNS_TTL, "required": true, "ok": dmarc_ok,
+            }));
+
+            // DKIM：只有磁盘上确实有 `.txt` zone 片段才列；期望值从片段里还原，
+            // 不凭 selector 编一个空公钥出来（那会让「未生成密钥」看起来像「已配置」）。
+            if let Some(expected) = std::fs::read_to_string(mailstack_auth::keys::txt_record_path(
+                &self.paths,
+                &domain,
+                &selector,
+            ))
+            .ok()
+            .and_then(|fragment| zone_txt_value(&fragment))
+            {
+                let name = dkim_record_name(&selector, &domain);
+                let dkim_ok = self
+                    .dns
+                    .lookup_txt(&name)
+                    .await
+                    .map(|records| records.iter().any(|r| has_dkim_public_key(r)))
+                    .unwrap_or(false);
+                items.push(json!({
+                    "type": "TXT", "name": name, "value": expected,
+                    "ttl": DNS_TTL, "required": true, "ok": dkim_ok,
+                }));
+            }
+        }
+
+        Ok(Value::Array(items))
+    }
+
+    /// `metrics.system`：CPU / 内存 / 磁盘占用百分比（前端系统瓦片）。
+    ///
+    /// 三项都是 0–100 的百分比（保留一位小数）。读不到一律回 `0.0`：这是**显示用**的
+    /// 资源瓦片，没有表达「读不到」的字段，故取默认值；诊断请用 `metrics.realtime`
+    /// （它会把 `unavailable` 明确列出来）。
+    pub fn metrics_system(&self, _data: &Value) -> Result<Value, HandlerError> {
+        Ok(json!({
+            "cpu": self.cpu_percent(),
+            "memory": self.memory_percent(),
+            "disk": self.disk_percent(),
+        }))
+    }
+
+    /// 差分 CPU 占用率。
+    ///
+    /// `/proc/stat` 的计数器是单调递增的累计值，单次快照算不出占用率，因此连续采样
+    /// 两次并在中间真的等 [`CPU_SAMPLE_INTERVAL_MS`]；不等待的话两次读到的增量常常是 0。
+    fn cpu_percent(&self) -> f64 {
+        let Some(prev) = read_cpu_counters(&self.proc_root) else {
+            return 0.0;
+        };
+        std::thread::sleep(Duration::from_millis(CPU_SAMPLE_INTERVAL_MS));
+        let Some(now) = read_cpu_counters(&self.proc_root) else {
+            return 0.0;
+        };
+        cpu_busy_percent(&prev, &now)
+    }
+
+    /// 内存占用百分比：`(total - available) / total × 100`。
+    ///
+    /// 用 `MemAvailable` 而非 `MemFree`：后者不含可回收的页缓存，会让「内存告急」
+    /// 看起来比实际严重得多（同 [`mailstack_core::sysinfo::read_meminfo`] 的口径）。
+    fn memory_percent(&self) -> f64 {
+        let Some(mem) = mailstack_core::sysinfo::read_meminfo(&self.proc_root) else {
+            return 0.0;
+        };
+        if mem.total_bytes == 0 {
+            return 0.0;
+        }
+        round1(
+            mem.total_bytes.saturating_sub(mem.available_bytes) as f64 / mem.total_bytes as f64
+                * 100.0,
+        )
+    }
+
+    /// 根文件系统占用百分比（`df -kP /`）。
+    ///
+    /// **必须带 `-P`**：POSIX 输出格式下长设备名不会折行，列数才与解析假设一致；
+    /// 不带 `-P` 时 `df` 会把长设备名换行，第 2/3 列随之错位。
+    fn disk_percent(&self) -> f64 {
+        let Ok(output) = self.runner.run("df", &["-kP", "/"]) else {
+            return 0.0;
+        };
+        if output.status != 0 {
+            return 0.0;
+        }
+        parse_df_percent(&output.stdout).unwrap_or(0.0)
+    }
+
+    /// `activity.list`：审计日志折成的活动流（前端 `ActivityItem`），最新在前，最多 50 条。
+    pub fn activity_list(&self, _data: &Value) -> Result<Value, HandlerError> {
+        Ok(Value::Array(read_activity(&self.paths.audit_log)?))
+    }
+
+    /// 受管域名表的第一列（与 `snapshot` 同源）。
+    fn managed_domains(&self) -> Vec<String> {
+        mailstack_core::atomic::rows(&self.paths.domains)
+            .into_iter()
+            .filter_map(|row| row.into_iter().next())
+            .collect()
+    }
+
+    /// DKIM 列表/ DNS 记录用的 selector：`setup.json` 的 `dkimSelector`，
+    /// 缺省用 auth crate 的默认常量（`mailstack`，**不是**向导的 `mail`）。
+    fn setup_dkim_selector(&self) -> String {
+        mailstack_core::config::read_setup_config(&self.paths)
+            .map(|config| config.dkim_selector)
+            .filter(|selector| !selector.trim().is_empty())
+            .unwrap_or_else(|| mailstack_auth::keys::DEFAULT_DKIM_SELECTOR.to_string())
+    }
 }
 
 /// 拆解本机提交端点常量（`127.0.0.1:25`）。
@@ -2074,6 +2533,183 @@ fn has_dkim_public_key(record: &str) -> bool {
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
         .collect();
     key.trim_end_matches('=').len() >= 100
+}
+
+// ─────────────────── 管理前端只读列表动作的辅助（CPU / DNS / 审计） ───────────────────
+
+/// CPU 差分采样的间隔（毫秒）。太短会因计数器粒度而得到 0 增量。
+const CPU_SAMPLE_INTERVAL_MS: u64 = 100;
+
+/// `dns.records` 展示的 TTL（秒）。
+///
+/// 是**向导建议值**而非实查值：本仓库的 `DnsQuery` 只返回记录文本，拿不到权威 TTL。
+const DNS_TTL: u64 = 3600;
+
+/// `activity.list` 最多返回的条目数（最新在前）。
+const ACTIVITY_MAX_ITEMS: usize = 50;
+
+/// DKIM TXT 记录的 owner 名：`<selector>._domainkey.<domain>`。
+fn dkim_record_name(selector: &str, domain: &str) -> String {
+    format!("{selector}._domainkey.{domain}")
+}
+
+/// 一次 `/proc/stat` 的 CPU 累计计数器。
+struct CpuCounters {
+    /// 空闲口径 `idle + iowait`（与基线 `telemetry.py:_cpu_percent` 一致）。
+    idle: u64,
+    total: u64,
+}
+
+/// 读 `/proc/stat` 的 CPU 计数器（取首个 `cpu` 行，即汇总行）。
+///
+/// 解析前**先剥掉核心序号**：`cpu0 <user> ...` 里的 `0` 会占掉 `user` 的位置，
+/// 整列错位一格（本项目在遥测首版踩过，见 `docs/TEST_REPORT.md` §4.20）。
+/// 汇总行本身没有序号，但同一段解析要对两种形态都成立。
+fn read_cpu_counters(proc_root: &Path) -> Option<CpuCounters> {
+    let text = std::fs::read_to_string(proc_root.join("stat")).ok()?;
+    let line = text.lines().find(|line| line.starts_with("cpu"))?;
+    // 汇总行是 `cpu `（紧跟空白），每核行是 `cpu0`；两种都先去掉可能的序号。
+    let rest = line.strip_prefix("cpu")?;
+    let counters = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    let fields: Vec<u64> = counters
+        .split_whitespace()
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    if fields.len() < 4 {
+        return None;
+    }
+    // user nice system idle iowait irq softirq steal
+    Some(CpuCounters {
+        idle: fields[3].saturating_add(fields.get(4).copied().unwrap_or(0)),
+        total: fields.iter().take(8).sum(),
+    })
+}
+
+/// 由两次采样算忙时百分比（0–100，保留一位小数）。
+fn cpu_busy_percent(prev: &CpuCounters, now: &CpuCounters) -> f64 {
+    let total_delta = now.total.saturating_sub(prev.total);
+    let idle_delta = now.idle.saturating_sub(prev.idle);
+    if total_delta == 0 {
+        return 0.0;
+    }
+    // idle_delta 理论上 ≤ total_delta；截断一下防止计数器回绕或夹具异常算出负值。
+    let busy = total_delta.saturating_sub(idle_delta.min(total_delta));
+    round1((busy as f64 / total_delta as f64 * 100.0).clamp(0.0, 100.0))
+}
+
+/// 解析 `df -kP /` 输出中的容量百分比。
+///
+/// 要求字段数 ≥ 6 且第 2/3 列是数字：表头行（`1024-blocks`）正因为不是数字而被跳过。
+/// 解析不出来就回 `None`，不拿残缺行凑一个数字。
+fn parse_df_percent(stdout: &str) -> Option<f64> {
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 6 {
+            continue;
+        }
+        let (Ok(total_kb), Ok(used_kb)) = (parts[1].parse::<u64>(), parts[2].parse::<u64>()) else {
+            continue;
+        };
+        if total_kb == 0 {
+            continue;
+        }
+        return Some(round1(used_kb as f64 / total_kb as f64 * 100.0));
+    }
+    None
+}
+
+/// 从 DKIM 的 zone 片段里还原纯 TXT 值（拼接各引号段）。
+///
+/// 片段形如 `<owner>\tIN\tTXT\t( "chunk1"\n\t"chunk2" )  ; comment`。取第一个 `(`
+/// 与最后一个 `)` 之间、奇数位的引号内容拼回 —— 与生成端
+/// [`mailstack_auth::keys::zone_txt_fragment`] 的往返不变量对应。
+fn zone_txt_value(fragment: &str) -> Option<String> {
+    let open = fragment.find('(')?;
+    let close = fragment.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let mut value = String::new();
+    for chunk in fragment[open + 1..close].split('"').skip(1).step_by(2) {
+        value.push_str(chunk);
+    }
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// 审计动作的前缀 → 前端活动流的 `kind`。
+fn activity_kind(action: &str) -> &'static str {
+    if action.starts_with("users.") {
+        "user"
+    } else if action.starts_with("domains.") {
+        "domain"
+    } else if action.starts_with("queue.") {
+        "queue"
+    } else if action.starts_with("services.") {
+        "service"
+    } else if action.starts_with("certs.") {
+        "cert"
+    } else {
+        "system"
+    }
+}
+
+/// 读审计日志（JSON lines）并折成前端活动项，最新在前，最多 [`ACTIVITY_MAX_ITEMS`] 条。
+///
+/// 无法解析的行（被截断的半行、格式回滚的旧记录）**跳过**而不是让整个列表失败 ——
+/// 审计日志随时可能正被追加，半行是正常中间态。日志不存在回空数组：还没写过审计
+/// 是合法状态，不是错误。
+///
+/// 日志是追加写的，故倒排即「最新在前」。**不**按 `time` 字符串重排：不同条目的
+/// 时区偏移可能不同，字典序排序会得出错误顺序。
+fn read_activity(log_path: &Path) -> Result<Vec<Value>, HandlerError> {
+    let text = match std::fs::read_to_string(log_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        // 与「不存在」不同，读不动（权限 / IO）是真故障：不静默成空列表。
+        Err(e) => {
+            return Err(HandlerError::new(format!(
+                "read audit log {}: {e}",
+                log_path.display()
+            )))
+        }
+    };
+    let mut items: Vec<Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<mailstack_core::audit::AuditRecord>(line).ok())
+        .map(|record| {
+            let kind = activity_kind(&record.action);
+            json!({
+                "kind": kind,
+                "title": record.action,
+                "sub": record.target,
+                "time": record.time,
+            })
+        })
+        .collect();
+    items.reverse();
+    items.truncate(ACTIVITY_MAX_ITEMS);
+    Ok(items)
+}
+
+/// `YYYY-MM-DD HH:MM:SS`（UTC）。
+///
+/// 慎用 `OffsetDateTime::to_string()`：格式随版本而变。`time_fmt` 只提供 ISO8601，
+/// 而 `dkim.keys` 的契约要的是空格分隔的展示形态，故这里本地拼一次。
+fn format_utc_stamp(dt: time::OffsetDateTime) -> String {
+    let dt = dt.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        dt.year(),
+        u8::from(dt.month()),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
+    )
 }
 
 /// 把请求载荷折算成中继端点校验请求。
@@ -2232,7 +2868,10 @@ fn check(name: &str, ok: bool, detail: impl Into<String>) -> Value {
 }
 
 /// 把 [`mailstack_core::certs::CertificateInfo`] 转成线上结构（camelCase）。
-fn certificate_to_json(info: mailstack_core::certs::CertificateInfo) -> Value {
+///
+/// `pub(crate)`：`acme.rs` 的 `certs.renew` / `setup.cert.issue` 成功后要返回同一
+/// 形状的证书对象，避免两处各写一份映射而漂移。
+pub(crate) fn certificate_to_json(info: mailstack_core::certs::CertificateInfo) -> Value {
     json!({
         "domain": info.domain,
         "certPath": info.cert_path.display().to_string(),
@@ -2427,6 +3066,118 @@ pub fn register(registry: &mut Registry, readers: Arc<Readers>) {
         let loopback = Arc::clone(&loopback);
         let data = data.clone();
         Box::pin(async move { loopback.mail_test_loopback(&data).await })
+    });
+
+    // ── 系统账号邮箱（§5.4.1 的 `users.*`；全部归 RW） ──
+    //
+    // 与 backup/security/setup 同一处注册：通道由 `ActionGate` 在调用前判定，
+    // 注册位置不影响 RO/RW。
+    let add = Arc::clone(&readers);
+    registry.register("users.add", move |data| add.users.add(data));
+
+    let status = Arc::clone(&readers);
+    registry.register("users.status", move |data| status.users.status(data));
+
+    let password = Arc::clone(&readers);
+    registry.register("users.password", move |data| password.users.password(data));
+
+    let remove = Arc::clone(&readers);
+    registry.register("users.delete", move |data| remove.users.delete(data));
+
+    // ── 证书签发 / 续期（`certs.*`；均归 RW） ──
+    //
+    // 用同步处理器（非 `register_async`）：`acme.sh` 最长可跑 300 秒，而本仓库
+    // 既有的破坏性/写面动作（`backup.create` 跑 tar、`dkim.rotate` 生成密钥）也同样
+    // 是同步处理器 —— 保持一条通道一种风格，且真正的阻塞上界由
+    // `CommandRunner::run_with_timeout` 兜住，不会无限期占住调用方。
+    let renew = Arc::clone(&readers);
+    registry.register("certs.renew", move |data| renew.acme.renew(data));
+
+    let issue = Arc::clone(&readers);
+    registry.register("setup.cert.issue", move |data| issue.acme.issue(data));
+
+    // ── AI 子系统（`ai.*`） ──
+    //
+    // `ai.config.set` 是纯本地校验+落盘（DNS 用同步解析器），故为同步处理器；
+    // 其余五个都会出站，注册为 async 并在其中 await transport。
+    let config_set = Arc::clone(&readers);
+    registry.register("ai.config.set", move |data| config_set.ai.config_set(data));
+
+    let models = Arc::clone(&readers);
+    registry.register_async("ai.models.list", move |data| {
+        let models = Arc::clone(&models);
+        let data = data.clone();
+        Box::pin(async move { models.ai.models_list(&data).await })
+    });
+
+    let ai_test = Arc::clone(&readers);
+    registry.register_async("ai.test", move |data| {
+        let ai_test = Arc::clone(&ai_test);
+        let data = data.clone();
+        Box::pin(async move { ai_test.ai.test(&data).await })
+    });
+
+    let chat = Arc::clone(&readers);
+    registry.register_async("ai.chat", move |data| {
+        let chat = Arc::clone(&chat);
+        let data = data.clone();
+        Box::pin(async move { chat.ai.chat(&data).await })
+    });
+
+    let diagnose = Arc::clone(&readers);
+    registry.register_async("ai.diagnose", move |data| {
+        let diagnose = Arc::clone(&diagnose);
+        let data = data.clone();
+        Box::pin(async move { diagnose.ai.diagnose(&data).await })
+    });
+
+    let parse = Arc::clone(&readers);
+    registry.register_async("ai.parse", move |data| {
+        let parse = Arc::clone(&parse);
+        let data = data.clone();
+        Box::pin(async move { parse.ai.parse(&data).await })
+    });
+
+    // ── 管理前端新增的 8 个只读列表动作（基线白名单之外的扩展） ──
+    //
+    // 通道由 `ActionGate` 在调用前判定，注册位置不影响 RO/RW。需要 await DNS 的
+    // `dkim.keys` / `dns.records` 用 `register_async`，其余六个是纯本地读。
+    let users_list = Arc::clone(&readers);
+    registry.register("users.list", move |data| users_list.users_list(data));
+
+    let aliases_list = Arc::clone(&readers);
+    registry.register("aliases.list", move |data| aliases_list.aliases_list(data));
+
+    let queue_list = Arc::clone(&readers);
+    registry.register("queue.list", move |data| queue_list.queue_list(data));
+
+    let services_list = Arc::clone(&readers);
+    registry.register("services.list", move |data| {
+        services_list.services_list(data)
+    });
+
+    let dkim_keys = Arc::clone(&readers);
+    registry.register_async("dkim.keys", move |data| {
+        let dkim_keys = Arc::clone(&dkim_keys);
+        let data = data.clone();
+        Box::pin(async move { dkim_keys.dkim_keys(&data).await })
+    });
+
+    let dns_records = Arc::clone(&readers);
+    registry.register_async("dns.records", move |data| {
+        let dns_records = Arc::clone(&dns_records);
+        let data = data.clone();
+        Box::pin(async move { dns_records.dns_records(&data).await })
+    });
+
+    let metrics_system = Arc::clone(&readers);
+    registry.register("metrics.system", move |data| {
+        metrics_system.metrics_system(data)
+    });
+
+    let activity_list = Arc::clone(&readers);
+    registry.register("activity.list", move |data| {
+        activity_list.activity_list(data)
     });
 }
 
@@ -3464,6 +4215,61 @@ mod tests {
         assert!(entry.last_error.is_none(), "上一次的失败描述必须被清掉");
         assert!(entry.last_code.is_none());
         assert_eq!(out[0]["status"], "active");
+    }
+
+    #[test]
+    fn queue_action_accepts_the_frontend_field_names() {
+        // 管理前端按 `{id, op}` 提交。少了 `op` 这个候选名，`op:"delete"` 会被忽略、
+        // 落到默认的 `retry` —— 于是「删除队列条目」变成「立刻重新投递」，
+        // 而且两边都不报错。这条测试就是钉死这个后果。
+        let f = Fixture::new("qfrontend");
+        let id = enqueue(&f, 0, NOW);
+        let readers = f.readers(always_ok_runner());
+
+        let out = readers
+            .queue_action(&json!({ "id": id, "op": "delete" }))
+            .unwrap();
+        assert_eq!(
+            out.as_array().unwrap().len(),
+            0,
+            "op=delete 必须真的删除条目，不能退化成重试"
+        );
+        assert!(mailstack_queue::QueueStore::from_paths(&f.paths)
+            .load_all()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn queue_action_maps_deliver_to_retry_and_refuses_hold() {
+        let f = Fixture::new("qdeliver");
+        let id = enqueue(&f, 3, NOW + 3600);
+        let readers = f.readers(always_ok_runner());
+
+        // 前端的 `deliver` = 本仓库的 `retry`（清零预算并提前到期）。
+        let out = readers
+            .queue_action(&json!({ "id": id, "op": "deliver" }))
+            .unwrap();
+        assert_eq!(out[0]["status"], "active");
+
+        // `hold` 在本仓库的队列模型里没有对应状态：必须显式失败，
+        // 而不是映射成某个「最接近」的动词悄悄做成别的事。
+        let err = readers
+            .queue_action(&json!({ "id": id, "op": "hold" }))
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid queue action"), "{err}");
+    }
+
+    #[test]
+    fn services_action_accepts_the_frontend_field_names() {
+        // 前端按 `{key, op}` 提交；只认 `id`/`verb` 会让重启请求变成默认动作或报错。
+        let f = Fixture::new("svcfrontend");
+        let readers = f.readers(always_ok_runner());
+
+        let out = readers
+            .services_action(&json!({ "key": "dovecot", "op": "status" }))
+            .unwrap();
+        assert!(out.is_array(), "key/op 必须能被识别");
     }
 
     #[test]
@@ -4598,6 +5404,17 @@ mod tests {
             })
     }
 
+    /// 往受管邮箱注册表写一条记录（`setup.mail.test` 的存在性检查据此命中）。
+    fn register_managed_mailbox(f: &Fixture, unix_user: &str, email: &str) {
+        let boxes = json!([{ "email": email, "unixUser": unix_user, "displayName": "" }]);
+        fs::create_dir_all(f.paths.managed_mailboxes.parent().unwrap()).unwrap();
+        fs::write(
+            &f.paths.managed_mailboxes,
+            serde_json::to_string_pretty(&boxes).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn the_mail_test_actions_are_registered() {
         let f = Fixture::new("mailregistered");
@@ -4608,8 +5425,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn setup_mail_test_submits_with_crlf_and_says_what_it_could_not_check() {
+    async fn setup_mail_test_submits_with_crlf_and_enforces_the_mailbox_checks() {
         let f = Fixture::new("mailtest");
+        // 命中存在性检查且未锁定：`alice@example.com` 必须在受管邮箱注册表里。
+        register_managed_mailbox(&f, "alice", "alice@example.com");
         let submitter = RecordingSubmitter::accepting();
         let readers = readers_with_mailtest(&f, Arc::clone(&submitter));
 
@@ -4617,8 +5436,8 @@ mod tests {
             .setup_mail_test(&json!({
                 "sender": "alice@example.com",
                 "recipient": "bob@example.com",
-                // 这两个字段本栈没有模型可查，必须被**忽略**而不是假装校验过。
                 "username": "alice",
+                // 既有口令的回放：只做格式校验，不参与认证。
                 "password": "Sup3rSecret!",
             }))
             .await
@@ -4629,9 +5448,10 @@ mod tests {
         assert_eq!(out["sender"], "alice@example.com");
         assert_eq!(out["recipient"], "bob@example.com");
         assert_eq!(out["code"], 250);
-        assert_eq!(
-            out["mailboxChecksSkipped"], true,
-            "没做的检查必须明说: {out}"
+        // 偏离已撤销：受管邮箱检查真实执行了，不再有「跳过」字段。
+        assert!(
+            out.get("mailboxChecksSkipped").is_none(),
+            "mailboxChecksSkipped 必须已移除: {out}"
         );
 
         let submissions = submitter.submissions();
@@ -4684,8 +5504,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_mail_test_requires_a_managed_mailbox_matching_the_sender() {
+        // sender 与 username 必须**同时**精确命中注册表里的一条记录。
+        let f = Fixture::new("mailtestnomatch");
+        register_managed_mailbox(&f, "alice", "alice@example.com");
+        let submitter = RecordingSubmitter::accepting();
+        let readers = readers_with_mailtest(&f, Arc::clone(&submitter));
+
+        for payload in [
+            // username 根本不在注册表里。
+            json!({
+                "sender": "bob@example.com",
+                "recipient": "bob@example.com",
+                "username": "bob",
+                "password": "Sup3rSecret!",
+            }),
+            // username 在注册表里，但 sender 与它记录里的地址不一致。
+            json!({
+                "sender": "carol@example.com",
+                "recipient": "bob@example.com",
+                "username": "alice",
+                "password": "Sup3rSecret!",
+            }),
+        ] {
+            let err = readers.setup_mail_test(&payload).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "mail test requires an explicit managed mailbox matching sender",
+                "{payload}"
+            );
+        }
+        assert!(
+            submitter.submissions().is_empty(),
+            "存在性检查必须在提交之前生效"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_mail_test_refuses_a_locked_mailbox() {
+        let f = Fixture::new("mailtestlocked");
+        register_managed_mailbox(&f, "alice", "alice@example.com");
+        let submitter = RecordingSubmitter::accepting();
+        // `passwd -S` 的第 2 个字段为 `L` ⇒ 账号被锁定。
+        let tracked = Arc::clone(&submitter);
+        let readers = f
+            .readers(FakeRunner::returning(0, "alice L 01/01/2026 0 99999 7 -1"))
+            .with_mailtest_env(MailTestEnv {
+                home_root: f.root.clone(),
+                submitter,
+            });
+
+        let err = readers
+            .setup_mail_test(&json!({
+                "sender": "alice@example.com",
+                "recipient": "bob@example.com",
+                "username": "alice",
+                "password": "Sup3rSecret!",
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "mailbox is disabled");
+        assert!(
+            tracked.submissions().is_empty(),
+            "锁定检查必须在提交之前生效"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_mail_test_rejects_an_invalid_username_or_password_shape() {
+        let f = Fixture::new("mailtestbadid");
+        register_managed_mailbox(&f, "alice", "alice@example.com");
+        let submitter = RecordingSubmitter::accepting();
+        let readers = readers_with_mailtest(&f, Arc::clone(&submitter));
+
+        // username 非法（大写）：与 sender/recipient 合并成同一文案。
+        let err = readers
+            .setup_mail_test(&json!({
+                "sender": "alice@example.com",
+                "recipient": "bob@example.com",
+                "username": "Root",
+                "password": "Sup3rSecret!",
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "invalid mailbox or sender");
+
+        // 口令形状非法（空）：这是既有口令的回放，只做格式校验。
+        let err = readers
+            .setup_mail_test(&json!({
+                "sender": "alice@example.com",
+                "recipient": "bob@example.com",
+                "username": "alice",
+                "password": "",
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("password must contain"),
+            "实际: {err}"
+        );
+
+        assert!(
+            submitter.submissions().is_empty(),
+            "被拒的请求不得发出任何邮件"
+        );
+    }
+
+    #[tokio::test]
     async fn setup_mail_test_never_reports_queued_when_the_mta_rejects_it() {
         let f = Fixture::new("mailtestreject");
+        register_managed_mailbox(&f, "alice", "alice@example.com");
         let submitter = RecordingSubmitter::rejecting("554 5.7.1 Relay access denied");
         let readers = readers_with_mailtest(&f, submitter);
 
@@ -4693,6 +5621,8 @@ mod tests {
             .setup_mail_test(&json!({
                 "sender": "alice@example.com",
                 "recipient": "attacker@external.example",
+                "username": "alice",
+                "password": "Sup3rSecret!",
             }))
             .await
             .unwrap_err();
@@ -4815,5 +5745,423 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Connection refused"), "{err}");
+    }
+
+    // ───────────── 管理前端新增的 8 个只读列表动作 ─────────────
+
+    #[test]
+    fn the_frontend_list_actions_are_registered() {
+        let f = Fixture::new("frontregistered");
+        let registry = Registry::new().with_readers(Arc::new(f.readers(always_ok_runner())));
+        for action in [
+            "users.list",
+            "aliases.list",
+            "queue.list",
+            "services.list",
+            "dkim.keys",
+            "dns.records",
+            "metrics.system",
+            "activity.list",
+        ] {
+            assert!(registry.is_implemented(action), "{action} 必须已接线");
+        }
+    }
+
+    /// 造一个能读到受管邮箱的 Reader：假 passwd 根 + 假注册表。
+    ///
+    /// `locked` 决定 `passwd -S` 的输出（`L` = 锁定），用来验证 `active` 的映射。
+    fn users_readers(
+        f: &Fixture,
+        passwd: &str,
+        mailboxes: &[(&str, &str)],
+        locked: bool,
+    ) -> Readers {
+        let etc = f.paths.etc.parent().unwrap();
+        fs::write(etc.join("passwd"), passwd).unwrap();
+        let boxes: Vec<Value> = mailboxes
+            .iter()
+            .map(
+                |(email, user)| json!({ "email": email, "unixUser": user, "displayName": "Alice" }),
+            )
+            .collect();
+        fs::create_dir_all(f.paths.managed_mailboxes.parent().unwrap()).unwrap();
+        fs::write(
+            &f.paths.managed_mailboxes,
+            serde_json::to_string(&boxes).unwrap(),
+        )
+        .unwrap();
+
+        let env = UsersEnv {
+            // 生产是 `/etc`；测试必须指向临时根，否则会去读真实的 `/etc/passwd`。
+            passwd_root: etc.to_path_buf(),
+            session_epoch_owner: None,
+            ..UsersEnv::default()
+        };
+        let stdout = if locked {
+            "alice L 2026-01-01 0 99999 7 -1\n"
+        } else {
+            ""
+        };
+        f.readers(FakeRunner::returning(0, stdout))
+            .with_users_env(env)
+    }
+
+    #[test]
+    fn users_list_maps_status_to_active_and_reports_the_absent_quota_as_zero() {
+        let f = Fixture::new("userslist");
+        let readers = users_readers(
+            &f,
+            "alice:x:1000:1000::/home/alice:/usr/sbin/nologin\n",
+            &[("alice@example.com", "alice")],
+            false,
+        );
+
+        let out = readers.users_list(&json!({})).unwrap();
+        let items = out.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["address"], "alice@example.com");
+        assert_eq!(items[0]["name"], "Alice");
+        assert_eq!(items[0]["active"], true);
+        // 配额没有落盘，恒为 0 —— 不是漏读，是本项目根本没有这个数据。
+        assert_eq!(items[0]["quotaUsed"], 0);
+        assert_eq!(items[0]["quotaTotal"], 0);
+        assert_eq!(items[0]["createdAt"], "");
+    }
+
+    #[test]
+    fn users_list_treats_a_locked_account_as_inactive() {
+        let f = Fixture::new("userslocked");
+        let readers = users_readers(
+            &f,
+            "alice:x:1000:1000::/home/alice:/usr/sbin/nologin\n",
+            &[("alice@example.com", "alice")],
+            true,
+        );
+        let out = readers.users_list(&json!({})).unwrap();
+        assert_eq!(out[0]["active"], false);
+    }
+
+    #[test]
+    fn aliases_list_exposes_the_first_target_and_keeps_every_destination() {
+        let f = Fixture::new("aliaseslist");
+        fs::write(
+            &f.paths.aliases,
+            "team@example.com alice@example.com bob@example.com\n",
+        )
+        .unwrap();
+
+        let out = f
+            .readers(always_ok_runner())
+            .aliases_list(&json!({}))
+            .unwrap();
+        let items = out.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["source"], "team@example.com");
+        assert_eq!(items[0]["target"], "alice@example.com");
+        assert_eq!(
+            items[0]["destinations"],
+            json!(["alice@example.com", "bob@example.com"])
+        );
+        // 别名表没有「禁用」概念 —— 写进表里就是生效的。
+        assert_eq!(items[0]["active"], true);
+        assert_eq!(items[0]["createdAt"], "");
+    }
+
+    #[test]
+    fn aliases_list_on_a_missing_table_is_empty_not_error() {
+        let f = Fixture::new("aliasesnone");
+        let out = f
+            .readers(always_ok_runner())
+            .aliases_list(&json!({}))
+            .unwrap();
+        assert!(out.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn queue_list_maps_only_the_two_real_states_and_derives_the_domain() {
+        let f = Fixture::new("queuelist");
+        enqueue(&f, 1, NOW); // 已到期 → active
+        enqueue(&f, 3, NOW + 3600); // 未到期 → deferred
+
+        let out = f
+            .readers(always_ok_runner())
+            .queue_list(&json!({}))
+            .unwrap();
+        let items = out.as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        let mut statuses: Vec<&str> = items
+            .iter()
+            .map(|item| item["status"].as_str().unwrap())
+            .collect();
+        statuses.sort_unstable();
+        // 只有 sending / pending 两态；delivered/failed/hold 本仓库永不产生。
+        assert_eq!(statuses, vec!["pending", "sending"]);
+        for item in items {
+            assert_eq!(item["domain"], "example.test");
+            assert_eq!(item["recipient"], "bob@example.test");
+            assert_eq!(item["service"], "outbound");
+            // `time` 是队列条目的到达时刻，落盘形态是 ISO8601（不是 unix 秒）。
+            assert_eq!(item["time"], "2026-01-01T00:00:00+00:00");
+            assert!(item["retry"].is_number());
+        }
+    }
+
+    #[test]
+    fn services_list_maps_active_status_to_running_and_reuses_the_service_items() {
+        let f = Fixture::new("serviceslist");
+        // systemd 不可用且 `pgrep` 失败 → 全部判为未运行。
+        let out = f
+            .readers(FakeRunner::returning(1, ""))
+            .services_list(&json!({}))
+            .unwrap();
+        let items = out.as_array().unwrap();
+        assert_eq!(items.len(), SERVICES.len());
+        assert_eq!(items[0]["key"], SERVICES[0].0);
+        assert_eq!(items[0]["detail"], SERVICES[0].1);
+        assert_eq!(items[0]["running"], false);
+
+        // systemd 可用且报告 active → running 为真。
+        let stdout =
+            "ActiveState=active\nMainPID=42\nMemoryCurrent=1048576\nActiveEnterTimestamp=\n";
+        let readers = f.readers_with_env(FakeRunner::returning(0, stdout), systemd_env());
+        let out = readers.services_list(&json!({})).unwrap();
+        assert_eq!(out[0]["running"], true);
+    }
+
+    #[tokio::test]
+    async fn dkim_keys_lists_only_domains_with_a_private_key() {
+        let f = Fixture::new("dkimkeys");
+        f.set_identity(); // selector = mail
+        fs::write(&f.paths.domains, "example.com OK\nother.test OK\n").unwrap();
+
+        // 只给 example.com 造一个私钥文件（动作只 stat，不解析内容）。
+        let private = mailstack_auth::keys::private_key_path(&f.paths, "example.com", "mail");
+        fs::create_dir_all(private.parent().unwrap()).unwrap();
+        fs::write(&private, b"-----BEGIN RSA PRIVATE KEY-----\n").unwrap();
+
+        let dns = StaticDns::new().with_txt("mail._domainkey.example.com", &[&dkim_txt_value()]);
+        let readers = readers_with_networks(&f, Arc::new(dns), ScriptedRelayProbe::passing());
+
+        let out = readers.dkim_keys(&json!({})).await.unwrap();
+        let items = out.as_array().unwrap();
+        assert_eq!(items.len(), 1, "没有密钥的域名不得产出条目: {out}");
+        assert_eq!(items[0]["domain"], "example.com");
+        assert_eq!(items[0]["selector"], "mail");
+        assert_eq!(items[0]["keySize"], 2048, "用常量而不是解析私钥");
+        assert_eq!(items[0]["published"], true);
+        assert!(
+            items[0]["lastRotated"].as_str().unwrap().contains(' '),
+            "应是 YYYY-MM-DD HH:MM:SS 形态: {}",
+            items[0]["lastRotated"]
+        );
+    }
+
+    #[tokio::test]
+    async fn dkim_keys_reports_unpublished_when_the_resolver_fails() {
+        let f = Fixture::new("dkimkeysfail");
+        f.set_identity();
+        fs::write(&f.paths.domains, "example.com OK\n").unwrap();
+        let private = mailstack_auth::keys::private_key_path(&f.paths, "example.com", "mail");
+        fs::create_dir_all(private.parent().unwrap()).unwrap();
+        fs::write(&private, b"key").unwrap();
+
+        let readers = readers_with_networks(
+            &f,
+            Arc::new(StaticDns::failing("resolver unreachable")),
+            ScriptedRelayProbe::passing(),
+        );
+        let out = readers.dkim_keys(&json!({})).await.unwrap();
+        // 解析失败与未发布都表现为 false：不得谎报已发布，也不得拖垮整条列表。
+        assert_eq!(out[0]["published"], false);
+    }
+
+    #[tokio::test]
+    async fn dns_records_covers_a_mx_spf_dmarc_and_dkim() {
+        let f = Fixture::new("dnsrecords");
+        f.set_identity();
+        fs::write(&f.paths.domains, "example.com OK\n").unwrap();
+        // 造出 DKIM 的 zone 片段：`dns.records` 的期望值从它还原。
+        let txt = mailstack_auth::keys::txt_record_path(&f.paths, "example.com", "mail");
+        fs::create_dir_all(txt.parent().unwrap()).unwrap();
+        fs::write(
+            &txt,
+            mailstack_auth::keys::zone_txt_fragment("mail._domainkey", &dkim_txt_value(), "c"),
+        )
+        .unwrap();
+
+        let dns = StaticDns::new()
+            .with_a(&["203.0.113.10"])
+            .with_mx(&["10 mail.example.com."])
+            .with_txt("example.com", &["v=spf1 mx -all"])
+            .with_txt("mail._domainkey.example.com", &[&dkim_txt_value()])
+            .with_txt(
+                "_dmarc.example.com",
+                &["v=DMARC1; rua=mailto:d@example.com"],
+            );
+        let readers = readers_with_networks(&f, Arc::new(dns), ScriptedRelayProbe::passing());
+
+        let out = readers.dns_records(&json!({})).await.unwrap();
+        let items = out.as_array().unwrap();
+        let types: Vec<&str> = items.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(types, vec!["A", "MX", "TXT", "TXT", "TXT"]);
+        assert_eq!(items[0]["name"], "mail.example.com");
+        assert_eq!(items[0]["value"], "203.0.113.10");
+        assert_eq!(items[1]["value"], "mail.example.com");
+        assert_eq!(items[2]["value"], "v=spf1 mx -all");
+        assert_eq!(items[3]["name"], "_dmarc.example.com");
+        assert_eq!(items[4]["name"], "mail._domainkey.example.com");
+        assert_eq!(items[4]["value"], dkim_txt_value());
+        for item in items {
+            assert_eq!(item["ttl"], 3600, "TTL 是向导建议值");
+            assert_eq!(item["required"], true);
+            assert_eq!(item["ok"], true, "记录齐全时应全部匹配: {item}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_records_reports_absent_records_as_not_ok_instead_of_failing() {
+        let f = Fixture::new("dnsrecordsnone");
+        f.set_identity();
+        fs::write(&f.paths.domains, "example.com OK\n").unwrap();
+        let readers = readers_with_networks(
+            &f,
+            Arc::new(StaticDns::new()),
+            ScriptedRelayProbe::passing(),
+        );
+
+        let out = readers.dns_records(&json!({})).await.unwrap();
+        let items = out.as_array().unwrap();
+        // 没有 DKIM 片段文件 ⇒ 不产出 DKIM 条目；A/MX/SPF/DMARC 都在但 ok 为 false。
+        assert_eq!(items.len(), 4, "缺 DKIM 密钥时不编造条目: {out}");
+        assert!(items.iter().all(|item| item["ok"] == false));
+    }
+
+    #[test]
+    fn metrics_system_reports_cpu_memory_and_disk_percentages() {
+        let f = Fixture::new("metricssystem");
+        // 两次读数相同的 /proc/stat → cpu 增量为 0。
+        fs::write(
+            f.proc_root.join("stat"),
+            "cpu  100 0 100 800 0 0 0 0 0 0\ncpu0 50 0 50 400 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+        // meminfo 夹具：total 1000 - available 400 ⇒ 60%。
+        let df = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 10000 2500 7500 25% /\n";
+        let out = f
+            .readers(FakeRunner::returning(0, df))
+            .metrics_system(&json!({}))
+            .unwrap();
+        assert_eq!(out["cpu"], 0.0);
+        assert_eq!(out["memory"], 60.0);
+        assert_eq!(out["disk"], 25.0);
+    }
+
+    #[test]
+    fn metrics_system_reports_zero_when_proc_and_df_are_unavailable() {
+        let f = Fixture::new("metricssystemfail");
+        // 无 stat 文件 + df 失败 ⇒ 全部 0，而不是恐慌。
+        let out = f
+            .readers(FakeRunner::returning(1, "df: /: Permission denied"))
+            .metrics_system(&json!({}))
+            .unwrap();
+        assert_eq!(out["cpu"], 0.0);
+        assert_eq!(out["disk"], 0.0);
+        // 内存仍能读到夹具。
+        assert_eq!(out["memory"], 60.0);
+    }
+
+    #[test]
+    fn read_cpu_counters_strips_the_core_index_before_splitting() {
+        let root = std::env::temp_dir().join(format!("mailstack-cpustat-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        // 汇总行的 `cpu` 后面直接是计数器。
+        fs::write(root.join("stat"), "cpu  100 0 100 800 0 0 0 0 0 0\n").unwrap();
+        let aggregate = read_cpu_counters(&root).unwrap();
+        assert_eq!(aggregate.total, 1000);
+        assert_eq!(aggregate.idle, 800);
+
+        // 每核行的序号必须被剥掉，否则整列错位一格（docs/TEST_REPORT.md §4.20）。
+        fs::write(root.join("stat"), "cpu0 100 0 100 700 100 0 0 0 0 0\n").unwrap();
+        let core = read_cpu_counters(&root).unwrap();
+        assert_eq!(core.total, 1000, "user..steal 八项之和");
+        assert_eq!(core.idle, 800, "idle + iowait");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cpu_busy_percent_is_the_non_idle_share_of_the_delta() {
+        let prev = CpuCounters {
+            idle: 100,
+            total: 200,
+        };
+        let now = CpuCounters {
+            idle: 300,
+            total: 600,
+        };
+        // idle +200、总量 +400 ⇒ 一半忙。
+        assert_eq!(cpu_busy_percent(&prev, &now), 50.0);
+        assert_eq!(cpu_busy_percent(&now, &now), 0.0, "零增量不能除零");
+    }
+
+    #[test]
+    fn parse_df_percent_skips_the_header_and_garbage() {
+        let out = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 100 900 10% /\n";
+        assert_eq!(parse_df_percent(out), Some(10.0));
+        assert_eq!(parse_df_percent(""), None);
+        assert_eq!(parse_df_percent("only one column\n"), None);
+    }
+
+    #[test]
+    fn zone_txt_value_flattens_a_multiline_fragment() {
+        let value = format!("v=DKIM1; k=rsa; p={}", "A".repeat(300));
+        let fragment = mailstack_auth::keys::zone_txt_fragment("mail._domainkey", &value, "c");
+        assert_eq!(zone_txt_value(&fragment).as_deref(), Some(value.as_str()));
+        assert_eq!(zone_txt_value("not a zone fragment"), None);
+    }
+
+    #[test]
+    fn activity_kind_maps_the_action_prefix() {
+        assert_eq!(activity_kind("users.add"), "user");
+        assert_eq!(activity_kind("domains.delete"), "domain");
+        assert_eq!(activity_kind("queue.action"), "queue");
+        assert_eq!(activity_kind("services.restart"), "service");
+        assert_eq!(activity_kind("certs.renew"), "cert");
+        assert_eq!(activity_kind("snapshot"), "system");
+    }
+
+    #[test]
+    fn read_activity_skips_unparseable_lines_and_orders_newest_first() {
+        let f = Fixture::new("activitylist");
+        let log = &f.paths.audit_log;
+        mailstack_core::audit::audit(log, "users.add", true, "", "alice").unwrap();
+        mailstack_core::audit::audit(log, "domains.add", true, "", "example.com").unwrap();
+        mailstack_core::audit::audit(log, "services.action", false, "boom", "postfix").unwrap();
+        // 半行与格式回滚的旧记录都必须被跳过，而不是让整条列表失败。
+        let mut text = fs::read_to_string(log).unwrap();
+        text.push_str("{\"action\":\"legacy\"}\n{\"partial\":");
+        fs::write(log, text).unwrap();
+
+        let out = f
+            .readers(always_ok_runner())
+            .activity_list(&json!({}))
+            .unwrap();
+        let items = out.as_array().unwrap();
+        assert_eq!(items.len(), 3, "半行与缺字段的旧记录要跳过");
+        assert_eq!(items[0]["title"], "services.action", "最新在前");
+        assert_eq!(items[0]["kind"], "service");
+        assert_eq!(items[0]["sub"], "postfix");
+        assert_eq!(items[1]["kind"], "domain");
+        assert_eq!(items[2]["kind"], "user");
+        assert!(items[0]["time"].as_str().unwrap().ends_with("+00:00"));
+    }
+
+    #[test]
+    fn activity_list_on_a_missing_log_is_empty_not_error() {
+        let f = Fixture::new("activitynone");
+        let out = f
+            .readers(always_ok_runner())
+            .activity_list(&json!({}))
+            .unwrap();
+        assert!(out.as_array().unwrap().is_empty());
     }
 }

@@ -1417,6 +1417,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mailstack-web-bin"
+version = "0.8.1-beta1"
+dependencies = [
+ "axum",
+ "clap",
+ "http-body-util",
+ "mailstack-core",
+ "mailstack-web",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower 0.4.13",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mailstackctl"
 version = "0.8.1-beta1"
 dependencies = [

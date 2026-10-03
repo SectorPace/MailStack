@@ -45,6 +45,46 @@ impl CommandOutput {
 /// 外部命令运行器。
 pub trait CommandRunner: Send + Sync {
     fn run(&self, program: &str, args: &[&str]) -> CoreResult<CommandOutput>;
+
+    /// 通过 **stdin** 把 `stdin` 喂给子进程后取回结果。
+    ///
+    /// 只有需要保密的输入才走这条路：`chpasswd` 的口令绝不能出现在 argv 里
+    /// （`ps` 能看到整条命令行）。
+    ///
+    /// 默认实现**必须是明确报错**，不能静默丢弃输入：既有的测试 runner 大多只实现
+    /// `run`，一旦某个动作走了这条路，它们应当**响亮失败**，而不是让子进程收到空
+    /// 输入后以「口令设为空/格式错」这种误导性的方式失败。
+    fn run_with_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin: &str,
+    ) -> CoreResult<CommandOutput> {
+        let _ = (args, stdin);
+        Err(CoreError::invalid(format!(
+            "{program}: 该 runner 未实现 stdin 注入（run_with_input）"
+        )))
+    }
+
+    /// 带超时地运行外部命令。
+    ///
+    /// 与 [`CommandRunner::run_with_input`] 同一风格：默认实现**明确报错**，
+    /// 既有的测试 runner 不必改动；一旦某个动作真的需要超时却用了没有超时能力的
+    /// runner，它会**响亮失败**，而不是悄悄地无限期挂住。
+    ///
+    /// 存在理由：`acme.sh` 的申请/续期可能耗时数分钟，基线用 180/300/120 秒超时。
+    /// 没有超时意味着一个卡住的 ACME 流程会永久占住调用方。
+    fn run_with_timeout(
+        &self,
+        program: &str,
+        args: &[&str],
+        timeout: std::time::Duration,
+    ) -> CoreResult<CommandOutput> {
+        let _ = (args, timeout);
+        Err(CoreError::invalid(format!(
+            "{program}: 该 runner 未实现超时（run_with_timeout）"
+        )))
+    }
 }
 
 /// 真实运行器。
@@ -59,6 +99,94 @@ impl CommandRunner for SystemCommandRunner {
             .output()
             .map_err(|e| CoreError::invalid(format!("cannot run {resolved}: {e}")))?;
 
+        Ok(CommandOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn run_with_input(
+        &self,
+        program: &str,
+        args: &[&str],
+        stdin: &str,
+    ) -> CoreResult<CommandOutput> {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let resolved = resolve_program(program);
+        let mut child = std::process::Command::new(&resolved)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| CoreError::invalid(format!("cannot run {resolved}: {e}")))?;
+
+        // 写完后必须 drop 句柄以关闭管道，否则子进程会一直等 EOF。
+        if let Some(mut pipe) = child.stdin.take() {
+            pipe.write_all(stdin.as_bytes()).map_err(|e| {
+                CoreError::invalid(format!("cannot write stdin to {resolved}: {e}"))
+            })?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|e| CoreError::invalid(format!("cannot wait for {resolved}: {e}")))?;
+
+        Ok(CommandOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn run_with_timeout(
+        &self,
+        program: &str,
+        args: &[&str],
+        timeout: std::time::Duration,
+    ) -> CoreResult<CommandOutput> {
+        use std::process::Stdio;
+        use std::time::Instant;
+
+        let resolved = resolve_program(program);
+        let mut child = std::process::Command::new(&resolved)
+            .args(args)
+            // 不继承调用方的 stdin：外部命令不该从助手进程偷读输入。
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| CoreError::invalid(format!("cannot run {resolved}: {e}")))?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(CoreError::invalid(format!(
+                        "cannot wait for {resolved}: {e}"
+                    )))
+                }
+            }
+            if Instant::now() >= deadline {
+                // 超时必须 kill 并回收，否则会留下僵尸进程。
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(CommandOutput {
+                    status: -1,
+                    stdout: String::new(),
+                    stderr: format!("{resolved} timed out after {timeout:?}"),
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| CoreError::invalid(format!("cannot wait for {resolved}: {e}")))?;
         Ok(CommandOutput {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),

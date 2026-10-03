@@ -15,12 +15,12 @@
 //!
 //! ## 尚未实现（诚实披露）
 //!
-//! * **Maildir 只读访问**：规格书把它列在 store 的职责里，但存在一个必须先定的
-//!   前提 —— 权威布局。基线是 Postfix 的 `local` 代理写系统用户的 `~/Maildir`
-//!   （`mail.py` 的环路自检同时探测 `/home/<u>/Maildir` 与 `/var/vmail/<domain>/<u>`），
-//!   而 Dovecot 的配置是 `mail_location = maildir:~/Maildir`。**在把权威布局定死之前
-//!   实现一个靠猜的路径解析，比不实现更糟**：它会在生产上静默读错目录。
-//!   目前也没有消费者（webmail 尚未开始）。
+//! * **Maildir 只读访问**：规格书把它列在 store 的职责里，**权威布局现已定死** ——
+//!   账号就是系统账号，Maildir 即 `<系统用户家目录>/Maildir`（Dovecot 侧配
+//!   `mail_location = maildir:~/Maildir`）；这一结论由 `users.*` 的实现固定下来
+//!   （`crates/priv/src/users.rs` 的 `useradd -m` + `~/Maildir/{cur,new,tmp}`）。
+//!   仍未实现的原因只剩**没有消费者**（webmail 尚未开始）：现在缺的不再是「布局未定」，
+//!   而是一个真正的读取需求。
 //! * **Dovecot auth socket**（webmail 认证桥，§3.5 第二行）：属 `mailstack-webmail`
 //!   的范围。
 

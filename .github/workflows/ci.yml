@@ -92,6 +92,11 @@ jobs:
             "wrong_sni_fails_verification"                    # INV-14 反例守卫
             "pinned_target_never_carries_a_hostname_into_the_dial_path" # INV-14
             "transparent_proxy_fake_ip_range_is_not_routable" # INV-14/INV-19
+            # 内嵌 IPv4 的 IPv6 形式（mapped / 6to4 / Teredo）里藏着一个 v4 地址，
+            # 而 v6 的属性判定看不见它：`::ffff:127.0.0.1` 既不是 v6 loopback，
+            # `is_private()` 也是 false，不拆就一路穿过全部 v4 规则打到本机。
+            "an_ipv4_mapped_address_is_screened_as_the_address_it_embeds" # INV-14/INV-15
+            "six_to_four_and_teredo_addresses_are_screened_through_their_embedded_ipv4" # INV-14/INV-15
             "empty_domain_table_fails_closed"                 # INV-17
             "unauthenticated_foreign_recipient_is_rejected"   # INV-17
             "rejects_plaintext_relay_with_the_documented_message" # INV-13
@@ -312,6 +317,13 @@ jobs:
             "changing_the_password_keeps_two_factor_working"
             # 2FA 的 HTTP 面已接线（404 表示路由没挂上）
             "two_factor_state_is_served_in_process_and_the_write_routes_are_wired"
+            # 全表守卫：**每一个已实现的特权动作**都必须有已接线的契约路由，
+            # 且该路由必须落在认证层之后（未带会话时回 401，而不是 404 或其他）。
+            # 前者防「已实现却点不到」，后者防「动作路由被误挂到免认证面」。
+            "every_implemented_action_route_is_wired_and_behind_auth"
+            # 进程内遥测路由（action 为 None）不在上面那条守卫的覆盖范围里，
+            # 这条单独钉住它：同样受认证保护，且响应是遥测对象本身。
+            "telemetry_is_served_in_process_and_returns_the_raw_object"
             # ── Phase 4：写面（特权动作真正的落点） ──
             # INV-43 在**动作面**的落点：白名单之外的键绝不写入
             "settings_set_applies_only_the_whitelisted_keys"
@@ -441,11 +453,47 @@ jobs:
             "mail_test_loopback_never_reports_success_when_the_submission_fails"
             "setup_mail_test_never_reports_queued_when_the_mta_rejects_it"
             "setup_mail_test_rejects_malformed_addresses_before_submitting"
-            # 「没做的检查」必须明说（users.* 未移植），且正文必须是 CRLF。
-            "setup_mail_test_submits_with_crlf_and_says_what_it_could_not_check"
+            # 受管邮箱存在性 / 锁定检查真实执行（`users.*` 已移植），且正文必须是 CRLF。
+            "setup_mail_test_submits_with_crlf_and_enforces_the_mailbox_checks"
             # Maildir 找不到是「没有额外证据」，不是投递失败。
             "a_missing_maildir_is_not_found_rather_than_an_error"
             "mail_test_loopback_reports_a_missing_maildir_as_absent_evidence_not_failure"
+            # ── Phase 3：管理前端接入（响应形状、RPC 桥、列表动作、静态托管） ──
+            # 成功响应必须是**裸对象**。套 `{ok,data}` 会让前端对非列表动作（snapshot /
+            # settings.get / users.status…）一个字段都读不到，而界面上看不出异常。
+            "success_body_is_the_bare_object_without_an_ok_wrapper"
+            # 桥的形状与 REST 相反且必须相反：前端 bridge() 按 body.ok / body.data 拆包。
+            "rpc_bridge_shapes_are_the_opposite_of_the_rest_routes"
+            # RPC 桥的动作名来自请求体，是本项目唯一的例外；允许集必须严于助手白名单，
+            # 只被登录流程内部使用的 admin.totp.verify 不得从 HTTP 面可达。
+            "the_rpc_bridge_only_exposes_actions_that_already_have_a_route"
+            # 新增的 8 个列表动作必须真的是纯读，不得落进变更面（那等于给列表开特权通道）。
+            "every_added_list_action_is_pure_read"
+            "the_frontend_list_actions_are_registered"
+            # 前端按 `{id, op}` 提交队列动作：少认一个 `op`，`delete` 会静默退化成
+            # 「立刻重新投递」—— 一次「删除邮件」变成「把邮件发出去」，且两边都不报错。
+            "queue_action_accepts_the_frontend_field_names"
+            "queue_action_maps_deliver_to_retry_and_refuses_hold"
+            "services_action_accepts_the_frontend_field_names"
+            # 前端用 address/name/active 称呼邮箱三要素；认不出时给的是「不是受管用户」，
+            # 看起来像权限问题而不是参数问题。
+            "the_frontend_field_names_address_and_name_are_understood"
+            "add_accepts_the_frontend_address_field"
+            # ── Phase 3：`mailstack-web` 服务入口与前端产物托管 ──
+            # `/api` 的兜底永远不能是 SPA 的 index.html，否则「接口不存在」会被前端
+            # 报成「解析失败 / 服务端坏了」。
+            "an_unknown_api_path_is_json_404_and_never_the_spa"
+            "api_paths_are_never_served_as_spa"
+            # 产物目录下的路径来自 URL：`..` 与绝对路径必须挡死。
+            "traversal_and_odd_segments_are_rejected"
+            # 「没部署前端」是 503（服务不可用），不是空白 200。
+            "a_missing_bundle_reports_503_instead_of_a_blank_page"
+            # 这个进程返回的大多数响应都是静态文件，安全响应头漏掉它们等于没加。
+            "static_responses_still_carry_the_security_headers"
+            # 内容类型必须按**解析后的文件名**判定：按 URL 判会让首页（`/` 无扩展名）
+            # 拿到 application/octet-stream，浏览器把整个管理界面下载下来而不是渲染。
+            # 这条是端到端冒烟测出来的，单元测试曾因「URL 与文件名都带 .js」而掩盖它。
+            "the_bundle_entry_is_served_as_html_not_octet_stream"
           )
           missing=0
           # 扫描范围含 bin/：那里也承载安全断言（如 mailstackctl 的退出码契约）。

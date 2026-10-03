@@ -1,0 +1,44 @@
+# 行尾与文件类型约定。
+#
+# 为什么必须有这个文件：本机 git 的 `core.autocrlf=true` 是**系统级**设置
+# （`git config --system --get core.autocrlf` 实测为 true），它会在**检出**时把 LF
+# 转成 CRLF。`deploy/*.sh` 与 `.github/workflows/ci.yml` 一旦被转成 CRLF：
+#
+#   * bash 脚本在 WSL 下报 `\r: command not found`，**整套门禁脚本直接失效**；
+#   * CI YAML 里的 `run: |` 块同样会被解析出错。
+#
+# 也就是说，一次普通的 Windows 检出就能让质量门禁与交付物门禁**静默失效** ——
+# 而门禁失效不会让构建失败，只会让它不再检查任何东西。所以必须显式钉死。
+
+# 默认：文本文件在仓库里存 LF，检出时**不**做转换。
+* text=auto eol=lf
+
+# 明确列出必须保持 LF 的类型（`* text=auto eol=lf` 已覆盖，这里是冗余保险，
+# 目的是让「意图」在文件里显式可见，避免后人误删这条规则）。
+*.sh    text eol=lf
+*.bash  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.py    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+
+# 二进制：一律不做行尾转换、不做 diff。
+# 字体与图片进了仓库（前端产物若被提交），按文本处理会产生大量假差异。
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.zst   binary
+*.gz    binary
+*.tar   binary
+*.tar.gz binary
