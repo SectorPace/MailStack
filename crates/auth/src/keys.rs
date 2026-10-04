@@ -1,6 +1,6 @@
 //! DKIM 密钥：生成、落盘、权限加固与 DNS 记录（规格书 §5.8）。
 //!
-//! 本模块是 `certs.py:173 dkim_rotate` 与 `core.py:725 set_dkim_key_permissions`
+//! 本模块是 `certs.py:181 dkim_rotate` 与 `core.py:725 set_dkim_key_permissions`
 //! 的等价移植，但把 `opendkim-genkey` 换成了 **mail-auth 的原生 RSA 生成**
 //! （规格书 §3.3 要求移除 OpenDKIM）。
 //!
@@ -21,7 +21,7 @@
 //! ## 密钥落盘位置（已登记的偏离）
 //!
 //! 基线里有两处不一致：`network.py:105` 的 setup 流程写
-//! `/etc/opendkim/keys/<domain>/`，而 `certs.py:182` 的 `dkim.rotate` 写
+//! `/etc/opendkim/keys/<domain>/`，而 `certs.py:190` 的 `dkim.rotate` 写
 //! `/etc/mailstack/dkim/<domain>/`。规格书 §2.5/§5.8 取的是前者，且
 //! `telemetry.key_permission_scan` 的默认扫描目录也是 `/etc/opendkim/keys`。
 //! 本实现**统一采用 `/etc/opendkim/keys/<domain>/`**，把 `certs.py` 的那条路径
@@ -40,7 +40,7 @@ use serde::Serialize;
 
 use crate::error::{AuthError, AuthResult};
 
-/// selector 缺省值（`certs.py:177`）。
+/// selector 缺省值（`certs.py:185`）。
 pub const DEFAULT_DKIM_SELECTOR: &str = "mailstack";
 /// 密钥长度（规格书 §5.8 与基线均要求 2048）。
 pub const DKIM_KEY_BITS: usize = 2048;
@@ -50,7 +50,7 @@ pub const DKIM_KEY_GROUP: &str = "opendkim";
 pub const DKIM_KEY_MODE: u32 = 0o640;
 
 /// `dkim.rotate` 的返回体，逐字对齐基线：
-/// `{status:'ok', domain, selector, record}`（`certs.py:191`）。
+/// `{status:'ok', domain, selector, record}`（`certs.py:199`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DkimRotation {
     pub status: &'static str,
@@ -82,7 +82,7 @@ pub struct DkimKeyMaterial {
     pub txt_record: String,
 }
 
-/// 校验并规范化域名；失败文案与 `certs.py:176` 逐字一致。
+/// 校验并规范化域名；失败文案与 `certs.py:184` 逐字一致。
 pub fn validate_domain(domain: &str) -> AuthResult<String> {
     let domain = domain.trim().to_ascii_lowercase();
     if !DOMAIN_RE.is_match(&domain) {
@@ -91,7 +91,7 @@ pub fn validate_domain(domain: &str) -> AuthResult<String> {
     Ok(domain)
 }
 
-/// 校验并规范化 selector；失败文案与 `certs.py:179` 逐字一致。
+/// 校验并规范化 selector；失败文案与 `certs.py:187` 逐字一致。
 ///
 /// 缺省与空串都落到 [`DEFAULT_DKIM_SELECTOR`]（基线为
 /// `str(data.get('selector', 'mailstack')).strip().lower() or 'mailstack'`）。
@@ -344,7 +344,7 @@ pub fn load_private_key_der(path: &Path) -> AuthResult<Vec<u8>> {
 
 /// `dkim.rotate`：生成并落盘一套 `<selector>.private` / `<selector>.txt`。
 ///
-/// 落盘顺序对齐基线（`certs.py:186-189`）：先由生成器写出私钥，**再**加固权限。
+/// 落盘顺序对齐基线（`certs.py:194-197`）：先由生成器写出私钥，**再**加固权限。
 /// 这里把「写出」拆成两步以保证中间态永远不比目标更宽松：先以 `0600` 原子落盘，
 /// 再 chmod 到 `0640` + chown 到 `root:opendkim`。这样即使加固失败，密钥也停在
 /// `0600`（更严），而不是 `0640 root:root`（更松）。

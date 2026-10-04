@@ -17,15 +17,15 @@ pub enum AuthError {
 
     /// 调用方输入非法。文案与 Python 基线逐字一致。
     ///
-    /// 已对齐的两条：`invalid domain format`（`certs.py:176`）、
-    /// `invalid DKIM selector`（`certs.py:179`）。
+    /// 已对齐的两条：`invalid domain format`（`certs.py:184`）、
+    /// `invalid DKIM selector`（`certs.py:187`）。
     #[error("{0}")]
     Invalid(String),
 
     /// DKIM 密钥生成失败。
     ///
-    /// **偏离登记**：基线 `certs.py:188` 抛的是 `OpenDKIM key generation failed`，
-    /// 并在 `certs.py:180` 先判 `opendkim-genkey` 是否安装。Rust 版改为**原生生成**
+    /// **偏离登记**：基线 `certs.py:196` 抛的是 `OpenDKIM key generation failed`，
+    /// 并在 `certs.py:188` 先判 `opendkim-genkey` 是否安装。Rust 版改为**原生生成**
     /// （不再调用外部二进制），因此「未安装」这一前置条件消失，文案也不再声称是
     /// OpenDKIM 的产出 —— 继续输出 `OpenDKIM ...` 会让运维去排查一个已被移除的组件。
     #[error("DKIM key generation failed")]

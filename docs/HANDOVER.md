@@ -3,7 +3,7 @@
 - 版本：`0.8.1-beta1`（`VERSION` / `Cargo.toml` 一致）
 - 报告生成日期：**2026-10-03**
 - 代码库路径：`e:\MailStack\mailstack-rust`（生产目标平台为 Linux，构建在 WSL Ubuntu 24.04）
-- 对照基线（Python/FastAPI/Postfix 老栈）：`e:\MailStack\MailStack-v0.8-beta.6\MailStack-v0.8-beta.6`
+- 对照基线（Python/FastAPI/Postfix 老栈）：`e:\MailStack\MailStack-v0.8.0-beta.10\MailStack-v0.8.0-beta.10`（**冲突时以此为准**；较新的 `MailStack-v0.8-beta.6` 亦只读参考，见 §9.2）
 - 规格书：`docs/REWRITE_TO_RUST.md` **v3**（在源码包内，**不在本仓库**）
 
 > **本文件是「进度存档」而非「完工报告」。** 存档之后开发继续推进 —— 见 §3 待完成清单。
@@ -594,16 +594,16 @@ wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
 > | 路径 | 定位 |
 > |---|---|
 > | **`E:\MailStack\mailstack-rust`** | **本项目**（Rust 重写）。所有改动只在这里 |
-> | `E:\MailStack\MailStack-v0.8-beta.6` | Python/FastAPI 基线（当前版本）。**只读参考** |
-> | `E:\MailStack\MailStack-v0.8.0-beta.10` | **更早**一版基线。**只读参考**；两版说法不一致时以 `beta.6` 为准 |
+> | `E:\MailStack\MailStack-v0.8.0-beta.10\MailStack-v0.8.0-beta.10` | **更早**一版基线。**只读参考**；两版说法不一致时**以 `beta.10` 为准**（即本项目声明的基线，见 `README.md`）。⚠️ 路径有**两层**同名嵌套 |
+> | `E:\MailStack\MailStack-v0.8-beta.6` | 较新一版基线。**只读参考**；与 `beta.10` 冲突时让位 |
 >
 > 两个基线都只是**参考**，不属于本项目：不被构建、不参与门禁、也不进版本控制。
 > 改到它们上面**不会让任何测试变红** —— 这正是需要小心的地方。
 
 | 资源 | 用途 |
 |---|---|
-| `e:\MailStack\MailStack-v0.8-beta.6\MailStack-v0.8-beta.6` | **主要**基线：响应形状与错误文案的对照来源（`backend/mailstackctl/*.py`、`backend/server.production.ts`） |
-| `e:\MailStack\MailStack-v0.8.0-beta.10` | 更早一版基线。仅在需要确认「某个行为是哪一版引入的」时查 |
+| `e:\MailStack\MailStack-v0.8.0-beta.10\MailStack-v0.8.0-beta.10` | **准绳**基线：响应形状与错误文案的对照来源（`backend/mailstackctl/*.py`、`backend/server.production.ts`）。⚠️ 路径有**两层**同名嵌套 |
+| `e:\MailStack\MailStack-v0.8-beta.6\MailStack-v0.8-beta.6` | 较新一版基线。**仅在需要确认「某个行为是哪一版引入的」时查**；与 `beta.10` 冲突时以 `beta.10` 为准 |
 | `…/CHANGELOG.md` | 基线的变更日志 —— 可用作本项目的「变更日志替代来源」（本项目自身的变更记录在 `TEST_REPORT.md` §4） |
 | `docs/REWRITE_TO_RUST.md` v3 | 规格书：§3.3 组件下线、§5.x 各子系统要求、§6 迁移路线、§8 的 43 条不变量 |
 | `E:\hage2\Documents\zcode\mailstack-admin-frontend` | **管理前端**（Vite + React 19，Phase 3 接入）。同样只读参考 —— 改它不会让 Rust 门禁变红，需另行 `npm run build` |
