@@ -1,8 +1,9 @@
 # MailStack Rust 重写 —— 项目移交报告（检查点 `0.8.1-beta1`）
 
 - 版本：`0.8.1-beta1`（`VERSION` / `Cargo.toml` 一致）
-- 报告生成日期：**2026-10-03**
+- 报告生成日期：**2026-10-03**（最近更新 **2026-10-04**）
 - 代码库路径：`e:\MailStack\mailstack-rust`（生产目标平台为 Linux，构建在 WSL Ubuntu 24.04）
+- 版本控制：本仓库**已建 git**（`main` 分支，**无远端**）。历史见 §3.6
 - 对照基线（Python/FastAPI/Postfix 老栈）：`e:\MailStack\MailStack-v0.8.0-beta.10\MailStack-v0.8.0-beta.10`（**冲突时以此为准**；较新的 `MailStack-v0.8-beta.6` 亦只读参考，见 §9.2）
 - 规格书：`docs/REWRITE_TO_RUST.md` **v3**（在源码包内，**不在本仓库**）
 
@@ -58,12 +59,13 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 
 | 维度 | 数值 | 说明 |
 |---|---|---|
-| 测试 | **1018 passed / 0 failed** | `cargo test`；含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
+| 测试 | **1083 passed / 0 failed** | `cargo test --workspace --all-targets`；含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 | 不变量门禁 | **277 / 277 存在** | `deploy/verify-invariant-gate.sh`（从 `ci.yml` 动态取名单） |
 | 质量门禁 | `QUALITY_GATE=PASS` | rustfmt + clippy(`-D warnings`) + 全量测试 |
 | 交付物门禁 | `DELIVERABLES_OK` | `deploy/verify-deliverables.sh` |
 | 特权动作 | **58 / 58** 已实现 | 只读面 22/22；变更面 36/36 |
 | HTTP 路由 | **72 / 72 已注册** | 无任何路径落到 `/api` 兜底 |
+| 破坏性动作 | **4 / 4** 需 `confirm: true` | 删域名 / 删用户 / 删备份 / **拆 2FA**（本轮新增） |
 | 规格书 Phase | 0 ✅ / 1 ✅ / 2 🟡机制完成 / 3 ✅ / 4 ✅动作面 / 5 ⏳ | 见 §2.4 |
 
 ### 2.2 完成百分比（分口径，避免一句话误导）
@@ -86,18 +88,18 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 
 | crate | 测试数 | 职责 |
 |---|---:|---|
-| `mailstack-core` | 188 | 动作三集/通道推导、原子写与锁、审计哈希链、配置 schema、口令策略、TOTP、证书解析、`/proc` 采样、权限体检、备份归档、手工封禁、命令原语与 `service_ctl` 降级链、部署模式与 AI 总闸 |
-| `mailstack-priv` | 228 | 动作门控（`ActionGate`）、RPC 帧、RO/RW socket 服务端、**全部 58 个动作的处理器**（含 ACME 证书、邮箱用户 `users.*`、AI 出站子系统、**为管理前端新增的 8 个只读列表动作**）、初始化向导、邮件环路自检、失败分类与 fallback 规则 |
-| `mailstack-smtp` | 138 (+7 真机 TLS) | IP 固定拨号、中继校验、分阶段中继测试、出站探测、MX 解析与直投目标、先测后写/回读/回滚、配置载体、DNS 查询、`AddressPolicy`（SSRF 地址筛选，含 IPv6 内嵌 IPv4 拆解） |
-| `mailstack-smtpd` | 139 (+11 真机 TCP/TLS) | 入站 SMTP 会话与命令、DATA 字节流（走私防护）、TLS 1.2 起、连接限速、IP 自动封禁、提交端口 SASL（Dovecot auth socket）、SPF/DKIM/DMARC 判定与入队 |
+| `mailstack-core` | 208 | 动作三集/通道推导、原子写与锁、审计哈希链、配置 schema、口令策略、TOTP（**含重放记账**）、证书解析、`/proc` 采样、权限体检、备份归档、手工封禁、命令原语与 `service_ctl` 降级链、部署模式与 AI 总闸 |
+| `mailstack-priv` | 230 | 动作门控（`ActionGate`）、RPC 帧、RO/RW socket 服务端、**全部 58 个动作的处理器**（含 ACME 证书、邮箱用户 `users.*`、AI 出站子系统、**为管理前端新增的 8 个只读列表动作**）、初始化向导、邮件环路自检、失败分类与 fallback 规则 |
+| `mailstack-smtp` | 141 (+7 真机 TLS +6 Postfix) | IP 固定拨号、中继校验、分阶段中继测试、出站探测、MX 解析与直投目标、先测后写/回读/回滚、配置载体、DNS 查询、`AddressPolicy`（SSRF 地址筛选，**IPv6 走 `2000::/3` 白名单**） |
+| `mailstack-smtpd` | 163 (+11 真机 TCP/TLS) | 入站 SMTP 会话与命令、DATA 字节流（走私防护）、TLS 1.2 起、连接限速、IP 自动封禁（**含认证失败记账**）、提交端口 SASL（Dovecot auth socket）、**RCPT 收件人名录查验**、SPF/DKIM/DMARC 判定与入队 |
 | `mailstack-queue` | 80 | 队列持久化与原子性、指数退避与去共振、DSN 退信、出站必签 DKIM、并发上限、快速失败与出站结论 |
-| `mailstack-store` | 31 (+10 真机 LMTP) | Postfix 风格表文件（域名/别名）与 `postmap` 序列、LMTP 客户端 |
-| `mailstack-auth` | 43 | DKIM 密钥（原生 RSA-2048 / SPKI 记录 / 0640 加固）、签名与自验、SPF、DMARC、ARC 校验与封印、离线 TXT 缓存 |
-| `mailstack-web` | 93 | 契约路由表、会话与 CSRF、登录限流、错误模型、特权通道、Axum 装配、动作×路由一致性守卫、时序遥测采集器、**RPC 桥（动作允许集由契约表推导）** |
+| `mailstack-store` | 42 (+10 真机 LMTP) | Postfix 风格表文件（域名/别名）与 `postmap` 序列、LMTP 客户端、**本地收件人名录**（`recipients.rs`，三态判定） |
+| `mailstack-auth` | 47 | DKIM 密钥（原生 RSA-2048 / SPKI 记录 / 0640 加固）、签名与自验、SPF、**DMARC（类型化策略）**、ARC 校验与封印、离线 TXT 缓存（**带 TTL 与容量上界**） |
+| `mailstack-web` | 94 | 契约路由表、会话与 CSRF、登录限流、错误模型、特权通道、Axum 装配、动作×路由一致性守卫、时序遥测采集器、**RPC 桥（动作允许集由契约表推导）** |
 | `mailstack-web-bin` | 9 | **管理控制台服务入口**（`bin/mailstack-web`）：API + 前端产物托管、SPA 回退、`/api` 兜底保持 JSON、路径穿越拒绝、遥测后台采样宿主 |
 | `mailstackd` | 28 | 进程入口：fail-closed 装配、监听集中绑定、RPC 双通道、停机扇出、队列调度、封禁热重载 |
 | `mailstackctl` | 7 | CLI：参数→特权调用的翻译、退出码映射 |
-| **合计** | **1018** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
+| **合计** | **1083** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 
 ### 2.4 Phase 进度明细
 
@@ -187,7 +189,23 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 - `mailstackctl`：`--confirm` 必须是真布尔；退出码 `0/1/2/3/4` 可区分「动作失败 / 用法错误 / 助手不可达 / 中途超时」，
   且**没有**「强制走某通道」的开关（那等于提供绕过门控的入口）。
 
-### 3.6 本检查点最近三轮的成果（供接续者定位）
+### 3.6 本检查点最近几轮的成果（供接续者定位）
+
+**历史提交（`main`，无远端，共 10 个）：**
+
+| 提交 | 内容 |
+|---|---|
+| `3ac583c` → `3fcd36b` | 从检查点 bundle 续上历史 + `.gitattributes`（挡系统级 `core.autocrlf=true`） |
+| `beccc46` | Phase 3 前端接入：Web 服务入口、RPC 桥、8 个只读动作 |
+| `8566085` | 真实环路验证：实跑 `mailstackd` 走完入站 SMTP 到队列落盘 |
+| `8bebd94` | 向导链路验证 + sudo 包装器前置条件（找出一个此前被漏掉的真实缺口） |
+| `b5d9a76` | 明确三个同名目录的定位（避免改到基线上去） |
+| `668e8e6` | 基线优先级改为以 `beta.10` 为准 + 修正随之失效的行号引用 |
+| `075a86a` | **修复 9 条多份审查独立收敛的 P0** + 管理前端纳入版本控制（`webui/`） |
+| `70b9c35` | **出站侧加固**：响应限长、CRLF 注入、裸 LF 走私、SSRF IPv6 白名单、DNS 超时、LMTP 尾部空行 |
+| `37ddfa1` | **批 2**：DMARC 类型化、RCPT 枚举防护、A-R 注入、TOTP 重放、会话吊销、Cookie `__Host-` |
+
+**更早的三轮（本检查点之前）：**
 
 1. **只读聚合面 + 写面**：`services.action`、`queue.action`、`security.ban/unban`（文件持久化 + 热重载）、
    `backup.*`（归档当不可信输入：成员白名单/拒绝链接与设备/SHA256 先验/O_NOFOLLOW/两阶段）。
@@ -196,12 +214,41 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 3. **邮件环路自检**：向硬编码 `127.0.0.1:25` 提交（`sendmail` 已随 Postfix 移除）；
    反中继守卫按「受管域」判据（与「有没有邮箱」无关 —— 基线旧写法在空邮箱时会整段跳过守卫）。
 
+**本轮（2026-10-04）：外部审查驱动的加固。** 起因是 5 份独立的第三方审查报告，
+它们在同一批缺陷上**独立收敛**（这是最强的信号）。完整清单见 `docs/REVIEW_FIXES.md`，
+摘要见 §4.0。
+
 ---
 
 ## 4. 待完成任务
 
 > **关于工时**：本节给出**优先级**与**规模（S/M/L）**，不给小时/天数估计 —— 规模按
 > 「是否需先做决策 / 是否引入新依赖 / 触及几个子系统」衡量，比时长更稳定、更可复现。
+
+### 4.0 外部审查驱动的加固（本轮，**进行中**）
+
+**背景**：2026-10-04 收到 5 份独立的第三方深度审查报告（CodeBuddy、`REVIEW-SCORECARD`
+及其 4 份 findings 明细、以及 3 份独立报告）。它们在**同一批缺陷上独立收敛** ——
+这是最强的信号，故逐条回源码复核后修复。
+
+**产出文档**：`docs/REVIEW_FIXES.md` 是这次加固的**完整台账**（每条修复的
+「改了什么 / 为什么 / 反例测试 / 我否掉了哪些报告结论」）。接续者请先读它。
+
+**进度**：
+
+| 批次 | 状态 | 内容 |
+|---|---|---|
+| 批 1 | ✅ 已提交 `075a86a` | 9 条多报告收敛的 P0（远程 abort、限流失效、空口令 fail-open、原子写权限窗口、未认证 OOM、TXT 缓存 TTL、client_ip 占位、认证失败不进封禁、命令未跑报成功） |
+| 批 2 | ✅ 已提交 `70b9c35` | 出站侧加固（响应限长、CRLF 注入、裸 LF 走私、SSRF IPv6 白名单、DNS 超时、LMTP 尾部空行） |
+| 批 3 | ✅ 已提交 `37ddfa1` | 认证与授权（DMARC 类型化、RCPT 枚举防护、A-R 注入、TOTP 重放、`totp.disable` 零验证、`revoke_user` 死代码、Cookie `__Host-`） |
+| 批 4 | ⏳ 未开始 | 特权与密码学：`locked()` 静默降级、`file_snapshot` 的 EACCES、`service_ctl` 无超时、`pgrep` 正则、`resolve_program` 执行位、`users` 三处忽略退出码、`PROTECTED_USERS`、socket 竞态、RPC 超时、`framing` 上限 |
+| 批 5 | ⏳ 未开始 | Web 与队列：`RequestBodyLimitLayer` 接线、用户名枚举预言机、PBKDF2 阻塞 async、503 误锁管理员、`run_once` 排他、投递 lease、5xx 不计入出站健康、`tables` RMW 加锁 |
+| 批 6 | ⏳ 未开始 | 工程化：CI 供应链门禁转强制、不变量门禁验断言、`deploy` 脚本 `set -euo pipefail`、`build.sh` 补 `mailstack-web`、`panic = "abort"` 重评估、审计链 fsync |
+
+> ⚠️ **批 4 至批 6 是「已证实存在、尚未修复」的清单** —— 不是猜测。
+> 每一条都在 `REVIEW_FIXES.md` 的「未修项」表里，含位置与影响。
+> 规模上大多是 1–20 行的局部修改，但**必须逐条配反例测试**（审查报告的核心批评正是
+> 「测试擅长验证『我实现的是对的』，不擅长验证『我声称的性质没被破坏』」）。
 
 ### 4.1 优先做（零新依赖、立刻让已有能力可见）
 
@@ -585,7 +632,8 @@ wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
 | `.github/workflows/ci.yml` | 三道 job：fmt+clippy+test / 供应链（audit+deny） / **不变量存在性（`required=(...)` 名单，扫描范围含 `bin/`）** |
 | `deploy/*.sh` | 构建、质量门禁、不变量门禁、交付物门禁、容器 Postfix 测试、WSL 工具 |
 | `crates/web/src/contract.rs` | **路由唯一真相源**（72 条）；RPC 桥的动作允许集也从它推导 |
-| `crates/core/src/actions.rs` | **动作白名单唯一真相源**（RO 22 / RW 36 / 破坏性 3） |
+| `crates/core/src/actions.rs` | **动作白名单唯一真相源**（RO 22 / RW 36 / 破坏性 4） |
+| `docs/REVIEW_FIXES.md` | **本轮外部审查加固的完整台账**（批 1–3 已修、批 4–6 未修项、被否掉的报告结论） |
 
 ### 9.2 仓库外（**只读对照，勿改**）
 
@@ -606,19 +654,30 @@ wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
 | `e:\MailStack\MailStack-v0.8-beta.6\MailStack-v0.8-beta.6` | 较新一版基线。**仅在需要确认「某个行为是哪一版引入的」时查**；与 `beta.10` 冲突时以 `beta.10` 为准 |
 | `…/CHANGELOG.md` | 基线的变更日志 —— 可用作本项目的「变更日志替代来源」（本项目自身的变更记录在 `TEST_REPORT.md` §4） |
 | `docs/REWRITE_TO_RUST.md` v3 | 规格书：§3.3 组件下线、§5.x 各子系统要求、§6 迁移路线、§8 的 43 条不变量 |
-| `E:\hage2\Documents\zcode\mailstack-admin-frontend` | **管理前端**（Vite + React 19，Phase 3 接入）。同样只读参考 —— 改它不会让 Rust 门禁变红，需另行 `npm run build` |
+| `E:\hage2\Documents\zcode\mailstack-admin-frontend` | 管理前端的**原始位置**。已复制进本仓库 `webui/`（见 `README.md`「前端」），此处仅作来源留痕 —— **不要再改它** |
 
 ### 9.3 建议的接续起点
 
-1. 先读 `docs/TEST_REPORT.md` §4（缺陷复盘）——**项目的隐性知识几乎都在那里**。
-2. 再读 §8.2 的偏离表，避免「把有意选择当成 bug 改回去」。
-3. **动作面、前端接入、版本控制、入站环路验证都已收口**（58/58 动作、72/72 路由、
-   `bin/mailstack-web`、`git` 历史 + `.gitattributes`、`deploy/verify-loopback-e2e.sh` 实测通过）。
-   下一步是 §4.3 余下的**真实环境验证**，按依赖顺序：
-   ① **LMTP → Dovecot Maildir**（需要本机装 Dovecot；`mail_test_loopback` 才有意义）；
-   ② **真实 Dovecot auth socket 联调**（提交端口 SASL）；
-   ③ **真实公网 MX 直投**；④ **机会式 TLS**（独立的安全策略决定，需单独登记与测试）；
-   ⑤ 审计链的真实升级演练；⑥ Phase 5 组件下线（Postfix / OpenDKIM / fail2ban / Node）。
-4. **短期值得做的清理**：`crates/priv/src/readers.rs` 已膨胀到约 5000 行（只读面 + 写面 +
-   向导 + 环路自检 + 用户 + 证书 + AI + 8 个列表动作），**已有 git 安全网**，可以按职责拆一层；
-   以及 §4.3 的前端向导缺口（`setup.mail.test` 那一步只收集收件人，缺 sender/username/password）。
+1. **先读 `docs/REVIEW_FIXES.md`** —— 本轮外部审查加固的完整台账。批 1–3 已提交，
+   批 4–6 的未修项（含位置与影响）全在里面。这是当前**最紧的线索**。
+2. 再读 `docs/TEST_REPORT.md` §4（缺陷复盘）——**项目的隐性知识几乎都在那里**。
+3. 再读 §8.2 的偏离表，避免「把有意选择当成 bug 改回去」。
+4. **已收口的部分**：58/58 动作、72/72 路由、`bin/mailstack-web`、前端入仓（`webui/`）、
+   `git` 历史 + `.gitattributes`、入站环路实跑验证（`deploy/verify-loopback-e2e.sh`）。
+5. **两条并行的下一步**，按你的优先级选：
+
+   **(A) 继续外部审查加固** —— 批 4（特权与密码学）→ 批 5（Web 与队列）→ 批 6（工程化）。
+   这批大多是 1–20 行的局部修改，风险低收益高；但**每条都要配能真正失败的反例测试**，
+   否则就是重复审查报告批评的那个错误（「测试只验证已实现的分支」）。
+
+   **(B) 真实环境验证** —— 需要外部依赖，按依赖顺序：
+   ① **LMTP → Dovecot Maildir**（需本机装 Dovecot；`mail_test_loopback` 才有意义）；
+   ② **真实 Dovecot auth socket 联调**（提交端口 SASL）；③ **真实公网 MX 直投**；
+   ④ **机会式 TLS**（独立的安全策略决定，需单独登记与测试）；⑤ 审计链的真实升级演练；
+   ⑥ Phase 5 组件下线（Postfix / OpenDKIM / fail2ban / Node）。
+6. **已知的部署硬前置条件**：本机 `/usr/local/libexec/mailstack-privileged` 仍是**重写前
+   留下的包装器**（`exec /opt/mailstack/backend/mailstackctl.py`），它不认识本项目任何
+   动作名 → **所有写操作都会失败**（只读动作不受影响）。换对它之前，向导的完整链路
+   无法真跑通。详见 `docs/DEPLOYMENT.md` §3.1.1。
+7. **短期值得做的清理**：`crates/priv/src/readers.rs` 约 5000 行（只读面 + 写面 + 向导 +
+   环路自检 + 用户 + 证书 + AI + 8 个列表动作），**已有 git 安全网**，可按职责拆一层。

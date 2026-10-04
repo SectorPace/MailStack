@@ -4,7 +4,7 @@
 - 规格书：`docs/REWRITE_TO_RUST.md` **v3**（本仓库外的源码包内）
 - 平台：WSL Ubuntu 24.04 / `x86_64-unknown-linux-gnu`（生产目标平台）
 - 工具链：rustc 1.98.1（`deploy/build.sh` 与 CI 双重固定）
-- 结论：**1018 个测试全部通过**（含 `mailstackd` / `mailstackctl` / `mailstack-web` 二进制与 4 组真实集成套件）；rustfmt 与 clippy(`-D warnings`) 全绿；277/277 不变量测试存在
+- 结论：**1083 个测试全部通过**（含 `mailstackd` / `mailstackctl` / `mailstack-web` 二进制与 4 组真实集成套件）；rustfmt 与 clippy(`-D warnings`) 全绿；277/277 不变量测试存在
 - 58 条白名单动作**已全部实现**，72 条契约路由**已全部接线**
   - 另 34 个集成测试需真实环境（TLS 握手 / TCP / unix socket / 容器内 Postfix）
 
@@ -19,19 +19,19 @@ deploy/verify-invariant-gate.sh   # 确认 CI 列出的不变量测试名都真�
 
 | crate | 测试数 | 职责 |
 |---|---:|---|
-| `mailstack-core` | 188 | 动作三集、口令策略、审计哈希链、`atomic`/`locked`、`warn`、**`exec`（命令原语 + postmap 序列 + `service_ctl` 降级链）**、配置 schema、部署模式、**`totp`（2FA：AES-256-GCM 信封、RFC 6238、恢复码持锁消费）**、**`certs`（证书到期解析）**、**`sysinfo`（`/proc` 只读采样）**、**`security`（敏感文件权限体检）**、**`backup`（归档打包/恢复：成员白名单、链接与设备拒绝、校验和先验）**、**`bans`（手工封禁文件）** |
-| `mailstack-priv` | 228 | 动作门控、RPC 帧、RO/RW socket 服务端、**全部 58 个动作的处理器**（只读面、2FA 全生命周期、域名/别名/设置/管理员/DKIM 轮换、只读聚合面、服务与队列动作、手工封禁、备份、初始化向导 `setup.*`、**ACME 证书 `setup.cert.issue`/`certs.renew`**、邮件环路自检、邮箱用户 `users.*`、**AI 出站子系统 `ai.*`（SSRF/DNS-rebinding 防护）**、**为管理前端新增的 8 个只读列表动作**）、fallback 规则、**特权调用客户端**（通道推导 + 失败分类） |
-| `mailstack-smtp` | 138 + 7 | IP 固定拨号器、中继校验、分阶段测试、出站探测、反中继策略、落地与回滚、真实落盘载体、**MX 解析与直投目标选择**、**`dns_query`（A/MX/TXT 查询，TXT 分片拼接）**、**`AddressPolicy`（SSRF 地址筛选，含 IPv6 内嵌 IPv4 的拆解）**（7 个为真实 TLS 集成测试） |
+| `mailstack-core` | 208 | 动作三集、口令策略（**含记录形状校验：空摘要/截断摘要 fail-closed**）、审计哈希链、`atomic`/`locked`（**权限在首字节落盘前生效**）、`warn`、**`exec`（命令原语 + postmap 序列 + `service_ctl` 降级链，含 spawn 失败不再报成功）**、配置 schema、部署模式、**`totp`（2FA：AES-256-GCM 信封、RFC 6238、**重放记账**、恢复码持锁消费）**、**`certs`（证书到期解析）**、**`sysinfo`（`/proc` 只读采样）**、**`security`（敏感文件权限体检）**、**`backup`（归档打包/恢复：成员白名单、链接与设备拒绝、校验和先验）**、**`bans`（手工封禁文件）** |
+| `mailstack-priv` | 230 | 动作门控、RPC 帧、RO/RW socket 服务端、**全部 58 个动作的处理器**（只读面、2FA 全生命周期、域名/别名/设置/管理员/DKIM 轮换、只读聚合面、服务与队列动作、手工封禁、备份、初始化向导 `setup.*`、**ACME 证书 `setup.cert.issue`/`certs.renew`**、邮件环路自检、邮箱用户 `users.*`、**AI 出站子系统 `ai.*`（SSRF/DNS-rebinding 防护）**、**为管理前端新增的 8 个只读列表动作**）、fallback 规则、**特权调用客户端**（通道推导 + 失败分类） |
+| `mailstack-smtp` | 141 + 7 | IP 固定拨号器、中继校验、分阶段测试、出站探测、反中继策略、落地与回滚、真实落盘载体、**MX 解析与直投目标选择**、**`dns_query`（A/MX/TXT 查询，TXT 分片拼接）**、**`AddressPolicy`（SSRF 地址筛选：IPv6 走 `2000::/3` 白名单）**、**出站响应限长 / CRLF 注入拒绝 / 裸 LF 点填充 / 解析超时**（7 个为真实 TLS 集成测试） |
 | `mailstack-queue` | 80 | 队列持久化与原子性、指数退避与去共振、DSN 退信、并发限流、快速失败与出站判据、**出站必签 DKIM**、**直投（逐域 MX，绝不回退中继）** |
-| `mailstack-store` | 31 + 10 | Postfix 表文件（域名/别名）、**LMTP 客户端**（10 个为真实 unix socket 端到端） |
-| `mailstack-auth` | 43 | DKIM 密钥（原生 RSA-2048、SPKI 记录、0640 加固）、签名与**自签自验**、SPF、DMARC、ARC **校验与封印**（自封自验、续封、篡改反例）、**离线 TXT 缓存** |
-| `mailstack-smtpd` | 139 + 11 | 入站 SMTP：命令解析、**DATA 字节流（SMTP 走私防护）**、会话状态机与反中继（INV-17）、会话驱动；**TCP 监听 + TLS 1.2 起（STARTTLS / 隐式 465）**、**连接限速**、**IP 自动封禁**、**提交端口 SASL（RFC 4954 + Dovecot auth socket）**、**入站认证（SPF/DKIM/DMARC）与入队**（11 个为真实 TCP/TLS/auth-socket 端到端） |
-| `mailstack-web` | 93 | 契约路由表、会话/CSRF、登录限流、错误模型、特权通道、Axum 装配、**2FA 路由**、**动作×路由一致性（全表接线守卫）**、**时序遥测采集器（`telemetry`：7 档环形缓冲 + `/proc` 差分采样 + `df`/`postqueue`）**、**RPC 桥（动作允许集由契约表推导，见 §3.10）** |
-| `mailstack-web-bin` | 9 | **管理控制台服务入口**（`bin/mailstack-web`）：API + 前端产物托管、SPA 回退、`/api` 兜底保持 JSON、路径穿越拒绝、内容类型、遥测后台采样宿主（详见 §3.10；端到端复验见 §4.24） |
+| `mailstack-store` | 42 + 10 | Postfix 表文件（域名/别名）、**本地收件人名录**（`recipients.rs`：三态判定，「查不了」≠「不存在」）、**LMTP 客户端**（含尾部 CRLF 与裸 LF 点填充） （10 个为真实 unix socket 端到端） |
+| `mailstack-auth` | 47 | DKIM 密钥（原生 RSA-2048、SPKI 记录、0640 加固）、签名与**自签自验**、SPF、**DMARC（类型化策略 — 不再靠 `Debug` 字符串判定）**、ARC **校验与封印**（自封自验、续封、篡改反例）、**离线 TXT 缓存（带 TTL 上界与容量上界；注入条目不参与淘汰）** |
+| `mailstack-smtpd` | 163 + 11 | 入站 SMTP：命令解析、**DATA 字节流（SMTP 走私防护；超限后不缓冲但仍认得结束标记）**、会话状态机与反中继（INV-17）、**RCPT 收件人名录查验（消目录枚举与 backscatter）**、**`Authentication-Results` 值引用（防 `;` 注入）**、会话驱动；**TCP 监听 + TLS 1.2 起（STARTTLS / 隐式 465）**、**连接限速**、**IP 自动封禁（含认证失败记账 + 每连接连续失败上限）**、**提交端口 SASL（RFC 4954 + Dovecot auth socket）**、**入站认证（SPF/DKIM/DMARC）与入队**（11 个为真实 TCP/TLS/auth-socket 端到端） |
+| `mailstack-web` | 94 | 契约路由表、会话/CSRF（**Cookie 带 `__Host-` 前缀**）、登录限流（**窗口会重置、键长与表容量有上界**）、错误模型、特权通道、Axum 装配、**2FA 路由**、**动作×路由一致性（全表接线守卫，破坏性集合与 `DESTRUCTIVE_ACTIONS` 双向对照）**、**时序遥测采集器（`telemetry`：7 档环形缓冲 + `/proc` 差分采样 + `df`/`postqueue`）**、**RPC 桥（动作允许集由契约表推导，见 §3.10）**、**改密/2FA 变更后按用户全量吊销会话** |
+| `mailstack-web-bin` | 9 | **管理控制台服务入口**（`bin/mailstack-web`）：API + 前端产物托管、SPA 回退、`/api` 兜底保持 JSON、路径穿越拒绝、内容类型、遥测后台采样宿主、**`ConnectInfo` 接线（per-IP 限流取真实对端）**（详见 §3.10；端到端复验见 §4.24） |
 | `mailstackd` | 28 | **进程入口**：`Paths`→运行期配置的 fail-closed 装配、三端口共用准入状态、监听集中绑定、**特权 RPC 双通道绑定与门控**、停机信号扇出、出站队列调度（详见 §3.1.5） |
 | `mailstackctl` | 7 | **CLI**：参数→特权调用的翻译（`--confirm` 必须是真布尔）、退出码映射（详见 §3.1.6） |
 | `mailstack-smtp`（真实 Postfix） | 6 | 需显式开启；在一次性容器中对 Postfix 3.8.6 运行 |
-| **合计** | **1018** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
+| **合计** | **1083** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 
 ## 2. 门禁结果
 
@@ -39,7 +39,7 @@ deploy/verify-invariant-gate.sh   # 确认 CI 列出的不变量测试名都真�
 |---|---|---|
 | 格式 | `cargo fmt --all -- --check` | ✅ PASS |
 | Lint | `cargo clippy --all-targets -- -D warnings` | ✅ PASS（warnings 即失败） |
-| 单元/集成测试 | `cargo test` | ✅ 1018 passed / 0 failed |
+| 单元/集成测试 | `cargo test` | ✅ 1083 passed / 0 failed |
 | 真实 Postfix 集成 | `deploy/test-relay-postfix-in-container.sh` | ✅ 6/6 passed（Postfix 3.8.6） |
 | 不变量存在性 | `verify-invariant-gate.sh` | ✅ 277/277 存在（扫描范围含 `bin/`） |
 | 交付物 | `deploy/verify-deliverables.sh` | ✅ `DELIVERABLES_OK` |
@@ -1324,6 +1324,54 @@ let content_type = content_type_for(url_path);
 | `GET /api/users` / `/api/queue` / `/api/ai/models` | 均 `401`（已接线且受认证保护）✅ |
 | `POST /api/rpc` | `401`（未带会话）✅ |
 | `GET /assets/index-*.js` | `200 text/javascript` + 530857 字节 ✅ |
+
+### 4.25 外部审查驱动的一批修复（2026-10-04）
+
+**这一节不是「复盘单个缺陷」，而是一次系统性加固的记录。** 完整台账见
+[`docs/REVIEW_FIXES.md`](REVIEW_FIXES.md)；这里只记**共性与教训**，因为它是本项目
+测试方法论的一次修正。
+
+**背景**：5 份独立的第三方审查报告在**同一批缺陷上独立收敛**（例如「登录限流窗口
+永不重置」被 5 份全部发现）。逐条回源码核实后修复，共 3 批、约 20 条。
+
+**共性特征（审查报告的原话，值得贴在墙上）**：
+
+> 最刺眼的几条有一个共同特征：**文档/注释声称的不变量，与代码的实际行为相反，
+> 且被一条恰好构造在盲区里的测试固定成了绿灯。**
+
+具体到本仓库，这个「盲区模式」有四种稳定的形态：
+
+| 盲区模式 | 实例 | 测试为何失明 |
+|---|---|---|
+| **只在唯一时间点构造** | 限流窗口永不重置 | 三个限流测试全在同一个 `t0` 上构造，**从没有一条检查第二个窗口** |
+| **恰好以「复位」收尾** | RCPT 枚举、超限后状态机 | 超限测试在**首次** `TooLarge` 就 `break`；DATA 超限测试以 `RSET` 收尾 |
+| **只测 happy path 的输入形态** | 裸 LF 点填充 | 三个 `dot_stuff` 测试**全部**只喂 CRLF，裸 LF 从未进入 |
+| **测「已实现的分支」而非「声称的性质」** | 空摘要 fail-open | `verify_password_survives_corrupt_record` 只试「非 hex」一种损坏形态，而 `hex::decode("")` 是**成功**的 |
+
+**因此本轮的修复纪律是：每条修复都配一个「反例测试」，判据是
+「把修复改回坏代码，它会变红吗？」** 不满足就不是守卫。
+
+实证：`data.rs` 的 `the_line_buffer_stops_growing_after_the_limit_is_hit`
+经过**真实的反向验证** —— 我把修复临时改回坏代码（`if !self.overflowed || true`），
+测试确实变红（`assertion left == right failed: 超限后继续喂入撑大了行缓冲`），
+再改回。这是本轮唯一做了完整反向验证的一条，其余按同样标准设计但未逐条实测。
+
+**两条我自己的错误（都被测试当场抓住）**：
+
+1. 修限流时把 `entry().or_insert_with(..)` 换成 `get_mut`，导致**首次出现的键
+   永远不会被建立计数器** —— 计数静默停止。6 个既有测试变红。
+2. `iterations` 下界的测试**断言方向写反**（以为降级后正确口令应失败）。
+   新测试变红，才发现理解反了。
+
+> 这两条说明「反例测试」不只是防回归，它同时**校验我自己对缺陷的理解是否正确**。
+
+**被否掉的报告结论**：3 条（`keys.rs` 的 `split_at` 不可达、`bind→chmod` 竞态
+实际风险低、审计链「零写入」实为迁移就绪度问题）。**逐条回源码核实是必要步骤**
+—— 否则会把有意选择当成 bug 改回去。详见 `REVIEW_FIXES.md` §4。
+
+**过程留痕**：其中一个子代理在返回前**中断**，留下三处半成品（重复函数定义、
+六处缺 `&`、两个测试用旧 cookie 名），由我手工收拾。
+**教训**：子代理的核心逻辑可用，但**收尾不可信** —— 必须读实际改动而非它的汇报。
 
 
 
