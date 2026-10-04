@@ -310,14 +310,47 @@ pub struct ServiceCtlOutcome {
     pub backend: ServiceBackend,
     /// 真正执行的命令；[`ServiceBackend::Noop`] 时为 `None`。
     pub output: Option<CommandOutput>,
+    /// spawn 失败的原因（程序不存在 / 权限不足 / fork 失败）。
+    ///
+    /// 与 `output == None` 的区别见 [`ServiceCtlOutcome::success`]。
+    pub spawn_error: Option<String>,
 }
 
 impl ServiceCtlOutcome {
-    /// 是否成功。`Noop` 视为成功 —— 与基线执行 `true` 的语义一致。
+    /// 是否成功。
+    ///
+    /// ## 为什么 `Noop` 与「执行失败」不能同义
+    ///
+    /// 原实现是 `None => true`，而 `None` 同时表示两件**性质相反**的事：
+    ///
+    /// * [`ServiceBackend::Noop`] —— 该单元不适用任何后端（真的什么都不用做）；
+    /// * **spawn 失败** —— `systemctl` 存在但 fork/exec 失败、权限不足、OOM。
+    ///   这时 `success()` 返回 `true`，于是「配置改了但没人重载」——
+    ///   正是本模块文档 [`service_ctl`] 自己声明要根除的失败模式。
+    ///
+    /// 调用方（`reload_ok`、API 响应）都只看这个布尔值，所以必须区分。
+    /// spawn 失败用 [`ServiceCtlOutcome::spawn_error`] 承载，不再压成 `None`。
     pub fn success(&self) -> bool {
         match &self.output {
             Some(output) => output.success(),
-            None => true,
+            None => self.spawn_error.is_none(),
+        }
+    }
+
+    /// 是否是「命令根本没跑起来」。
+    ///
+    /// 与「跑了但失败」分开：前者通常是环境/权限问题（该叫人），
+    /// 后者是服务自己拒绝（可能是正常的）。
+    pub fn spawn_failed(&self) -> bool {
+        self.spawn_error.is_some()
+    }
+
+    /// 人类可读的原因，供 API 层如实上报。
+    pub fn failure_reason(&self) -> Option<String> {
+        match (&self.output, &self.spawn_error) {
+            (Some(output), _) if !output.success() => Some(output.stderr.clone()),
+            (_, Some(message)) => Some(message.clone()),
+            _ => None,
         }
     }
 }
@@ -338,17 +371,35 @@ pub fn service_ctl(
     unit: &str,
     verb: ServiceVerb,
 ) -> ServiceCtlOutcome {
-    let run = |program: &str, args: &[&str]| ServiceCtlOutcome {
-        backend: match program {
-            "systemctl" => ServiceBackend::Systemctl,
-            "service" => ServiceBackend::Service,
-            "rc-service" => ServiceBackend::RcService,
-            "postfix" => ServiceBackend::Postfix,
-            "dovecot" => ServiceBackend::Dovecot,
-            "fail2ban-client" => ServiceBackend::Fail2ban,
-            other => ServiceBackend::InitScript(PathBuf::from(other)),
+    let run = |program: &str, args: &[&str]| match runner.run(program, args) {
+        Ok(output) => ServiceCtlOutcome {
+            backend: match program {
+                "systemctl" => ServiceBackend::Systemctl,
+                "service" => ServiceBackend::Service,
+                "rc-service" => ServiceBackend::RcService,
+                "postfix" => ServiceBackend::Postfix,
+                "dovecot" => ServiceBackend::Dovecot,
+                "fail2ban-client" => ServiceBackend::Fail2ban,
+                other => ServiceBackend::InitScript(PathBuf::from(other)),
+            },
+            output: Some(output),
+            spawn_error: None,
         },
-        output: runner.run(program, args).ok(),
+        // 曾经是 `.ok()` —— spawn 失败被压成 `None`，而 `success()` 对 `None`
+        // 返回 `true`，于是「systemctl 根本没跑起来」被报成「重载成功」。
+        Err(error) => ServiceCtlOutcome {
+            backend: match program {
+                "systemctl" => ServiceBackend::Systemctl,
+                "service" => ServiceBackend::Service,
+                "rc-service" => ServiceBackend::RcService,
+                "postfix" => ServiceBackend::Postfix,
+                "dovecot" => ServiceBackend::Dovecot,
+                "fail2ban-client" => ServiceBackend::Fail2ban,
+                other => ServiceBackend::InitScript(PathBuf::from(other)),
+            },
+            output: None,
+            spawn_error: Some(format!("{program}: {error}")),
+        },
     };
 
     if env.program_available("systemctl") && env.path_exists(Path::new("/run/systemd/system")) {
@@ -367,12 +418,7 @@ pub fn service_ctl(
     }
     let init_script = PathBuf::from(format!("/etc/init.d/{unit}"));
     if env.path_exists(&init_script) {
-        return ServiceCtlOutcome {
-            backend: ServiceBackend::InitScript(init_script.clone()),
-            output: runner
-                .run(&init_script.to_string_lossy(), &[verb.as_str()])
-                .ok(),
-        };
+        return run(&init_script.to_string_lossy(), &[verb.as_str()]);
     }
     if unit == "postfix" && env.program_available("postfix") {
         return run("postfix", &[verb.as_str()]);
@@ -400,6 +446,8 @@ pub fn service_ctl(
     ServiceCtlOutcome {
         backend: ServiceBackend::Noop,
         output: None,
+        // 真的什么都不用做 —— 与上面「跑了但失败」相反的情形。
+        spawn_error: None,
     }
 }
 
@@ -772,6 +820,41 @@ mod tests {
         assert!(outcome.output.is_none());
         assert!(outcome.success(), "与基线的 `true` 一致：视为成功");
         assert!(runner.calls().is_empty(), "Noop 不应产生任何 fork");
+    }
+
+    /// 反例守卫：**命令没跑起来**不得报成功。
+    ///
+    /// 原实现把 spawn 失败 `.ok()` 成 `None`，而 `success()` 对 `None` 一律 `true`
+    /// —— 于是 `systemctl` 因权限不足 / fork 失败而根本没执行时，
+    /// `reload_ok` 仍然是 `true`，API 回答「已重载」。
+    /// 这正是本模块文档开头声明要根除的「配置改了但没人重载」。
+    #[test]
+    fn a_command_that_never_started_is_not_reported_as_success() {
+        struct FailingRunner;
+        impl CommandRunner for FailingRunner {
+            fn run(&self, program: &str, _args: &[&str]) -> CoreResult<CommandOutput> {
+                Err(CoreError::io(
+                    PathBuf::from(program),
+                    std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                ))
+            }
+        }
+
+        // 命中第一条降级链，于是确实会去 fork systemctl。
+        let env = FakeEnv::with(&["systemctl"], &["/run/systemd/system"]);
+        let outcome = service_ctl(&env, &FailingRunner, "postfix", ServiceVerb::Reload);
+
+        assert_eq!(outcome.backend, ServiceBackend::Systemctl, "应走 systemctl");
+        assert!(outcome.output.is_none(), "spawn 失败时没有输出");
+        assert!(outcome.spawn_failed(), "spawn 失败必须被标记出来");
+        assert!(
+            !outcome.success(),
+            "命令没跑起来绝不能报成功：配置改了但没人重载"
+        );
+        assert!(
+            outcome.failure_reason().is_some(),
+            "如实上报原因，别让调用方只看到一个 bool"
+        );
     }
 
     #[test]

@@ -62,6 +62,20 @@ pub trait MessageSink: Send + Sync {
     fn accept<'a>(&'a self, message: AcceptedMessage, peer: SocketAddr) -> SinkFuture<'a>;
 }
 
+/// 同一连接内允许的**连续**认证失败次数，超过即断开。
+///
+/// ## 为什么必须有这个上限
+///
+/// RFC 4954 允许客户端在一条连接上重试 `AUTH`，但**没有规定次数上限**。
+/// 原实现对认证失败只打日志、不计数、不封禁，于是同一条连接可以无限次重发
+/// `AUTH PLAIN`，每次都真的打到 Dovecot auth socket —— 一次成功的爆破可以
+/// 持续整条 TCP 连接的时长（提交端口的空闲超时是分钟级）。
+///
+/// 与封禁表的关系：这里是**每连接**的止损（让爆破必须重新建连、重新过准入），
+/// [`BanList`](crate::ban::BanList) 是**跨连接**的封禁（真正的惩罚）。两者都要有：
+/// 只有前者则换个 IP 即可重来；只有后者则连接内的重试完全免费。
+pub const MAX_CONSECUTIVE_AUTH_FAILURES: u32 = 5;
+
 /// 把一条已渲染的应答写出去。
 pub(crate) async fn write_reply<S>(stream: &mut S, reply: &Reply) -> std::io::Result<()>
 where
@@ -81,6 +95,22 @@ pub enum ServeOutcome {
     /// 对端要求 STARTTLS；**明文读缓冲已在返回前丢弃**，
     /// 调用方应完成 TLS 握手后以 [`serve_after_upgrade`] 重新进入。
     StartTls,
+    /// 会话期间发生了**这么多次**认证失败（凭据错，不是后端不可用）。
+    ///
+    /// ## 为什么把它带回监听层
+    ///
+    /// 封禁表（[`BanList`](crate::ban::BanList)）归监听层所有，`drive` 拿不到它。
+    /// 而认证失败必须计入封禁 —— 否则提交端口（465/587）上同一条连接可以
+    /// 无限次重发 `AUTH`，每次都真打到 Dovecot auth socket，而
+    /// 「替代 fail2ban」的那套封禁表**对爆破完全失明**（限速只按连接数计数，
+    /// 认证尝试不消耗任何配额）。
+    ///
+    /// 只回传**计数**而不是「要不要封禁」：阈值与封禁时长是监听层的策略，
+    /// 会话驱动不该知道全局策略。
+    ClosedAfterAuthFailures {
+        /// 连续的凭据错误次数。
+        failures: u32,
+    },
 }
 
 /// 取出一行（不含行结束符）以及「已消费到哪」。
@@ -173,6 +203,9 @@ where
 {
     let policy = session.config().bare_newline_policy;
     let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+    // 连续凭据错误次数。`InvalidCredentials` 才 +1；`TemporaryFailure`（后端挂了）
+    // 不算 —— 否则 Dovecot 一抖动就把正常用户全封了。
+    let mut auth_failures: u32 = 0;
 
     if greet {
         write_reply(&mut stream, &session.greeting()).await?;
@@ -265,6 +298,8 @@ where
                 match &outcome {
                     AuthOutcome::Success { user } => {
                         tracing::info!(peer = %peer, user = %user, "提交认证成功");
+                        // 成功即清零：限流要罚的是**连续**爆破，不是累计次数。
+                        auth_failures = 0;
                     }
                     AuthOutcome::TemporaryFailure(reason) => {
                         // 只记原因，不记凭据 —— 这是排查「Dovecot 挂了」与
@@ -272,11 +307,27 @@ where
                         tracing::warn!(peer = %peer, reason = %reason, "认证后端暂时不可用");
                     }
                     AuthOutcome::InvalidCredentials => {
-                        tracing::info!(peer = %peer, "提交认证失败");
+                        // 原来这里只打日志就放过 —— 于是同一条连接可以无限次重发
+                        // `AUTH`，每次都真的打到后端，封禁表完全不知情。
+                        auth_failures = auth_failures.saturating_add(1);
+                        tracing::info!(
+                            peer = %peer,
+                            consecutive_failures = auth_failures,
+                            "提交认证失败"
+                        );
                     }
                 }
                 let reply = session.complete_auth(outcome);
                 write_reply(&mut stream, &reply).await?;
+
+                // 达阈值就断开：连接留着等于给了爆破一个**零成本**的无限重试通道。
+                // 阈值用会话侧的常量（见 `MAX_CONSECUTIVE_AUTH_FAILURES`），封禁
+                // 仍由监听层的表决定。
+                if auth_failures >= MAX_CONSECUTIVE_AUTH_FAILURES {
+                    return Ok(ServeOutcome::ClosedAfterAuthFailures {
+                        failures: auth_failures,
+                    });
+                }
             }
             Action::EnterData(reply) => {
                 write_reply(&mut stream, &reply).await?;
@@ -456,6 +507,35 @@ mod tests {
         );
         served.expect("会话驱动不应返回 I/O 错误");
         (out, sink.accepted.lock().unwrap().clone())
+    }
+
+    /// 同 [`run_collect_with_auth`]，但把 [`ServeOutcome`] 也带回来。
+    ///
+    /// 需要它来断言「认证失败达阈值后**主动断开**」—— 那条信息只出现在
+    /// 返回值里，光看输出文本无法区分「回 535 后继续」与「回 535 后断开」。
+    async fn run_collect_outcome<A: Authenticator + ?Sized>(
+        input: &[u8],
+        limits: ServerLimits,
+        config: SessionConfig,
+        sink: &RecordingSink,
+        auth: &A,
+    ) -> (String, ServeOutcome) {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut session = Session::new(config, RelayPolicy::new(["example.org"]));
+        let peer: SocketAddr = "203.0.113.7:54321".parse().unwrap();
+
+        let client_task = async {
+            client.write_all(input).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut out = String::new();
+            client.read_to_string(&mut out).await.unwrap();
+            out
+        };
+        let (out, served) = tokio::join!(
+            client_task,
+            serve(server, &mut session, sink, auth, peer, limits)
+        );
+        (out, served.expect("会话驱动不应返回 I/O 错误"))
     }
 
     /// 记录认证请求并回一个可配置的结果。
@@ -889,5 +969,167 @@ mod tests {
         assert!(out.contains("535 5.7.8"), "{out}");
         assert!(out.contains("554 5.7.1"), "认证失败后仍不得中继：{out}");
         assert!(accepted.is_empty());
+    }
+
+    /// 反例守卫：同一条连接上的**重复**认证失败必须被计数并在阈值处断开。
+    ///
+    /// ## 为什么原测试全都漏了它
+    ///
+    /// 原有的认证测试每条只发**一次** `AUTH`（失败或成功），所以它们完全
+    /// 看不到「连续多次」这条路径 —— 而这正是爆破的形态。RFC 4954 允许
+    /// 在一条连接上重试 `AUTH` 且不规定次数上限，原实现也不计数、不封禁、
+    /// 不断开，于是同一条连接可以无限次重发、每次都真的打到 Dovecot auth socket。
+    ///
+    /// 断言两件事：返回值的 `failures`（供监听层记账）与**确实断开**
+    /// （后面几条命令不得有应答）。
+    #[tokio::test]
+    async fn repeated_auth_failures_are_counted_and_the_connection_is_dropped() {
+        let auth = RecordingAuth::with_outcome(AuthOutcome::InvalidCredentials);
+        let sink = RecordingSink::default();
+        // 连发 6 次 AUTH：阈值是 5，第 6 次根本不该被处理。
+        let mut input = String::from("EHLO client.test\r\n");
+        for _ in 0..MAX_CONSECUTIVE_AUTH_FAILURES + 1 {
+            input.push_str("AUTH PLAIN AGJhZABwYXNz\r\n");
+        }
+        input.push_str("MAIL FROM:<alice@example.org>\r\n");
+
+        let (out, outcome) = run_collect_outcome(
+            input.as_bytes(),
+            limits(),
+            submission_config(),
+            &sink,
+            &auth,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            ServeOutcome::ClosedAfterAuthFailures {
+                failures: MAX_CONSECUTIVE_AUTH_FAILURES
+            },
+            "达到阈值后必须断开并把次数回传给监听层（供封禁表记账）"
+        );
+
+        let attempts = auth.requests().len();
+        assert_eq!(
+            attempts,
+            MAX_CONSECUTIVE_AUTH_FAILURES as usize,
+            "第 {} 次 AUTH 不该再打到认证后端",
+            MAX_CONSECUTIVE_AUTH_FAILURES + 1
+        );
+        // 断开后不得再处理任何命令。注意 `250-` 是 EHLO 的能力行（正常），
+        // 所以要看**最后一次 AUTH 之后**有没有出现收尾应答 `250 `（带空格）
+        // 或 `250 MAIL`——那些都说明连接还活着。
+        let after_first_auth = out
+            .find("535 5.7.8")
+            .map(|idx| &out[idx..])
+            .unwrap_or_default();
+        assert!(
+            !after_first_auth.contains("250 MAIL") && !after_first_auth.contains("250 2"),
+            "断开后不得再处理 MAIL FROM：{after_first_auth}"
+        );
+        assert!(
+            !after_first_auth.contains("354 "),
+            "不得进入 DATA：{after_first_auth}"
+        );
+        assert!(
+            sink.accepted.lock().unwrap().is_empty(),
+            "认证从未成功，不得有邮件被接受"
+        );
+    }
+
+    /// 反例守卫：**一次成功就把连续失败计数清零**。
+    ///
+    /// 要罚的是**连续**爆破，不是累计次数。否则一个每次都换错口令的用户
+    /// （比如口误的老手）会在第 N 次被误断开，而真正的爆破在成功那一刻就已结束。
+    #[tokio::test]
+    async fn a_success_resets_the_consecutive_failure_count() {
+        // 前 4 次失败、第 5 次成功 —— 不应触发断开。
+        struct FlakyAuth {
+            calls: Mutex<usize>,
+        }
+        impl Authenticator for FlakyAuth {
+            fn authenticate<'a>(
+                &'a self,
+                request: AuthRequest,
+            ) -> Pin<Box<dyn Future<Output = AuthOutcome> + Send + 'a>> {
+                let n = {
+                    let mut guard = self.calls.lock().unwrap();
+                    *guard += 1;
+                    *guard
+                };
+                Box::pin(async move {
+                    let _ = request;
+                    if n < MAX_CONSECUTIVE_AUTH_FAILURES as usize {
+                        AuthOutcome::InvalidCredentials
+                    } else {
+                        AuthOutcome::Success {
+                            user: "alice".to_string(),
+                        }
+                    }
+                })
+            }
+        }
+
+        let auth = FlakyAuth {
+            calls: Mutex::new(0),
+        };
+        let sink = RecordingSink::default();
+        let mut input = String::from("EHLO client.test\r\n");
+        for _ in 0..MAX_CONSECUTIVE_AUTH_FAILURES - 1 {
+            input.push_str("AUTH PLAIN AGJhZABwYXNz\r\n");
+        }
+        input.push_str("AUTH PLAIN AGFsaWNlAHNlY3JldA==\r\nQUIT\r\n");
+
+        let (out, outcome) = run_collect_outcome(
+            input.as_bytes(),
+            limits(),
+            submission_config(),
+            &sink,
+            &auth,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ServeOutcome::Closed),
+            "成功认证后不得再因之前的失败而断开，实际 {outcome:?}"
+        );
+        assert!(out.contains("235"), "最后一次 AUTH 应当成功：{out}");
+    }
+
+    /// 反例守卫：后端**临时不可用**不得计入连续失败。
+    ///
+    /// 否则 Dovecot 一抖动，正在提交邮件的正常用户会在 5 次 454 之后被断开。
+    /// 凭据错（535）与后端不可用（454）的区分正是这一条要守的东西。
+    #[tokio::test]
+    async fn a_temporary_backend_failure_does_not_accumulate() {
+        let auth = RecordingAuth::with_outcome(AuthOutcome::TemporaryFailure(
+            "dovecot socket refused".to_string(),
+        ));
+        let sink = RecordingSink::default();
+        let mut input = String::from("EHLO client.test\r\n");
+        for _ in 0..MAX_CONSECUTIVE_AUTH_FAILURES + 2 {
+            input.push_str("AUTH PLAIN AGJhZABwYXNz\r\n");
+        }
+        input.push_str("QUIT\r\n");
+
+        let (out, outcome) = run_collect_outcome(
+            input.as_bytes(),
+            limits(),
+            submission_config(),
+            &sink,
+            &auth,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ServeOutcome::Closed),
+            "454 不应累计成断开（否则后端抖动会误伤正常用户），实际 {outcome:?}"
+        );
+        assert!(out.contains("454"), "{out}");
+        assert_eq!(
+            auth.requests().len(),
+            MAX_CONSECUTIVE_AUTH_FAILURES as usize + 2
+        );
     }
 }

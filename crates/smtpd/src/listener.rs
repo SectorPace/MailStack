@@ -384,6 +384,35 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
 
             match outcome {
                 Ok(ServeOutcome::Closed) => return,
+                Ok(ServeOutcome::ClosedAfterAuthFailures { failures }) => {
+                    // 认证失败必须进封禁表。这是本项目自称「替代 fail2ban」的那套
+                    // 机制最该管的场景，而原实现的 `record_failure` 只出现在
+                    // TLS 握手失败 / I/O 错误 / 触发限速三处 —— 认证失败一条都没有，
+                    // 于是提交端口上的口令爆破**永远不会被封**。
+                    //
+                    // 逐次记账（而不是只记一次）：阈值判定在封禁表里，
+                    // 这里只负责把「又失败了一次」如实喂进去。
+                    let now = self.clock.now_millis() / 1000;
+                    let mut ban = None;
+                    for _ in 0..failures.max(1) {
+                        ban = self.bans.record_failure(ip, now);
+                    }
+                    match ban {
+                        Some(ban) => tracing::warn!(
+                            peer = %peer,
+                            failures,
+                            until = ban.until_unix,
+                            permanent = ban.permanent,
+                            "认证失败已达封禁阈值"
+                        ),
+                        None => tracing::warn!(
+                            peer = %peer,
+                            failures,
+                            "认证失败已记账，尚未达到封禁阈值"
+                        ),
+                    }
+                    return;
+                }
                 Ok(ServeOutcome::StartTls) => {
                     let Some(acceptor) = self.tls.as_ref() else {
                         // 状态机只在 offer_starttls 时回 StartTls，而构造期已保证

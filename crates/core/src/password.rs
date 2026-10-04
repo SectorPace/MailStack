@@ -14,6 +14,20 @@ pub const MAX_PASSWORD_LENGTH: usize = 256;
 /// （INV-37），不得为了「性能」下调。
 pub const PBKDF2_ITERATIONS: u32 = 310_000;
 
+/// 口令记录的算法标识。**写与读共用同一个常量**：校验端要靠它拒绝
+/// 「不是本实现产生的」记录，写入端不能再内联字面量 —— 两处各写一遍
+/// 就等于给漂移留了缝。
+pub const PASSWORD_ALGORITHM: &str = "pbkdf2-sha256";
+
+/// 盐的字节长度（[`generate_password_record`] 生成的 PBKDF2 盐）。
+pub const SALT_LEN: usize = 16;
+/// 盐的 **hex 编码后**长度。
+pub const SALT_HEX_LEN: usize = SALT_LEN * 2;
+/// 派生密钥的字节长度（PBKDF2-HMAC-SHA256 的输出，等于 SHA-256 摘要长度）。
+pub const HASH_LEN: usize = 32;
+/// 派生密钥的 **hex 编码后**长度。
+pub const HASH_HEX_LEN: usize = HASH_LEN * 2;
+
 /// 禁止出现的控制字符（对应 `FORBIDDEN_PASSWORD_CHARS`）。
 const FORBIDDEN_PASSWORD_CHARS: [char; 3] = ['\r', '\n', '\0'];
 
@@ -143,13 +157,13 @@ pub fn password_record(username: &str, password: &str) -> CoreResult<PasswordRec
     }
     validate_mailbox_password(password, [username])?;
 
-    let mut salt = [0u8; 16];
+    let mut salt = [0u8; SALT_LEN];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt);
-    let digest = pbkdf2_sha256(password.as_bytes(), &salt, PBKDF2_ITERATIONS, 32);
+    let digest = pbkdf2_sha256(password.as_bytes(), &salt, PBKDF2_ITERATIONS, HASH_LEN);
 
     Ok(PasswordRecord {
         username: username.to_string(),
-        algorithm: "pbkdf2-sha256".to_string(),
+        algorithm: PASSWORD_ALGORITHM.to_string(),
         iterations: PBKDF2_ITERATIONS,
         salt: hex::encode(salt),
         hash: hex::encode(digest),
@@ -158,18 +172,51 @@ pub fn password_record(username: &str, password: &str) -> CoreResult<PasswordRec
 }
 
 /// 校验口令是否匹配既有记录（常量时间比较，防时序侧信道）。
+///
+/// ## 为什么必须先校验记录形状（fail-closed）
+///
+/// 本函数原先只解 hex 就直接比长度，`hash == ""` 这一个输入就让整个校验变成
+/// **恒真**：
+///
+/// * `hex::decode("")` → `Ok(vec![])`，于是 `dk_len == 0`；
+/// * `pbkdf2_sha256(.., dk_len = 0)` 里 `blocks = 0.div_ceil(32) == 0`，
+///   `for 1..=0` **一次都不执行**，返回空 `Vec`；
+/// * `constant_time_eq(&[], &[])` → `true` —— **任意口令通过**。
+///
+/// 这不是假想输入：`config.rs` 的 `password_configured` 就是
+/// `!config.hash.is_empty()`，说明「空 hash」是被显式考虑过的状态；而
+/// `admin.json` 会因手工编辑、半写损坏、从旧备份恢复而出现这个值。
+/// 其它任何损坏形态（salt 非 hex、hash 非 hex）都 fail-closed，唯独这一形态
+/// fail-open —— 必须显式挡住。
+///
+/// ## 为什么 `iterations` 取下界
+///
+/// 记录里的 `iterations` 是**攻击者可控**的持久化字段。只挡 `0` 的话，
+/// `iterations = 1` 让 PBKDF2 退化成一次 HMAC，口令哈希可以被廉价爆破 ——
+/// 而 `admin.json` 只有 root 与 `mailstack-admin` 组可读，但备份会带着它走。
+/// 因此不足 [`PBKDF2_ITERATIONS`] 的一律按后者计算。
 pub fn verify_password(record: &PasswordRecord, password: &str) -> bool {
+    // 记录形状校验：算法必须是我们唯一会写出的那个。
+    if record.algorithm != PASSWORD_ALGORITHM {
+        return false;
+    }
+    // 盐固定 16 字节、摘要固定 32 字节（PBKDF2-HMAC-SHA256 的输出长度）。
+    // 这两条同时挡住「空摘要」「截断摘要」「空盐」三类畸形记录。
+    if record.salt.len() != SALT_HEX_LEN || record.hash.len() != HASH_HEX_LEN {
+        return false;
+    }
     let Ok(salt) = hex::decode(&record.salt) else {
         return false;
     };
     let Ok(expected) = hex::decode(&record.hash) else {
         return false;
     };
-    let iterations = if record.iterations == 0 {
-        PBKDF2_ITERATIONS
-    } else {
-        record.iterations
-    };
+    // 解码后再查一次长度：`hex::decode` 对奇数长度会成功但产生半字节，
+    // 不能只靠上面的字符串长度判断。
+    if expected.len() != HASH_LEN || salt.len() != SALT_LEN {
+        return false;
+    }
+    let iterations = record.iterations.max(PBKDF2_ITERATIONS);
     let actual = pbkdf2_sha256(password.as_bytes(), &salt, iterations, expected.len());
     constant_time_eq(&actual, &expected)
 }
@@ -414,6 +461,76 @@ mod tests {
         record.salt = hex::encode([0u8; 16]);
         record.hash = "not-hex".into();
         assert!(!verify_password(&record, "Tr0ubadour9x"));
+    }
+
+    /// 反例守卫：**空摘要曾让任意口令通过**（fail-open）。
+    ///
+    /// 原来的 `verify_password_survives_corrupt_record` 只试了「非 hex」这一种
+    /// 损坏形态，而 `hex::decode("")` 是**成功**的 —— 于是空摘要走进了
+    /// `dk_len = 0` 的分支，`pbkdf2_sha256` 一次循环都不跑，返回空 Vec，
+    /// `constant_time_eq(&[], &[])` 判等成立。测试恰好构造在盲区里。
+    #[test]
+    fn an_empty_hash_record_accepts_nothing_at_all() {
+        let mut record = password_record("admin", "Tr0ubadour9x").unwrap();
+        record.hash = String::new();
+        for candidate in ["", "Tr0ubadour9x", "whatever", " "] {
+            assert!(
+                !verify_password(&record, candidate),
+                "空摘要记录不得接受任何口令（候选 {candidate:?}）"
+            );
+        }
+    }
+
+    /// 反例守卫：空盐同样不得放行。
+    #[test]
+    fn an_empty_salt_record_accepts_nothing() {
+        let mut record = password_record("admin", "Tr0ubadour9x").unwrap();
+        record.salt = String::new();
+        assert!(!verify_password(&record, "Tr0ubadour9x"));
+        assert!(!verify_password(&record, ""));
+    }
+
+    /// 反例守卫：**截断**摘要（同长度但内容短）不得放行。
+    #[test]
+    fn a_truncated_hash_record_accepts_nothing() {
+        let mut record = password_record("admin", "Tr0ubadour9x").unwrap();
+        // 偶数个 hex 字符但只解出 16 字节 —— 不是「奇数长度」那种一眼可辨的畸形。
+        record.hash = "ab".repeat(32);
+        assert!(!verify_password(&record, "Tr0ubadour9x"));
+    }
+
+    /// 反例守卫：未知算法不得放行。
+    #[test]
+    fn an_unknown_algorithm_record_accepts_nothing() {
+        let mut record = password_record("admin", "Tr0ubadour9x").unwrap();
+        // 即便 hash/salt 都对，算法不是本实现写出的那个也不认。
+        record.algorithm = "pbkdf2-sha512".into();
+        assert!(!verify_password(&record, "Tr0ubadour9x"));
+    }
+
+    /// 反例守卫：把 `iterations` 调到 1 不能让校验变便宜。
+    ///
+    /// `iterations` 存在持久化文件里，`admin.json` 又会随备份流转。原先只挡 `0`，
+    /// 写成 `1` 就等于把 PBKDF2 降成一次 HMAC —— 口令哈希可以被廉价爆破
+    /// （改一个字符的成本从 31 万次 HMAC 降到 1 次）。
+    ///
+    /// 修法是取下界 `[record.iterations, PBKDF2_ITERATIONS].max()`。这条断言
+    /// 钉住它的**可观测后果**：记录里的 `iterations` 被改成 1 后，**正确口令
+    /// 仍然通过** —— 因为实现按 310k 重算，摘要与当初生成时一致。
+    /// 若实现改为信任该字段，一次迭代算出的摘要对不上，正确口令会**失败**
+    /// （既当了拒绝服务，也说明计算成本已被记录里的小数字压低）。
+    #[test]
+    fn a_downgraded_iteration_count_neither_rejects_nor_weakens_verification() {
+        let mut record = password_record("admin", "Tr0ubadour9x").unwrap();
+        record.iterations = 1;
+        assert!(
+            verify_password(&record, "Tr0ubadour9x"),
+            "偏小的 iterations 必须被抬到下界：否则一次 HMAC 就能完成校验"
+        );
+        assert!(
+            !verify_password(&record, "wrong"),
+            "抬下界不应把错误口令也放进来"
+        );
     }
 
     #[test]

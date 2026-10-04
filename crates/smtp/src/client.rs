@@ -416,14 +416,38 @@ pub fn dot_stuff(data: &str) -> String {
 }
 
 /// 解析 `250-FOO` / `250 FOO` → (code, continued)。
+///
+/// ## 为什么按字节而不是按字符切
+///
+/// 状态码是三个 **ASCII 数字**，位置固定在首字节。但 [`line`] 来自
+/// `String::from_utf8_lossy` —— 它是任意合法 UTF-8。若按 `line[..3]` 切 &str，
+/// 对端发一个以多字节字符开头的 banner（`"éé"` = `C3 A9 C3 A9 ...`，`len() == 4`）
+/// 就会让下标 3 落在字符中间，**Rust 判定为非法边界直接 panic**。
+///
+/// 而本 crate 的投递路径由 `mailstackd` 承载，根 `Cargo.toml` 设有
+/// `panic = "abort"` ⇒ 这是**对端可控的整进程终止**。这条代码路径在
+/// `SmtpSession::connect` 之后**立即**对原始 banner 调用，因此不配置中继
+/// （默认直投）时任意收件域的 MX 都能触发。
+///
+/// 按字节处理同时天然覆盖了非 ASCII：非数字的首 3 字节走 `parse` 失败分支，
+/// 返回协议错误而不是崩溃。
 fn parse_response_line(line: &str) -> SmtpResult<(u16, bool)> {
-    if line.len() < 3 {
+    let bytes = line.as_bytes();
+    if bytes.len() < 3 {
         return Err(SmtpError::Protocol(format!("malformed response: {line:?}")));
     }
-    let code: u16 = line[..3]
-        .parse()
-        .map_err(|_| SmtpError::Protocol(format!("malformed status code: {line:?}")))?;
-    let continued = line.as_bytes().get(3) == Some(&b'-');
+    // 前三位必须是 ASCII 数字，故可安全地逐字节拼装，无需字符边界。
+    let digits = &bytes[..3];
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return Err(SmtpError::Protocol(format!(
+            "malformed status code: {line:?}"
+        )));
+    }
+    let code: u16 = std::str::from_utf8(digits)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| SmtpError::Protocol(format!("malformed status code: {line:?}")))?;
+    let continued = bytes.get(3) == Some(&b'-');
     Ok((code, continued))
 }
 

@@ -71,6 +71,14 @@ pub struct DataSink {
     out: Vec<u8>,
     /// 已超限：继续切行找结束标记，但不再保存内容。
     overflowed: bool,
+    /// 当前行已见字节数，**饱和**计数（0 / 1 / ≥2）。
+    ///
+    /// ## 为什么用计数而不是 `line == b"."`
+    ///
+    /// 超限后不再缓冲（见 [`DataSink::push`]），`line` 恒为空，于是
+    /// `line == b"."` 永远为假 —— 结束标记再也认不出来，会话会一直挂着直到超时。
+    /// 饱和计数与缓冲解耦：它只回答「这一行是不是恰好一个点」，与是否保存内容无关。
+    line_len: u8,
 }
 
 impl DataSink {
@@ -83,6 +91,7 @@ impl DataSink {
             line: Vec::with_capacity(1024),
             out: Vec::with_capacity(4096),
             overflowed: false,
+            line_len: 0,
         }
     }
 
@@ -136,13 +145,37 @@ impl DataSink {
     }
 
     fn push(&mut self, byte: u8) -> DataEvent {
-        self.line.push(byte);
+        // 「这一行是不是单点」必须**无条件**更新，即使超限、即使不再缓冲 ——
+        // 它是超限后唯一还能认出结束标记的依据（见 `line_is_single_dot`）。
+        //
+        // `line_len` 饱和在 2：只需区分「空行(0) / 单点(1) / 其它(2)」。
+        // 写法上刻意不用「`line.is_empty() && byte == b'.'`」——超限后 `line`
+        // 恒空，那样的判据会把任何以 `.` 开头**且之后还有字节**的行误判成结束标记。
+        self.line_len = match self.line_len {
+            0 => u8::from(byte == b'.'),
+            // 已有 1 字节：再收一个 '.' 就是长度 2（不是单点），收别的也是长度 2。
+            1 => 2,
+            _ => 2,
+        };
+        // 超限后**不再累积**。这不是优化，是内存上限：
+        // `complete_line` 靠 CRLF 切行，而对端若一直不发 CRLF，`line` 就会
+        // 每字节增长且永不回收 —— 未认证的远程攻击者只需持续喂入就能撑爆
+        // 入站进程内存（`max_message_size` 只是「被丢弃」的阈值，不是内存上限）。
+        //
+        // 保留状态机（而不是一超限就断开）是为了仍然能找到结束标记，避免会话错位。
+        if !self.overflowed {
+            self.line.push(byte);
+        }
         self.check_size()
     }
 
     /// 一行结束（含结束符）时的处理。
     fn complete_line(&mut self, terminator: Terminator) -> DataEvent {
         let line = std::mem::take(&mut self.line);
+        // 单点判定只依赖饱和计数，与「是否还在缓冲」无关 —— 这正是超限后仍能
+        // 认出结束标记的原因。
+        let is_single_dot = self.line_len == 1;
+        self.line_len = 0;
         self.state = State::InLine;
 
         // 1) 裸 LF：Reject 策略下无条件拒收。
@@ -151,7 +184,7 @@ impl DataSink {
         }
 
         // 2) 结束标记。
-        if line == b"." {
+        if is_single_dot {
             return if terminator.is_bare_line_feed() {
                 // 归一化由**裸 LF** 造出来的结束标记：上游很可能不认为这是结束。
                 // 按自己的理解切分正是走私的形态，所以拒绝。
@@ -337,6 +370,92 @@ mod tests {
             }
         }
         assert_eq!(event, DataEvent::TooLarge);
+        assert_eq!(sink.feed(b".\r\n").0, DataEvent::Complete { data: None });
+    }
+
+    /// 反例守卫：超限之后**继续**喂入，行缓冲不得再增长。
+    ///
+    /// ## 为什么原测试漏了它
+    ///
+    /// 上一个测试（`an_endless_line_cannot_exhaust_memory`）在**首次**
+    /// `TooLarge` 就 `break`，因此它的名字承诺的性质（「巨大行不能耗尽内存」）
+    /// 实际只覆盖到超限**之前**。而真正的缺陷恰好在超限**之后**：
+    /// `check_size` 里的清空逻辑写在 `if self.overflowed { return }` 的**后面**，
+    /// 于是只在首次超限时执行一次；此后对端只要不再发 CRLF，状态机就持续
+    /// `push` 而 `line` 每字节增长、永不回收 —— 未认证的远程内存耗尽。
+    ///
+    /// 用 8 MiB 而不是更小的值：要跨过 `line` 的容量增长与分配器行为，
+    /// 几十字节的输入可能观察不到差别。
+    #[test]
+    fn the_line_buffer_stops_growing_after_the_limit_is_hit() {
+        const LIMIT: usize = 1024;
+        let mut sink = DataSink::new(LIMIT, BareNewlinePolicy::Reject);
+
+        // 先把大小顶破，且**不**结束会话。
+        let mut hit = false;
+        for _ in 0..64 {
+            if sink.feed(&[b'a'; 512]).0 == DataEvent::TooLarge {
+                hit = true;
+                break;
+            }
+        }
+        assert!(hit, "本用例的前提是已经超限");
+
+        // 关键：`line` 必须为空 —— 这是「不再缓冲」的可观测后果。
+        assert!(
+            sink.line.is_empty(),
+            "超限后不应再缓冲未完成行（实际占 {} 字节）",
+            sink.line.len()
+        );
+        let after_limit = sink.line.capacity();
+
+        // 再灌 8 MiB，全程不发 CRLF：缓冲不得增长。
+        let chunk = vec![b'b'; 8192];
+        for _ in 0..1024 {
+            let event = sink.feed(&chunk).0;
+            assert_ne!(
+                event,
+                DataEvent::Complete { data: None },
+                "不该在超限后提前判定结束"
+            );
+        }
+        assert_eq!(
+            sink.line.capacity(),
+            after_limit,
+            "超限后继续喂入撑大了行缓冲：这是未认证的远程内存耗尽"
+        );
+        assert!(
+            sink.line.is_empty(),
+            "超限后 `line` 必须始终为空（实际占 {} 字节）",
+            sink.line.len()
+        );
+
+        // 结束标记仍必须被认出来（否则会话会挂到超时）。
+        assert_eq!(sink.feed(b".\r\n").0, DataEvent::Complete { data: None });
+    }
+
+    /// 反例守卫：超限后仍能区分「单点」与「以点开头的长行」。
+    ///
+    /// 上一条用饱和计数代替了 `line == b"."` 来认结束标记。这条钉住替换的
+    /// **等价性**：若计数逻辑写错（例如把 `.foo` 当成单点），对端就能用一个
+    /// 以点开头的行提前结束 DATA —— 剩下的正文会被上层当成 SMTP 命令解析，
+    /// 正是走私的形态。
+    #[test]
+    fn a_line_starting_with_a_dot_is_not_mistaken_for_the_terminator() {
+        let mut sink = DataSink::new(16, BareNewlinePolicy::Reject);
+        // 先超限，再送一个「以点开头但不止一个字节」的行。
+        for _ in 0..8 {
+            if sink.feed(&[b'a'; 64]).0 == DataEvent::TooLarge {
+                break;
+            }
+        }
+        // `.foo` 不是结束标记 —— 不应产生 Complete。
+        assert_eq!(
+            sink.feed(b".foo\r\n").0,
+            DataEvent::NeedMore,
+            "`.foo` 被误判成结束标记：正文截断即走私"
+        );
+        // 真正的单点仍然被认出。
         assert_eq!(sink.feed(b".\r\n").0, DataEvent::Complete { data: None });
     }
 

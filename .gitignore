@@ -3,6 +3,12 @@
 **/*.rs.bk
 *.pdb
 
+# 前端依赖与产物（`webui/` 是管理控制台，Vite + React）。
+# `node_modules` 有数百 MB 且**可由 `package-lock.json` 完全重建**，
+# 进版本历史只会拖慢每个 clone；`dist` 同理（`npm run build` 产物）。
+/webui/node_modules/
+/webui/dist/
+
 # 发布产物
 /dist
 /release

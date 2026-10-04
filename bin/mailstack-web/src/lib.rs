@@ -89,7 +89,17 @@ pub async fn run(paths: Paths, config: WebConfig) -> Result<(), WebError> {
         "管理控制台已启动（API 路由 + 前端产物）"
     );
 
-    let result = axum::serve(listener, app).await;
+    let result = axum::serve(
+        listener,
+        // `into_make_service_with_connect_info` 是 `client_key` 能取到真实对端的前提：
+        // 不启用它，`Option<ConnectInfo<_>>` 永远是 `None`，per-IP 限流桶就退化成
+        // 全站共用一个（限流形同虚设，且任何人都能把自己挤在门外）。
+        //
+        // 为什么只认传输层对端、不解析 `X-Forwarded-For`：见 `mailstack_web::routes`
+        // 里 `client_key` 的注释 —— 那个头是请求可控的明文，读它等于让限流器失效。
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await;
     sampling.abort();
     result.map_err(WebError::Serve)
 }

@@ -25,6 +25,20 @@ pub const ACCOUNT_LIMIT_PER_MINUTE: u32 = 10;
 pub const FAILURE_LOCKOUT_THRESHOLD: u32 = 5;
 /// 锁定时长。
 pub const LOCKOUT_SECONDS: i64 = 900;
+/// 单个键（IP 或账号名）的最大长度。
+///
+/// ## 为什么需要它
+///
+/// 键直接取自请求体，而登录接口是**免认证**的。没有上界时，攻击者每次请求发一个
+/// 2 MB 的 `username`，就往 `by_account` 与 `failures` 各插入一条常驻字符串 ——
+/// 未认证的内存耗尽。原实现对键长与表大小都无约束，且**没有任何淘汰路径**
+/// （唯一的 `remove` 只删当前正在检查的那一个键）。
+pub const MAX_KEY_LEN: usize = 256;
+/// 三张表各自允许的最大条目数。
+///
+/// 上界配合淘汰：只要条目数超限就在每次判定前清扫已过窗口的项，因此攻击者
+/// 无法靠「窗口内高基数」把内存顶起来。
+pub const MAX_TRACKED_KEYS: usize = 4096;
 
 /// 桶类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,33 +109,39 @@ impl LoginLimiter {
     pub fn check_at(&self, ip: &str, account: &str, now: OffsetDateTime) -> LimitVerdict {
         let mut state = self.lock();
 
+        let ip_key = sanitized(ip);
+        let account_key = sanitized(account);
+
         // 账号锁定优先于桶限流。
-        if let Some((_, Some(until))) = state.failures.get(account) {
+        if let Some((_, Some(until))) = state.failures.get(account_key.as_ref()) {
             if *until > now {
                 return LimitVerdict::Limited {
                     retry_after_secs: (*until - now).whole_seconds().max(1),
                 };
             }
             // 锁定期已过，清除。
-            state.failures.remove(account);
+            state.failures.remove(account_key.as_ref());
         }
 
-        let global_verdict = {
-            let counter = state.global.get_or_insert_with(|| Counter::new(now));
-            counter.peek(now, GLOBAL_LIMIT_PER_MINUTE)
-        };
-        let ip_verdict = state
-            .by_ip
-            .entry(ip.to_string())
-            .or_insert_with(|| Counter::new(now))
-            .peek(now, IP_LIMIT_PER_MINUTE);
-        let account_verdict = state
-            .by_account
-            .entry(account.to_string())
-            .or_insert_with(|| Counter::new(now))
-            .peek(now, ACCOUNT_LIMIT_PER_MINUTE);
+        // 淘汰必须在下面查表**之前**做完。原实现把 `entry().or_insert_with(..)`
+        // 放在判决前，于是「被限流的请求」也留下新键 —— 限流器本身成了内存增长来源。
+        state.evict_expired(now);
 
-        // 任一桶超限即拒绝；此时**不**累加任何桶。
+        // 先只读判决：不存在的桶不新建。这样「判决」不会产生副作用。
+        let global_verdict = match state.global.as_mut() {
+            Some(counter) => counter.peek(now, GLOBAL_LIMIT_PER_MINUTE),
+            None => LimitVerdict::Allow,
+        };
+        let ip_verdict = match state.by_ip.get_mut(ip_key.as_ref()) {
+            Some(counter) => counter.peek(now, IP_LIMIT_PER_MINUTE),
+            None => LimitVerdict::Allow,
+        };
+        let account_verdict = match state.by_account.get_mut(account_key.as_ref()) {
+            Some(counter) => counter.peek(now, ACCOUNT_LIMIT_PER_MINUTE),
+            None => LimitVerdict::Allow,
+        };
+
+        // 任一桶超限即拒绝；此时**不**累加任何桶，也不新建任何桶。
         for verdict in [&global_verdict, &ip_verdict, &account_verdict] {
             if let LimitVerdict::Limited { retry_after_secs } = verdict {
                 return LimitVerdict::Limited {
@@ -130,16 +150,19 @@ impl LoginLimiter {
             }
         }
 
-        // 全部放行：统一累加。
-        if let Some(c) = state.global.as_mut() {
-            c.count += 1;
-        }
-        if let Some(c) = state.by_ip.get_mut(ip) {
-            c.count += 1;
-        }
-        if let Some(c) = state.by_account.get_mut(account) {
-            c.count += 1;
-        }
+        // 全部放行：这时才累加，并**顺带**为首次出现的键建立计数器。
+        let global = state.global.get_or_insert_with(|| Counter::new(now));
+        global.count += 1;
+        state
+            .by_ip
+            .entry(ip_key.into_owned())
+            .or_insert_with(|| Counter::new(now))
+            .count += 1;
+        state
+            .by_account
+            .entry(account_key.into_owned())
+            .or_insert_with(|| Counter::new(now))
+            .count += 1;
         LimitVerdict::Allow
     }
 
@@ -150,10 +173,10 @@ impl LoginLimiter {
 
     pub fn record_failure_at(&self, account: &str, now: OffsetDateTime) {
         let mut state = self.lock();
-        let entry = state
-            .failures
-            .entry(account.to_string())
-            .or_insert((0, None));
+        state.evict_expired(now);
+        // 键与 `check_at` 用同一个规范化函数，否则两者会记到不同桶上。
+        let key = sanitized(account);
+        let entry = state.failures.entry(key.into_owned()).or_insert((0, None));
         entry.0 += 1;
         if entry.0 >= FAILURE_LOCKOUT_THRESHOLD {
             entry.1 = Some(now + Duration::seconds(LOCKOUT_SECONDS));
@@ -187,19 +210,92 @@ impl LoginLimiter {
     }
 }
 
+impl LimiterState {
+    /// 清扫已过窗口的条目，并在表超上界时强制收缩。
+    ///
+    /// ## 为什么必须有这一步
+    ///
+    /// 三张表原先只增不减，唯一的 `remove` 恰好删的是当前正在检查的那个键 ——
+    /// 于是未认证的匿名者用随机 `username` 就能让 `by_account` / `failures`
+    /// 无限增长（长期运行必然 OOM，而这是唯一的管理台）。
+    ///
+    /// 为什么不简单地「超限就拒绝新键」：那样攻击者能用**先占满**的方式让真实
+    /// 管理员进不来（登录 DoS）。所以先按窗口清扫；仍超上界时按**最旧窗口**淘汰，
+    /// 保证「最热的键」优先留下。
+    fn evict_expired(&mut self, now: OffsetDateTime) {
+        let window = Duration::minutes(1);
+        self.by_ip.retain(|_, c| now - c.window_start < window);
+        self.by_account.retain(|_, c| now - c.window_start < window);
+        // `failures` 的过期判定与桶不同：**已过锁定期**的条目没有价值，直接删。
+        // 但 `until == None` 表示「失败次数还没攒到阈值」—— 那是正在计数的条目，
+        // 必须留下（早先写成「只留 `until > now`」会把第一次失败就抹掉，
+        // 于是账号永远锁不上：计数在 1 处被清空，永远到不了 5）。
+        self.failures
+            .retain(|_, (_, until)| until.is_none_or(|until| until > now));
+
+        // 仍超上界（攻击者在**同一个窗口内**制造高基数）：按窗口起点最旧者淘汰。
+        // 排序键是 `window_start`，取最旧 = 留最热。
+        for map in [&mut self.by_ip, &mut self.by_account] {
+            while map.len() > MAX_TRACKED_KEYS {
+                let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, c)| c.window_start)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                map.remove(&oldest);
+            }
+        }
+        while self.failures.len() > MAX_TRACKED_KEYS {
+            // 失败计数没有窗口起点，用「是否锁定」+ 插入序不可得，故直接清掉
+            // 一个已过锁定期的条目；全都在锁定期时按任意一个删，内存上界优先。
+            let Some(victim) = self
+                .failures
+                .iter()
+                .find(|(_, (_, until))| until.is_none())
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.failures.remove(&victim);
+        }
+    }
+}
+
+/// 把键规范化成一个**有界**的 `Cow<str>`。
+///
+/// 键取自免认证的登录请求体，因此：
+/// * 超长截断 —— 否则单个 2 MB 的 `username` 就能常驻一份；
+/// * 截断标记不可省略 —— 否则 `"admin"` 与 256 字节前缀相同的攻击者会**共用一个桶**，
+///   反而给攻击者提供了撞库掩护。
+fn sanitized(key: &str) -> std::borrow::Cow<'_, str> {
+    if key.len() <= MAX_KEY_LEN {
+        return std::borrow::Cow::Borrowed(key);
+    }
+    // 按字符边界截断，避免 panic。`MAX_KEY_LEN` 处的边界用 `floor_char_boundary`
+    // 之类不可得，故退到 `char_indices` 找最后一个合法边界。
+    let cut = key
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|i| *i <= MAX_KEY_LEN)
+        .last()
+        .unwrap_or(0);
+    std::borrow::Cow::Owned(format!("{}\u{0}", &key[..cut]))
+}
+
 impl Counter {
     /// 只读检查：不累加。
-    fn peek(&self, now: OffsetDateTime, limit: u32) -> LimitVerdict {
-        let effective_start = if now - self.window_start >= Duration::minutes(1) {
-            now
-        } else {
-            self.window_start
-        };
+    ///
+    /// 窗口过期时必须重置 `window_start` 和 `count`；否则计数器一旦建立超过
+    /// 60 秒，此后每次检查都会直接返回 `Allow`，导致该桶永久失效。
+    fn peek(&mut self, now: OffsetDateTime, limit: u32) -> LimitVerdict {
         if now - self.window_start >= Duration::minutes(1) {
-            return LimitVerdict::Allow; // 窗口已过期，视为空
+            self.window_start = now;
+            self.count = 0;
         }
         if self.count >= limit {
-            let elapsed = (now - effective_start).whole_seconds();
+            let elapsed = (now - self.window_start).whole_seconds();
             return LimitVerdict::Limited {
                 retry_after_secs: (60 - elapsed).max(1),
             };

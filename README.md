@@ -45,6 +45,7 @@ crates/web      mailstack-web     管理 API（Axum）、会话/CSRF/限流、�
 bin/mailstackd  mailstackd        守护进程：入站 SMTP（25/465/587）+ 出站队列调度 + 特权 RPC 双通道
 bin/mailstackctl mailstackctl     CLI：调用特权 RPC 面上的已登记动作
 bin/mailstack-web mailstack-web   管理控制台服务：管理 API + 前端产物托管（--dist）+ 遥测采样宿主
+webui/          —                管理控制台前端（Vite + React 19，见「前端」一节）
 deploy/         构建、质量门禁与 WSL 工具脚本
 docs/           部署文档与测试报告
 .github/        CI：质量门禁 + 供应链 + 不变量存在性检查
@@ -57,15 +58,23 @@ docs/           部署文档与测试报告
 
 ## 前端
 
-管理界面是**独立的前端产物**（Vite + React 19 单页应用，不在本仓库内）。后端只托管它：
+管理界面是**独立的前端产物**（Vite + React 19 单页应用）。后端只托管它。
+
+前端源码在**本仓库内**的 `webui/` 目录 —— 原先它在
+仓外的 `E:\hage2\Documents\zcode\mailstack-admin-frontend`，那样改了前端不会让任何 Rust 门禁
+变红、也不会进版本历史。放进 `webui/` 后它与后端同仓演进，但**仍然各自独立构建**：
 
 ```bash
-# 在前端仓库内构建，产出 dist/
-npm ci && npm run build
+# 构建前端，产出 webui/dist/
+cd webui && npm ci && npm run build
 
 # 启动管理控制台（只绑回环；对外暴露交给反向代理或 SSH 隧道）
-mailstack-web --dist /usr/share/mailstack/admin
+mailstack-web --dist webui/dist
 ```
+
+> **注意 `webui/node_modules` 与 `webui/dist` 都不进版本控制**（见 `.gitignore`）：
+> 前者可由 `package-lock.json` 完全重建，后者是 `npm run build` 的产物。
+> 改前端后要重新 `npm run build`，否则后端托管的还是旧产物。
 
 三点必须知道：
 
@@ -73,8 +82,9 @@ mailstack-web --dist /usr/share/mailstack/admin
   不可用，不是「页面不存在」）。这比回一个空白 200 更容易被监控发现。
 * **`/api` 的兜底永远是 JSON 404**，绝不会回 `index.html`。否则前端打到不存在的接口时
   会拿到一段 HTML 并报「解析失败」，把「接口不存在」伪装成「服务端坏了」。
-* 前端产物是**外部输入**，本项目不构建也不校验它；后端只负责路径安全（拒绝 `..` 与
-  符号链接逃逸）、内容类型、以及上面两条形状约定。
+* 前端产物对后端而言是**外部输入**：本仓库的 Rust 门禁不构建也不校验它；后端只负责路径
+  安全（拒绝 `..` 与符号链接逃逸）、内容类型、以及上面两条形状约定。
+  **改前端不会让 `deploy/wsl-quality-gate.sh` 变红**，必须自己跑 `npm run build`。
 
 ## 构建与测试
 

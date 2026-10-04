@@ -5,8 +5,9 @@
 //! 白名单就形同虚设。
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -165,6 +166,48 @@ pub async fn rpc_bridge(
     }
 }
 
+/// 取用于限流的客户端标识。
+///
+/// ## 为什么不能用 `X-Forwarded-For`
+///
+/// 本进程**默认只绑回环**（`bin/mailstack-web` 的 `DEFAULT_BIND = 127.0.0.1:8443`），
+/// 生产靠反向代理 / SSH 隧道终止 TLS。那种拓扑下对端地址是 `127.0.0.1`，于是
+/// per-IP 桶会退化成单桶 —— 原实现正是因此写死了 `let client_ip = "unknown"`。
+/// 改成读 `X-Forwarded-For` 看似解决了问题，**却把限流器变成攻击者的工具**：
+/// 头是请求体可控的明文，任何人都能每次换一个值，让「per-IP」桶对真正的爆破者
+/// 永久失效。fail-closed 优先于「看起来能用」。
+///
+/// 因此这里只取**传输层真实对端**。反向代理拓扑下需要按跳数配置可信代理白名单，
+/// 但那属于部署层决策，且在本进程默认绑回环的前提下没有收益 —— 故不做。
+/// 真实来源仍然有效：SSH 隧道 / 本机 curl / 反代不隐藏时都能得到真实 IP，
+/// 且**伪造不了**。
+fn client_key(peer: Option<&SocketAddr>) -> String {
+    match peer {
+        Some(addr) => normalize_ip(addr.ip()),
+        // 拿不到对端地址（测试里的 `oneshot`、未来的 in-process 调用）：
+        // 用一个固定键而不是编造 IP，避免凭空造出「每个请求一个新桶」。
+        None => "local".to_string(),
+    }
+}
+
+/// 归一化 IP 的限流键：IPv4 映射形式折叠到 `::ffff:a.b.c.d` 的 `a.b.c.d`，
+/// 去掉 IPv6 的 `%zone` 与大写写法。
+fn normalize_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.to_string();
+            }
+            let mut s = v6.to_string();
+            if let Some(idx) = s.find('%') {
+                s.truncate(idx);
+            }
+            s.to_ascii_lowercase()
+        }
+    }
+}
+
 /// `POST /api/auth/login`。
 ///
 /// 语义（规格书 §5.2、INV-23）：
@@ -173,7 +216,11 @@ pub async fn rpc_bridge(
 /// * **唯一例外**：密码正确但已启用 2FA → `401 TOTP_REQUIRED`
 ///
 /// 会话建立后返回 `{ ok, csrf, username }` 并下发 HttpOnly Cookie。
-pub async fn login(State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Response {
+pub async fn login(
+    State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
     let username = body
         .get("username")
         .and_then(|v| v.as_str())
@@ -190,9 +237,10 @@ pub async fn login(State(state): State<AppState>, Json(body): Json<serde_json::V
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    // 限流：三档桶 + 账号锁定。IP 由调用方在反代层注入；此处取占位。
-    let client_ip = "unknown";
-    match state.inner.login_limiter.check(client_ip, &username) {
+    // 限流：三档桶 + 账号锁定。取**传输层真实对端**，不读 XFF（理由见 `client_key`）。
+    let peer_addr = peer.map(|ConnectInfo(addr)| addr);
+    let client_ip = client_key(peer_addr.as_ref());
+    match state.inner.login_limiter.check(&client_ip, &username) {
         crate::ratelimit::LimitVerdict::Allow => {}
         crate::ratelimit::LimitVerdict::Limited { retry_after_secs } => {
             return ApiError::rate_limited(retry_after_secs).into_response();

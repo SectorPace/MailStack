@@ -370,14 +370,28 @@ impl AsyncWrite for Stream {
 }
 
 /// 解析 `250-...` / `250 ...` → (状态码, 是否还有后续行)。
+///
+/// ## 为什么按字节切
+///
+/// 与 [`mailstack_smtp::client`](../../smtp/client.rs) 同一处缺陷的另一个副本：
+/// `line[..3]` 是 &str 的**字节**索引，而状态码固定是 ASCII 三位数字。
+/// 对端（Dovecot）回一个以多字节字符开头的行即让下标落在字符中间 → panic。
+/// 可达性低于 SMTP 那一处（对端是本机 Dovecot），但修法一致：**按字节判定**，
+/// 非数字直接返回协议错误。
 fn parse_status_line(line: &str) -> StoreResult<(u16, bool)> {
-    if line.len() < 3 {
+    let bytes = line.as_bytes();
+    if bytes.len() < 3 {
         return Err(StoreError::Lmtp(format!("malformed response: {line:?}")));
     }
-    let code: u16 = line[..3]
-        .parse()
-        .map_err(|_| StoreError::Lmtp(format!("malformed status code: {line:?}")))?;
-    Ok((code, line.as_bytes().get(3) == Some(&b'-')))
+    let digits = &bytes[..3];
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return Err(StoreError::Lmtp(format!("malformed status code: {line:?}")));
+    }
+    let code: u16 = std::str::from_utf8(digits)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| StoreError::Lmtp(format!("malformed status code: {line:?}")))?;
+    Ok((code, bytes.get(3) == Some(&b'-')))
 }
 
 fn is_positive(code: u16) -> bool {

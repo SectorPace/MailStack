@@ -40,26 +40,54 @@ fn locked_lock_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.lock"))
 }
 
-/// 临时文件路径：同目录下 `<name>.tmp`。
+/// 临时文件路径：同目录下 `<name>.tmp.<pid>.<seq>.<nanos>`。
 ///
-/// 必须与目标同目录，`rename` 才是同文件系统内的原子操作。
+/// ## 为什么带唯一后缀
+///
+/// 原实现是固定 `<name>.tmp`，有三个问题：
+///
+/// 1. **固定名会交错**：两个无锁写者（`locked()` 的降级路径）各自打开同一个
+///    `<name>.tmp`，写的内容互相覆盖，最终 `rename` 出去的是**半写文件**。
+/// 2. **跟随符号链接**：`File::create` 是 `O_CREAT|O_TRUNC`，**不**拒绝已存在的
+///    符号链接。能在目标目录写文件的人可以预置一个指向自选路径的 `.tmp`，
+///    于是密钥内容被引到那里（本地提权跳板）。
+/// 3. **失败无清理**：`rename` 出错时 `.tmp` 就留在盘上，长期留一份机密副本。
+///
+/// 唯一后缀让「(2) 预置符号链接」不再可能（`create_new` 要求不存在），
+/// 同时让「(1) 交错」的两个写者落在不同文件上。仍固定同目录，rename 才是
+/// 同文件系统内的原子操作。
 fn temp_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    path.with_file_name(format!("{name}.tmp"))
+    // 进程内自增计数：同一进程内多次写同一目标也不会撞名
+    // （时间戳在快速连续写入下可能相同）。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    path.with_file_name(format!("{name}.tmp.{}.{seq}.{nanos}", std::process::id()))
 }
 
-/// 原子写入 `data` 到 `path`，权限 `mode` 在 **rename 之前**应用（INV-33）。
+/// 原子写入 `data` 到 `path`，权限 `mode` 在 **首字节落盘之前**就已确定（INV-33）。
 ///
 /// 步骤与 `core.py:621-662` 逐条对应：
 /// 1. `mkdir -p` 目标目录
 /// 2. 在 sidecar `.<name>.lock` 上取排他锁
-/// 3. 写临时文件 → `flush` → `fsync`
-/// 4. `chmod(tmp, mode)`（**在 rename 之前**，secret 不得以进程 umask 落盘）
+/// 3. 以 `O_CREAT|O_EXCL` + `mode(mode)` 创建**唯一**临时文件（权限此刻即生效）
+/// 4. 写 → `flush` → `fsync`
 /// 5. `chown(tmp, -1, mailstack-admin)`（尽力而为，失败仅 warn）
-/// 6. `rename(tmp, path)`
+/// 6. `rename(tmp, path)`，随后 **fsync 父目录**
+///
+/// ## 为什么第 3 步就用 `mode`
+///
+/// 基线与本模块文档原本都写「`chmod` 在 rename 之前」—— 那只保证了 rename 时
+/// 权限已收紧，却**没有覆盖真正的风险窗口**：临时文件从 `create` 到 `chmod`
+/// 之间已经写入了完整机密，而这段时间它的权限是 `0666 & ~umask`（root ⇒ 0644）。
+/// 用 inotify 守着目录即可稳定命中。真正要的是「首字节落盘之前就是 0600」。
 pub fn atomic(path: &Path, data: &[u8], mode: u32) -> CoreResult<()> {
     atomic_as(path, data, mode, Some(ADMIN_GROUP))
 }
@@ -75,21 +103,77 @@ pub fn atomic_as(path: &Path, data: &[u8], mode: u32, group: Option<&str>) -> Co
     let _guard = lock_handle.as_ref().map(FileLock::acquire);
 
     let tmp = temp_path(path);
-    {
+    // `OpenOptions` 而不是 `File::create`：三处差别都指向同一个不变量（INV-33）。
+    //
+    // * `mode(mode)` —— **在 create(2) 那一刻**就把权限定死。原实现用
+    //   `File::create`（`0666 & ~umask`，root 常见 umask 022 ⇒ **0644**）写完
+    //   完整内容、fsync 之后才 `set_mode`。于是 `admin.json`（口令哈希）、
+    //   `totp.key`（AES 主密钥）、`tls/<domain>/privkey.pem`（TLS 私钥）、
+    //   `ai-provider.json`（API Key）在「写完 → chmod」这段窗口里是
+    //   **0644 明文**，目录 0755 可列、文件名可预测 ⇒ 用 inotify 守着目录就能
+    //   稳定命中。这与本函数文档第 4 步写的「secret 不得以进程 umask 落盘」
+    //   **直接相反**：文档承诺 chmod 在 rename 之前，但真正的风险窗口是
+    //   「首字节落盘之前」，比 rename 早得多。
+    // * `create_new(true)` —— `O_EXCL`，已存在（含符号链接）即失败。不加它，
+    //   能在目标目录写文件的人可预置一个指向自选路径的同名临时文件，
+    //   把密钥内容引过去（本地提权跳板）。
+    // * 失败路径显式删除临时文件 —— 否则一次 rename 失败就在盘上留一份
+    //   长期存在的机密副本。
+    let write_result = (|| -> CoreResult<()> {
         use std::io::Write;
-        let mut f = File::create(&tmp).map_err(|e| CoreError::io(&tmp, e))?;
+        // `.mode(..)` 是 `OpenOptionsExt`（Unix）的方法。生产目标是 Linux，
+        // 与 `backup.rs` 里 `open_no_follow` 的做法一致；Windows 上没有「创建时
+        // 指定权限」这回事，故只在 Unix 上挂载。
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)
+            .map_err(|e| CoreError::io(&tmp, e))?;
         f.write_all(data).map_err(|e| CoreError::io(&tmp, e))?;
         f.flush().map_err(|e| CoreError::io(&tmp, e))?;
         f.sync_all().map_err(|e| CoreError::io(&tmp, e))?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        // 尽力清理：失败不是关键路径，不能让它掩盖真正的错误。
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
     }
 
-    set_mode(&tmp, mode)?;
     if let Some(group) = group {
         chown_group_best_effort(&tmp, group);
     }
 
-    fs::rename(&tmp, path).map_err(|e| CoreError::io(path, e))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(CoreError::io(path, err));
+    }
+    // `rename` 只保证「同一次挂起内可见」，**不保证已落盘**：掉电时目录项可能
+    // 尚未写回。fsync 父目录才把这次重命名固化，否则「断电不丢件」只在
+    // 不掉电时成立。
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent);
+    }
     Ok(())
+}
+
+/// fsync 目录本身（`rename` 落盘的持久化保证）。
+///
+/// 失败只 warn：某些文件系统（如某些网络/FUSE 挂载）不支持目录 fsync，
+/// 那时它也不支持掉电持久化，不该让写入整体失败。
+fn fsync_dir(dir: &Path) {
+    match File::open(dir) {
+        Ok(handle) => {
+            if let Err(err) = handle.sync_all() {
+                crate::warn::warn(&format!("fsync {}: {err}", dir.display()));
+            }
+        }
+        Err(err) => crate::warn::warn(&format!("open dir {}: {err}", dir.display())),
+    }
 }
 
 /// 在整个 read-modify-write 临界区持排他锁（`core.py:664-724`）。
