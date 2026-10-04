@@ -771,9 +771,29 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,
-            HeaderValue::from_static("theme=dark; mailstack_session=abc123; lang=zh"),
+            HeaderValue::from_static("theme=dark; __Host-mailstack_session=abc123; lang=zh"),
         );
         assert_eq!(session_cookie(&headers).as_deref(), Some("abc123"));
+    }
+
+    /// 回归守卫：`__Host-` 前缀是这次安全修复的一部分，解析侧必须认新名字。
+    ///
+    /// 若解析仍按旧名 `mailstack_session` 找 substring，`__Host-mailstack_session=…`
+    /// 里恰好也含 `mailstack_session=`，所以**这条断言单独看不出问题**；
+    /// 真正的风险是「下发新名、解析旧名」这种不一致。因此下面再钉一条
+    /// 「旧名（无前缀）不再被接受」—— 强制所有浏览器重新登录正是本次改动的
+    /// 明确意图（见 `SESSION_COOKIE` 的文档）。
+    #[test]
+    fn session_cookie_parsing_requires_the_host_prefix() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("mailstack_session=abc123"),
+        );
+        assert!(
+            session_cookie(&headers).is_none(),
+            "不带 `__Host-` 前缀的旧 cookie 不得再被接受"
+        );
     }
 
     #[test]
@@ -789,7 +809,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,
-            HeaderValue::from_static("mailstack_session=; other=1"),
+            HeaderValue::from_static("__Host-mailstack_session=; other=1"),
         );
         assert!(session_cookie(&headers).is_none());
     }

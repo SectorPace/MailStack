@@ -52,7 +52,7 @@ pub use cache::{system_resolver, TxtCache};
 pub use dkim::{
     from_domain, sign, sign_with_default_headers, DkimStatus, DkimVerdict, DEFAULT_SIGNED_HEADERS,
 };
-pub use dmarc::{DmarcCheck, DmarcStatus};
+pub use dmarc::{DmarcCheck, DmarcPolicy, DmarcStatus};
 pub use error::{AuthError, AuthResult};
 pub use keys::{
     apply_key_permissions, dkim_key_dir, dkim_txt_value, generate_key_material,

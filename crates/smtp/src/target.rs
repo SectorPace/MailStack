@@ -561,21 +561,21 @@ mod tests {
     fn non_global_unicast_ipv6_is_rejected_wholesale() {
         let policy = AddressPolicy::public_only();
         for blocked in [
-            "::127.0.0.1",      // IPv4-compatible（RFC 4291 §2.5.5.1）
-            "::10.0.0.1",       // 同上，指向私网
-            "::",               // 未指定
-            "::1",              // loopback
+            "::127.0.0.1",          // IPv4-compatible（RFC 4291 §2.5.5.1）
+            "::10.0.0.1",           // 同上，指向私网
+            "::",                   // 未指定
+            "::1",                  // loopback
             "64:ff9b::127.0.0.1",   // NAT64（RFC 6052）
             "64:ff9b:1::127.0.0.1", // local-use NAT64（RFC 8215）
-            "fec0::1",          // 废弃的 site-local
-            "192.88.99.1",      // 废弃的 6to4 relay anycast（RFC 7526）
-            "ff02::1",          // 多播
-            "fe80::1",          // link-local
-            "fc00::1",          // 唯一本地
-            "2001:db8::1",      // 文档
-            "2001:2::1",        // 基准测试
-            "2001:20::1",       // ORCHIDv2
-            "3fff::1",          // 文档（RFC 9637）
+            "fec0::1",              // 废弃的 site-local
+            "192.88.99.1",          // 废弃的 6to4 relay anycast（RFC 7526）
+            "ff02::1",              // 多播
+            "fe80::1",              // link-local
+            "fc00::1",              // 唯一本地
+            "2001:db8::1",          // 文档
+            "2001:2::1",            // 基准测试
+            "2001:20::1",           // ORCHIDv2
+            "3fff::1",              // 文档（RFC 9637）
         ] {
             assert!(
                 !policy.accepts(ip(blocked)),

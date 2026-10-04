@@ -113,7 +113,18 @@ pub const ALLOWED_ACTIONS_RW: &[&str] = &[
 ];
 
 /// 破坏性动作：必须携带 `confirm: true`，否则助手直接拒绝且不产生任何副作用（INV-2）。
-pub const DESTRUCTIVE_ACTIONS: &[&str] = &["domains.delete", "users.delete", "backup.delete"];
+///
+/// `admin.totp.disable` 在此名单里：它把账号的第二个因子整个作废（secret 与
+/// 恢复码一并丢弃），属不可逆且**削弱**安全性的动作。基线曾把它排除在外，
+/// 理由是「2FA 已经不在了，确认没有意义」—— 但恰恰相反，会话被劫持时攻击者
+/// 拿到的是**已认证会话**，不是第二个因子；此时唯一还能证明「你是你」的东西
+/// 就是这个因子，把它无验证地关掉正是最需要确认的一步。
+pub const DESTRUCTIVE_ACTIONS: &[&str] = &[
+    "domains.delete",
+    "users.delete",
+    "backup.delete",
+    "admin.totp.disable",
+];
 
 static RO_SET: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ALLOWED_ACTIONS_RO.iter().copied().collect());
@@ -248,10 +259,29 @@ mod tests {
     }
 
     #[test]
-    fn destructive_set_is_exactly_three_actions() {
+    fn destructive_set_is_exactly_three_plus_totp_disable() {
+        // 3 → 4：新增 `admin.totp.disable`。拆 2FA 不可逆且削弱安全性，
+        // 必须与删域名 / 删用户 / 删备份一样先要 `confirm: true`。
         let mut got = DESTRUCTIVE_ACTIONS.to_vec();
         got.sort_unstable();
-        assert_eq!(got, vec!["backup.delete", "domains.delete", "users.delete"]);
+        assert_eq!(
+            got,
+            vec![
+                "admin.totp.disable",
+                "backup.delete",
+                "domains.delete",
+                "users.delete",
+            ]
+        );
+    }
+
+    #[test]
+    fn disabling_two_factor_needs_confirmation() {
+        // 回归守卫：`admin.totp.disable` 一旦被移出破坏性名单，劫持来的会话
+        // 就能静默拆掉 2FA，而这条断言会变红。
+        assert!(is_destructive("admin.totp.disable"));
+        assert!(is_rw("admin.totp.disable"), "它仍是变更动作");
+        assert!(!is_ro("admin.totp.disable"));
     }
 
     #[test]

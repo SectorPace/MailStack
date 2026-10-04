@@ -13,6 +13,9 @@ mailstack-core.workspace = true
 mailstack-smtp.workspace = true
 # 入站认证：SPF / DKIM / DMARC / ARC 与 Authentication-Results 头。
 mailstack-auth.workspace = true
+# RCPT 阶段查本地收件人是否存在（反目录枚举 / 反 backscatter）：真源是既有的
+# managed-mailboxes.json 与别名表，刻意复用而不另立一份。
+mailstack-store.workspace = true
 # 收信入队 —— 本服务端不自己投递，投递全部交给队列（单一出站路径）。
 mailstack-queue.workspace = true
 serde.workspace = true

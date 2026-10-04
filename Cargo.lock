@@ -1370,6 +1370,7 @@ dependencies = [
  "mailstack-core",
  "mailstack-queue",
  "mailstack-smtp",
+ "mailstack-store",
  "rcgen",
  "rustls",
  "rustls-pki-types",

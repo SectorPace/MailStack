@@ -97,7 +97,11 @@ impl QueueSink {
 
         // DMARC 策略：只有**明确判定为 fail** 且域策略为 reject 才拒收。
         // temperror / permerror 不退信 —— 那是「我们没算出来」，不是「对方违规」。
-        if matches!(check.status, DmarcStatus::Fail(_)) && check.policy == "reject" {
+        //
+        // 判据走类型化的 `policy_is_reject()`，不比较 `policy` 字符串 ——
+        // 后者来自第三方 enum 的 `Debug` 输出，上游一改派生就再也匹配不上，
+        // 于是这个 550 分支永不触发、邮件静默放行，而测试照样全绿。
+        if matches!(check.status, DmarcStatus::Fail(_)) && check.policy_is_reject() {
             return Err(Reply::with_enhanced(550, "5.7.1", texts::DMARC_REJECTED));
         }
 

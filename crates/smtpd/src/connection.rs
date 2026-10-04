@@ -153,7 +153,7 @@ fn next_line(buffer: &[u8], policy: BareNewlinePolicy) -> LineOutcome {
 /// `auth` 是 SASL 认证后端（见 [`crate::sasl`]）：只有驱动做 I/O，状态机只收结果。
 pub async fn serve<S, K, A>(
     stream: S,
-    session: &mut Session,
+    session: &mut Session<'_>,
     sink: &K,
     auth: &A,
     peer: SocketAddr,
@@ -173,7 +173,7 @@ where
 /// 由客户端首先发 EHLO。若这里再问一次，客户端会把它当成对 EHLO 的应答而错位。
 pub async fn serve_after_upgrade<S, K, A>(
     stream: S,
-    session: &mut Session,
+    session: &mut Session<'_>,
     sink: &K,
     auth: &A,
     peer: SocketAddr,
@@ -189,7 +189,7 @@ where
 
 async fn drive<S, K, A>(
     mut stream: S,
-    session: &mut Session,
+    session: &mut Session<'_>,
     sink: &K,
     auth: &A,
     peer: SocketAddr,
@@ -374,7 +374,7 @@ enum DataOutcome {
 async fn collect_data<S>(
     stream: &mut S,
     buffer: &mut Vec<u8>,
-    session: &mut Session,
+    session: &mut Session<'_>,
     limits: &ServerLimits,
 ) -> std::io::Result<DataOutcome>
 where
@@ -439,7 +439,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::sasl::{AuthFuture, UnavailableAuthenticator};
-    use crate::session::SessionConfig;
+    use crate::session::{RecipientChecker, SessionConfig};
 
     /// 记录收到的邮件，并可被要求拒绝。
     #[derive(Default)]
@@ -1130,6 +1130,163 @@ mod tests {
         assert_eq!(
             auth.requests().len(),
             MAX_CONSECUTIVE_AUTH_FAILURES as usize + 2
+        );
+    }
+
+    // ────────────── 本地收件人存在性：从 RCPT 到 MessageSink 的端到端 ──────────────
+
+    /// 只放行一个地址的假名录；其余一律「确认不存在」。
+    struct OnlyAlice;
+
+    impl RecipientChecker for OnlyAlice {
+        fn exists(&self, address: &str) -> Result<bool, String> {
+            Ok(address == "alice@example.org")
+        }
+    }
+
+    /// 名录后端不可用。
+    struct BrokenDirectory;
+
+    impl RecipientChecker for BrokenDirectory {
+        fn exists(&self, _address: &str) -> Result<bool, String> {
+            Err("registry is unreadable".to_string())
+        }
+    }
+
+    /// 跑一次带名录的会话。
+    async fn run_collect_with_directory<D: RecipientChecker>(
+        input: &[u8],
+        config: SessionConfig,
+        sink: &RecordingSink,
+        directory: &D,
+    ) -> (String, Vec<AcceptedMessage>) {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut session =
+            Session::with_recipients(config, RelayPolicy::new(["example.org"]), directory);
+        let peer: SocketAddr = "203.0.113.7:54321".parse().unwrap();
+
+        let client_task = async {
+            client.write_all(input).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut out = String::new();
+            client.read_to_string(&mut out).await.unwrap();
+            out
+        };
+        let (out, served) = tokio::join!(
+            client_task,
+            serve(
+                server,
+                &mut session,
+                sink,
+                &UnavailableAuthenticator,
+                peer,
+                limits()
+            )
+        );
+        served.expect("会话驱动不应返回 I/O 错误");
+        (out, sink.accepted.lock().unwrap().clone())
+    }
+
+    /// 反例守卫：**不存在的本域收件人不得进 `MessageSink`**。
+    ///
+    /// 这是任务里点名的两条之一。只断言 550 是不够的 —— 拒了但邮件仍被
+    /// 交给投递方，等于什么都没做（还会产生 backscatter）。
+    #[tokio::test]
+    async fn an_unknown_local_recipient_is_refused_and_never_reaches_the_sink() {
+        let sink = RecordingSink::default();
+        let input = concat!(
+            "EHLO c.test\r\n",
+            // 伪造第三方发件人 + 不存在的本域收件人 = 典型 backscatter 组合。
+            "MAIL FROM:<victim@third.com>\r\n",
+            "RCPT TO:<nobody@example.org>\r\n",
+            "DATA\r\n",
+            "Subject: t\r\n\r\nbody\r\n.\r\n",
+            "QUIT\r\n"
+        );
+        let (out, accepted) =
+            run_collect_with_directory(input.as_bytes(), session_config(), &sink, &OnlyAlice).await;
+
+        assert!(
+            out.contains("550 5.1.1"),
+            "不存在的本域收件人必须 550：{out}"
+        );
+        assert!(
+            accepted.is_empty(),
+            "被拒的收件人绝不能进 MessageSink：{out}"
+        );
+        // 会话没有错位：QUIT 仍被处理。
+        assert!(out.contains("221 "), "QUIT 必须被处理：{out}");
+    }
+
+    /// 回归守卫：名录里的收件人照旧一路走到 sink。
+    #[tokio::test]
+    async fn a_known_local_recipient_still_reaches_the_sink() {
+        let sink = RecordingSink::default();
+        let input = concat!(
+            "EHLO c.test\r\n",
+            "MAIL FROM:<a@remote.test>\r\n",
+            "RCPT TO:<alice@example.org>\r\n",
+            "DATA\r\n",
+            "body\r\n.\r\n",
+            "QUIT\r\n"
+        );
+        let (out, accepted) =
+            run_collect_with_directory(input.as_bytes(), session_config(), &sink, &OnlyAlice).await;
+
+        assert!(out.contains("250 2.1.5"), "{out}");
+        assert_eq!(accepted.len(), 1, "真实收件人必须被接受：{out}");
+        assert_eq!(
+            accepted[0].recipients,
+            vec!["alice@example.org".to_string()]
+        );
+    }
+
+    /// 反例守卫：名录不可用时**不得**误拒 —— 邮件必须继续走到 sink。
+    ///
+    /// 若「查不了」被当成「不存在」，磁盘一抖就会全站拒收真邮件。
+    #[tokio::test]
+    async fn an_unavailable_directory_does_not_reject_a_real_message() {
+        let sink = RecordingSink::default();
+        let input = concat!(
+            "EHLO c.test\r\n",
+            "MAIL FROM:<a@remote.test>\r\n",
+            "RCPT TO:<alice@example.org>\r\n",
+            "DATA\r\n",
+            "body\r\n.\r\n",
+            "QUIT\r\n"
+        );
+        let (out, accepted) =
+            run_collect_with_directory(input.as_bytes(), session_config(), &sink, &BrokenDirectory)
+                .await;
+
+        assert!(!out.contains("550 5.1.1"), "查不了时不得误拒真邮件：{out}");
+        assert_eq!(
+            accepted.len(),
+            1,
+            "查不了时应保持现状（只判域），邮件继续投递：{out}"
+        );
+    }
+
+    /// 远程域**不得**因为挂了名录就被拒 —— 反中继与提交语义不受影响。
+    #[tokio::test]
+    async fn a_remote_recipient_is_unaffected_by_the_local_directory() {
+        let sink = RecordingSink::default();
+        let input = concat!(
+            "EHLO c.test\r\n",
+            "MAIL FROM:<a@remote.test>\r\n",
+            "RCPT TO:<bob@gmail.com>\r\n",
+            "QUIT\r\n"
+        );
+        let (out, _) =
+            run_collect_with_directory(input.as_bytes(), session_config(), &sink, &OnlyAlice).await;
+
+        assert!(
+            out.contains("554 5.7.1"),
+            "未认证的外域必须仍按反中继拒：{out}"
+        );
+        assert!(
+            !out.contains("550 5.1.1"),
+            "外域收件人不得走本地名录判定：{out}"
         );
     }
 }

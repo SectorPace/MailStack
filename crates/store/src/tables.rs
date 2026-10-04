@@ -260,6 +260,25 @@ pub fn read_rows(path: &Path) -> Vec<TableRow> {
     rows(path)
 }
 
+/// 表文件**文本** → 行：分词规则与 [`read_rows`] 完全一致。
+///
+/// 为什么要单独暴露：有些调用方需要**先自己 `read_to_string`** 才能区分
+/// 「文件不存在（= 空表）」与「文件存在但读不了（权限/IO 错误）」——
+/// 这两种情况在 [`read_rows`] 里被合并成空表，而调用方需要据此决定
+/// fail-closed 还是 fail-open。抽出这一层是为了让它们与 [`read_rows`]
+/// 共用**同一个**分词实现：两处各写一遍，语义迟早漂移。
+pub fn rows_from_text(text: &str) -> Vec<TableRow> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            Some(line.split_whitespace().map(str::to_string).collect())
+        })
+        .collect()
+}
+
 /// 校验并归一化域名。
 pub fn validated_domain(input: &str) -> StoreResult<String> {
     let domain = input.trim().to_ascii_lowercase();

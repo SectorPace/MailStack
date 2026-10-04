@@ -11,7 +11,11 @@
 //! 2. **反中继**：不在本机纳管域内、且会话未认证的收件人一律拒绝，且**复用**
 //!    `mailstack_smtp::RelayPolicy`（出站侧同一份实现），避免两处语义漂移。
 //!    域名表为空时拒绝而非放行（历史缺陷不得复现）。
-//! 3. **VRFY**：恒为 502。它唯一的现实用途是**目录枚举**，本机不需要。
+//! 3. **本地收件人存在性**：本域收件人还要过 [`RecipientChecker`]。`VRFY` 恒回
+//!    502 就是为了堵目录枚举，若 `RCPT` 逐地址给 250/550 差别，等于把同一个
+//!    信息面重新打开；拒掉不存在的收件人同时消掉了 backscatter。
+//!    **只有「确认不存在」才 550**，「查不了」保持现状 —— 见 [`RecipientChecker`]。
+//! 4. **VRFY**：恒为 502。它唯一的现实用途是**目录枚举**，本机不需要。
 //!
 //! ## SASL 认证为什么也留在这里（而不是丢给驱动）
 //!
@@ -22,11 +26,70 @@
 //! [`Session::complete_auth`] 把结果交回来 —— 这样口令永远不进入会话状态。
 
 use mailstack_smtp::{RelayDecision, RelayPolicy};
+use mailstack_store::LocalRecipients;
 
 use crate::command::{Command, MailParams};
 use crate::data::BareNewlinePolicy;
 use crate::reply::{texts, Reply};
 use crate::sasl::{is_valid_base64, AuthOutcome};
+
+/// 本地收件人存在性判定（`RCPT` 阶段用）。
+///
+/// ## 为什么不直接把查询写在状态机里
+///
+/// 状态机**不做 I/O**（见模块说明），而查注册表是 I/O。抽成 trait 之后，
+/// 「查得到就 550、查不到就保持现状」这条判定链可以在不起真实文件的情况下
+/// 被穷举测试 —— 尤其「后端不可用」那一支，若只能靠真的把文件搞坏来触发，
+/// 就没有测试愿意写它。
+///
+/// 实现者**不得**把「查不了」报告成「不存在」：那会让一次磁盘抖动变成全站拒收。
+pub trait RecipientChecker: Send + Sync {
+    /// 该地址是否为本机可投递收件人。`Err` 一律表示**查不了**，不表示不存在。
+    fn exists(&self, address: &str) -> Result<bool, String>;
+}
+
+impl std::fmt::Debug for dyn RecipientChecker + '_ {
+    // 名录内容是**用户数据**（邮箱列表），不进日志：日志会被转发到别处，
+    // 而邮箱清单对收信方没有价值。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecipientChecker")
+    }
+}
+
+/// 生产实现：读既有的注册表（`managed-mailboxes.json` + 别名表）。
+#[derive(Debug, Clone)]
+pub struct DirectoryRecipients {
+    directory: LocalRecipients,
+}
+
+impl DirectoryRecipients {
+    pub fn new(directory: LocalRecipients) -> Self {
+        Self { directory }
+    }
+}
+
+impl RecipientChecker for DirectoryRecipients {
+    fn exists(&self, address: &str) -> Result<bool, String> {
+        match self.directory.lookup(address) {
+            mailstack_store::Lookup::Known => Ok(true),
+            mailstack_store::Lookup::Missing => Ok(false),
+            mailstack_store::Lookup::Unavailable(reason) => Err(reason),
+        }
+    }
+}
+
+/// 什么都不查的占位实现。
+///
+/// 用在**不配置**收件人名录的场合：此时行为与引入本判定之前完全一致
+/// （只判域）。存在的意义是让「没配置」成为**显式选择**而不是隐式遗漏。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AnyRecipient;
+
+impl RecipientChecker for AnyRecipient {
+    fn exists(&self, _address: &str) -> Result<bool, String> {
+        Ok(true)
+    }
+}
 
 /// 会话配置。
 #[derive(Debug, Clone)]
@@ -115,9 +178,14 @@ enum Phase {
 }
 
 /// 一次会话。
-pub struct Session {
+pub struct Session<'a> {
     config: SessionConfig,
     relay: RelayPolicy,
+    /// 本地收件人名录（`RCPT` 阶段的存在性判定）。
+    ///
+    /// 刻意**不**叫 `recipients`：那个名字已经属于事务里已接受的收件人列表，
+    /// 两个含义混在一个字段上会让人读错判定链。
+    directory: &'a dyn RecipientChecker,
     phase: Phase,
     helo: Option<String>,
     esmtp: bool,
@@ -131,12 +199,22 @@ pub struct Session {
     tls_active: bool,
 }
 
-impl Session {
+impl<'a> Session<'a> {
     pub fn new(config: SessionConfig, relay: RelayPolicy) -> Self {
+        Self::with_recipients(config, relay, &AnyRecipient)
+    }
+
+    /// 带收件人名录的构造：生产用 [`DirectoryRecipients`]。
+    pub fn with_recipients(
+        config: SessionConfig,
+        relay: RelayPolicy,
+        recipients: &'a dyn RecipientChecker,
+    ) -> Self {
         let tls_active = config.tls_active;
         Self {
             config,
             relay,
+            directory: recipients,
             phase: Phase::Connected,
             helo: None,
             esmtp: false,
@@ -280,7 +358,15 @@ impl Session {
         // **本机策略**，不是猜测。没有配置就明确拒绝。
         let to = if to == "postmaster" {
             match &self.config.postmaster {
-                Some(address) => address.clone(),
+                Some(address) => {
+                    let address = address.clone();
+                    // 显式接受，**不查收件人名录**：这个地址是运维在
+                    // `SessionConfig::postmaster` 里配的策略值，不保证是一个
+                    // 注册邮箱。让名录去判它会把「按 RFC 必须接受的保留地址」
+                    // 变成 550 —— 而这条路径本来就是规范强制的兜底入口
+                    //（Abuse 报告、DSN 都往这里发）。
+                    return self.accept_recipient(address);
+                }
                 None => {
                     return Action::Reply(Reply::with_enhanced(
                         550,
@@ -303,7 +389,13 @@ impl Session {
 
         let domain = to.rsplit_once('@').map_or("", |(_, domain)| domain);
         match self.relay.evaluate(domain, self.authenticated) {
-            RelayDecision::DeliverLocal | RelayDecision::RelayAuthenticated => {}
+            // 只有 `DeliverLocal` 才继续往下查收件人：`RelayAuthenticated`（提交
+            // 到外部域）去本地名录里查**没有意义**，而且会把「提交」变成一条
+            // 拒绝服务向量 —— 只要后端稍慢，587 就整体不可用。
+            RelayDecision::DeliverLocal => {}
+            RelayDecision::RelayAuthenticated => {
+                return self.accept_recipient(to);
+            }
             RelayDecision::Reject { code, message } => {
                 // 拒绝文案来自策略（单一来源），并带上被拒的收件人便于排障。
                 // 注：地址是主人可控输入，`Reply` 会净化掉其中的 CR/LF。
@@ -311,6 +403,33 @@ impl Session {
             }
         }
 
+        // 本地域：查收件人是否存在。
+        //
+        // `VRFY` 已经恒回 502，但 `RCPT` 逐地址的 250/550 差别会把同一个信息面
+        // 重新打开 —— 目录枚举。拒掉不存在的收件人同时消掉了 backscatter
+        // （伪造发件人 + 不存在的本域收件人 ⇒ 本机向第三方发 DSN）。
+        match self.directory.exists(&to) {
+            Ok(true) => {}
+            // 只有**确认**不存在才回 550。`Err` 是「查不了」（磁盘/权限抖动），
+            // 把它当成不存在会让一次抖动变成全站拒收真邮件 —— 那比放过一次枚举
+            // 严重得多。保持现状（只判域），并如实记日志。
+            Ok(false) => {
+                return Action::Reply(Reply::with_enhanced(550, "5.1.1", texts::RECIPIENT_UNKNOWN))
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    helo = %self.helo.clone().unwrap_or_default(),
+                    reason = %reason,
+                    "收件人名录不可用，本次 RCPT 只判域（不据此拒绝）"
+                );
+            }
+        }
+
+        self.accept_recipient(to)
+    }
+
+    /// 收件人已通过全部判定：去重后接受。
+    fn accept_recipient(&mut self, to: String) -> Action {
         if self.recipients.iter().any(|existing| existing == &to) {
             // 重复收件人不报错（客户端有权这么做），但只记一次 ——
             // 否则一次投递会被重复计费，也会让「收件人数量上限」被轻易撑满。
@@ -512,7 +631,7 @@ impl Session {
     }
 }
 
-impl std::fmt::Debug for Session {
+impl std::fmt::Debug for Session<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
             .field("phase", &self.phase)
@@ -529,7 +648,7 @@ impl std::fmt::Debug for Session {
 mod tests {
     use super::*;
 
-    fn session(domains: &[&str]) -> Session {
+    fn session(domains: &[&str]) -> Session<'static> {
         session_with(
             domains,
             SessionConfig {
@@ -540,12 +659,12 @@ mod tests {
         )
     }
 
-    fn session_with(domains: &[&str], config: SessionConfig) -> Session {
+    fn session_with(domains: &[&str], config: SessionConfig) -> Session<'static> {
         Session::new(config, RelayPolicy::new(domains.iter().copied()))
     }
 
     /// 走一遍 `EHLO` → `MAIL` → `RCPT`，返回会话。
-    fn ready(session: &mut Session, from: &str, to: &str) {
+    fn ready(session: &mut Session<'_>, from: &str, to: &str) {
         let _ = session.handle(Command::Ehlo("client.test".into()));
         let _ = session.handle(Command::Mail {
             from: from.into(),
@@ -959,7 +1078,7 @@ mod tests {
     // ─────────────────────────── SASL 提交认证 ───────────────────────────
 
     /// 提交端口上的会话：已在 TLS 之上且通告 AUTH。
-    fn submission_session() -> Session {
+    fn submission_session() -> Session<'static> {
         session_with(
             &["example.org"],
             SessionConfig {
@@ -1147,5 +1266,328 @@ mod tests {
             "实际 {action:?}"
         );
         assert!(!session.awaiting_auth_response());
+    }
+
+    // ────────────────────── 本地收件人存在性（反枚举 / 反 backscatter）──────────────────────
+
+    /// 可编程的假名录：回答「存在 / 确认不存在 / 查不了」三态，并记录查询。
+    struct FakeDirectory {
+        known: Vec<String>,
+        /// `Some(reason)` 表示后端不可用（**不等于**「不存在」）。
+        unavailable: Option<String>,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeDirectory {
+        fn knowing(known: &[&str]) -> Self {
+            Self {
+                known: known.iter().map(|s| s.to_string()).collect(),
+                unavailable: None,
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn broken() -> Self {
+            Self {
+                known: Vec::new(),
+                unavailable: Some("registry is corrupt".to_string()),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn queried(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl RecipientChecker for FakeDirectory {
+        fn exists(&self, address: &str) -> Result<bool, String> {
+            self.seen.lock().unwrap().push(address.to_string());
+            if let Some(reason) = &self.unavailable {
+                return Err(reason.clone());
+            }
+            Ok(self.known.iter().any(|k| k == address))
+        }
+    }
+
+    /// 开着名录的会话。名录必须活得比会话久，因此借用它。
+    fn session_with_directory<'a>(domains: &[&str], directory: &'a FakeDirectory) -> Session<'a> {
+        Session::with_recipients(
+            SessionConfig {
+                hostname: "mail.example.org".to_string(),
+                postmaster: Some("postmaster@example.org".to_string()),
+                ..SessionConfig::default()
+            },
+            RelayPolicy::new(domains.iter().copied()),
+            directory,
+        )
+    }
+
+    /// 走到 `RCPT` 之前（`EHLO` + `MAIL`）。
+    fn opened(session: &mut Session<'_>, from: &str) {
+        let _ = session.handle(Command::Ehlo("client.test".into()));
+        let _ = session.handle(Command::Mail {
+            from: from.into(),
+            params: MailParams::default(),
+        });
+    }
+
+    /// 反例守卫（目录枚举）：本地域 + **不存在**的收件人 ⇒ 550，且不进事务。
+    ///
+    /// 改回坏代码（只判域）时这条会红：那时会回 250 并把收件人记进事务，
+    /// 攻击者就能在 25 端口逐地址试出全部真实邮箱。
+    #[test]
+    fn an_unknown_local_recipient_is_refused_with_550_and_never_enters_the_transaction() {
+        let directory = FakeDirectory::knowing(&["alice@example.org"]);
+        let mut session = session_with_directory(&["example.org"], &directory);
+        opened(&mut session, "attacker@evil.test");
+
+        let action = session.handle(Command::Rcpt {
+            to: "nobody@example.org".into(),
+        });
+        let Action::Reply(reply) = action else {
+            panic!("应回应答");
+        };
+        assert_eq!(reply.code, 550, "不存在的本域收件人必须 550");
+        assert_eq!(reply.enhanced, Some("5.1.1"), "必须是 user unknown");
+        assert!(session.recipients().is_empty(), "被拒的收件人不得进入事务");
+        // 也不能走到 DATA。
+        let action = session.handle(Command::Data);
+        assert!(
+            matches!(action, Action::Reply(ref r) if r.code == 503),
+            "没有收件人时 DATA 必须拒绝：{action:?}"
+        );
+    }
+
+    /// 回归守卫：名录里**存在**的收件人照旧 250。
+    ///
+    /// 这条挡的是「为了反枚举把真实收件人也拒了」这种过度实现。
+    #[test]
+    fn a_known_local_recipient_is_still_accepted() {
+        let directory = FakeDirectory::knowing(&["alice@example.org"]);
+        let mut session = session_with_directory(&["example.org"], &directory);
+        opened(&mut session, "a@remote.test");
+
+        let action = session.handle(Command::Rcpt {
+            to: "alice@example.org".into(),
+        });
+        let Action::Reply(reply) = action else {
+            panic!("应回应答");
+        };
+        assert!(reply.is_positive_completion(), "{reply:?}");
+        assert_eq!(session.recipients(), &["alice@example.org".to_string()]);
+    }
+
+    /// 反例守卫：**远程域不去查本地名录**，反中继规则照旧。
+    ///
+    /// 两条都必须成立：
+    /// 1. 未认证的外域收件人仍按 `RelayPolicy` 拒（554），不能因为查了本地表
+    ///    就把外域全拒掉（那会把 587 的正常提交也一起打死）；
+    /// 2. 名录**一次都没被查** —— 去本地名录里问「bob@gmail.com 在不在」既没有
+    ///    意义，又等于把名录变成一个可探测的拒绝服务面。
+    #[test]
+    fn a_remote_domain_is_judged_by_relay_policy_and_never_queries_the_directory() {
+        let directory = FakeDirectory::knowing(&[]);
+        let mut session = session_with_directory(&["example.org"], &directory);
+        opened(&mut session, "a@remote.test");
+
+        // 未认证 + 外域：反中继拒绝。
+        let Action::Reply(reply) = session.handle(Command::Rcpt {
+            to: "bob@gmail.com".into(),
+        }) else {
+            panic!("应回应答");
+        };
+        assert_eq!(reply.code, 554, "外域未认证必须按反中继拒");
+        assert!(
+            directory.queried().is_empty(),
+            "远程域不得查本地名录（实际查了 {:?}）",
+            directory.queried()
+        );
+    }
+
+    /// 认证后的**提交**到远程域也不查名录 —— 587 的正常路径不能被拖慢或被拒。
+    #[test]
+    fn an_authenticated_relay_to_a_remote_domain_never_queries_the_directory() {
+        let directory = FakeDirectory::broken();
+        let mut session = Session::with_recipients(
+            SessionConfig {
+                offer_auth: true,
+                tls_active: true,
+                ..SessionConfig::default()
+            },
+            RelayPolicy::new(["example.org"]),
+            &directory,
+        );
+        let _ = session.handle(Command::Ehlo("c.test".into()));
+        let _ = session.handle(auth_plain(Some("AGJvYg==")));
+        let _ = session.complete_auth(AuthOutcome::Success {
+            user: "alice@example.org".to_string(),
+        });
+        let _ = session.handle(Command::Mail {
+            from: "alice@example.org".into(),
+            params: MailParams::default(),
+        });
+
+        // 名录**坏着**：若这里去查了名录，提交就会 550 —— 那是一个真实的
+        // 拒绝服务缺陷（磁盘一抖，全站提交不可用）。
+        let action = session.handle(Command::Rcpt {
+            to: "bob@gmail.com".into(),
+        });
+        let Action::Reply(reply) = action else {
+            panic!("应回应答");
+        };
+        assert!(
+            reply.is_positive_completion(),
+            "认证后提交到外域必须放行：{reply:?}"
+        );
+        assert!(directory.queried().is_empty(), "提交路径不得查本地名录");
+    }
+
+    /// 反例守卫：**「查不到」不得误拒**。
+    ///
+    /// 名录损坏（磁盘/权限抖动）时若把它当成「不存在」，一次抖动就会让全站
+    /// 拒收真邮件 —— 那比放过一次目录枚举严重得多。所以这里必须**保持现状**
+    /// （只判域、回 250），把判断留给投递阶段。
+    #[test]
+    fn an_unavailable_directory_never_turns_into_a_rejection() {
+        let directory = FakeDirectory::broken();
+        let mut session = session_with_directory(&["example.org"], &directory);
+        opened(&mut session, "a@remote.test");
+
+        let action = session.handle(Command::Rcpt {
+            to: "alice@example.org".into(),
+        });
+        let Action::Reply(reply) = action else {
+            panic!("应回应答");
+        };
+        assert!(
+            reply.is_positive_completion(),
+            "查不了时必须保持现状（只判域），不得误拒：{reply:?}"
+        );
+        assert_eq!(
+            directory.queried(),
+            vec!["alice@example.org".to_string()],
+            "确实问过名录（否则这条测试什么也没证明）"
+        );
+    }
+
+    /// 同一个地址在「查得到」与「查不了」两种后端下必须给出**不同**结果 ——
+    /// 这正是 `Result` 而非 `bool` 的意义。
+    #[test]
+    fn unknown_and_unavailable_are_distinguished_and_only_the_first_one_refuses() {
+        let missing = FakeDirectory::knowing(&[]);
+        let mut session = session_with_directory(&["example.org"], &missing);
+        opened(&mut session, "a@remote.test");
+        let Action::Reply(refused) = session.handle(Command::Rcpt {
+            to: "nobody@example.org".into(),
+        }) else {
+            panic!("应回应答");
+        };
+        assert_eq!(refused.code, 550);
+
+        let broken = FakeDirectory::broken();
+        let mut session = session_with_directory(&["example.org"], &broken);
+        opened(&mut session, "a@remote.test");
+        let Action::Reply(allowed) = session.handle(Command::Rcpt {
+            to: "nobody@example.org".into(),
+        }) else {
+            panic!("应回应答");
+        };
+        assert!(
+            allowed.is_positive_completion(),
+            "同一个地址：查得到 ⇒ 550，查不了 ⇒ 放行。实际 {allowed:?}"
+        );
+    }
+
+    /// 不挂名录（默认构造）时行为与引入本判定之前**完全一致**：只判域。
+    ///
+    /// 这条是「没配置 = 有意的选择」这条设计的回归守卫。
+    #[test]
+    fn without_a_directory_the_previous_domain_only_behaviour_is_preserved() {
+        let mut session = session(&["example.org"]);
+        opened(&mut session, "a@remote.test");
+        let action = session.handle(Command::Rcpt {
+            to: "nobody@example.org".into(),
+        });
+        let Action::Reply(reply) = action else {
+            panic!("应回应答");
+        };
+        assert!(
+            reply.is_positive_completion(),
+            "未挂名录时不得拒本域收件人：{reply:?}"
+        );
+    }
+
+    /// 别名目标（不是邮箱）也必须是合法收件人 —— 名录判定要认别名表。
+    /// 用真实的 [`DirectoryRecipients`] 走一遍，证明生产接线是通的。
+    #[test]
+    fn the_production_directory_reads_the_real_registries() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = mailstack_core::paths::Paths::rooted(dir.path());
+        std::fs::create_dir_all(&paths.postfix).unwrap();
+        std::fs::create_dir_all(paths.managed_mailboxes.parent().unwrap()).unwrap();
+        std::fs::write(
+            &paths.managed_mailboxes,
+            r#"[{"email":"alice@example.org","unixUser":"alice"}]"#,
+        )
+        .unwrap();
+        std::fs::write(&paths.aliases, "sales@example.org alice\n").unwrap();
+
+        let recipients = DirectoryRecipients::new(mailstack_store::LocalRecipients::new(&paths));
+        let mut session = Session::with_recipients(
+            SessionConfig::default(),
+            RelayPolicy::new(["example.org"]),
+            &recipients,
+        );
+        opened(&mut session, "a@remote.test");
+
+        for known in ["alice@example.org", "sales@example.org"] {
+            let action = session.handle(Command::Rcpt {
+                to: known.to_string(),
+            });
+            assert!(
+                matches!(action, Action::Reply(ref r) if r.is_positive_completion()),
+                "{known} 应当在名录里：{action:?}"
+            );
+        }
+        let Action::Reply(reply) = session.handle(Command::Rcpt {
+            to: "nobody@example.org".into(),
+        }) else {
+            panic!("应回应答");
+        };
+        assert_eq!(reply.code, 550, "名录外的本域地址必须 550");
+    }
+
+    /// 回归守卫：**`RCPT TO:<postmaster>` 不受名录约束**。
+    ///
+    /// `postmaster` 的地址是运维在 `SessionConfig::postmaster` 里配的策略值，
+    /// **不保证**是一个注册邮箱。若让它走名录判定，RFC 5321 §4.1.1.3 要求必须
+    /// 接受的保留地址就会变成 550 —— 而 Abuse 报告与 DSN 都往这里发。
+    #[test]
+    fn the_rfc_mandated_postmaster_address_is_not_judged_by_the_directory() {
+        // 名录里**只有** alice：配置里的 postmaster 地址并不在其中。
+        let directory = FakeDirectory::knowing(&["alice@example.org"]);
+        let mut session = session_with_directory(&["example.org"], &directory);
+        opened(&mut session, "a@remote.test");
+
+        let action = session.handle(Command::Rcpt {
+            to: "postmaster".into(),
+        });
+        let Action::Reply(reply) = action else {
+            panic!("应回应答");
+        };
+        assert!(
+            reply.is_positive_completion(),
+            "RFC 5321 §4.1.1.3 要求必须接受 postmaster：{reply:?}"
+        );
+        assert_eq!(
+            session.recipients(),
+            &["postmaster@example.org".to_string()]
+        );
+        assert!(
+            directory.queried().is_empty(),
+            "postmaster 不该查名录（实际查了 {:?}）",
+            directory.queried()
+        );
     }
 }

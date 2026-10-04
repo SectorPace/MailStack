@@ -458,10 +458,7 @@ mod tests {
     #[test]
     fn a_body_already_ending_with_crlf_gets_no_extra_blank_line() {
         let stuff = dot_stuff("line1\r\nline2\r\n");
-        assert_eq!(
-            stuff, "line1\r\nline2\r\n",
-            "转义不得改动正文的行结构"
-        );
+        assert_eq!(stuff, "line1\r\nline2\r\n", "转义不得改动正文的行结构");
         let separator = if stuff.ends_with("\r\n") { "" } else { "\r\n" };
         assert_eq!(
             format!("{stuff}{separator}.\r\n"),

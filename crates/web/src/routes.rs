@@ -14,6 +14,7 @@ use axum::Json;
 
 use crate::error::{api_not_found, ApiError};
 use crate::ratelimit::{ERR_INVALID_CREDENTIALS, ERR_TOTP_REQUIRED};
+use crate::session::{forwarded_proto, session_cookie_secure};
 use crate::{AppState, AuthenticatedUser};
 
 /// 为一个特权动作生成处理器函数。
@@ -49,13 +50,10 @@ action_handlers! {
     settings_get            => "settings.get",
     settings_set            => "settings.set",
     admin_get               => "admin.get",
-    admin_set               => "admin.set",
     aliases_add             => "aliases.add",
     aliases_delete          => "aliases.delete",
     dkim_rotate             => "dkim.rotate",
     totp_begin              => "admin.totp.begin",
-    totp_enable             => "admin.totp.enable",
-    totp_disable            => "admin.totp.disable",
     system_doctor           => "system.doctor",
     setup_status            => "setup.status",
     ai_config_get           => "ai.config.get",
@@ -123,6 +121,193 @@ async fn run_action(
         Ok(value) => crate::error::ok_json(value),
         Err(e) => e.into_response(),
     }
+}
+
+/// `POST /api/admin` —— 改用户名 / 改口令（`admin.set`）。
+///
+/// ## 为什么这里必须吊销会话
+///
+/// 改密是事故响应的**第一步**，而在此之前 [`SessionStore::revoke_user`] 是死代码
+/// —— 没有任何非测试调用点。于是「我改密码了」与「攻击者的会话失效了」之间
+/// 毫无关系：攻击者那 7 天绝对上限内的会话仍然完全可用，第一步形同虚设。
+///
+/// ## 决策：**连当前会话一起吊销**，并要求重新登录
+///
+/// 备选方案是「保留当前会话、吊销其余全部」（`revoke_others`）。不选它的理由：
+///
+/// 1. **无法区分「当前会话」是不是攻击者的**。劫持场景下两种可能各占一半，
+///    猜错的那一半等于没做任何事，而这恰恰是事故响应最不能承受的失败模式。
+/// 2. **基线也是这么做的**：`server.production.ts` 的 `POST /api/admin` 在
+///    `admin.set` 成功后 `sessions.clear()` 并回 `reauthenticate: true`，
+///    明确要求重新登录。保持一致也让前端逻辑不必新增分支。
+/// 3. 体验代价只有「再输一次口令」，而误判的代价是攻击者全身而退。
+///
+/// fail-closed 的含义也在这里：**宁可多登出一次**，不可少吊销一个。
+///
+/// ## 为什么用户名从 `admin.json` 读而不是从请求体取
+///
+/// 请求体的 `username` 可以是空串（「只改密码」是既有语义），也可能被篡改。
+/// 吊销是**按用户维度全量生效**的操作，一旦用户名取错就会「踢光别人、留下自己」
+/// —— 恰好与目的相反。以落盘配置为准才是真相源。
+pub async fn admin_set(
+    State(state): State<AppState>,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    let payload = json_body(body);
+
+    if let Err(e) = state.inner.client.call("admin.set", &payload).await {
+        // 失败**不吊销**：凭据没变，踢下线只会白白让用户重登，
+        // 还把「改密失败」这个真正需要看到的事实盖掉。
+        return e.into_response();
+    }
+
+    let Some(username) = admin_username(&state) else {
+        return e500_missing_admin_config();
+    };
+    let mut response = revoke_sessions(&state, &username, serde_json::json!({ "ok": true }));
+    clear_session_cookie(&mut response, &state);
+    response
+}
+
+/// `POST /api/admin/2fa/enable` —— 启用 2FA。
+///
+/// 理由与 [`admin_set`] 相同，但要更严：`enable` 之后 2FA 才真正生效，
+/// 而**在此之前建立的全部会话**都没有经过第二因子验证 —— 它们是在更弱的
+/// 信任边界下拿到的，全部不再可信。
+///
+/// 响应体必须原样带回助手的 `recoveryCodes`：那是**只此一次**的明文，
+/// 丢在这里就等于让用户永远拿不到恢复码（而没有恢复码的 2FA 等于没有）。
+///
+/// `begin` **不**走这里：它只是把 secret 交给用户，2FA 尚未生效，
+/// 若此时踢下线，用户会发现自己刚点「开始绑定」就被登出（基线对此有明确
+/// 注释：`wasEnabled` 为真时才清会话，否则每次 begin 都会把会话作废掉）。
+pub async fn totp_enable(
+    State(state): State<AppState>,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    let payload = json_body(body);
+    match state.inner.client.call("admin.totp.enable", &payload).await {
+        Ok(value) => {
+            let Some(username) = admin_username(&state) else {
+                return e500_missing_admin_config();
+            };
+            let mut response = revoke_sessions(&state, &username, value);
+            clear_session_cookie(&mut response, &state);
+            response
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /api/admin/2fa/disable` —— 关 2FA。
+///
+/// 与 [`totp_enable`] 同一套收尾：2FA 消失之后，旧会话不再受第二因子保护，
+/// 全部吊销并要求重新登录。**这里更不能「保留当前会话」** ——
+/// 能发起这个请求的会话正是劫持来的。
+pub async fn totp_disable(
+    State(state): State<AppState>,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    let payload = json_body(body);
+    match state
+        .inner
+        .client
+        .call("admin.totp.disable", &payload)
+        .await
+    {
+        Ok(value) => {
+            let Some(username) = admin_username(&state) else {
+                return e500_missing_admin_config();
+            };
+            let mut response = revoke_sessions(&state, &username, value);
+            clear_session_cookie(&mut response, &state);
+            response
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+/// 请求体归一化：缺体与 `null` 都变成空对象。
+fn json_body(body: Option<Json<serde_json::Value>>) -> serde_json::Value {
+    match body.map(|Json(v)| v) {
+        Some(v) if !v.is_null() => v,
+        _ => serde_json::json!({}),
+    }
+}
+
+/// 读落盘配置里的管理员用户名。
+///
+/// 读不到就返回 `None`：**吊销是按用户名全量生效的**，拿不到用户名时
+/// 宁可显式报错，也不能「吊销 0 个」然后告诉用户「成功」。
+fn admin_username(state: &AppState) -> Option<String> {
+    mailstack_core::config::read_admin_config(state.paths()).map(|c| c.username)
+}
+
+/// 按用户维度**全量**吊销会话，并把助手的返回值原样包进响应。
+///
+/// 返回值里额外带 `revokedSessions` 与 `reauthenticate`：前者让用户知道
+/// 「其它几个设备已登出」，后者告诉前端「请把会话作废并回登录页」。
+fn revoke_sessions(state: &AppState, username: &str, mut value: serde_json::Value) -> Response {
+    let revoked = state.inner.sessions.revoke_user(username);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("revokedSessions".to_string(), revoked.into());
+        obj.insert("reauthenticate".to_string(), true.into());
+    }
+    crate::error::ok_json(value)
+}
+
+/// 下发一个「立即作废」的会话 Cookie。
+///
+/// `Max-Age=0` 让浏览器马上丢弃；`__Host-` 前缀与 `Secure` 必须与登录时
+/// 下发的那一枚**逐字一致** —— 属性不同的同名 Cookie 在浏览器里是两条独立
+/// 记录，只清掉一条的话另一条仍会被发回服务端（表现为「登出了但立刻又自动
+/// 登录」）。
+///
+/// ## 为什么这里的 `Secure` 走保守判定
+///
+/// 本函数在**响应**阶段，没有请求头也没有对端地址可用（处理器已消费掉）。
+/// 沿用 [`cookie_secure`] 的同一套判定：读显式配置项，读不到就不加 ——
+/// 与登录路径的默认行为一致，因此「下发」与「作废」必然配对。
+fn clear_session_cookie(response: &mut Response, state: &AppState) {
+    let mut cookie = format!(
+        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+        crate::SESSION_COOKIE,
+        "",
+    );
+    if secure_cookie_from_env(state) {
+        cookie.push_str("; Secure");
+    }
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+}
+
+/// 只看显式配置项的 `Secure` 判定（响应阶段没有请求信息可用）。
+///
+/// **刻意不**在这里推断「当前是不是 https」：作废 Cookie 若与下发时算出的
+/// 属性不一致，浏览器就清不掉那一枚 —— 那比多加一次 `Secure` 更糟。
+/// 配置项是运维能同时对齐两处的唯一手段。
+fn secure_cookie_from_env(state: &AppState) -> bool {
+    let env_flag = std::env::var(crate::session::SESSION_COOKIE_SECURE_ENV).ok();
+    session_cookie_secure(
+        env_flag.as_deref(),
+        state.inner.public_mode,
+        None,
+        &axum::http::HeaderMap::new(),
+    )
+}
+
+/// `admin.json` 读不到时的 500。
+///
+/// 走到这里说明「凭据已改但吊销目标不明」，属于**半完成状态**：必须让调用方
+/// 看见，而不是静默当作成功。
+fn e500_missing_admin_config() -> Response {
+    ApiError::new(
+        crate::ratelimit::ERR_INTERNAL_ERROR,
+        "administrator configuration is unreadable; sessions were not revoked",
+    )
+    .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+    .into_response()
 }
 
 /// `POST /api/rpc` —— 管理前端的 RPC 桥。
@@ -216,9 +401,16 @@ fn normalize_ip(ip: IpAddr) -> String {
 /// * **唯一例外**：密码正确但已启用 2FA → `401 TOTP_REQUIRED`
 ///
 /// 会话建立后返回 `{ ok, csrf, username }` 并下发 HttpOnly Cookie。
+///
+/// ## 为什么 cookie 的 `Secure` 要逐请求判定
+///
+/// `Secure` 一旦加错方向，登录就**开箱即坏**（浏览器不再回传 cookie）。
+/// 而「外部是不是 HTTPS」只有本进程能判定，且必须区分「可信来源」与
+/// 「任何人可伪造的头」—— 详见 [`session_cookie_secure`]。
 pub async fn login(
     State(state): State<AppState>,
     peer: Option<ConnectInfo<SocketAddr>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let username = body
@@ -317,11 +509,11 @@ pub async fn login(
         .map(|s| s.csrf)
         .unwrap_or_default();
 
-    let cookie = format!(
-        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-        crate::SESSION_COOKIE,
-        sid,
-        crate::session::SESSION_TTL_SECONDS
+    let cookie = build_session_cookie(
+        &sid,
+        &state,
+        peer_addr.as_ref(),
+        forwarded_proto(&headers).as_deref(),
     );
 
     let mut response = Json(serde_json::json!({
@@ -334,6 +526,45 @@ pub async fn login(
         response.headers_mut().append(header::SET_COOKIE, value);
     }
     response
+}
+
+/// 组装会话 Cookie 的 `Set-Cookie` 值。
+///
+/// `__Host-` 前缀是常量（见 [`crate::SESSION_COOKIE`]）；`Secure` 由
+/// [`session_cookie_secure`] 逐请求判定，理由见那里的注释（默认不加，
+/// 以免把「只提供 HTTP」的默认部署弄成登不进去）。
+fn build_session_cookie(
+    sid: &str,
+    state: &AppState,
+    peer: Option<&SocketAddr>,
+    forwarded_proto: Option<&str>,
+) -> String {
+    let mut cookie = format!(
+        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        crate::SESSION_COOKIE,
+        sid,
+        crate::session::SESSION_TTL_SECONDS
+    );
+    if cookie_secure(state, peer, forwarded_proto) {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+/// 本次下发是否应带 `Secure`。
+fn cookie_secure(
+    state: &AppState,
+    peer: Option<&SocketAddr>,
+    forwarded_proto: Option<&str>,
+) -> bool {
+    let mut headers = axum::http::HeaderMap::new();
+    if let Some(proto) = forwarded_proto {
+        if let Ok(value) = HeaderValue::from_str(proto) {
+            headers.insert("x-forwarded-proto", value);
+        }
+    }
+    let env_flag = std::env::var(crate::session::SESSION_COOKIE_SECURE_ENV).ok();
+    session_cookie_secure(env_flag.as_deref(), state.inner.public_mode, peer, &headers)
 }
 
 /// `GET /api/auth/sessions`。
@@ -614,10 +845,22 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        assert!(cookie.starts_with("mailstack_session="), "cookie: {cookie}");
+        assert!(
+            cookie.starts_with(&format!("{}=", crate::SESSION_COOKIE)),
+            "cookie: {cookie}"
+        );
+        // `__Host-` 前缀是浏览器强制「必须 Secure + 必须 Path=/ + 不得有 Domain」
+        // 的那条线，缺了它同站子域就能写同名 cookie 覆盖会话。
+        assert!(
+            crate::SESSION_COOKIE.starts_with("__Host-"),
+            "会话 Cookie 必须带 `__Host-` 前缀，否则同站子域可覆盖它"
+        );
         assert!(cookie.contains("HttpOnly"), "会话 Cookie 必须是 HttpOnly");
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Path=/"));
+        // 注意：默认部署只提供 HTTP，所以**不能**无条件断言 `Secure` ——
+        // 加了它浏览器就不回传 cookie，登录会直接坏掉。`Secure` 由
+        // `session_cookie_secure()` 判定，其行为由该函数的专属测试覆盖。
 
         let body = body_json(response).await;
         assert_eq!(body["ok"], true);

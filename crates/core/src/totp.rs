@@ -10,6 +10,10 @@
 //! * **INV-32**：整个「读 → 判定 → 改 → 写」都在 [`crate::atomic::locked`] 临界区内。
 //!   `atomic()` 只保证最后写入那一瞬是原子的；若各自 read 之后再 write，
 //!   两次并发消费会各自基于「码还在」的同一份快照写回 —— 同一张码被用两次。
+//! * **重放保护（RFC 6238 §5.2 建议的 lastUsedStep）**：6 位动态码一旦被接受，
+//!   同一个 step **不得**再被接受。不记这一步的话，±1 的偏移窗口（±30 秒）把
+//!   一个 6 位码的有效期拉长到约 90 秒，攻击者在窗口内可以**无限次重放**同一个码
+//!   —— 恢复码有一张一消费（INV-29），动态码却没有，这个不对称是真实缺口。
 //!
 //! ## 为什么自己实现而不引第三方 TOTP crate
 //!
@@ -46,6 +50,12 @@ pub const RECOVERY_CODE_COUNT: usize = 8;
 pub const RECOVERY_CODE_LEN: usize = 10;
 /// 信封格式版本。读到未知版本一律拒绝（fail-closed），不做「尽力解析」。
 pub const ENVELOPE_VERSION: u32 = 1;
+/// 已消费 step 记账保留的条数。
+///
+/// 取 8 而不是 1：只记「最后一个」的话，攻击者只要在 ±1 窗口里交替提交
+/// `step-1` 与 `step+1` 两个码，就能把中间那一步反复绕过。窗口内最多 3 个 step，
+/// 记不下 3 个就等于没记。8 有余量，代价只是 admin.json 里多几个整数。
+pub const USED_STEPS_KEPT: usize = 8;
 
 /// AEAD 附加认证数据：把信封绑定到它唯一的用途，避免密文被搬到别处复用。
 const AEAD_AAD: &[u8] = b"mailstack.totp.v1";
@@ -318,11 +328,30 @@ fn step_at(unix_time: u64) -> i64 {
     (unix_time / TOTP_PERIOD_SECS) as i64
 }
 
-/// 校验 6 位动态码，容忍前后各一步的时钟偏移。
-pub fn verify_code(secret: &[u8], code: &str, unix_time: u64) -> bool {
+/// 输入形状是否可参与比较（6 位纯数字）。
+///
+/// 单独拎出来是为了让「形状不对」不必进偏移窗口循环：**8** 个字符的畸形输入
+/// 会白算 3 次 HMAC，而它本来就绝不可能是任何一步的动态码。
+fn code_shape_ok(code: &str) -> bool {
     let code = code.trim();
-    if code.len() != TOTP_DIGITS as usize || !code.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
+    code.len() == TOTP_DIGITS as usize && code.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 在 `step ± TOTP_WINDOW_STEPS` 里找出与 `code` 匹配的那个 step。
+///
+/// 返回 `None` 表示不匹配。**返回 step 而不只是 bool 是重放保护的前提**：
+/// 只有知道「命中的是哪一步」，才能把它记进已消费集合。
+///
+/// ## 为什么保留 step=0
+///
+/// `step.checked_add(offset).filter(|s| *s >= 0)` 会把 `step=0` 的 `step-1`
+/// 直接跳过。这本身是对的（负 step 不存在），但**记账时必须把 0 当作正常值**：
+/// 一旦用 `if step > 0` 之类的真值判断去写 `usedSteps`，step 0 就永远记不上，
+/// 于是「epoch 后第一分钟」那个码可以被无限重放。
+pub fn matching_step(secret: &[u8], code: &str, unix_time: u64) -> Option<i64> {
+    let code = code.trim();
+    if !code_shape_ok(code) {
+        return None;
     }
     let step = step_at(unix_time);
     for offset in -TOTP_WINDOW_STEPS..=TOTP_WINDOW_STEPS {
@@ -335,10 +364,15 @@ pub fn verify_code(secret: &[u8], code: &str, unix_time: u64) -> bool {
             width = TOTP_DIGITS as usize
         );
         if ct_eq(expected.as_bytes(), code.as_bytes()) {
-            return true;
+            return Some(candidate);
         }
     }
-    false
+    None
+}
+
+/// 校验 6 位动态码，容忍前后各一步的时钟偏移。
+pub fn verify_code(secret: &[u8], code: &str, unix_time: u64) -> bool {
+    matching_step(secret, code, unix_time).is_some()
 }
 
 /// 常数时间比较（长度不同直接判否；长度本身不是秘密）。
@@ -453,6 +487,51 @@ fn recovery_hashes(block: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 读已消费 step 记账。
+///
+/// **只认非负整数**：手改过 `admin.json`（或降级到旧版本再回来）可能塞进字符串、
+/// 浮点或负数；把它们当成有效记账会让某个 step 永久被拒，而那正是攻击者要的
+/// 「让合法管理员进不来」。宁可当作没有记账（退化成可重放）也不伪造拒绝 ——
+/// 但注意退化的方向是**不再拦合法用户**，不是**放行攻击者**：匹配上的码仍要过一次
+/// 真正的 HMAC 比对。
+fn used_steps(block: &Value) -> Vec<i64> {
+    block
+        .get("usedSteps")
+        .and_then(Value::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter_map(Value::as_i64)
+                .filter(|s| *s >= 0)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 已消费 step 记账里是否已有 `step`。
+fn step_already_used(block: &Value, step: i64) -> bool {
+    used_steps(block).contains(&step)
+}
+
+/// 把 `step` 记进已消费集合并返回新的块。
+///
+/// 记账**只增不减**（直到超出 `USED_STEPS_KEPT` 才淘汰最旧的），
+/// 因此时钟回拨不会让旧码复活：回拨后 `last` 可能变小，但集合里那个 step 仍在，
+/// 于是同一个码第二次提交照样被拒。
+fn block_with_step_used(block: &Value, step: i64) -> Value {
+    let mut steps = used_steps(block);
+    if !steps.contains(&step) {
+        steps.push(step);
+    }
+    // 降序去重：同一步只留一个，且最新的排在前面 —— 淘汰时丢的是最旧的那些。
+    steps.sort_unstable_by(|a, b| b.cmp(a));
+    steps.dedup();
+    steps.truncate(USED_STEPS_KEPT);
+    let mut next = block.clone();
+    next["usedSteps"] = Value::Array(steps.into_iter().map(Value::from).collect());
+    next
+}
+
 // ─────────────────────────── 生命周期操作 ───────────────────────────
 
 /// `admin.totp.begin`：生成新 secret 并写入**未启用**的信封。
@@ -538,7 +617,41 @@ pub fn enable(paths: &Paths, code: &str, unix_time: u64) -> CoreResult<Vec<Strin
 }
 
 /// `admin.totp.disable`：整块移除（secret 与恢复码一并作废）。返回是否原本启用。
-pub fn disable(paths: &Paths) -> CoreResult<bool> {
+///
+/// ## 为什么必须带二次因子
+///
+/// 拆 2FA 是**削弱**账号安全性的动作，而会话是被劫持时攻击者最先拿到的东西。
+/// 若这一动作零验证，攻击者拿到会话就能静默拆掉 2FA，之后 `admin.set` 改密、
+/// 改域名、发信全都畅通 —— 而管理员自己再也进不去（恢复码此时也已被一并作废）。
+/// 恢复码有「一张一消费」（INV-29），唯独这里曾是敞开的，这个不对称必须补上。
+///
+/// ## 复用 `verify` 而不是另写一套
+///
+/// 走的是登录/关 2FA 完全相同的那条路径，于是顺带拿到两件事：
+/// 动态码**记重放账**（同一 step 不能既用来登录又用来拆 2FA），恢复码**被消费**。
+/// 单独再实现一份比对，等于多一个「忘记记重放」的地方。
+///
+/// ## 只有已启用时才要求码
+///
+/// `Pending`（已 `begin` 未确认）与从未启用都**没有第二个因子可交**，用户在
+/// 这一步多半正是「验证器丢了 / 输错了码」的状态。若此时也要码，唯一的出路
+/// 就是手改 `admin.json` —— 那等于把一个可自助恢复的状态变成死锁。
+pub fn disable(paths: &Paths, code: &str, unix_time: u64) -> CoreResult<bool> {
+    // 状态判定故意放在锁外、且允许与下面持锁的那次不一致：
+    // 两次之间发生的唯一可能是「另一个请求抢先关掉了 2FA」，此时第二次
+    // 拿不到码而拒绝，代价只是「重复点一次按钮」，换来的是不为纯读付一次锁。
+    if state_at(paths) == TotpState::Enabled {
+        let outcome = verify(paths, code, unix_time)?;
+        if !outcome.valid {
+            // **与「码不对」刻意用同一句话**：区分「这个码曾经有效」与
+            // 「这个码从没有效」会把 6 位空间的搜索效率提高一个量级，
+            // 而这正是重放保护要挡的探测方式。
+            return Err(CoreError::invalid(
+                "a valid two-factor code is required to disable two-factor authentication",
+            ));
+        }
+    }
+
     update_admin_config(&paths.admin_config, |current| {
         let was_enabled = state(current) != TotpState::Disabled;
         let mut next = current.clone();
@@ -589,10 +702,51 @@ pub fn consume_recovery(paths: &Paths, code: &str) -> CoreResult<bool> {
     })
 }
 
-/// 校验一次 2FA 输入：先试动态码（无写副作用），再试恢复码（有消费副作用）。
+/// 消费一个动态码：命中且**尚未被消费过**的 step 才算通过，并就地记账。
+///
+/// 整个「读块 → 判是否已用 → 记账 → 写回」都在 [`update_admin_config`] 的
+/// `locked()` 临界区内（INV-32）：若锁外读、锁外判，两个并发请求会各自看到
+/// 「这一步还没用过」并双双放行 —— 那等于没有重放保护。
+///
+/// 记账的写入是一次真实的 `admin.json` 覆写，因此**只在形状像动态码时才进临界区**：
+/// 恢复码与畸形输入根本不可能命中任何一步，让它们也去改一次配置文件毫无意义。
+fn consume_totp_step(paths: &Paths, secret: &[u8], code: &str, unix_time: u64) -> CoreResult<bool> {
+    // 形状先判：非 6 位数字既不可能是动态码，也不值得一次写盘。
+    if !code_shape_ok(code) {
+        return Ok(false);
+    }
+    // secret / 时间都不随配置变，所以「命中哪一步」可以锁外算；真正需要串行化的
+    // 是「这一步是否已被消费过」的判定与记账，那部分在锁内。
+    let Some(step) = matching_step(secret, code, unix_time) else {
+        return Ok(false);
+    };
+
+    update_admin_config(&paths.admin_config, |current| {
+        let Some(block) = totp_block(current) else {
+            return Ok((current.clone(), false));
+        };
+        if state(current) != TotpState::Enabled {
+            return Ok((current.clone(), false));
+        }
+        if step_already_used(block, step) {
+            // **刻意与「码不对」返回同一个结论、同一段文案**：若这里给一个
+            // 「该码已被使用」的错误，攻击者就能用它区分「我猜的码曾经有效过」
+            // 与「这个码从没有效过」，从而把 6 位空间的搜索效率提高一个量级。
+            // 重放保护的效果必须完全落在「这个码现在无效」这一事实上。
+            return Ok((current.clone(), false));
+        }
+        let mut next = current.clone();
+        next.totp = Some(block_with_step_used(block, step));
+        Ok((next, true))
+    })
+}
+
+/// 校验一次 2FA 输入：先试动态码（记账后不可重放），再试恢复码（有消费副作用）。
 ///
 /// 顺序是刻意的：动态码是常态路径，不能因为「顺便试一下恢复码」而在每次登录
-/// 都去改写 `admin.json`。
+/// 都去改写 `admin.json`；而恢复码必须留到最后 —— 它是一次性物资，被动态码的
+/// 试探误伤（形状恰好不匹配时不会，但语义上必须「动态码优先」）就成了一次
+/// 无谓的损失。
 pub fn verify(paths: &Paths, code: &str, unix_time: u64) -> CoreResult<VerifyResult> {
     let Some(config) = crate::config::read_admin_config(paths) else {
         return Ok(VerifyResult::rejected());
@@ -606,7 +760,7 @@ pub fn verify(paths: &Paths, code: &str, unix_time: u64) -> CoreResult<VerifyRes
 
     let key = load_master_key(paths)?;
     let secret = open(&key, &envelope_from_block(block)?)?;
-    if verify_code(&secret, code, unix_time) {
+    if consume_totp_step(paths, &secret, code, unix_time)? {
         return Ok(VerifyResult {
             valid: true,
             method: Some(VerifyMethod::Totp),
@@ -925,12 +1079,12 @@ mod tests {
         let now = now_unix();
         let codes = enable(&f.paths, &code_at(&secret, now), now).unwrap();
 
-        assert!(disable(&f.paths).unwrap());
+        assert!(disable(&f.paths, &code_at(&secret, now), now).unwrap());
         assert_eq!(state_at(&f.paths), TotpState::Disabled);
         assert!(f.admin_json().get("totp").is_none(), "整块必须被移除");
         assert!(!verify(&f.paths, &codes[0], now).unwrap().valid);
-        // 再次 disable 是幂等的。
-        assert!(!disable(&f.paths).unwrap());
+        // 再次 disable 是幂等的（整块已不在，没有第二个因子可要）。
+        assert!(!disable(&f.paths, "", now).unwrap());
     }
 
     // ── 校验路径 ──
@@ -964,6 +1118,8 @@ mod tests {
             "走动态码不得消费恢复码"
         );
 
+        // 恢复码不受「同 step 只能用一次」的影响：它是一次性物资，
+        // 语义上就是「用过即废」，与动态码的重放账是两套独立规则。
         let recovery = verify(&f.paths, &codes[0], now).unwrap();
         assert!(recovery.valid);
         assert_eq!(recovery.method, Some(VerifyMethod::Recovery));
@@ -1086,6 +1242,318 @@ mod tests {
         crate::config::admin_set(&f.paths, "admin", "An0therGood1").unwrap();
         assert_eq!(state_at(&f.paths), TotpState::Enabled);
         assert!(verify(&f.paths, &code_at(&secret, now), now).unwrap().valid);
+    }
+
+    // ── 重放保护（RFC 6238 §5.2 的 lastUsedStep） ──
+
+    /// 已启用 2FA 并返回 secret 与恢复码。
+    fn enabled(tag: &str) -> (Fixture, Vec<u8>, Vec<String>) {
+        let f = Fixture::new(tag);
+        let enrollment = begin(&f.paths, "admin").unwrap();
+        let secret = decode_secret_from_enrollment(&f, &enrollment);
+        let now = now_unix();
+        let codes = enable(&f.paths, &code_at(&secret, now), now).unwrap();
+        (f, secret, codes)
+    }
+
+    #[test]
+    fn a_totp_code_cannot_be_used_twice_in_the_same_step() {
+        // 反例守卫：±1 窗口（约 90 秒）曾让一个 6 位码可以被无限重放。
+        let (f, secret, _) = enabled("replay");
+        let now = now_unix();
+        let code = code_at(&secret, now);
+
+        let first = verify(&f.paths, &code, now).unwrap();
+        assert!(first.valid, "第一次必须通过");
+        assert_eq!(first.method, Some(VerifyMethod::Totp));
+
+        // 同一个 step 再来一次（哪怕间隔 29 秒，仍落在同一个 30 秒格里）。
+        let second = verify(&f.paths, &code, now + 29).unwrap();
+        assert!(
+            !second.valid,
+            "同一个 step 的同一个码不得被接受第二次（重放）"
+        );
+        assert_eq!(second.method, None, "重放必须与「码不对」给同一个结论");
+    }
+
+    #[test]
+    fn a_wrong_guess_does_not_burn_the_real_code_of_the_current_step() {
+        // 记账必须**只在命中时**发生。若实现改成「每次尝试都记一步」，
+        // 攻击者只要先猜错一次就能把管理员自己那一步作废 —— 把重放保护
+        // 变成了拒绝服务。这条断言把「记账的触发条件」钉死。
+        let (f, secret, _) = enabled("wrongguess");
+        let now = now_unix();
+        let real = code_at(&secret, now);
+
+        // 一个**不匹配窗口内任何步**的 6 位码：在本地算出来（不在循环里调
+        // `verify` —— 那是持锁的文件操作，跑一百万次纯属浪费）。
+        let step_now = (now / TOTP_PERIOD_SECS) as i64;
+        let window: Vec<String> = (step_now - TOTP_WINDOW_STEPS..=step_now + TOTP_WINDOW_STEPS)
+            .map(|s| code_at(&secret, (s * TOTP_PERIOD_SECS as i64) as u64))
+            .collect();
+        let wrong = (0..=999_999u32)
+            .map(|c| format!("{c:06}"))
+            .find(|c| !window.contains(c))
+            .expect("6 位空间里必然有不匹配窗口的码");
+        for _ in 0..5 {
+            assert!(!verify(&f.paths, &wrong, now).unwrap().valid);
+        }
+        assert!(
+            used_steps(&f.admin_json()["totp"]).is_empty(),
+            "猜错不得写进记账：{:?}",
+            f.admin_json()["totp"]["usedSteps"]
+        );
+
+        // 真正的码仍然能用 —— 说明上面的失败没有把它顶掉。
+        assert!(verify(&f.paths, &real, now).unwrap().valid);
+    }
+
+    #[test]
+    fn the_ledger_records_steps_so_a_neighbouring_step_is_not_blocked() {
+        // 记 step（而不是「记一个码」或「记一个时间戳」）的语义锚：
+        // 消费掉当前步之后，**窗口内相邻步**的码必须照常可用。
+        let (f, secret, _) = enabled("ledgerstep");
+        let now = now_unix() + 10 * TOTP_PERIOD_SECS;
+        let base = now - (now % TOTP_PERIOD_SECS);
+
+        assert!(
+            verify(&f.paths, &code_at(&secret, base), base)
+                .unwrap()
+                .valid
+        );
+        let recorded = used_steps(&f.admin_json()["totp"]);
+        assert_eq!(
+            recorded,
+            vec![(base / TOTP_PERIOD_SECS) as i64],
+            "记账里必须是 step 本身，而不是码或时间戳"
+        );
+
+        for neighbour in [base - TOTP_PERIOD_SECS, base + TOTP_PERIOD_SECS] {
+            assert!(
+                verify(&f.paths, &code_at(&secret, neighbour), neighbour)
+                    .unwrap()
+                    .valid,
+                "相邻步不得因为中心步被消费而被连带拒绝"
+            );
+        }
+    }
+
+    #[test]
+    fn each_step_in_the_window_may_be_used_once_but_neighbouring_steps_still_work() {
+        // 防的是「只记最后一个 step」这种实现：那样 `step-1` 与 `step+1`
+        // 就能交替提交，把中间那一步反复绕过。
+        let (f, secret, _) = enabled("replaywindow");
+        let now = now_unix() + 10 * TOTP_PERIOD_SECS;
+        let base = now - (now % TOTP_PERIOD_SECS);
+
+        for (i, step) in [base - TOTP_PERIOD_SECS, base, base + TOTP_PERIOD_SECS]
+            .into_iter()
+            .enumerate()
+        {
+            let code = code_at(&secret, step);
+            assert!(
+                verify(&f.paths, &code, step).unwrap().valid,
+                "窗口内第 {i} 个 step 必须各能用一次"
+            );
+            assert!(
+                !verify(&f.paths, &code, step).unwrap().valid,
+                "窗口内第 {i} 个 step 用第二次必须被拒"
+            );
+        }
+        assert_eq!(
+            used_steps(&f.admin_json()["totp"]).len(),
+            3,
+            "三个 step 都必须被记账"
+        );
+    }
+
+    #[test]
+    fn a_clock_rollback_does_not_revive_a_previously_used_code() {
+        // 反例守卫：把「上次成功校验的 step」当成唯一判据的话，
+        // 时钟回拨（`last` 变小）后同一个码会重新可用。记账必须**只增不减**。
+        let (f, secret, _) = enabled("rollback");
+        let now = now_unix() + 20 * TOTP_PERIOD_SECS;
+        let base = now - (now % TOTP_PERIOD_SECS);
+        let code = code_at(&secret, base);
+        assert!(verify(&f.paths, &code, base).unwrap().valid);
+
+        // 时钟被拨回 5 分钟：同一个码在一个「更早」的时刻再次提交。
+        let earlier = base - 10 * TOTP_PERIOD_SECS;
+        assert!(!verify(&f.paths, &code, earlier).unwrap().valid);
+        // 再拨回 10 分钟仍然不行（哪怕此时 `step` 已经小于记账里的任何值）。
+        let much_earlier = base - 20 * TOTP_PERIOD_SECS;
+        assert!(!verify(&f.paths, &code, much_earlier).unwrap().valid);
+    }
+
+    #[test]
+    fn step_zero_is_recorded_like_any_other_step() {
+        // 反例守卫：step=0 是**合法值**，不是「没有值」。
+        // 若记账用真值判断（`if step > 0`）或 `Option<i64>` 默认值来跳，
+        // epoch 后第一分钟的那个码就会被无限重放。
+        let f = Fixture::new("stepzero");
+        let enrollment = begin(&f.paths, "admin").unwrap();
+        let secret = decode_secret_from_enrollment(&f, &enrollment);
+        enable(&f.paths, &code_at(&secret, 0), 0).unwrap();
+
+        let code = code_at(&secret, 0);
+        assert!(verify(&f.paths, &code, 0).unwrap().valid, "step 0 必须能用");
+        assert!(
+            used_steps(&f.admin_json()["totp"]).contains(&0),
+            "step 0 必须被记账，实际: {:?}",
+            f.admin_json()["totp"]["usedSteps"]
+        );
+        assert!(
+            !verify(&f.paths, &code, 0).unwrap().valid,
+            "step 0 的码不得被重放"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_totp_verifications_of_one_step_yield_exactly_one_success() {
+        // 与恢复码的 double-spend 同理：如果「判已用」与「记账」不在同一把锁内，
+        // 两个并发请求会各自看到「还没用过」并双双放行。
+        let (f, secret, _) = enabled("replayrace");
+        let now = now_unix();
+        let code = code_at(&secret, now);
+
+        let successes = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let paths = f.paths.clone();
+            let code = code.clone();
+            let successes = Arc::clone(&successes);
+            handles.push(std::thread::spawn(move || {
+                if verify(&paths, &code, now).unwrap().valid {
+                    successes.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            successes.load(Ordering::SeqCst),
+            1,
+            "并发用同一个 step 的同一个码只能有一次成功"
+        );
+    }
+
+    #[test]
+    fn used_steps_ledger_is_bounded_and_drops_the_oldest_first() {
+        // 记账不得无限增长（admin.json 是每次登录都要覆写的文件）。
+        let (f, secret, _) = enabled("usedledger");
+        let start = now_unix() + 100 * TOTP_PERIOD_SECS;
+        for i in 0..(USED_STEPS_KEPT as u64 * 3) {
+            let t = start + i * TOTP_PERIOD_SECS;
+            assert!(verify(&f.paths, &code_at(&secret, t), t).unwrap().valid);
+        }
+        let steps = used_steps(&f.admin_json()["totp"]);
+        assert_eq!(steps.len(), USED_STEPS_KEPT, "记账必须有界：{steps:?}");
+        assert_eq!(
+            steps[0],
+            ((start + (USED_STEPS_KEPT as u64 * 3 - 1) * TOTP_PERIOD_SECS) / TOTP_PERIOD_SECS)
+                as i64,
+            "最新的 step 必须排在最前（淘汰时丢最旧的）"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_used_steps_ledger_does_not_lock_the_admin_out() {
+        // 记账是**防御性数据**，不是安全根：它被手改成垃圾时，代价最多是
+        // 退化成「无重放保护」，而**绝不能**是把所有 step 都判成已用、
+        // 让管理员再也进不来。因此非整数/负数一律当没有记账。
+        let (f, secret, _) = enabled("corruptledger");
+        let now = now_unix();
+        let code = code_at(&secret, now);
+        let this_step = (now / TOTP_PERIOD_SECS) as i64;
+
+        let mut value = f.admin_json();
+        value["totp"]["usedSteps"] = json!([this_step, -1, "x", 1.5, null]);
+        fs::write(
+            &f.paths.admin_config,
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+
+        // `this_step` 是个合法的非负整数 —— 它必须被认作「已消费」，
+        // 而旁边的垃圾项不得被当成「全都用过」。
+        assert!(!verify(&f.paths, &code, now).unwrap().valid);
+        // 但**下一个** step 必须仍能用（说明垃圾项没有被当成「全都用过」）。
+        let next = now + TOTP_PERIOD_SECS;
+        assert!(
+            verify(&f.paths, &code_at(&secret, next), next)
+                .unwrap()
+                .valid,
+            "垃圾记账不得把合法管理员锁在门外"
+        );
+    }
+
+    // ── 关 2FA 的二次因子 ──
+
+    #[test]
+    fn disable_requires_a_valid_second_factor_and_leaves_no_side_effect_on_failure() {
+        let (f, secret, _) = enabled("disableauth");
+        let now = now_unix();
+
+        for bad in ["", "000000", "nope", "12345", "already-spent"] {
+            let err = disable(&f.paths, bad, now).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("a valid two-factor code is required"),
+                "{bad:?} 实际: {err}"
+            );
+            assert_eq!(
+                state_at(&f.paths),
+                TotpState::Enabled,
+                "拒绝后 2FA 必须还在"
+            );
+        }
+        assert_eq!(
+            recovery_hashes(&f.admin_json()["totp"]).len(),
+            RECOVERY_CODE_COUNT,
+            "被拒绝的 disable 不得消耗恢复码"
+        );
+
+        assert!(disable(&f.paths, &code_at(&secret, now), now).unwrap());
+        assert_eq!(state_at(&f.paths), TotpState::Disabled);
+    }
+
+    #[test]
+    fn disable_accepts_a_recovery_code_because_it_never_had_a_second_factor() {
+        // 这一条是「为什么恢复码路径也走 verify」的锚：丢了验证器的人
+        // 还能靠恢复码自救，不必手改 admin.json。
+        let (f, _, codes) = enabled("disablerecovery");
+        let now = now_unix();
+        assert!(disable(&f.paths, &codes[3], now).unwrap());
+        assert_eq!(state_at(&f.paths), TotpState::Disabled);
+    }
+
+    #[test]
+    fn disable_does_not_demand_a_code_when_nothing_was_enabled() {
+        // 从未启用 / 只 begin 未确认的状态**没有第二个因子可交**；
+        // 用户在这个阶段多半正是「验证器丢了」的人。若也要码，
+        // 唯一的出路就是手改 admin.json —— 把可自助恢复变成死锁。
+        let f = Fixture::new("disablepending");
+        // 从未启用。返回 `was_enabled == false`（原先就没有块）。
+        assert!(!disable(&f.paths, "", now_unix()).unwrap());
+        // 已 begin 未确认：**不要求码**就把 pending 块撤掉。
+        begin(&f.paths, "admin").unwrap();
+        assert_eq!(state_at(&f.paths), TotpState::Pending);
+        assert!(
+            disable(&f.paths, "", now_unix()).unwrap(),
+            "pending 块原先存在，was_enabled 应为 true"
+        );
+        assert_eq!(state_at(&f.paths), TotpState::Disabled);
+    }
+
+    #[test]
+    fn disabling_twice_never_succeeds_twice_and_never_burns_a_second_factor() {
+        let (f, _, codes) = enabled("disableidempotent");
+        let now = now_unix();
+        assert!(disable(&f.paths, &codes[0], now).unwrap());
+        // 第二次：整块已不在，因此不再要求码（也不该把码吃掉）。
+        assert!(!disable(&f.paths, "", now).unwrap());
     }
 
     #[test]

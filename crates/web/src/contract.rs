@@ -377,7 +377,11 @@ mod tests {
     }
 
     #[test]
-    fn destructive_routes_are_the_three_confirmed_ones() {
+    fn destructive_routes_mirror_the_destructive_action_set() {
+        // 这条断言的价值在于「两处**同步**」：`DESTRUCTIVE_ACTIONS` 加了动作而
+        // 这里没跟上（或反之），就会有一边不要求 `confirm: true`。
+        // 历史上有过 3 个（删域名/删用户/删备份），加入 `admin.totp.disable`
+        // 后是 4 个 —— 拆 2FA 同样不可逆且削弱安全性。
         let destructive: Vec<&str> = ROUTES
             .iter()
             .filter(|s| {
@@ -389,10 +393,22 @@ mod tests {
             .collect();
         let mut sorted = destructive.clone();
         sorted.sort_unstable();
+        let mut expected = mailstack_core::actions::DESTRUCTIVE_ACTIONS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            sorted, expected,
+            "破坏性路由集合必须与 DESTRUCTIVE_ACTIONS 一致（规格书 §5.4.1）"
+        );
+        // 显式钉住当前集合，避免有人同时改两边而断言仍然通过。
         assert_eq!(
             sorted,
-            vec!["backup.delete", "domains.delete", "users.delete"],
-            "破坏性路由集合与 §5.4.1 的 DESTRUCTIVE 集必须一致"
+            vec![
+                "admin.totp.disable",
+                "backup.delete",
+                "domains.delete",
+                "users.delete",
+            ],
+            "破坏性动作集合已变化，请同步更新本断言与 ci.yml 的不变量名单"
         );
     }
 

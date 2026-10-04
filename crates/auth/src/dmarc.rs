@@ -67,9 +67,80 @@ pub struct DmarcCheck {
     /// 被评估的域（RFC5322.From 的域）。
     pub domain: String,
     /// 该域公布的策略（`p=`），无记录时为空串。
+    ///
+    /// 这是**给界面与 `Authentication-Results` 看的原文**；要判定「是否拒收」
+    /// 请用 [`DmarcCheck::policy_is_reject`]，不要比较字符串 —— 见那里的理由。
     pub policy: String,
+    /// 类型化的策略值（`p=` 的语义）。
+    ///
+    /// ## 为什么不能靠 `policy` 字符串做判定
+    ///
+    /// 原实现是 `format!("{:?}", output.policy()).to_lowercase()`，消费侧
+    /// （`smtpd::sink`）再比 `== "reject"`。也就是说**安全判定依赖第三方
+    /// enum 的 `Debug` 输出**：上游一改派生输出（哪怕只是给变体加字段、
+    /// 或从 `Reject` 改成 `Policy(Reject)`），这个字符串就再也匹配不上，
+    /// 于是 **550 拒收分支永不触发、邮件静默放行**，而测试照样全绿。
+    ///
+    /// 用类型化的 [`DmarcPolicy`] 就没这个问题：变体增减是编译期错误，
+    /// 而 `matches!(p, DmarcPolicy::Reject)` 永远成立。
+    pub policy_value: DmarcPolicy,
     pub spf: SpfCheck,
     pub dkim: Vec<DkimVerdict>,
+}
+
+/// DMARC 策略的类型化表示（对应 `mail_auth::dmarc::Policy`）。
+///
+/// 之所以自己再定义一份而不直接用上游的：上游那个 enum 的
+/// `Unspecified`（无记录）与 `None`（`p=none`）语义不同，我们需要**两套都拒**
+/// 才能 fail-closed，而把它暴露到本 crate 的公开接口上会让调用方直接依赖
+/// 上游类型 —— 上游一改派生就是破坏性变更。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmarcPolicy {
+    /// `p=none`：只监测，不要求处置。
+    None,
+    /// `p=quarantine`。
+    Quarantine,
+    /// `p=reject`：判定为 fail 时应拒收。
+    Reject,
+    /// 无 `p=` 标签（含整个 DMARC 记录缺失）。
+    ///
+    /// 按 RFC 7489 §6.3，`p` 缺省等价于 `none`，但为了**fail-closed**，
+    /// 这里与 [`DmarcPolicy::None`] 同等对待：无法确定策略时一律不拒收邮件
+    /// （拒收是破坏性动作，宁可放行并留痕）。
+    Unspecified,
+}
+
+impl DmarcPolicy {
+    /// 是否应当拒收（`p=reject`）。
+    ///
+    /// 这是**唯一**该用于「要不要 550」的判据。
+    pub fn is_reject(self) -> bool {
+        matches!(self, DmarcPolicy::Reject)
+    }
+
+    /// `Authentication-Results` / 日志里用的关键字。
+    pub fn keyword(self) -> &'static str {
+        match self {
+            DmarcPolicy::None => "none",
+            DmarcPolicy::Quarantine => "quarantine",
+            DmarcPolicy::Reject => "reject",
+            DmarcPolicy::Unspecified => "unspecified",
+        }
+    }
+}
+
+/// 上游的 `policy()` 按值返回（`Policy` 是 `Copy`），所以这里也按值收。
+impl From<mail_auth::dmarc::Policy> for DmarcPolicy {
+    fn from(value: mail_auth::dmarc::Policy) -> Self {
+        use mail_auth::dmarc::Policy as P;
+        match value {
+            P::None => DmarcPolicy::None,
+            P::Quarantine => DmarcPolicy::Quarantine,
+            P::Reject => DmarcPolicy::Reject,
+            // 上游把「无记录」也归到 `Unspecified`，这里保持一致。
+            P::Unspecified => DmarcPolicy::Unspecified,
+        }
+    }
 }
 
 /// 对一封入站邮件做 SPF + DKIM + DMARC 的完整评估。
@@ -115,22 +186,44 @@ pub async fn evaluate(
     Ok(DmarcCheck {
         status: DmarcStatus::from(&output.result()),
         domain: output.domain().to_string(),
+        // 展示用的原文（`p=` 的值），**不作判定用**。
         policy: format!("{:?}", output.policy()).to_lowercase(),
+        policy_value: DmarcPolicy::from(output.policy()),
         spf,
         dkim,
     })
 }
 
-/// `DkimStatus` 与 `SpfStatus` 的便捷判定：DMARC 通过要么靠 SPF 对齐、要么靠 DKIM 对齐。
 impl DmarcCheck {
-    pub fn spf_aligned(&self) -> bool {
+    /// SPF 是否通过。
+    ///
+    /// ## 为什么叫 `spf_pass` 而不是 `spf_aligned`
+    ///
+    /// 原名 `spf_aligned()` 有误导性：它**只判 pass，完全不做组织域对齐比较**。
+    /// DMARC 的「对齐」要求签名域与 RFC5322.From 的域**同组织域**（RFC 7489
+    /// §3.1.1）—— `From: bank@example.com` 由 `d=attacker.example` 签名，
+    /// SPF/DKIM 都是 pass，但**不是对齐**的。
+    ///
+    /// 真正的对齐结论由上游 `verify_dmarc` 给出（体现在
+    /// [`DmarcStatus::Pass`] 里），本类型上的方法只是它两个输入的便捷读取。
+    /// 名字改成 `_pass` 就是为了不再暗示这里做了对齐判断 —— 那个判断**不在**
+    /// 这一层。
+    pub fn spf_pass(&self) -> bool {
         self.spf.status == SpfStatus::Pass
     }
 
-    pub fn dkim_aligned(&self) -> bool {
+    /// 是否有**任一** DKIM 签名通过（同样不含对齐判断，理由见 [`Self::spf_pass`]）。
+    pub fn dkim_pass(&self) -> bool {
         self.dkim
             .iter()
             .any(|verdict| verdict.status == DkimStatus::Pass)
+    }
+
+    /// 该域的策略是否要求拒收（`p=reject`）。
+    ///
+    /// **判定拒收时用这个，不要比较 [`DmarcCheck::policy`] 字符串。**
+    pub fn policy_is_reject(&self) -> bool {
+        self.policy_value.is_reject()
     }
 }
 
@@ -185,10 +278,13 @@ mod tests {
         assert_eq!(check.status, DmarcStatus::Pass, "{check:?}");
         assert_eq!(check.domain, "example.com");
         assert_eq!(check.policy, "reject");
-        assert!(check.spf_aligned());
+        // 展示字符串仍在（界面与 A-R 头要用），但**判定**走类型化字段。
+        assert!(check.policy_is_reject());
+        assert_eq!(check.policy_value, DmarcPolicy::Reject);
+        assert!(check.spf_pass());
         assert!(
-            !check.dkim_aligned(),
-            "报文里没有 DKIM 签名，不该凭空产生对齐"
+            !check.dkim_pass(),
+            "报文里没有 DKIM 签名，不该凭空产生通过结论"
         );
     }
 

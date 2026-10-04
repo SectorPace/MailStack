@@ -145,9 +145,33 @@ impl Registry {
             Ok(json!({ "ok": true, "recoveryCodes": codes }))
         });
 
+        // 拆 2FA 必须过第二因子，且与登录走**同一条** `verify` 路径 ——
+        // 顺带继承动态码的重放记账与恢复码的一次性消费。
+        //
+        // 错误文案与基线 `totp_disable` 逐字一致（"invalid TOTP or recovery code"），
+        // 前端已有的「验证码不正确」提示因此不需要分支；更重要的是它**不区分**
+        // 「码不对」与「这个码曾经有效过」—— 那种区分会把 6 位空间的搜索效率
+        // 提高一个量级。只有 `Invalid`（判定不通过）才这么报，IO/JSON 故障按原样
+        // 上抛：把「磁盘写失败」说成「验证码错误」会让运维查错方向。
         let p = paths.clone();
-        registry.register("admin.totp.disable", move |_data| {
-            let was_enabled = mailstack_core::totp::disable(&p)?;
+        registry.register("admin.totp.disable", move |data| {
+            // **刻意容忍缺失的 code**：`disable` 在「2FA 本就没启用」时不要求码
+            // （没有第二个因子可交，见 core 侧说明），若在这里因为字段缺失就
+            // 报错，会把一个本该成功的幂等调用变成失败。
+            let code = ["code", "verificationCode"]
+                .iter()
+                .find_map(|key| optional_str(data, key))
+                .unwrap_or("");
+            let was_enabled =
+                mailstack_core::totp::disable(&p, code, mailstack_core::totp::now_unix()).map_err(
+                    |e| {
+                        if e.is_client_error() {
+                            HandlerError::new("invalid TOTP or recovery code")
+                        } else {
+                            HandlerError::from(e)
+                        }
+                    },
+                )?;
             Ok(json!({ "ok": true, "wasEnabled": was_enabled }))
         });
 
@@ -813,14 +837,100 @@ mod tests {
             )
             .unwrap();
 
+        // `enable` 本身不记重放账（见 core 的说明），所以这里用 enable 时的
+        // 那个码即可关掉 2FA。
         let out = registry
-            .dispatch_blocking("admin.totp.disable", &json!({}))
+            .dispatch_blocking(
+                "admin.totp.disable",
+                &json!({ "code": mailstack_core::totp::code_at(&secret, now) }),
+            )
             .unwrap();
         assert_eq!(out["wasEnabled"], true);
 
         let public = registry.dispatch_blocking("admin.get", &json!({})).unwrap();
         assert_eq!(public["twoFactorEnabled"], false);
         assert_eq!(public["recoveryCodesRemaining"], 0);
+    }
+
+    #[test]
+    fn totp_disable_refuses_without_a_valid_second_factor() {
+        // 反例守卫：拆 2FA 曾是零验证动作 —— 拿到会话的攻击者可以直接静默
+        // 拆掉 2FA。这条断言把「必须带码」钉在助手的对外行为上。
+        let f = with_admin("totpdisableauth");
+        let registry = f.registry();
+        registry
+            .dispatch_blocking("admin.totp.begin", &json!({}))
+            .unwrap();
+        let secret = decrypt_current_secret(&f);
+        let now = mailstack_core::totp::now_unix();
+        registry
+            .dispatch_blocking(
+                "admin.totp.enable",
+                &json!({ "code": mailstack_core::totp::code_at(&secret, now) }),
+            )
+            .unwrap();
+
+        for bad in [
+            json!({}),
+            json!({ "code": "" }),
+            json!({ "code": "000000" }),
+            json!({ "code": "nope" }),
+            json!({ "code": "already-spent" }),
+        ] {
+            let err = registry
+                .dispatch_blocking("admin.totp.disable", &bad)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid TOTP or recovery code"),
+                "{bad:?} 实际: {err}"
+            );
+        }
+
+        // 拒绝必须**没有副作用**：2FA 块还在，恢复码一张没少。
+        let public = registry.dispatch_blocking("admin.get", &json!({})).unwrap();
+        assert_eq!(
+            public["twoFactorEnabled"], true,
+            "失败的 disable 不得拆掉 2FA"
+        );
+        assert_eq!(
+            public["recoveryCodesRemaining"],
+            mailstack_core::totp::RECOVERY_CODE_COUNT,
+            "失败的 disable 不得消耗恢复码"
+        );
+    }
+
+    #[test]
+    fn totp_disable_accepts_an_unused_recovery_code() {
+        // 与基线一致：关 2FA 也接受一张**未用过**的恢复码，且用掉它。
+        let f = with_admin("totpdisablerecovery");
+        let registry = f.registry();
+        registry
+            .dispatch_blocking("admin.totp.begin", &json!({}))
+            .unwrap();
+        let secret = decrypt_current_secret(&f);
+        let now = mailstack_core::totp::now_unix();
+        let enabled = registry
+            .dispatch_blocking(
+                "admin.totp.enable",
+                &json!({ "code": mailstack_core::totp::code_at(&secret, now) }),
+            )
+            .unwrap();
+        let code = enabled["recoveryCodes"][0].as_str().unwrap().to_string();
+
+        let out = registry
+            .dispatch_blocking("admin.totp.disable", &json!({ "code": &code }))
+            .unwrap();
+        assert_eq!(out["wasEnabled"], true);
+        assert_eq!(
+            registry.dispatch_blocking("admin.get", &json!({})).unwrap()["twoFactorEnabled"],
+            false
+        );
+
+        // 整块已被移除，所以这张码也不再是任何凭据。
+        let again = registry
+            .dispatch_blocking("admin.totp.disable", &json!({ "code": &code }))
+            .unwrap();
+        assert_eq!(again["wasEnabled"], false, "重复 disable 幂等且不假装成功");
     }
 
     #[test]

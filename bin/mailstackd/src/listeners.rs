@@ -15,9 +15,10 @@
 use std::sync::Arc;
 
 use mailstack_smtpd::{
-    tls_acceptor, AuthBackend, BanList, Clock, DovecotAuthClient, MailServer, MessageSink,
-    RateLimiter, ServerConfig, SessionConfig, TlsMode,
+    tls_acceptor, AuthBackend, BanList, Clock, DirectoryRecipients, DovecotAuthClient, MailServer,
+    MessageSink, RateLimiter, ServerConfig, SessionConfig, TlsMode,
 };
+use mailstack_store::LocalRecipients;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
@@ -112,6 +113,11 @@ where
         auth: plan.offer_auth.then(|| {
             AuthBackend::new(Arc::new(DovecotAuthClient::new(config.auth_socket.clone())))
         }),
+        // 收件人名录：复用既有的 managed-mailboxes.json + 别名表，不另立一份。
+        // 查不了时 `RCPT` 保持现状（只判域），所以装配它不需要任何可用性前提。
+        recipients: Some(Arc::new(DirectoryRecipients::new(LocalRecipients::new(
+            &config.paths,
+        )))),
         ..ServerConfig::default()
     };
 

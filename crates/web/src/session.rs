@@ -15,7 +15,92 @@ use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 
 /// Cookie 名（对外契约，不得改动）。
-pub const SESSION_COOKIE: &str = "mailstack_session";
+///
+/// **`__Host-` 前缀**：浏览器强制它的三条规则（必须 `Secure`、必须 `Path=/`、
+/// **不得**有 `Domain`）正好把「同站子域写入同名 cookie 覆盖会话」这条攻击路径
+/// 彻底关掉 —— 攻击者控制的 `evil.example.com` 无法给 `example.com` 写 cookie，
+/// 而不带前缀的 `mailstack_session` 是可以的。代价是改名会让**所有人重新登录**
+/// （浏览器会把新名字当成从未见过的 cookie），这在一次安全修复里是可接受的：
+/// 强制重登恰好也是我们想顺手做掉的事。
+pub const SESSION_COOKIE: &str = "__Host-mailstack_session";
+
+/// 显式覆盖会话 Cookie `Secure` 标志的环境变量。
+///
+/// 取值语义与基线 `COOKIE_SECURE` 一致：`1` 强制开、`0` 强制关、
+/// 未设置则按 [`session_cookie_secure`] 自动判定。
+pub const SESSION_COOKIE_SECURE_ENV: &str = "MAILSTACK_COOKIE_SECURE";
+
+/// 会话 Cookie 是否应带 `Secure`。
+///
+/// ## 判定顺序
+///
+/// 1. `MAILSTACK_COOKIE_SECURE=1/0` —— 运维的显式裁决，最高优先级。
+/// 2. **公网模式**（`ACCESS_MODE=caddy|direct`）⇒ `true`。这两种模式的部署
+///    前提就是「有 TLS 终结」，此时不加 `Secure` 等于允许明文携带会话。
+/// 3. 请求来自**可信回环对端**且带 `X-Forwarded-Proto: https` ⇒ `true`。
+///    这是「反代终止 TLS」这一主流拓扑的正向判定，也是本进程唯一能**可靠**
+///    得知外部是 HTTPS 的途径。
+/// 4. 其余一切 ⇒ **`false`（不加 `Secure`）**。
+///
+/// ## 为什么第 3 条只信回环
+///
+/// `X-Forwarded-Proto` 是请求可控的明文：只有来源可信时才能读，否则等于把
+/// 决定权交给攻击者（这与 [`crate::routes::client_key`] 不读 `X-Forwarded-For`
+/// 是同一个理由的两面）。本进程默认只绑 `127.0.0.1:8443`，生产靠反代 / SSH
+/// 隧道终止 TLS，于是对端**必然**是回环；而远程攻击者无法把自己的源地址
+/// 变成 `127.0.0.1`。因此「对端是回环」是一个可以本地判定、无需额外配置的
+/// 可信信号。拿不到传输层对端时（in-process 调用）一律视为不可信。
+///
+/// ## 为什么第 4 条是「不加」而不是 fail-closed
+///
+/// 加了 `Secure` 而实际是 HTTP 时，浏览器**根本不会**把这个 cookie 发回来 ——
+/// 登录会直接坏掉，用户看到的现象是「密码输对了却提示未登录」。
+/// 本进程默认就只提供 HTTP（`DEFAULT_BIND = 127.0.0.1:8443`，TLS 属部署层），
+/// 在这种默认部署里强制 `Secure` 等于让产品**开箱即坏**。
+/// 两种后果严重度不对称：漏加 `Secure` 是「明文多传一跳」，误加 `Secure` 是
+/// 「所有人都登不进去」—— 后者严重得多且只有用户能发现，前者需要抓包才能发现。
+/// 因此选择**保守可用**，并把收紧路径做成显式配置项（部署到 TLS 后置 `=1`）。
+pub fn session_cookie_secure(
+    env_flag: Option<&str>,
+    public_mode: bool,
+    peer: Option<&std::net::SocketAddr>,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    if let Some(flag) = env_flag.map(str::trim).filter(|f| !f.is_empty()) {
+        let flag = flag.to_lowercase();
+        return !matches!(flag.as_str(), "0" | "false" | "no" | "off");
+    }
+    if public_mode {
+        return true;
+    }
+    if !is_trusted_proxy(peer) {
+        return false;
+    }
+    forwarded_proto(headers).as_deref() == Some("https")
+}
+
+/// 是否是可信代理的回环来源。
+fn is_trusted_proxy(peer: Option<&std::net::SocketAddr>) -> bool {
+    // 拿不到传输层对端（测试里的 in-process 调用）：**不**认定可信。
+    // 保守方向必须一致 —— 否则一个伪造 `X-Forwarded-Proto` 的调用
+    // 就能在非 TLS 部署里骗到 `Secure`。
+    peer.map(|addr| addr.ip().is_loopback()).unwrap_or(false)
+}
+
+/// 从请求头取出 `x-forwarded-proto` 的首个值（小写、去空白）。
+pub fn forwarded_proto(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|v| !v.is_empty())
+}
 
 /// 会话 TTL：8 小时（滑动）。
 pub const SESSION_TTL_SECONDS: i64 = 28_800;
@@ -146,7 +231,9 @@ impl SessionStore {
         before - map.len()
     }
 
-    /// 吊销某个用户的全部会话（改密/2FA 重绑后使用）。
+    /// 吊销某个用户的全部会话（改密 / 2FA 重绑后使用）。
+    ///
+    /// 返回吊销数量，调用方可据此告诉用户「其它 N 个设备已登出」。
     pub fn revoke_user(&self, username: &str) -> usize {
         let mut map = self.lock();
         let before = map.len();

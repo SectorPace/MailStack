@@ -41,7 +41,7 @@ use crate::connection::{
 use crate::ratelimit::{RateDecision, RateLimitConfig, RateLimiter};
 use crate::reply::{texts, Reply};
 use crate::sasl::{AuthBackend, Authenticator, UnavailableAuthenticator};
-use crate::session::{Session, SessionConfig};
+use crate::session::{RecipientChecker, Session, SessionConfig};
 use crate::tls::{BoxedStream, TlsMode};
 
 /// 时间源。注入的目的是让时间相关行为可被确定性验证。
@@ -83,6 +83,12 @@ pub struct ServerConfig {
     /// SASL 认证后端（§3.5）。**会话通告 AUTH 时它必须存在**，由构造期校验 ——
     /// 通告了却做不到会让客户端白跑一次认证。
     pub auth: Option<AuthBackend>,
+    /// 本地收件人名录（`RCPT` 阶段的存在性判定）。
+    ///
+    /// `None` 表示**不查**（只判域）—— 与引入该判定之前的行为一致。刻意做成
+    /// `Option` 而不是默认实现：生产装配（`mailstackd`）必须显式提供名录，
+    /// 「忘了配」与「有意不查」因此在代码里是两件可分辨的事。
+    pub recipients: Option<Arc<dyn RecipientChecker>>,
 }
 
 impl Default for ServerConfig {
@@ -96,6 +102,7 @@ impl Default for ServerConfig {
             ban: BanConfig::default(),
             shutdown_grace: Duration::from_secs(10),
             auth: None,
+            recipients: None,
         }
     }
 }
@@ -126,6 +133,8 @@ pub struct MailServer<S: MessageSink + ?Sized> {
     clock: Arc<dyn Clock>,
     rate: Arc<RateLimiter>,
     bans: Arc<BanList>,
+    /// 与 `config.recipients` 同源，但单独持有一份以便在每条连接上借用。
+    recipients: Option<Arc<dyn RecipientChecker>>,
 }
 
 impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
@@ -163,6 +172,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
         bans: Arc<BanList>,
     ) -> Result<Self, ConfigError> {
         validate(&config, tls.as_ref(), tls_mode)?;
+        let recipients = config.recipients.clone();
         Ok(Self {
             listener,
             config,
@@ -172,6 +182,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
             clock,
             rate,
             bans,
+            recipients,
         })
     }
 
@@ -199,6 +210,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
             clock,
             rate,
             bans,
+            recipients,
         } = self;
 
         let semaphore = Arc::new(Semaphore::new(config.max_connections.max(1)));
@@ -233,6 +245,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
                                 clock: Arc::clone(&clock),
                                 rate: Arc::clone(&rate),
                                 bans: Arc::clone(&bans),
+                                recipients: recipients.clone(),
                             };
                             tasks.spawn(async move {
                                 let _permit = permit;
@@ -294,6 +307,7 @@ struct ConnectionContext<S: MessageSink + ?Sized> {
     clock: Arc<dyn Clock>,
     rate: Arc<RateLimiter>,
     bans: Arc<BanList>,
+    recipients: Option<Arc<dyn RecipientChecker>>,
 }
 
 impl<S: MessageSink + ?Sized> ConnectionContext<S> {
@@ -348,7 +362,13 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
             TlsMode::StartTls => Box::new(stream),
         };
         session_config.tls_active = self.tls_mode == TlsMode::Implicit;
-        let mut session = Session::new(session_config, self.config.relay.clone());
+        let mut session = Session::with_recipients(
+            session_config,
+            self.config.relay.clone(),
+            self.recipients
+                .as_deref()
+                .unwrap_or(&crate::session::AnyRecipient),
+        );
         let mut upgraded = false;
 
         // 没有后端时用占位实现：此时会话不会通告 AUTH（构造期已校验），

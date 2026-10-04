@@ -125,6 +125,15 @@ pub mod texts {
     pub const NESTED_MAIL: &str = "Sender already specified";
     pub const MAIL_OK: &str = "Sender OK";
     pub const RCPT_OK: &str = "Recipient OK";
+    /// 550 5.1.1：收件人不存在。
+    ///
+    /// 刻意**不回显地址**：RFC 5321 §4.2.4 允许回显，但回显等于把对端刚发来的
+    /// 字符串再送回去一次（虽已被 `Reply` 净化），而这里没有任何排障价值 ——
+    /// 对方发错地址时自己知道错在哪。
+    ///
+    /// 这条文案是**契约**：它同时是「`VRFY` 不给信息、但 `RCPT` 给」的**唯一**
+    /// 刻意例外，客户端与测试都靠它区分「查得到但没有」与「查不了而已」。
+    pub const RECIPIENT_UNKNOWN: &str = "No such user";
     pub const NO_RECIPIENTS: &str = "Need RCPT before DATA";
     pub const DATA_START: &str = "End data with <CR><LF>.<CR><LF>";
     pub const DATA_OK: &str = "Message accepted for delivery";

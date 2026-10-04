@@ -60,6 +60,9 @@ pub use sasl::{
     AuthBackend, AuthFuture, AuthOutcome, AuthRequest, Authenticator, DovecotAuthClient,
     UnavailableAuthenticator, DEFAULT_AUTH_SOCKET,
 };
-pub use session::{AcceptedMessage, Action, Session, SessionConfig};
+pub use session::{
+    AcceptedMessage, Action, AnyRecipient, DirectoryRecipients, RecipientChecker, Session,
+    SessionConfig,
+};
 pub use sink::QueueSink;
 pub use tls::{acceptor as tls_acceptor, CertPaths, TlsError, TlsMode};
