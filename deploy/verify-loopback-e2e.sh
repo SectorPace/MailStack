@@ -73,15 +73,19 @@ JSON
 # 曾经命名成 cert.pem/key.pem，结果 TLS 装载失败而错误消息指向「证书缺失」，
 # 读起来像是配置写错了 —— 实际只是文件名不对。
 #
-# `-quiet` 压掉点阵进度（openssl 的进度走 **stderr**，所以 `>/dev/null` 压不掉它；
-# 而错误信息也在 stderr，必须留着 —— 曾经因为目录不存在导致它静默失败，
-# 被 `set -e` 报成一个看不出原因的错误码，排查多花了一轮）。
-openssl req -x509 -newkey rsa:2048 -nodes -quiet \
+# 别用 openssl 的 `-quiet`：本机 openssl 不认这个选项，会报 Unknown option 然后
+# 什么也不生成。它的点阵进度走 **stderr**，但那里同时还有真正的错误信息，
+# 所以只能丢 stdout（`1>/dev/null`），不能丢 stderr。
+openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout "$ROOT/etc/mailstack/tls/$DOMAIN/privkey.pem" \
   -out "$ROOT/etc/mailstack/tls/$DOMAIN/fullchain.pem" \
   -days 30 -subj "/CN=$MAIL_HOST" \
-  -addext "subjectAltName=DNS:$MAIL_HOST"
+  -addext "subjectAltName=DNS:$MAIL_HOST" 1>/dev/null
 chmod 0600 "$ROOT/etc/mailstack/tls/$DOMAIN/privkey.pem"
+# 立刻验证证书真的生成了：否则报错会出现在后面「TLS 材料不可用」处，
+# 指向一个与真实原因毫无关系的方向。
+[ -s "$ROOT/etc/mailstack/tls/$DOMAIN/fullchain.pem" ] \
+  || { echo "  **openssl 未生成证书**（上面应有它的错误输出）"; exit 1; }
 echo "  夹具就绪：$(find "$ROOT" -type f | wc -l) 个文件"
 
 say "2. 启动 mailstackd（监听 $PORT_SMTP / $PORT_SUB），日志见 $ROOT/daemon.log"

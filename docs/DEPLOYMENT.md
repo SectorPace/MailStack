@@ -96,6 +96,49 @@ WantedBy=multi-user.target
 > 迁移期与旧的 RPC 交付方式**不要同时跑** —— 两边都想绑同一对 socket，后启动的会
 > 把先启动的那个顶掉。请确认切换完成后再停旧的。
 
+> ### 3.1.1 sudo 包装器（RW 通道的唯一入口）
+>
+> **本节是部署的硬前置条件**：包装器没换对之前，**所有写操作都会失败**。
+>
+> `mailstackd` 只在 unix socket 上提供 RPC。RO 面（只读）Web 进程可直连
+> `helper-ro.sock`，而 **RW 面恒经 `sudo /usr/local/libexec/mailstack-privileged`** ——
+> `helper.sock` 是 `0600 root:root`，Web 进程（非 root）连不上，这是设计而不是缺陷。
+>
+> 迁移期主机上可能已经存在**重写之前**留下的同名包装器，它 exec 的是旧的 Python 助手：
+>
+> ```bash
+> # 危险的旧包装器（重写前留下的）
+> exec "$PY" /opt/mailstack/backend/mailstackctl.py
+> ```
+>
+> 那个文件**可能仍然存在**，于是包装器会**正常执行**——但它不认识本项目的任何动作名，
+> 对任何 RW 动作都以 `exit 1` 结束，客户端只看到 `PRIVILEGED_OPERATION_FAILED`，
+> 界面报出来的是笼统的「操作失败」。排查时容易误以为是权限或代码问题。
+>
+> 部署时必须确认包装器指向**本仓库**的助手：
+>
+> ```bash
+> # 1) 看包装器现在指向什么（出现 .py 即为旧助手）
+> grep -E 'exec|mailstackctl' /usr/local/libexec/mailstack-privileged
+>
+> # 2) 让它转发到本仓库的 mailstackctl（路径按实际安装位置调整）
+> #    注意 --config-dir 必须由调用方给出，包装器不应自带生产路径
+> cat > /usr/local/libexec/mailstack-privileged <<'WRAPPER'
+> #!/usr/bin/env bash
+> set -Eeuo pipefail
+> export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+> exec /usr/local/bin/mailstackctl "$@"
+> WRAPPER
+> chmod 0750 /usr/local/libexec/mailstack-privileged
+>
+> # 3) 验证：取一个只读动作（直连 socket，不经包装器）与一个变更动作（经包装器）
+> mailstackctl domains.list --config-dir /etc/mailstack
+> mailstackctl users.list   --config-dir /etc/mailstack   # RW，应能应答
+> ```
+>
+> `deploy/verify-setup-wizard-e2e.sh` 会先检查这一点：包装器不可用时它**跳过**
+> RW 步骤并如实说明，而不是把「包装器不对」报成「链路不通」。
+
 ### 3.2 提交端口 SASL（Dovecot auth socket，§3.5）
 
 25/465/587 三个端口的认证能力**不同**，这是刻意的：

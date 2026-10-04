@@ -1418,6 +1418,36 @@ mail-auth 的验签侧有 `try_strip_rsa_prefix(...).unwrap_or(bytes)` 会**两�
 **尚未**覆盖：LMTP 投到 Dovecot Maildir、出站直投真实公网 MX、提交端口 SASL、
 DKIM 出站签名。这些需要本机装 Dovecot / 真实域名与公网环境，见 §5 的对应条目。
 
+### 5.5 初始化向导链路的验证（`deploy/verify-setup-wizard-e2e.sh`）
+
+向导第 5 步横跨三个动作，而**每一步的前置条件失败方式都是「返回错误」而不是
+「功能不存在」** —— 界面能渲染、按钮能点，只有真发请求才知道通不通。
+脚本按真实顺序验证，并**先复现失败再验证成功**：
+
+| 步骤 | 动作 | 前置条件 |
+|---|---|---|
+| 1 | `domains.add` | 域名必须在受管域名表里。**`setup.identity.apply` 只写 `setup.json`，不写这张表** —— 漏了这一步，后面 `users.add` 与 `mailstackd` 都会拒绝 |
+| 2 | `users.add` | **受管邮箱表只有这一个动作会写**，而 `setup.mail.test` 强校验 `(username, sender)` 命中它 |
+| 3 | `setup.mail.test` | 口令不得含 `admin` / 完整邮箱（`validate_mailbox_password` 的 context 就是这两项），且长度与连续字符也要合规 |
+
+脚本同时验证两个**反例**，因为它们证明校验真的在生效而不是我们单方面拦了一道：
+未建号时发信回 `managed mailbox`；不合格口令回 `password must not contain`；
+重复建号回 `already exists`（向导据此当成功继续）。
+
+**实测结果（RO 段全通，RW 段被前置条件挡住）**
+
+* ✅ `mailstackd` fail-closed 装配、监听 25/587、`domains.add`（RO 直连 socket）返回裸数组、SIGTERM 停机
+* ⚠️ **RW 步骤被跳过并已如实说明**：本机 `/usr/local/libexec/mailstack-privileged` 是**重写前留下的包装器**，它 `exec` 的是 `/opt/mailstack/backend/mailstackctl.py`（文件仍在，但它不认识本项目的任何动作名，于是对任何 RW 动作都 `exit 1`，客户端看到 `PRIVILEGED_OPERATION_FAILED`）。
+
+**这不是本仓库的缺陷，恰恰证明特权边界在工作**：所有 RW 动作恒经该包装器（DEPLOYMENT §3.1），
+Web 进程无法绕过它直连 `helper.sock`。也因此得到一条**部署硬要求**：
+
+> 真实部署必须先把 `/usr/local/libexec/mailstack-privileged` 指向本仓库的 `mailstackctl`。
+> 在此之前，**所有写操作（建用户、加域名、发信、备份、证书…）都会失败**，
+> 而界面报出来的是笼统的「权限不足」，与真实原因（包装器指向旧助手）毫无关联。
+
+换成新包装器后重跑该脚本即可覆盖完整链路。
+
 ## 6. 构建环境约束（影响后续推进）
 
 - Windows 开发机的 mingw 工具链上任何 tokio 异步测试都会 `STATUS_ACCESS_VIOLATION`
