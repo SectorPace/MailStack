@@ -16,6 +16,23 @@ use crate::dial::{EstablishedStream, PinnedDialer, TlsMode};
 use crate::error::{SmtpError, SmtpResult};
 use crate::target::PinnedTarget;
 
+/// 出站单行长度上限。
+///
+/// ## 为什么出站也要限长（入站早就限了）
+///
+/// 入站侧有两道限长（`MAX_COMMAND_BUFFER` + `data.rs` 的 `max_size`），出站侧
+/// 原先**一道都没有**：`read_line` 一直 append 到出现 `\n` 为止。而直投模式
+/// 会连向**任意收件域的 MX** —— 对端可以完全恶意，一条永不出 LF 的应答就能让
+/// 投递任务的内存无界增长。这条路径不需要认证、不需要被攻击者认识本机，
+/// 只要收到一封邮件就会自动触发。
+pub const MAX_RESPONSE_LINE_BYTES: usize = 4096;
+
+/// 出站单条应答的最大行数。
+///
+/// 多行应答（`250-` 续行）没有上限时，对端可以用海量续行撑爆内存。
+/// 真实的 EHLO 能力通常在 10 行以内，64 行留足了余量。
+pub const MAX_RESPONSE_LINES: usize = 64;
+
 /// 单条响应。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
@@ -119,6 +136,15 @@ impl LineIo {
     }
 
     /// 读一行（含结尾换行；EOF 前无换行时返回残余内容）。
+    ///
+    /// ## 为什么这里必须限长
+    ///
+    /// 对端是任意收件域的 MX（直投模式下），可以完全恶意。原实现只等 `\n`，
+    /// 于是「一条永不出 LF 的应答」能让 `buf` 无界增长 —— 每个收到邮件的
+    /// 部署都自动暴露这条路径，不需要任何认证。
+    ///
+    /// 超限按**协议错误**断开而不是截断：截断出来的半行会被上层当作完整应答
+    /// 解析（状态码恰好在前 3 字节），那比直接断开更危险。
     async fn read_line(&mut self) -> std::io::Result<String> {
         loop {
             if let Some(idx) = self.buf[self.pos..].iter().position(|&b| b == b'\n') {
@@ -132,6 +158,17 @@ impl LineIo {
             if self.pos > 0 {
                 self.buf.drain(..self.pos);
                 self.pos = 0;
+            }
+
+            // 判据放在 append **之前**：未消费的部分就已超限，说明对端在发一条
+            // 不肯换行的应答。再等下去只会把内存吃光。
+            if self.buf.len() >= MAX_RESPONSE_LINE_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "response line exceeded {MAX_RESPONSE_LINE_BYTES} bytes without a newline"
+                    ),
+                ));
             }
 
             let mut chunk = [0u8; 2048];
@@ -222,6 +259,13 @@ impl SmtpSession {
 
             if !continued {
                 break;
+            }
+            // 续行数有上界：否则对端可以用海量 `250-` 续行撑爆内存。
+            // 判据放在 push **之后**，故超限时表里最多多留一行。
+            if lines.len() > MAX_RESPONSE_LINES {
+                return Err(SmtpError::Protocol(format!(
+                    "response exceeded {MAX_RESPONSE_LINES} lines"
+                )));
             }
         }
 
@@ -330,7 +374,9 @@ impl SmtpSession {
         recipients: &[String],
         data: &str,
     ) -> SmtpResult<MessageOutcome> {
-        let mail = self.command(&format!("MAIL FROM:<{mail_from}>")).await?;
+        let mail = self
+            .command(&format!("MAIL FROM:<{}>", checked_addr(mail_from)?))
+            .await?;
         if !mail.is_positive_completion() {
             return Ok(MessageOutcome::Rejected {
                 permanent: mail.code >= 500,
@@ -339,7 +385,9 @@ impl SmtpSession {
         }
 
         for rcpt in recipients {
-            let response = self.command(&format!("RCPT TO:<{rcpt}>")).await?;
+            let response = self
+                .command(&format!("RCPT TO:<{}>", checked_addr(rcpt)?))
+                .await?;
             if !response.is_positive_completion() {
                 return Ok(MessageOutcome::Rejected {
                     permanent: response.code >= 500,
@@ -387,6 +435,27 @@ impl LineIo {
     }
 }
 
+/// 校验一个即将拼进命令行的信封地址。
+///
+/// ## 为什么必须查 CR/LF
+///
+/// `MAIL FROM:<{}>` 是**字符串拼接**。地址里若有 `\r\n`，拼出来就是两条命令：
+/// `MAIL FROM:<a@example.org>` 换行后接 `RCPT TO:<victim@elsewhere>`。
+/// 本机随即以自己的身份向第三方投递 —— 这正是入站侧 `smtpd` 拼了命防的走私形态，
+/// 只是方向相反：这里发生在**发送侧**。
+///
+/// 原实现信任上游生产者「会校验」，那是把安全性质建立在约定上；队列的入口
+/// 有多个（`queue.action`、DSN 生成、恢复的备份），漏一个就能注入。
+/// 在**拼接点**拒绝，才对所有调用点同时成立。
+///
+/// 顺带禁掉 NUL：它同样能截断某些下游的 C 字符串处理。
+pub fn checked_addr(addr: &str) -> SmtpResult<&str> {
+    if addr.contains(['\r', '\n', '\0']) {
+        return Err(SmtpError::HeaderInjection(addr.to_string()));
+    }
+    Ok(addr)
+}
+
 /// 把正文封成 DATA 阶段的字节：dot-stuffing + `CRLF.CRLF` 终止符。
 ///
 /// 两处细节都是**真机联调才会暴露**的（自建的脚本化测试服务端不读正文，所以看不见）：
@@ -402,9 +471,33 @@ pub fn terminate_data(data: &str) -> String {
 }
 
 /// 对行首的 `.` 做 dot-stuffing（RFC 5321 §4.5.2）。
+///
+/// ## 为什么必须同时按裸 LF 切行
+///
+/// 原实现只按 `\r\n` 切分，于是**含裸 LF 的行完全不做 stuffing**。而队列
+/// 是公共写入面（`queue.action`、DSN 生成、恢复的备份都能塞进正文），攻击者
+/// 只需让正文里出现 `<裸 LF>.` 开头的行，邮件就会在那个「句点行」处被对端
+/// **截断**，剩余部分被当作 SMTP 命令解析。
+///
+/// 这与入站侧严防的走私形态**完全同构**，只是发生在发送方向：入站是
+/// 「防别人走私进我」，这里是「我不小心替别人走私出去」。
+///
+/// ## 副作用：行尾一律规范成 CRLF
+///
+/// 按 `\n` 切分后必然要重新用 CRLF 拼接，这会把正文里的**裸 LF 也变成 CRLF**。
+/// 这是有意的，且是必须的：SMTP 的行边界就是 CRLF（RFC 5321 §2.1），
+/// 保留裸 LF 意味着交给对端一份「行边界与对端理解不一致」的数据。
+/// 入站侧对裸 LF 的默认策略也是 `Reject`，即本项目两端对裸 LF 的立场一致。
+///
+/// **裸 CR 保留**（不删）：删掉它会改变正文、破坏上游的 DKIM body hash。
+/// 保留它则接收侧的逐字节状态机会原样收下 —— 与 `smtpd::data` 的既定
+/// 行为一致（有测试钉住）。
 pub fn dot_stuff(data: &str) -> String {
-    data.split("\r\n")
+    data.split('\n')
         .map(|line| {
+            // 去掉切分带来的 `\r`（它属于行终止符，不属于行内容），
+            // 行首判定与重新拼接都在「干净的行」上做。
+            let line = line.strip_suffix('\r').unwrap_or(line);
             if line.starts_with('.') {
                 format!(".{line}")
             } else {
@@ -624,6 +717,57 @@ mod tests {
         assert_eq!(dot_stuff("a.b"), "a.b");
         assert_eq!(dot_stuff(".a\r\n.b"), "..a\r\n..b");
         assert_eq!(dot_stuff("text\r\n.\r\nmore"), "text\r\n..\r\nmore");
+    }
+
+    /// 反例守卫：**裸 LF 开头的句点行也必须被 stuffing**。
+    ///
+    /// ## 为什么这条是漏洞
+    ///
+    /// 原实现只按 `\r\n` 切分，所以正文里一行以 `<裸 LF>.` 开头时**完全不做
+    /// stuffing**。邮件发出去后，对端在那个「句点行」处认为 DATA 结束，剩余
+    /// 正文被当作 SMTP 命令解析 —— 这就是 CVE-2023-51764 的**发送侧**形态。
+    ///
+    /// 队列是公共写入面（`queue.action`、DSN 生成、备份恢复都能塞正文），
+    /// 所以这不是假想输入。
+    #[test]
+    fn a_bare_lf_dot_line_is_stuffed_too() {
+        // 关键用例：分隔符是裸 LF，不是 CRLF。
+        assert_eq!(
+            dot_stuff("body\n.evil\nrest"),
+            "body\r\n..evil\r\nrest",
+            "裸 LF 后的句点行必须被加倍，否则邮件在该行被截断"
+        );
+        // 混合分隔符：逐行都按「行首有没有点」判定，与用什么分隔无关。
+        assert_eq!(dot_stuff("a\r\n.b\n.c"), "a\r\n..b\r\n..c");
+        // 无点行不受影响。
+        assert_eq!(dot_stuff("a\nb"), "a\r\nb");
+    }
+
+    /// 反例守卫：信封地址里的 CR/LF 必须**硬失败**，不得拼进命令行。
+    ///
+    /// `MAIL FROM:<a@example.org>\r\nRCPT TO:<victim@x>` 会让本机以自己的
+    /// 身份向第三方投递第二条命令。原实现在拼接点没有任何检查，把安全性质
+    /// 建立在「上游生产者会校验」这个约定上 —— 而队列入口有多个。
+    #[test]
+    fn an_address_containing_crlf_is_refused() {
+        for evil in [
+            "a@example.org\r\nRCPT TO:<victim@elsewhere>",
+            "a@example.org\nRCPT TO:<victim@elsewhere>",
+            "a@example.org\rDATA",
+            "evil\0null",
+        ] {
+            match checked_addr(evil) {
+                Ok(_) => panic!("地址 {evil:?} 含 CR/LF/NUL，必须被拒绝"),
+                Err(SmtpError::HeaderInjection(_)) => {}
+                Err(other) => panic!("应报 HeaderInjection，实际 {other:?}"),
+            }
+        }
+        // 正常地址（含空格的显示名形式）必须放行。
+        assert_eq!(checked_addr("a@example.org").unwrap(), "a@example.org");
+        assert_eq!(
+            checked_addr("Real Name <a@example.org>").unwrap(),
+            "Real Name <a@example.org>"
+        );
     }
 
     #[test]

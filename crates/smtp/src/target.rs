@@ -71,6 +71,29 @@ impl AddressPolicy {
             // 未指定地址会连到本机、多播/广播没有意义。
             return !is_unspecified(ip) && !ip.is_multicast();
         }
+        // IPv6：全球单播**只在** `2000::/3`（RFC 4291 §2.5）。
+        //
+        // ## 为什么是白名单而不是继续枚举黑名单
+        //
+        // 原来的写法是「枚举已知的特殊段并拒绝」，那**必然漏**——漏掉的每一段
+        // 都是一条绕过 SSRF 筛选的路径。已被实测漏掉的：
+        //
+        // * `::127.0.0.1`（IPv4-compatible，`::/96`）—— 不等于 `::1`，
+        //   `is_private()` 也不命中，整段穿了过去；
+        // * `64:ff9b::127.0.0.1`（NAT64，RFC 6052）与 `64:ff9b:1::`
+        //   （local-use NAT64，RFC 8215）—— 在 NAT64 主机上 TCP 会被翻译成
+        //   `127.0.0.1:25`；
+        // * `fec0::1`（废弃的 site-local）、`192.88.99.1`（废弃的 6to4
+        //   relay anycast）。
+        //
+        // `2000::/3` 这一个判断**一次性消灭上面整类**：它们的首段全都不在
+        // `0x2000..=0x3fff` 之内。而 `2000::/3` 内部还有 IANA 特殊登记段
+        // （`2001:db8::/32` 等），那些由 [`is_special_use`] 排除。
+        if let IpAddr::V6(v6) = ip {
+            if (v6.segments()[0] & 0xe000) != 0x2000 {
+                return false;
+            }
+        }
         !(is_unspecified(ip)
             || ip.is_loopback()
             || ip.is_multicast()
@@ -111,11 +134,26 @@ fn is_special_use(ip: IpAddr) -> bool {
                 || (o[0] == 192 && o[1] == 0 && o[2] == 2)
                 || (o[0] == 198 && o[1] == 51 && o[2] == 100)
                 || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+                // 192.88.99.0/24 —— 废弃的 6to4 relay anycast（RFC 7526）
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
         }
-        // IPv6：文档段 2001:db8::/32（唯一本地地址由 is_private 覆盖）
+        // IPv6：**只判 `2000::/3` 内部**的 IANA 特殊登记段。
+        //
+        // 为什么不管范围外的：`::1` / `::/96`（IPv4-compatible）/ `64:ff9b::/96`
+        // （NAT64）/ `fc00::/7` / `fe80::/10` 这些段已经由 `accepts` 里的
+        // `2000::/3` 白名单拒掉了，在这里重复判定只会让两处逻辑各说一半。
         IpAddr::V6(v6) => {
             let seg = v6.segments();
-            seg[0] == 0x2001 && seg[1] == 0x0db8
+            // 2001:db8::/32 —— 文档（RFC 3849）
+            (seg[0] == 0x2001 && seg[1] == 0x0db8)
+                // 2001::/32 —— IETF 协议分配（Teredo 的内嵌 v4 由另一处单独判定）
+                || (seg[0] == 0x2001 && seg[1] == 0x0000)
+                // 2001:2::/48 —— 基准测试（RFC 5180）
+                || (seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0)
+                // 2001:20::/28 —— ORCHIDv2（RFC 7343）
+                || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0020)
+                // 3fff::/20 —— 文档（RFC 9637）
+                || (seg[0] & 0xfff0) == 0x3ff0
         }
     }
 }
@@ -174,10 +212,28 @@ fn is_private(ip: IpAddr) -> bool {
     }
 }
 
+/// DNS 解析超时。
+///
+/// ## 为什么这条路径必须有超时
+///
+/// 这一步是 **IP 固定拨号的前置条件**，也是全仓最不该卡住的一条路径：
+/// 连接超时了、解析却没超时，于是投递任务会一直挂着占住 worker。
+///
+/// 更糟的是 `tokio::net::lookup_host` 在**阻塞**线程池里做 `getaddrinfo`：
+/// 解析慢时占的是 tokio 的 blocking 槽位，高并发下会把整个 worker 池吃干，
+/// 连带收信与出站一起卡住。
+///
+/// 5 秒是「一次投递总共允许多久」的量级：DNS 解析本来就该在毫秒级完成，
+/// 超过 5 秒基本可以断定是网络故障或配置错误。
+pub const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 解析并固定目标。
 ///
 /// 步骤与 `_resolve_probe_targets` 一致：解析 → 地址筛选 → 取第一个作为固定拨号目标。
 /// 解析结果为空或全部被策略拒绝时**失败**（fail-closed），不得回落到「按域名连」。
+///
+/// 超时按**可重试失败**返回（[`SmtpError::Dns`]），不是退信信号：DNS 故障是
+/// 基础设施问题，等一会儿重试通常就好了。
 pub async fn resolve_pinned(
     hostname: &str,
     port: u16,
@@ -190,10 +246,19 @@ pub async fn resolve_pinned(
         ));
     }
 
-    let resolved: Vec<SocketAddr> = tokio::net::lookup_host((hostname.as_str(), port))
-        .await
-        .map_err(|e| SmtpError::Dns(format!("resolve {hostname}: {e}")))?
-        .collect();
+    let resolved = tokio::time::timeout(
+        RESOLVE_TIMEOUT,
+        tokio::net::lookup_host((hostname.as_str(), port)),
+    )
+    .await
+    .map_err(|_| {
+        SmtpError::Dns(format!(
+            "resolve {hostname}: timed out after {}s",
+            RESOLVE_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|e| SmtpError::Dns(format!("resolve {hostname}: {e}")))?;
+    let resolved: Vec<SocketAddr> = resolved.collect();
 
     let addresses: Vec<IpAddr> = resolved
         .iter()
@@ -473,5 +538,56 @@ mod tests {
         // 相邻但不属于文档段，应放行。
         assert!(policy.accepts(ip("203.0.114.1")));
         assert!(policy.accepts(IpAddr::V4(Ipv4Addr::new(192, 0, 3, 1))));
+    }
+
+    /// 反例守卫：IPv4-compatible / NAT64 / 废弃段**一律**拒收。
+    ///
+    /// ## 为什么原测试漏了它
+    ///
+    /// 原来的 IPv6 判定是「`seg[0]==0x2001 && seg[1]==0x0db8` 才拒」，
+    /// 也就是**只**拒文档段，其余全放。实测下列地址**全部穿过**了
+    /// `public_only()` —— 且它们各自都能把连接导向内网或本机：
+    ///
+    /// * `::127.0.0.1` —— IPv4-compatible（`::/96`）。`is_loopback()` 只认 `::1`，
+    ///   `is_private()` 只认 `fc00::/7`，两者都不命中；而内核会按 v4 兼容处理，
+    ///   实际连的是本机。
+    /// * `64:ff9b::127.0.0.1` / `64:ff9b:1::127.0.0.1` —— NAT64（RFC 6052 /
+    ///   RFC 8215）。在 NAT64 主机上 TCP 会被翻译成 `127.0.0.1:25`。
+    /// * `fec0::1` —— 废弃的 site-local。
+    ///
+    /// 修法是反转成 `2000::/3` 白名单。这条测试钉住「白名单确实生效」，
+    /// 而不只是「某几个黑名单项还在」。
+    #[test]
+    fn non_global_unicast_ipv6_is_rejected_wholesale() {
+        let policy = AddressPolicy::public_only();
+        for blocked in [
+            "::127.0.0.1",      // IPv4-compatible（RFC 4291 §2.5.5.1）
+            "::10.0.0.1",       // 同上，指向私网
+            "::",               // 未指定
+            "::1",              // loopback
+            "64:ff9b::127.0.0.1",   // NAT64（RFC 6052）
+            "64:ff9b:1::127.0.0.1", // local-use NAT64（RFC 8215）
+            "fec0::1",          // 废弃的 site-local
+            "192.88.99.1",      // 废弃的 6to4 relay anycast（RFC 7526）
+            "ff02::1",          // 多播
+            "fe80::1",          // link-local
+            "fc00::1",          // 唯一本地
+            "2001:db8::1",      // 文档
+            "2001:2::1",        // 基准测试
+            "2001:20::1",       // ORCHIDv2
+            "3fff::1",          // 文档（RFC 9637）
+        ] {
+            assert!(
+                !policy.accepts(ip(blocked)),
+                "{blocked} 必须被拒（它把连接导向内网/本机或根本不可路由）"
+            );
+        }
+        // 反例的**反例**：真正的全球单播必须放行，否则整个 IPv6 投递全废。
+        for allowed in ["2606:4700:4700::1111", "2001:4860:4860::8888"] {
+            assert!(
+                policy.accepts(ip(allowed)),
+                "{allowed} 是全球单播 IPv6，必须放行"
+            );
+        }
     }
 }

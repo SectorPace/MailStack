@@ -34,6 +34,15 @@ pub enum SmtpError {
     #[error("SMTP protocol error: {0}")]
     Protocol(String),
 
+    /// 信封地址里含 CR/LF —— 命令注入。
+    ///
+    /// 单独一个变体而不是塞进 [`SmtpError::Protocol`]：这是**本机代码或队列
+    /// 数据的缺陷**，不是对端的协议违规，排查方向完全不同（前者要查数据来源，
+    /// 后者要查网络）。而且它必须是**硬失败**：`MAIL FROM:<a\r\nRCPT TO:<b>>`
+    /// 这种拼接会让攻击者往命令流里注入第二条命令，以本机身份向第三方投递。
+    #[error("refusing to build a command from an address containing CR or LF: {0:?}")]
+    HeaderInjection(String),
+
     #[error("SMTP server rejected the command: {0}")]
     Rejected(String),
 
@@ -85,6 +94,7 @@ impl SmtpError {
             SmtpError::ConnectTimeout { .. } => "ConnectTimeout",
             SmtpError::Tls(_) => "TlsError",
             SmtpError::Protocol(_) => "ProtocolError",
+            SmtpError::HeaderInjection(_) => "HeaderInjection",
             SmtpError::Rejected(_) => "SmtpRejected",
             SmtpError::IncompleteCredentials => "IncompleteCredentials",
             SmtpError::TlsRequired => "TlsRequired",

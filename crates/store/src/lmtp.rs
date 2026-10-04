@@ -224,7 +224,20 @@ impl LmtpClient {
             )));
         }
 
-        let payload = format!("{}\r\n.\r\n", dot_stuff(data));
+        // 正文已以 CRLF 结尾时**不得**再补一个。
+        //
+        // 原实现是 `format!("{}\r\n.\r\n", ...)` 无条件补，于是正文已以 CRLF
+        // 结尾的邮件（绝大多数）落箱后**尾部凭空多出一个空行** ——
+        // 那是对正文的改写，收件人转发或校验时上游的 DKIM body hash 会失效。
+        //
+        // 这正是 `smtp::client::terminate_data` 早就修好的同一个坑（同仓的
+        // 注释里写着「与出站路径行为不一致」），LMTP 这一侧当时漏了。
+        //
+        // 刻意**不复用**那个函数：`store` 当前不依赖 `smtp`，为一个函数引入
+        // 一条 crate 边（而 `smtp` 还带 TLS/拨号栈）不划算。判据与它逐条一致。
+        let body = dot_stuff(data);
+        let separator = if body.ends_with("\r\n") { "" } else { "\r\n" };
+        let payload = format!("{body}{separator}.\r\n");
         self.write_all(&mut io, payload.as_bytes()).await?;
 
         // LMTP 的关键差异：DATA 之后**每个进入队列的收件人各回一条**应答。
@@ -412,9 +425,15 @@ fn collect(slots: Vec<Option<RecipientResult>>) -> StoreResult<Vec<RecipientResu
 }
 
 /// DATA 阶段的行首句点转义（RFC 5321 §4.5.2，LMTP 沿用同一套 DATA 帧格式）。
+///
+/// 与 `smtp::client::dot_stuff` 逐条一致，包括**按裸 LF 切行**：
+/// 只按 `\r\n` 切分会让 `<裸 LF>.` 开头的行逃过转义，Dovecot 在那一行判定
+/// DATA 结束，剩余正文被当作 LMTP 命令解析。
 fn dot_stuff(data: &str) -> String {
-    data.split("\r\n")
+    data.split('\n')
         .map(|line| {
+            // 去掉切分带来的 `\r`（它属于行终止符，不属于行内容）。
+            let line = line.strip_suffix('\r').unwrap_or(line);
             if line.starts_with('.') {
                 format!(".{line}")
             } else {
@@ -423,4 +442,47 @@ fn dot_stuff(data: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 反例守卫：正文已以 CRLF 结尾时，落箱帧**不得**多出一个空行。
+    ///
+    /// 原实现无条件 `format!("{}\r\n.\r\n", ...)`，于是每封以 CRLF 结尾的邮件
+    /// （绝大多数）落箱后尾部凭空多出一个空行 —— 对正文的改写，收件人转发或
+    /// 校验时上游的 DKIM body hash 会失效。
+    ///
+    /// 端到端测试测不出来：它们只读到单独的 `.` 就停，不检查 `.` 之前的内容。
+    #[test]
+    fn a_body_already_ending_with_crlf_gets_no_extra_blank_line() {
+        let stuff = dot_stuff("line1\r\nline2\r\n");
+        assert_eq!(
+            stuff, "line1\r\nline2\r\n",
+            "转义不得改动正文的行结构"
+        );
+        let separator = if stuff.ends_with("\r\n") { "" } else { "\r\n" };
+        assert_eq!(
+            format!("{stuff}{separator}.\r\n"),
+            "line1\r\nline2\r\n.\r\n",
+            "已以 CRLF 结尾时不得再补一个空行"
+        );
+
+        // 反例：未以 CRLF 结尾时**必须**补，否则 Dovecot 一直等这一行结束。
+        let no_eol = dot_stuff("line1");
+        let separator = if no_eol.ends_with("\r\n") { "" } else { "\r\n" };
+        assert_eq!(format!("{no_eol}{separator}.\r\n"), "line1\r\n.\r\n");
+    }
+
+    /// 反例守卫：裸 LF 开头的句点行也必须转义，否则 Dovecot 在该行截断正文。
+    #[test]
+    fn a_bare_lf_dot_line_is_stuffed_too() {
+        assert_eq!(
+            dot_stuff("body\n.evil\nrest"),
+            "body\r\n..evil\r\nrest",
+            "裸 LF 后的句点行必须被加倍"
+        );
+        assert_eq!(dot_stuff("a\r\n.b\n.c"), "a\r\n..b\r\n..c");
+    }
 }
