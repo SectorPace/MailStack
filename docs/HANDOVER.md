@@ -587,13 +587,26 @@ wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
 | `crates/web/src/contract.rs` | **路由唯一真相源**（72 条）；RPC 桥的动作允许集也从它推导 |
 | `crates/core/src/actions.rs` | **动作白名单唯一真相源**（RO 22 / RW 36 / 破坏性 3） |
 
-### 9.2 仓库外（对照用）
+### 9.2 仓库外（**只读对照，勿改**）
+
+> ⚠️ `E:\MailStack` 下有**三个**名字相近的目录，改代码前先确认自己在哪一个：
+>
+> | 路径 | 定位 |
+> |---|---|
+> | **`E:\MailStack\mailstack-rust`** | **本项目**（Rust 重写）。所有改动只在这里 |
+> | `E:\MailStack\MailStack-v0.8-beta.6` | Python/FastAPI 基线（当前版本）。**只读参考** |
+> | `E:\MailStack\MailStack-v0.8.0-beta.10` | **更早**一版基线。**只读参考**；两版说法不一致时以 `beta.6` 为准 |
+>
+> 两个基线都只是**参考**，不属于本项目：不被构建、不参与门禁、也不进版本控制。
+> 改到它们上面**不会让任何测试变红** —— 这正是需要小心的地方。
 
 | 资源 | 用途 |
 |---|---|
-| `e:\MailStack\MailStack-v0.8-beta.6\MailStack-v0.8-beta.6` | Python/FastAPI 基线：**响应形状与错误文案的对照来源**（`backend/mailstackctl/*.py`） |
-| `…/CHANGELOG.md` | 基线的变更日志 —— 可用作本项目的「更换日志替代来源」（本项目自身的变更记录在 `TEST_REPORT.md` §4） |
+| `e:\MailStack\MailStack-v0.8-beta.6\MailStack-v0.8-beta.6` | **主要**基线：响应形状与错误文案的对照来源（`backend/mailstackctl/*.py`、`backend/server.production.ts`） |
+| `e:\MailStack\MailStack-v0.8.0-beta.10` | 更早一版基线。仅在需要确认「某个行为是哪一版引入的」时查 |
+| `…/CHANGELOG.md` | 基线的变更日志 —— 可用作本项目的「变更日志替代来源」（本项目自身的变更记录在 `TEST_REPORT.md` §4） |
 | `docs/REWRITE_TO_RUST.md` v3 | 规格书：§3.3 组件下线、§5.x 各子系统要求、§6 迁移路线、§8 的 43 条不变量 |
+| `E:\hage2\Documents\zcode\mailstack-admin-frontend` | **管理前端**（Vite + React 19，Phase 3 接入）。同样只读参考 —— 改它不会让 Rust 门禁变红，需另行 `npm run build` |
 
 ### 9.3 建议的接续起点
 
