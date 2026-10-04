@@ -1,4 +1,4 @@
-﻿# MailStack（Rust 全栈重写）
+# MailStack（Rust 全栈重写）
 
 `MailStack` 从 Node/TypeScript 全栈重写为 Rust 的工程。规格书见
 [`docs/REWRITE_TO_RUST.md`](docs/REWRITE_TO_RUST.md)（本仓库外的源码包内）。
@@ -82,7 +82,15 @@ mailstack-web --dist /usr/share/mailstack/admin
 # 生产目标平台是 Linux；Windows 开发机请用 WSL（见 TOOLCHAIN.md）
 deploy/build.sh              # release 构建 + SHA256SUMS + SBOM
 deploy/wsl-quality-gate.sh   # rustfmt + clippy(-D warnings) + cargo test
+
+# 真实环路验证（需要先 build 出 mailstackd/mailstackctl；会实跑 SMTP 并用掉 25 端口）
+deploy/wsl-cargo.sh build -p mailstackd -p mailstackctl
+deploy/verify-loopback-e2e.sh
 ```
+
+> `verify-loopback-e2e.sh` 之前必须保证 **25 端口空闲**（装了 Postfix 的话它会抢走 25）。
+> 它验证的是**入站收信 → 队列落盘**这一段；LMTP → Dovecot Maildir、公网 MX 直投
+> 与提交端口 SASL 仍需相应的真实环境（见 `docs/HANDOVER.md` §4.3）。
 
 ## 安全设计要点
 

@@ -1,4 +1,4 @@
-﻿# MailStack Rust 重写 —— 项目移交报告（检查点 `0.8.1-beta1`）
+# MailStack Rust 重写 —— 项目移交报告（检查点 `0.8.1-beta1`）
 
 - 版本：`0.8.1-beta1`（`VERSION` / `Cargo.toml` 一致）
 - 报告生成日期：**2026-10-03**
@@ -46,8 +46,9 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 
 **机制层已完整可用**：`mailstackd` 能收信、按策略投递（本地 LMTP / 中继 / 直投）、承载特权 RPC 双通道、
 优雅停机；**58 条白名单动作已全部实现，72 条契约路由已全部接线**；
-管理控制台服务入口 `mailstack-web` 已落地（API + 前端产物托管 + 遥测采样宿主）。
-**未完成**的是真实环境验证（真实 `mailstackd` 环路、Dovecot auth socket、公网 MX、审计链升级演练）。
+管理控制台服务入口 `mailstack-web` 已落地（API + 前端产物托管 + 遥测采样宿主）；
+**入站真实环路已用实跑验证**（`deploy/verify-loopback-e2e.sh`：真实 SMTP 会话 → 队列落盘 → SIGTERM 停机）。
+**未完成**的是其余真实环境验证（LMTP → Dovecot Maildir、公网 MX 直投、提交端口 SASL、审计链升级演练）。
 
 ---
 
@@ -259,7 +260,7 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 
 | 任务 | 规模 | 说明 |
 |---|---|---|
-| 真实 `mailstackd` 上的完整环路验证 | **M** | 提交 → 入站认证 → 入队 → LMTP → Dovecot 写 Maildir → 扫描命中；当前只用了注入替身 |
+| 真实 `mailstackd` 上的完整环路验证 | 🟡 **入站段已验证** | **已完成（`deploy/verify-loopback-e2e.sh`，实测通过）**：实跑 `mailstackd` 监听 25/587 → fail-closed 装配 → 真实 SMTP 会话走完 `220/EHLO/MAIL FROM/RCPT TO/DATA` 得 `250 Message accepted` → 队列**真实落盘** `entries/*.json` → RPC 双 socket 权限与契约一致 → SIGTERM 扇出停机。**尚未**：LMTP → Dovecot Maildir、出站直投、提交端口 SASL、DKIM 出站签名 |
 | 真实 Dovecot auth socket 联调 | **S** | 现有测试用替身；需在装好 Dovecot 的主机上跑一次 |
 | 真实公网 MX 直投 + 机会式 TLS | **M** | 机会式 TLS 是独立的安全策略决定，需单独登记与测试（见 §8） |
 | 审计链真实升级演练 | **S** | 需要一次真实迁移/升级过程来验证链的连续性 |
@@ -269,7 +270,7 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 
 | 事项 | 规模 | 说明 |
 |---|---|---|
-| **建立版本控制** | **S** | **当前目录不是 git 仓库**（无 `.git`）。本次检查点已在快照内做了一次初始提交 + `git bundle`，但**工作目录本身仍无历史**。建议立即 `git init` 并把检查点作为首个提交 |
+| ~~**建立版本控制**~~ | ✅ **已完成** | 已 `git init` 并从检查点 bundle **续上历史**（`3ac583c` → `beccc46` Phase 3 接入 → `3fcd36b`）。另补 `.gitattributes`（`* text=auto eol=lf`）挡住本机**系统级** `core.autocrlf=true`：它会把 `deploy/*.sh` 与 CI YAML 转成 CRLF，使门禁脚本与 CI **静默失效**。已用全新克隆实测：151=151 文件、`build.sh` LF=108/CRLF=0、`ci.yml` CRLF=0 |
 | 阶段性 `#[allow]` 与 TODO 清理 | **S** | `verify-auth-clean-tree.sh` 已用于守住一部分 |
 | crate 边界复核 | **M** | `readers.rs` 已承载「只读面 + 写面 + 向导 + 环路自检」，接近需要拆分 |
 
@@ -598,12 +599,13 @@ wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
 
 1. 先读 `docs/TEST_REPORT.md` §4（缺陷复盘）——**项目的隐性知识几乎都在那里**。
 2. 再读 §8.2 的偏离表，避免「把有意选择当成 bug 改回去」。
-3. **动作面与前端接入都已收口**（58/58 动作、72/72 路由、`bin/mailstack-web` 服务入口
-   与静态托管），§4.1 / §4.2 的条目都已做完。下一步是 §4.3 的**真实环境验证**：
-   ① 真实 `mailstackd` 上的完整环路（提交 → 入站认证 → 入队 → LMTP → Dovecot 写 Maildir → 扫描命中）；
-   ② 真实 Dovecot auth socket 联调；③ 真实公网 MX 直投 + 机会式 TLS（后者是独立的安全策略
-   决定，需单独登记与测试）；④ 审计链的真实升级演练；⑤ Phase 5 组件下线（Postfix /
-   OpenDKIM / fail2ban / Node）。
+3. **动作面、前端接入、版本控制、入站环路验证都已收口**（58/58 动作、72/72 路由、
+   `bin/mailstack-web`、`git` 历史 + `.gitattributes`、`deploy/verify-loopback-e2e.sh` 实测通过）。
+   下一步是 §4.3 余下的**真实环境验证**，按依赖顺序：
+   ① **LMTP → Dovecot Maildir**（需要本机装 Dovecot；`mail_test_loopback` 才有意义）；
+   ② **真实 Dovecot auth socket 联调**（提交端口 SASL）；
+   ③ **真实公网 MX 直投**；④ **机会式 TLS**（独立的安全策略决定，需单独登记与测试）；
+   ⑤ 审计链的真实升级演练；⑥ Phase 5 组件下线（Postfix / OpenDKIM / fail2ban / Node）。
 4. **短期值得做的清理**：`crates/priv/src/readers.rs` 已膨胀到约 5000 行（只读面 + 写面 +
-   向导 + 环路自检 + 用户 + 证书 + AI + 8 个列表动作），下次动它时按职责再拆一层；
-   以及 §4.4 的「建立版本控制」（**当前工作目录仍不是 git 仓库**）。
+   向导 + 环路自检 + 用户 + 证书 + AI + 8 个列表动作），**已有 git 安全网**，可以按职责拆一层；
+   以及 §4.3 的前端向导缺口（`setup.mail.test` 那一步只收集收件人，缺 sender/username/password）。

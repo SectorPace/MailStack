@@ -1,4 +1,4 @@
-﻿# MailStack v0.8.1-beta1 测试报告（Rust 重写）
+# MailStack v0.8.1-beta1 测试报告（Rust 重写）
 
 - 版本：`0.8.1-beta1`
 - 规格书：`docs/REWRITE_TO_RUST.md` **v3**（本仓库外的源码包内）
@@ -1166,7 +1166,9 @@ Dovecot 写 Maildir → 扫描命中）**未在 CI 中跑过** —— 需要一�
   第一列，`priv` 的 `domains.list` 还要 `target` 列，两者都建立在同一个
   `core::atomic::rows` 之上。合并需要让 priv 为一个一行的映射而依赖 store，
   收益不足，暂不合并（**不是**遗留缺陷，只是约定有两处消费者）
-- 队列落盘目录取 `/var/lib/mailstack/queue`（规格书 §2.5 未定义队列目录，选用状态目录的子目录）
+- 队列落盘目录取 `/var/lib/mailstack/queue`（规格书 §2.5 未定义队列目录，选用状态目录的子目录）。
+  条目落在其下的 **`entries/`**（`QueueStore::entries_dir`），队列根只有
+  `outbound-health.json` 与它的锁 —— 手工查队列时别只看根目录
 - 分阶段中继测试**未对真实中继端点**跑过端到端（仅验证了结构与前置校验路径）
 - `cargo-deny` / `cargo-audit` 在 CI 中暂为 `continue-on-error`
 - 未产出 SBOM（`cargo-sbom` 未安装，已退化为依赖清单）
@@ -1378,6 +1380,43 @@ mail-auth 的验签侧有 `try_strip_rsa_prefix(...).unwrap_or(bytes)` 会**两�
 | **`network.check_port` 忽略请求里的 `host`** | 这是**有意的 SSRF 防护**：探测目标只能来自部署配置（`probe_targets`），不接受请求体指定主机。前端传的 `host` 会被忽略，实际探测的是配置中的目标 |
 | **遥测只有 2 秒采样的前台宿主** | 后台采样任务现在由 `mailstack-web` 启动。**若以 API-only 模式短时运行再退出**（例如只跑一次自检），`points` 不会积累 —— 那是进程生命周期的正常结果，不是采集器故障 |
 | **管理面默认只绑回环** | `--bind 127.0.0.1:8443`。TLS 终止与对外暴露交给反向代理或 SSH 隧道，**本进程不做 TLS**（规格书 §3.4 把 TLS 栈留给真正需要加解密的组件）。若有人把 `--bind` 改成 `0.0.0.0` 而无反代，管理面就是明文暴露 —— 部署时必须注意 |
+
+## 5.4 真实环路验证（`deploy/verify-loopback-e2e.sh`）
+
+在 WSL 里**实跑** `mailstackd`（非注入替身），走完入站 SMTP 会话并检查队列落盘。
+一条命令完成「建夹具 → 起进程 → 验证 → SIGTERM 停机 → 报告」，可重复执行。
+
+**实测结果（全部通过）**
+
+| 环节 | 证据 |
+|---|---|
+| fail-closed 装配 | `配置装配完成 domain=example.com mail_host=mail.example.com ports=[25, 587] relay="<direct>"`；缺 `setup.json` / 证书 / 域名表时**拒绝启动**（已实测，见下） |
+| 监听 | `监听已就绪 port=25 mode=StartTls` 与 `port=587` |
+| **RPC 双通道权限** | `srw-rw---- root mailstack-admin helper-ro.sock` / `srw------- root root helper.sock` —— 与 DEPLOYMENT §3.1 的契约**逐字一致** |
+| 真实 SMTP 会话 | `220` 问候 → EHLO 得 `250-SIZE/8BITMIME/ENHANCEDSTATUSCODES/STARTTLS` → `250 2.1.0 Sender OK` → `250 2.1.5 Recipient OK` → `354` → **`250 2.0.0 Message accepted for delivery`** |
+| **队列落盘** | `queue/entries/1A1027297040000.json`，`kind=outbound`、`recipients=['postmaster@example.com']`、`attempts=0` |
+| RO socket 取数 | `mailstackctl snapshot` 经 RO socket 返回 JSON（`certs:[]` 与 `domains:[]` 在本夹具下是**正确**的：无已签发证书、域名表只对 `snapshot` 的 `domains` 字段可见） |
+| 优雅停机 | SIGTERM 后扇出停止：listener → 队列调度 → 手工封禁热重载 → RPC 双面 → `守护进程已退出` |
+
+**三个环境陷阱（都不是产品缺陷，但都让「测试失败」看起来像「代码坏了」）**
+
+1. **WSL 的 `/tmp` 在每次 `wsl` 命令启动时被清理。**
+   实测：建标记文件后，下一条**独立**的 wsl 命令读同一路径已是 `No such file or directory`。
+   于是「生成夹具」与「使用夹具」分成两条命令的做法**必然失败** —— 表现为「启动失败」，
+   而根因与启动毫无关系。本脚本因此把根目录放在 `/root/mailstack-loopback`，
+   并把生成与消费合并进同一条命令。*（连续三轮看起来互不相关的失败，根因是同一个。*
+2. **客户端超时要大于服务端 `data_timeout`（默认 600 秒，`connection.rs:49`）。**
+   客户端只等 15 秒时，症状是「发完正文就超时、服务端日志一行都没有」——
+   与「服务端卡住」**完全同形**，区别只在这个常量。第一轮排查在这里绕了很久，
+   靠打印实际发出的字节才排除掉脚本自身的转义问题。
+3. **证书文件名是 `fullchain.pem` / `privkey.pem`**（`CertPaths::for_domain`），
+   不是 `cert.pem` / `key.pem`。写错时错误消息指向「证书」，读起来像配置问题。
+   同理 **`relay.json` 不该写**：它是 `BTreeMap<String,String>`（值必须全是字符串），
+   而 `relayhost` 键**不存在即合法**（= 直投，`bin/mailstackd/src/config.rs:230`）。
+
+**覆盖边界（诚实说明）**：本脚本验证的是**入站收信 → 队列落盘**这一段。
+**尚未**覆盖：LMTP 投到 Dovecot Maildir、出站直投真实公网 MX、提交端口 SASL、
+DKIM 出站签名。这些需要本机装 Dovecot / 真实域名与公网环境，见 §5 的对应条目。
 
 ## 6. 构建环境约束（影响后续推进）
 
