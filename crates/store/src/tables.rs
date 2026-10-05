@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mailstack_core::atomic::{atomic_as, rows};
+use mailstack_core::atomic::{atomic_as, locked_with, rows};
 use mailstack_core::exec::{
     postmap_and_reload, CommandRunner, PostmapOutcome, ServiceEnv, SystemCommandRunner,
     SystemServiceEnv,
@@ -74,6 +74,47 @@ impl std::fmt::Debug for TableStore {
     }
 }
 
+#[cfg(all(test, unix))]
+fn assert_waits_for_table_lock<T: Send + 'static>(
+    table_path: &Path,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let table_path = table_path.to_path_buf();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        mailstack_core::atomic::locked(&table_path, || {
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        })
+    });
+    locked_rx.recv().unwrap();
+
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let result = operation();
+        let _ = finished_tx.send(());
+        result
+    });
+    let finished_while_locked = match finished_rx.recv_timeout(Duration::from_millis(250)) {
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+        Err(mpsc::RecvTimeoutError::Timeout) => false,
+    };
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap().unwrap();
+    let result = writer.join().unwrap();
+    assert!(
+        !finished_while_locked,
+        "表的读改写必须等待已持有的 sidecar 锁"
+    );
+    result
+}
+
 impl TableStore {
     /// 生产构造：真实命令运行器 + 真实环境探测。
     pub fn new(paths: Paths) -> Self {
@@ -114,15 +155,16 @@ impl TableStore {
     /// 添加域名（`domain_add`）：校验 → 去重写入 → `postmap` → 返回新列表。
     pub fn add_domain(&self, name: &str) -> StoreResult<Vec<String>> {
         let domain = validated_domain(name)?;
-        let mut table: Vec<TableRow> = read_rows(&self.paths.domains)
-            .into_iter()
-            .filter(|row| row.first() != Some(&domain))
-            .collect();
-        // Postfix 的 virtual_alias_domains 只关心 key；`OK` 是基线的占位值，
-        // 保持逐字一致以免 .db 内容与历史部署出现差异。
-        table.push(vec![domain, "OK".to_string()]);
-        self.write_rows(&self.paths.domains, &table)?;
-        Ok(self.domains())
+        let path = self.paths.domains.clone();
+        locked_with(&path, || {
+            let mut table = read_rows_for_update(&path)?;
+            table.retain(|row| row.first() != Some(&domain));
+            // Postfix 的 virtual_alias_domains 只关心 key；`OK` 是基线的占位值，
+            // 保持逐字一致以免 .db 内容与历史部署出现差异。
+            table.push(vec![domain, "OK".to_string()]);
+            self.write_rows(&path, &table)?;
+            Ok(self.domains())
+        })
     }
 
     /// 删除域名（`domain_delete`）：**同时删除该域下的所有别名行**。
@@ -131,25 +173,26 @@ impl TableStore {
     /// 「删了域名但收信路由没变」。
     pub fn delete_domain(&self, name: &str) -> StoreResult<Vec<String>> {
         let domain = validated_domain(name)?;
-
-        let domains: Vec<TableRow> = read_rows(&self.paths.domains)
-            .into_iter()
-            .filter(|row| row.first() != Some(&domain))
-            .collect();
-        self.write_rows(&self.paths.domains, &domains)?;
-
+        let domains_path = self.paths.domains.clone();
+        let aliases_path = self.paths.aliases.clone();
         let suffix = format!("@{domain}");
-        let aliases: Vec<TableRow> = read_rows(&self.paths.aliases)
-            .into_iter()
-            .filter(|row| {
-                !row.first()
-                    .map(|source| source.ends_with(&suffix))
-                    .unwrap_or(false)
-            })
-            .collect();
-        self.write_rows(&self.paths.aliases, &aliases)?;
+        locked_with(&domains_path, || {
+            locked_with(&aliases_path, || {
+                let mut domains = read_rows_for_update(&domains_path)?;
+                let mut aliases = read_rows_for_update(&aliases_path)?;
+                domains.retain(|row| row.first() != Some(&domain));
+                aliases.retain(|row| {
+                    !row.first()
+                        .map(|source| source.ends_with(&suffix))
+                        .unwrap_or(false)
+                });
 
-        Ok(self.domains())
+                // 两张表都读成功后才开始写，避免第二张表不可读时先删掉域名。
+                self.write_rows(&domains_path, &domains)?;
+                self.write_rows(&aliases_path, &aliases)?;
+                Ok(self.domains())
+            })
+        })
     }
 
     // ───────────────────────────── 别名表 ─────────────────────────────
@@ -206,15 +249,16 @@ impl TableStore {
             return Err(StoreError::invalid("invalid alias: too many destinations"));
         }
 
-        let mut table: Vec<TableRow> = read_rows(&self.paths.aliases)
-            .into_iter()
-            .filter(|row| row.first() != Some(&source))
-            .collect();
-        let mut row = vec![source];
-        row.extend(normalised);
-        table.push(row);
-        self.write_rows(&self.paths.aliases, &table)?;
-        Ok(self.aliases())
+        let path = self.paths.aliases.clone();
+        locked_with(&path, || {
+            let mut table = read_rows_for_update(&path)?;
+            table.retain(|row| row.first() != Some(&source));
+            let mut row = vec![source];
+            row.extend(normalised);
+            table.push(row);
+            self.write_rows(&path, &table)?;
+            Ok(self.aliases())
+        })
     }
 
     /// 删除别名（`alias_del`）。id 同样要校验 —— 见模块文档的第二条注入防护。
@@ -231,12 +275,13 @@ impl TableStore {
             return Err(StoreError::invalid("invalid alias"));
         }
 
-        let table: Vec<TableRow> = read_rows(&self.paths.aliases)
-            .into_iter()
-            .filter(|row| row.first() != Some(&source))
-            .collect();
-        self.write_rows(&self.paths.aliases, &table)?;
-        Ok(self.aliases())
+        let path = self.paths.aliases.clone();
+        locked_with(&path, || {
+            let mut table = read_rows_for_update(&path)?;
+            table.retain(|row| row.first() != Some(&source));
+            self.write_rows(&path, &table)?;
+            Ok(self.aliases())
+        })
     }
 
     /// 原子写入表文件并让 Postfix 重读（`postmap` + `postfix check` + `reload`）。
@@ -258,6 +303,16 @@ impl TableStore {
 /// 读表文件（`rows`）：跳过空行与 `#` 注释、按空白分词；文件缺失视为空表。
 pub fn read_rows(path: &Path) -> Vec<TableRow> {
     rows(path)
+}
+
+fn read_rows_for_update(path: &Path) -> StoreResult<Vec<TableRow>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(StoreError::io(path, error)),
+    }
+    let text = std::fs::read_to_string(path).map_err(|error| StoreError::io(path, error))?;
+    Ok(rows_from_text(&text))
 }
 
 /// 表文件**文本** → 行：分词规则与 [`read_rows`] 完全一致。
@@ -343,6 +398,15 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
             })
+        }
+
+        fn run_with_timeout(
+            &self,
+            program: &str,
+            args: &[&str],
+            _timeout: std::time::Duration,
+        ) -> mailstack_core::CoreResult<CommandOutput> {
+            self.run(program, args)
         }
     }
 
@@ -669,6 +733,76 @@ mod tests {
         let aliases = f.store.delete_alias("a@example.com").unwrap();
         assert_eq!(aliases.len(), 1);
         assert_eq!(aliases[0].source, "b@example.com");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn table_mutations_wait_for_their_read_modify_write_locks() {
+        let f = Fixture::new();
+
+        let store = f.store.clone();
+        assert_waits_for_table_lock(&f.paths.domains, move || store.add_domain("example.com"))
+            .unwrap();
+
+        let store = f.store.clone();
+        assert_waits_for_table_lock(&f.paths.domains, move || store.delete_domain("example.com"))
+            .unwrap();
+
+        let store = f.store.clone();
+        assert_waits_for_table_lock(&f.paths.aliases, move || store.delete_domain("example.com"))
+            .unwrap();
+
+        let store = f.store.clone();
+        assert_waits_for_table_lock(&f.paths.aliases, move || {
+            store.add_alias("sales@example.com", &["alice".to_string()])
+        })
+        .unwrap();
+
+        let store = f.store.clone();
+        assert_waits_for_table_lock(&f.paths.aliases, move || {
+            store.delete_alias("sales@example.com")
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_domain_refuses_to_replace_a_table_when_reading_it_fails() {
+        use std::os::unix::fs::symlink;
+
+        let f = Fixture::new();
+        let target = f.paths.postfix.join("domains-target");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &f.paths.domains).unwrap();
+
+        let error = f.store.add_domain("example.com").unwrap_err();
+
+        assert!(matches!(error, StoreError::Io { .. }));
+        assert!(std::fs::symlink_metadata(&f.paths.domains)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_domain_does_not_modify_either_table_when_alias_read_fails() {
+        use std::os::unix::fs::symlink;
+
+        let f = Fixture::new();
+        std::fs::write(&f.paths.domains, "example.com OK\n").unwrap();
+        let target = f.paths.postfix.join("aliases-target");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &f.paths.aliases).unwrap();
+
+        let error = f.store.delete_domain("example.com").unwrap_err();
+
+        assert!(matches!(error, StoreError::Io { .. }));
+        assert_eq!(f.read(&f.paths.domains), "example.com OK\n");
+        assert!(std::fs::symlink_metadata(&f.paths.aliases)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

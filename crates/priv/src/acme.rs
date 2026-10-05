@@ -240,8 +240,8 @@ impl Acme {
             // 全部校验通过后才落盘。
             self.validate_custom_certificate(&cert_pem, &key_pem, &domain)?;
             std::fs::create_dir_all(&out_dir).map_err(|e| HandlerError::new(e.to_string()))?;
-            atomic::atomic(&fullchain, format!("{cert_pem}\n").as_bytes(), 0o644)?;
-            atomic::atomic(&privkey, format!("{key_pem}\n").as_bytes(), 0o600)?;
+            atomic::atomic_as(&fullchain, format!("{cert_pem}\n").as_bytes(), 0o644, None)?;
+            atomic::atomic_as(&privkey, format!("{key_pem}\n").as_bytes(), 0o600, None)?;
         } else {
             let email = str_field(data, "email").trim().to_string();
             if email.is_empty() || !email.contains('@') {
@@ -299,8 +299,11 @@ impl Acme {
                 0o750,
             )?;
 
-            let fullchain_str = fullchain.display().to_string();
-            let privkey_str = privkey.display().to_string();
+            let stage = PrivateCertStage::create(&out_dir)?;
+            let staged_fullchain = stage.0.join("fullchain.pem");
+            let staged_privkey = stage.0.join("privkey.pem");
+            let fullchain_str = staged_fullchain.display().to_string();
+            let privkey_str = staged_privkey.display().to_string();
             let installed = self.runner.run_with_timeout(
                 ACME_BIN,
                 &[
@@ -323,8 +326,15 @@ impl Acme {
                 return Err(HandlerError::new("ACME certificate installation failed"));
             }
 
-            set_mode(&privkey, 0o600);
-            set_mode(&fullchain, 0o644);
+            set_mode(&staged_privkey, 0o600)?;
+            set_mode(&staged_fullchain, 0o644)?;
+            let key_pem = std::fs::read(&staged_privkey)
+                .map_err(|error| HandlerError::new(format!("read staged TLS key: {error}")))?;
+            let cert_pem = std::fs::read(&staged_fullchain).map_err(|error| {
+                HandlerError::new(format!("read staged certificate chain: {error}"))
+            })?;
+            atomic::atomic_as(&privkey, &key_pem, 0o600, None)?;
+            atomic::atomic_as(&fullchain, &cert_pem, 0o644, None)?;
         }
 
         if self.probes.which("postconf").is_some() {
@@ -426,19 +436,70 @@ fn str_field<'a>(data: &'a Value, key: &str) -> &'a str {
     data.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
-        mailstack_core::warn::warn_with_detail(
-            &format!("chmod {}", path.display()),
-            &error.to_string(),
-        );
+struct PrivateCertStage(PathBuf);
+
+impl PrivateCertStage {
+    fn create(parent: &Path) -> Result<Self, HandlerError> {
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt;
+
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for _ in 0..16 {
+            let sequence = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let path = parent.join(format!(
+                ".mailstack-acme-install.{}.{sequence}.{nanos}",
+                std::process::id()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            match builder.create(&path) {
+                Ok(()) => {
+                    set_mode(&path, 0o700)?;
+                    return Ok(Self(path));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(HandlerError::new(format!(
+                        "create private ACME staging directory: {error}"
+                    )))
+                }
+            }
+        }
+        Err(HandlerError::new(
+            "unable to create a unique private ACME staging directory",
+        ))
     }
 }
 
+impl Drop for PrivateCertStage {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                mailstack_core::warn::warn_with_detail(
+                    "remove private ACME staging directory",
+                    &format!("{}: {error}", self.0.display()),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> Result<(), HandlerError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|error| HandlerError::new(format!("chmod {}: {error}", path.display())))
+}
+
 #[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) {}
+fn set_mode(_path: &Path, _mode: u32) -> Result<(), HandlerError> {
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -955,13 +1016,28 @@ mod tests {
         );
         #[cfg(unix)]
         {
+            use std::os::unix::fs::MetadataExt;
             use std::os::unix::fs::PermissionsExt;
             let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode(&dir.join("privkey.pem")), 0o600);
             assert_eq!(mode(&dir.join("fullchain.pem")), 0o644);
+            assert_eq!(
+                fs::metadata(dir.join("privkey.pem")).unwrap().gid(),
+                unsafe { libc::getegid() },
+                "TLS 私钥不应 chown 到 mailstack-admin 组"
+            );
         }
         // custom 分支不写 reload 脚本。
         assert!(probes.writes().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn certificate_mode_failure_is_returned_instead_of_ignored() {
+        let f = Fixture::new("chmodfailure");
+        let missing = f.root.join("missing-privkey.pem");
+        let error = set_mode(&missing, 0o600).unwrap_err();
+        assert!(error.to_string().contains("chmod "));
     }
 
     // ───────────────────────── setup.cert.issue: ACME ─────────────────────────
@@ -1161,6 +1237,37 @@ mod tests {
             ]
         );
         assert_eq!(issue.timeout, Some(ISSUE_TIMEOUT));
+
+        let install = runner
+            .acme_calls()
+            .into_iter()
+            .find(|call| call.args.iter().any(|arg| arg == "--install-cert"))
+            .unwrap();
+        let arg_value = |flag: &str| {
+            install.args[install.args.iter().position(|arg| arg == flag).unwrap() + 1].clone()
+        };
+        let key_path = arg_value("--key-file");
+        let chain_path = arg_value("--fullchain-file");
+        let key_path = PathBuf::from(key_path);
+        let chain_path = PathBuf::from(chain_path);
+        assert_ne!(key_path, f.paths.etc.join("tls/example.com/privkey.pem"));
+        assert_eq!(key_path.parent(), chain_path.parent());
+        assert!(!key_path.parent().unwrap().exists(), "私有暂存目录必须清理");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let private_key = f.paths.etc.join("tls/example.com/privkey.pem");
+            assert_eq!(
+                fs::metadata(&private_key).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(private_key).unwrap().gid(),
+                unsafe { libc::getegid() },
+                "ACME TLS key 不应属于共享管理组"
+            );
+        }
 
         // postconf 三条 -e 与两次服务重载的顺序与参数。
         let tail: Vec<Call> = runner

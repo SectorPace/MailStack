@@ -40,7 +40,7 @@ impl DenyReason {
 /// 动作分派门。
 pub struct ActionGate {
     paths: Paths,
-    /// 若为 `Some`，则覆盖 AI 出站判定（测试注入用）。
+    /// 若为 `Some`，则覆盖 AI 出站判定（仅测试注入）。
     ai_outbound_override: Option<bool>,
 }
 
@@ -53,7 +53,8 @@ impl ActionGate {
     }
 
     /// 注入 AI 出站判定结果，避免测试触碰进程环境变量。
-    pub fn with_ai_outbound(paths: Paths, enabled: bool) -> Self {
+    #[cfg(test)]
+    fn with_ai_outbound(paths: Paths, enabled: bool) -> Self {
         Self {
             paths,
             ai_outbound_override: Some(enabled),
@@ -127,7 +128,7 @@ impl ActionGate {
 ///
 /// 注意 `ai.config.get` / `ai.models.list` 的归属：
 /// `ai.config.get` 是纯读配置，不在出站闸内；
-/// `ai.models.list` 会向供应商发起出站请求，故受门控。
+/// `ai.models.list` 会向供应商发起出站请求、且携带密钥，故走 RW 并受出站门控。
 pub fn is_ai_outbound_action(action: &str) -> bool {
     matches!(
         action,
@@ -225,6 +226,10 @@ mod tests {
             gate.evaluate(Channel::Ro, "admin.totp.verify", &json!({})),
             "ACTION_REQUIRES_PRIVILEGE",
         );
+        assert_denied(
+            gate.evaluate(Channel::Ro, "ai.models.list", &json!({})),
+            "ACTION_REQUIRES_PRIVILEGE",
+        );
     }
 
     #[test]
@@ -234,6 +239,7 @@ mod tests {
         assert_allowed(gate.evaluate(Channel::Rw, "domains.list", &json!({})));
         assert_allowed(gate.evaluate(Channel::Rw, "domains.add", &json!({})));
         assert_allowed(gate.evaluate(Channel::Rw, "queue.action", &json!({})));
+        assert_allowed(gate.evaluate(Channel::Rw, "ai.models.list", &json!({})));
     }
 
     #[test]

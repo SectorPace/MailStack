@@ -49,7 +49,7 @@ pub use relay_store::{
     SaslEntry, SystemCommandRunner,
 };
 pub use stages::{RelayStage, RelayTestFailure, RelayTestResult, StageOutcome};
-pub use target::{resolve_pinned, AddressPolicy, PinnedTarget};
+pub use target::{is_private_network_address, resolve_pinned, AddressPolicy, PinnedTarget};
 pub use validate::{validate_relay, RelayEndpoint, RelayValidationRequest};
 
 /// 连接超时（§5.9.4：连接 20s）。

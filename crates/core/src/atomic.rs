@@ -99,8 +99,7 @@ pub fn atomic_as(path: &Path, data: &[u8], mode: u32, group: Option<&str>) -> Co
     }
 
     let lock_path = atomic_lock_path(path);
-    let lock_handle = open_lock_sidecar(&lock_path);
-    let _guard = lock_handle.as_ref().map(FileLock::acquire);
+    let _guard = FileLock::acquire(open_lock_sidecar(&lock_path)?, &lock_path)?;
 
     let tmp = temp_path(path);
     // `OpenOptions` 而不是 `File::create`：三处差别都指向同一个不变量（INV-33）。
@@ -179,56 +178,50 @@ fn fsync_dir(dir: &Path) {
 /// 在整个 read-modify-write 临界区持排他锁（`core.py:664-724`）。
 ///
 /// 锁 sidecar 为 `<name>.lock`，与 [`atomic`] 的 `.<name>.lock` 不同名。
-/// 降级链：POSIX `flock` → Windows 字节锁 → 无锁（接口不变）。
+/// POSIX 使用 `flock`，Windows 使用字节锁；无法打开或取得锁时返回错误，不进入临界区。
 pub fn locked<T, F>(path: &Path, f: F) -> CoreResult<T>
 where
     F: FnOnce() -> CoreResult<T>,
 {
+    locked_with(path, f)
+}
+
+/// 在整个读改写临界区持锁，并把锁错误转换为调用方的错误类型。
+pub fn locked_with<T, E, F>(path: &Path, f: F) -> Result<T, E>
+where
+    E: From<CoreError>,
+    F: FnOnce() -> Result<T, E>,
+{
     let lock_path = locked_lock_path(path);
     if let Some(parent) = lock_path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent).map_err(|e| CoreError::io(parent, e))?;
     }
 
-    let handle = match open_lock_sidecar(&lock_path) {
-        Some(h) => Some(h),
-        None => {
-            // 无法打开 sidecar 时降级为无锁，但保留同样的接口语义。
-            crate::warn::warn(&format!("open lock sidecar {}", lock_path.display()));
-            None
-        }
-    };
-    let _guard = handle.as_ref().map(FileLock::acquire);
+    let _guard = FileLock::acquire(open_lock_sidecar(&lock_path)?, &lock_path)?;
 
     f()
 }
 
-fn open_lock_sidecar(path: &Path) -> Option<File> {
+fn open_lock_sidecar(path: &Path) -> CoreResult<File> {
     OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
         .open(path)
-        .ok()
+        .map_err(|e| CoreError::io(path, e))
 }
 
-/// RAII 排他锁；析构时释放。
-struct FileLock;
+/// RAII 排他锁；句柄由 guard 持有，析构时关闭并释放内核锁。
+struct FileLock {
+    _file: File,
+}
 
 impl FileLock {
-    fn acquire(file: &File) -> Self {
+    fn acquire(file: File, path: &Path) -> CoreResult<Self> {
         // `fs2` 在 Unix 上走 flock(LOCK_EX)、Windows 上走 LockFileEx，
         // 语义与 `core.py` 的 fcntl.flock 降级链一致。
-        if let Err(e) = fs2::FileExt::lock_exclusive(file) {
-            crate::warn::warn_with_error("acquire file lock", &e);
-        }
-        Self
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        // 释放在句柄关闭时由内核完成（flock 随 fd 关闭释放），
-        // 故此处无需持有 File 引用。
+        fs2::FileExt::lock_exclusive(&file).map_err(|e| CoreError::io(path, e))?;
+        Ok(Self { _file: file })
     }
 }
 
@@ -304,12 +297,16 @@ pub struct FileSnapshot {
 
 /// 记录 `path` 的 `{exists, content, mode}`。
 pub fn file_snapshot(path: &Path) -> CoreResult<FileSnapshot> {
-    if !path.exists() {
-        return Ok(FileSnapshot {
-            exists: false,
-            content: Vec::new(),
-            mode: None,
-        });
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FileSnapshot {
+                exists: false,
+                content: Vec::new(),
+                mode: None,
+            });
+        }
+        Err(e) => return Err(CoreError::io(path, e)),
     }
     let content = fs::read(path).map_err(|e| CoreError::io(path, e))?;
     Ok(FileSnapshot {
@@ -466,6 +463,34 @@ mod tests {
     }
 
     #[test]
+    fn locked_fails_closed_when_the_sidecar_cannot_be_opened() {
+        let dir = temp_dir("lock-open-error");
+        let target = dir.join("state");
+        fs::create_dir(locked_lock_path(&target)).unwrap();
+        let called = std::sync::atomic::AtomicBool::new(false);
+
+        let result = locked(&target, || {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert!(result.is_err(), "锁 sidecar 不能打开时必须拒绝操作");
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn atomic_fails_closed_when_the_sidecar_cannot_be_opened() {
+        let dir = temp_dir("atomic-lock-open-error");
+        let target = dir.join("secret");
+        fs::create_dir(atomic_lock_path(&target)).unwrap();
+
+        assert!(atomic_as(&target, b"secret", 0o600, None).is_err());
+        assert!(!target.exists(), "无法取得锁时不能写入目标文件");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn file_snapshot_and_restore_round_trip() {
         let dir = temp_dir("snap");
         let target = dir.join("relay.conf");
@@ -475,6 +500,19 @@ mod tests {
         fs::write(&target, b"mutated").unwrap();
         file_restore(&target, &snap, None).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"original");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_snapshot_reports_metadata_errors_instead_of_treating_them_as_missing() {
+        let dir = temp_dir("snapshot-metadata-error");
+        let parent_file = dir.join("not-a-directory");
+        fs::write(&parent_file, b"file").unwrap();
+        let target = parent_file.join("state.json");
+
+        let result = file_snapshot(&target);
+
+        assert!(matches!(result, Err(CoreError::Io { .. })));
         fs::remove_dir_all(&dir).ok();
     }
 

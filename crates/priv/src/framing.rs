@@ -8,7 +8,7 @@
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// 单帧最大字节数上限（响应侧 16 MB，规格书 §5.4.3）。
+/// 通用帧最大字节数上限（用于服务端响应与客户端接收响应，规格书 §5.4.3）。
 pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
 /// 请求体上限 256 KB（与 `mailstackctl.py` 的 stdin 上限一致）。
@@ -18,8 +18,10 @@ pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 pub enum FrameError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("frame length {0} exceeds maximum {MAX_FRAME_BYTES}")]
+    #[error("frame length {0} exceeds maximum {MAX_FRAME_BYTES} bytes")]
     TooLarge(u32),
+    #[error("request length {0} exceeds maximum {MAX_REQUEST_BYTES} bytes")]
+    RequestTooLarge(u32),
     #[error("frame truncated: expected {expected} bytes, got {got}")]
     Truncated { expected: u32, got: usize },
     #[error("json error: {0}")]
@@ -34,12 +36,23 @@ pub async fn read_frame<R>(reader: &mut R) -> Result<Vec<u8>, FrameError>
 where
     R: AsyncReadExt + Unpin,
 {
+    read_frame_with_limit(reader, MAX_FRAME_BYTES as usize).await
+}
+
+async fn read_frame_with_limit<R>(reader: &mut R, max_bytes: usize) -> Result<Vec<u8>, FrameError>
+where
+    R: AsyncReadExt + Unpin,
+{
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf);
 
-    if len > MAX_FRAME_BYTES {
-        return Err(FrameError::TooLarge(len));
+    if len as usize > max_bytes {
+        return Err(if max_bytes == MAX_REQUEST_BYTES {
+            FrameError::RequestTooLarge(len)
+        } else {
+            FrameError::TooLarge(len)
+        });
     }
 
     let mut payload = vec![0u8; len as usize];
@@ -57,6 +70,16 @@ where
     R: AsyncReadExt + Unpin,
 {
     let payload = read_frame(reader).await?;
+    Ok(serde_json::from_slice(&payload)?)
+}
+
+/// 读取并解析 RPC 请求帧；在按声明长度分配内存前执行 256 KB 上限检查。
+pub(crate) async fn read_json_request_frame<T, R>(reader: &mut R) -> Result<T, FrameError>
+where
+    T: serde::de::DeserializeOwned,
+    R: AsyncReadExt + Unpin,
+{
+    let payload = read_frame_with_limit(reader, MAX_REQUEST_BYTES).await?;
     Ok(serde_json::from_slice(&payload)?)
 }
 
@@ -160,6 +183,23 @@ mod tests {
             matches!(err, FrameError::TooLarge(_)),
             "应报 TooLarge，实际: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_requests_above_256_kib_before_reading_or_allocating_the_payload() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&((MAX_REQUEST_BYTES as u32) + 1).to_be_bytes());
+        let mut cursor = Cursor::new(buf);
+
+        let error = read_json_request_frame::<serde_json::Value, _>(&mut cursor)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FrameError::RequestTooLarge(length) if length as usize == MAX_REQUEST_BYTES + 1
+        ));
+        assert_eq!(cursor.position(), 4, "不得读取超限帧的负载");
     }
 
     #[tokio::test]

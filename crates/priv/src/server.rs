@@ -24,7 +24,7 @@ use crate::{RpcRequest, RpcResponse};
 // Unix socket 相关符号仅在 Unix 目标存在（生产目标为 Linux）；
 // 其余逻辑保持可移植，以便在开发机上跑通与平台无关的测试。
 #[cfg(unix)]
-use crate::framing::{read_json_frame, write_json_frame};
+use crate::framing::{read_json_request_frame, write_json_frame};
 #[cfg(unix)]
 use std::path::Path;
 #[cfg(unix)]
@@ -36,6 +36,8 @@ pub const DEFAULT_RO_SOCKET: &str = "/run/mailstack/helper-ro.sock";
 pub const DEFAULT_RW_SOCKET: &str = "/run/mailstack/helper.sock";
 /// 助手调用超时默认值（毫秒），对应 `MAILSTACK_HELPER_TIMEOUT_MS`。
 pub const HELPER_TIMEOUT_MS_DEFAULT: u64 = 120_000;
+/// 单个 RPC 请求帧读取超时，避免占满 worker 的连接停留在半帧状态。
+const RPC_REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// RO 服务配置。
 #[derive(Debug, Clone)]
@@ -122,18 +124,42 @@ impl RoServer {
 
     /// 在已建立的连接上服务请求，直到对端关闭。
     #[cfg(unix)]
-    pub async fn serve_connection(&self, channel: Channel, mut stream: UnixStream) {
+    pub async fn serve_connection(&self, channel: Channel, stream: UnixStream) {
+        self.serve_connection_with_timeout(channel, stream, RPC_REQUEST_READ_TIMEOUT)
+            .await;
+    }
+
+    #[cfg(unix)]
+    async fn serve_connection_with_timeout(
+        &self,
+        channel: Channel,
+        mut stream: UnixStream,
+        read_timeout: std::time::Duration,
+    ) {
         loop {
-            let request: RpcRequest = match read_json_frame(&mut stream).await {
-                Ok(r) => r,
-                Err(crate::framing::FrameError::Io(e))
+            let request: RpcRequest = match tokio::time::timeout(
+                read_timeout,
+                read_json_request_frame(&mut stream),
+            )
+            .await
+            {
+                Ok(Ok(request)) => request,
+                Ok(Err(crate::framing::FrameError::Io(e)))
                     if e.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
                     // 对端正常关闭。
                     return;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let _ = write_json_frame(&mut stream, &RpcResponse::err(e.to_string())).await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = write_json_frame(
+                        &mut stream,
+                        &RpcResponse::err("RPC request read timed out"),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -183,9 +209,13 @@ impl RoServer {
 
         loop {
             let (stream, _addr) = listener.accept().await?;
-            let permit = match semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return Ok(()),
+            let permit = match semaphore.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    drop(stream);
+                    continue;
+                }
+                Err(tokio::sync::TryAcquireError::Closed) => return Ok(()),
             };
             let server = Arc::clone(&self);
             tokio::spawn(async move {
@@ -214,20 +244,22 @@ pub fn bind_unix_socket(
     }
 
     let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
-
-    if let Some(group) = group {
-        if let Some(gid) = mailstack_core::atomic::gid_by_name(group) {
-            if let Err(e) = std::os::unix::fs::chown(path, Some(u32::MAX), Some(gid)) {
-                mailstack_core::warn::warn(&format!(
-                    "chown socket {} to group {group}: {e}",
-                    path.display()
-                ));
-            }
-        } else {
-            // 开发主机可能没有 mailstack-admin 组；响亮降级而不是静默。
-            mailstack_core::warn::warn(&format!("resolve group {group} for socket"));
+    let permission_result = (|| {
+        if let Some(group) = group {
+            let gid = mailstack_core::atomic::gid_by_name(group).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("cannot resolve socket group {group}"),
+                )
+            })?;
+            std::os::unix::fs::chown(path, None, Some(gid))?;
         }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    })();
+    if let Err(error) = permission_result {
+        drop(listener);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
     }
 
     Ok(listener)
@@ -280,6 +312,20 @@ mod tests {
             .await;
         assert!(!resp.ok);
         assert!(resp.error.unwrap().starts_with("UNKNOWN_ACTION"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn socket_group_resolution_failure_aborts_binding() {
+        let (root, _) = test_paths("missing-group");
+        let socket = root.join("helper-ro.sock");
+        let missing_group = format!("mailstack-missing-{}", std::process::id());
+
+        let error = bind_unix_socket(&socket, 0o660, Some(&missing_group))
+            .expect_err("不存在的 socket 属组必须令绑定失败");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!socket.exists(), "失败的 bind 不得留下可被抢占的 socket");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -380,6 +426,44 @@ mod tests {
 
         drop(client);
         let _ = accept.await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn idle_rpc_connections_are_closed_after_the_request_read_timeout() {
+        use std::time::Duration;
+
+        let (root, paths) = test_paths("idle-timeout");
+        let server = server_for(&root, paths);
+        let listener = server.bind().unwrap();
+        let accept = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                server
+                    .serve_connection_with_timeout(Channel::Ro, stream, Duration::from_millis(20))
+                    .await;
+            })
+        };
+
+        let mut client = UnixStream::connect(root.join("helper-ro.sock"))
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::framing::read_json_frame::<RpcResponse, _>(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("request read timed out"));
+        accept.await.unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
 }

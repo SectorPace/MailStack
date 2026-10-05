@@ -1561,13 +1561,19 @@ impl Readers {
             unit,
             parsed,
         );
-        if let Some(output) = outcome.output.as_ref().filter(|o| !o.success()) {
-            // 命令跑了但返回非零：如实报错，而不是回一个「看起来重启成功」的列表。
+        if !outcome.success() {
+            // 命令跑了但返回非零，或 runner 不支持超时/进程未能启动：如实报错，而不是回一个「看起来重启成功」的列表。
+            let detail = outcome
+                .output
+                .as_ref()
+                .map(|output| output.diagnostic(parsed.as_str()))
+                .or_else(|| outcome.failure_reason())
+                .unwrap_or_else(|| "command failed".to_string());
             return Err(HandlerError::new(format!(
                 "{} {}: {}",
                 parsed.as_str(),
                 unit,
-                output.diagnostic(parsed.as_str())
+                detail
             )));
         }
 
@@ -3233,6 +3239,15 @@ mod tests {
             ));
             Ok(self.output.clone())
         }
+
+        fn run_with_timeout(
+            &self,
+            program: &str,
+            args: &[&str],
+            _timeout: std::time::Duration,
+        ) -> mailstack_core::CoreResult<CommandOutput> {
+            self.run(program, args)
+        }
     }
 
     /// 什么都不存在的环境探测：所有服务都判为未运行。
@@ -4120,6 +4135,35 @@ mod tests {
             .services_action(&json!({ "id": "dovecot", "verb": "restart" }))
             .unwrap_err();
         assert!(err.to_string().contains("exited with 1"), "实际: {err}");
+    }
+
+    #[test]
+    fn services_action_reports_a_runner_without_timeout_support_as_failure() {
+        let f = Fixture::new("svctimeoutunsupported");
+        struct NoTimeoutRunner;
+        impl CommandRunner for NoTimeoutRunner {
+            fn run(
+                &self,
+                _program: &str,
+                _args: &[&str],
+            ) -> mailstack_core::CoreResult<CommandOutput> {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let readers = f.readers_with_env(Arc::new(NoTimeoutRunner), systemd_env());
+
+        let error = readers
+            .services_action(&json!({ "id": "dovecot", "verb": "restart" }))
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("未实现超时"),
+            "实际错误：{error}"
+        );
     }
 
     #[test]

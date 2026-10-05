@@ -14,6 +14,7 @@
 //! 表文件写好了、hash 表也编译了，但 Postfix 仍在用旧配置读。因此降级链必须
 //! **逐级按基线语义**实现，并且每一级都要有测试。
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::error::{CoreError, CoreResult};
@@ -93,7 +94,7 @@ pub struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn run(&self, program: &str, args: &[&str]) -> CoreResult<CommandOutput> {
-        let resolved = resolve_program(program);
+        let resolved = resolve_program_for_execution(program)?;
         let output = std::process::Command::new(&resolved)
             .args(args)
             .output()
@@ -115,7 +116,7 @@ impl CommandRunner for SystemCommandRunner {
         use std::io::Write;
         use std::process::Stdio;
 
-        let resolved = resolve_program(program);
+        let resolved = resolve_program_for_execution(program)?;
         let mut child = std::process::Command::new(&resolved)
             .args(args)
             .stdin(Stdio::piped())
@@ -150,7 +151,7 @@ impl CommandRunner for SystemCommandRunner {
         use std::process::Stdio;
         use std::time::Instant;
 
-        let resolved = resolve_program(program);
+        let resolved = resolve_program_for_execution(program)?;
         let mut child = std::process::Command::new(&resolved)
             .args(args)
             // 不继承调用方的 stdin：外部命令不该从助手进程偷读输入。
@@ -195,9 +196,11 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
-/// 解析可执行文件路径：先查 `PATH`，再查常见 sbin 目录。
+/// 解析可信可执行文件路径：先查 `PATH`，再查常见 sbin 目录。
 ///
 /// 与 `core.py` 的 `run()` 行为一致 —— 特权助手的 `PATH` 通常不含 `/usr/sbin`。
+/// Unix 下只接受由 root 或当前进程用户拥有、且自身不可被组/其他用户改写的程序，
+/// 并跳过不可信目录，避免特权进程执行被 PATH 劫持的命令。
 pub fn resolve_program(program: &str) -> String {
     if program.contains('/') {
         return program.to_string();
@@ -207,7 +210,7 @@ pub fn resolve_program(program: &str) -> String {
     }
     for dir in ["/usr/sbin", "/sbin", "/usr/local/sbin", "/usr/local/bin"] {
         let candidate = format!("{dir}/{program}");
-        if Path::new(&candidate).exists() {
+        if is_trusted_executable(Path::new(&candidate)) {
             return candidate;
         }
     }
@@ -216,10 +219,86 @@ pub fn resolve_program(program: &str) -> String {
 
 fn which(program: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    find_in_path(program, &path)
+}
+
+fn find_in_path(program: &str, path: &OsStr) -> Option<String> {
+    std::env::split_paths(path)
         .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_trusted_executable(candidate))
         .map(|p| p.to_string_lossy().into_owned())
+}
+
+fn resolve_program_for_execution(program: &str) -> CoreResult<String> {
+    let path = if program.contains('/') {
+        PathBuf::from(program)
+    } else {
+        which(program)
+            .map(PathBuf::from)
+            .or_else(|| {
+                ["/usr/sbin", "/sbin", "/usr/local/sbin", "/usr/local/bin"]
+                    .iter()
+                    .map(|dir| PathBuf::from(dir).join(program))
+                    .find(|candidate| is_trusted_executable(candidate))
+            })
+            .ok_or_else(|| CoreError::NotFound(PathBuf::from(program)))?
+    };
+    if !is_trusted_executable(&path) {
+        return Err(CoreError::io(
+            path,
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        ));
+    }
+    std::fs::canonicalize(&path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| CoreError::io(path, error))
+}
+
+#[cfg(unix)]
+fn is_trusted_executable(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return false;
+    };
+    let effective_uid = unsafe { libc::geteuid() };
+    let mode = metadata.mode();
+    if !metadata.is_file()
+        || mode & 0o111 == 0
+        || mode & 0o022 != 0
+        || !is_trusted_owner(metadata.uid(), effective_uid)
+    {
+        return false;
+    }
+
+    let mut directory = path.parent();
+    while let Some(path) = directory {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        let mode = metadata.mode();
+        if !metadata.is_dir()
+            || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+            || !is_trusted_owner(metadata.uid(), effective_uid)
+        {
+            return false;
+        }
+        directory = path.parent();
+    }
+    true
+}
+
+#[cfg(unix)]
+fn is_trusted_owner(owner: u32, effective_uid: u32) -> bool {
+    owner == 0 || owner == effective_uid
+}
+
+#[cfg(not(unix))]
+fn is_trusted_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 // ───────────────────────── 服务控制（§5.7.4） ─────────────────────────
@@ -235,6 +314,8 @@ pub enum ServiceVerb {
     Restart,
     Reload,
 }
+
+const SERVICE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl ServiceVerb {
     pub fn as_str(&self) -> &'static str {
@@ -371,35 +452,37 @@ pub fn service_ctl(
     unit: &str,
     verb: ServiceVerb,
 ) -> ServiceCtlOutcome {
-    let run = |program: &str, args: &[&str]| match runner.run(program, args) {
-        Ok(output) => ServiceCtlOutcome {
-            backend: match program {
-                "systemctl" => ServiceBackend::Systemctl,
-                "service" => ServiceBackend::Service,
-                "rc-service" => ServiceBackend::RcService,
-                "postfix" => ServiceBackend::Postfix,
-                "dovecot" => ServiceBackend::Dovecot,
-                "fail2ban-client" => ServiceBackend::Fail2ban,
-                other => ServiceBackend::InitScript(PathBuf::from(other)),
+    let run = |program: &str, args: &[&str]| {
+        match runner.run_with_timeout(program, args, SERVICE_COMMAND_TIMEOUT) {
+            Ok(output) => ServiceCtlOutcome {
+                backend: match program {
+                    "systemctl" => ServiceBackend::Systemctl,
+                    "service" => ServiceBackend::Service,
+                    "rc-service" => ServiceBackend::RcService,
+                    "postfix" => ServiceBackend::Postfix,
+                    "dovecot" => ServiceBackend::Dovecot,
+                    "fail2ban-client" => ServiceBackend::Fail2ban,
+                    other => ServiceBackend::InitScript(PathBuf::from(other)),
+                },
+                output: Some(output),
+                spawn_error: None,
             },
-            output: Some(output),
-            spawn_error: None,
-        },
-        // 曾经是 `.ok()` —— spawn 失败被压成 `None`，而 `success()` 对 `None`
-        // 返回 `true`，于是「systemctl 根本没跑起来」被报成「重载成功」。
-        Err(error) => ServiceCtlOutcome {
-            backend: match program {
-                "systemctl" => ServiceBackend::Systemctl,
-                "service" => ServiceBackend::Service,
-                "rc-service" => ServiceBackend::RcService,
-                "postfix" => ServiceBackend::Postfix,
-                "dovecot" => ServiceBackend::Dovecot,
-                "fail2ban-client" => ServiceBackend::Fail2ban,
-                other => ServiceBackend::InitScript(PathBuf::from(other)),
+            // 曾经是 `.ok()` —— spawn 失败被压成 `None`，而 `success()` 对 `None`
+            // 返回 `true`，于是「systemctl 根本没跑起来」被报成「重载成功」。
+            Err(error) => ServiceCtlOutcome {
+                backend: match program {
+                    "systemctl" => ServiceBackend::Systemctl,
+                    "service" => ServiceBackend::Service,
+                    "rc-service" => ServiceBackend::RcService,
+                    "postfix" => ServiceBackend::Postfix,
+                    "dovecot" => ServiceBackend::Dovecot,
+                    "fail2ban-client" => ServiceBackend::Fail2ban,
+                    other => ServiceBackend::InitScript(PathBuf::from(other)),
+                },
+                output: None,
+                spawn_error: Some(error.to_string()),
             },
-            output: None,
-            spawn_error: Some(format!("{program}: {error}")),
-        },
+        }
     };
 
     if env.program_available("systemctl") && env.path_exists(Path::new("/run/systemd/system")) {
@@ -494,7 +577,8 @@ pub fn is_service_active(env: &dyn ServiceEnv, runner: &dyn CommandRunner, unit:
         }
     }
 
-    match runner.run("pgrep", &["-f", unit]) {
+    let pattern = format!(".*{}.*", regex::escape(unit));
+    match runner.run("pgrep", &["-f", &pattern]) {
         Ok(out) => out.success(),
         Err(_) => false,
     }
@@ -588,6 +672,7 @@ mod tests {
     /// 记录调用并按脚本返回结果。
     struct RecordingRunner {
         calls: Mutex<Vec<(String, Vec<String>)>>,
+        timeouts: Mutex<Vec<(String, std::time::Duration)>>,
         postmap_status: i32,
         check_status: i32,
         reload_status: i32,
@@ -597,6 +682,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                timeouts: Mutex::new(Vec::new()),
                 postmap_status: 0,
                 check_status: 0,
                 reload_status: 0,
@@ -634,6 +720,33 @@ mod tests {
                 },
             })
         }
+
+        fn run_with_timeout(
+            &self,
+            program: &str,
+            args: &[&str],
+            timeout: std::time::Duration,
+        ) -> CoreResult<CommandOutput> {
+            self.timeouts
+                .lock()
+                .unwrap()
+                .push((program.to_string(), timeout));
+            self.run(program, args)
+        }
+    }
+
+    #[test]
+    fn service_ctl_runs_its_command_with_a_bounded_timeout() {
+        let runner = RecordingRunner::new();
+        let env = FakeEnv::with(&["systemctl"], &["/run/systemd/system"]);
+
+        let outcome = service_ctl(&env, &runner, "postfix", ServiceVerb::Reload);
+
+        assert!(outcome.success());
+        assert_eq!(
+            *runner.timeouts.lock().unwrap(),
+            vec![("systemctl".to_string(), SERVICE_COMMAND_TIMEOUT)]
+        );
     }
 
     /// 可编排的环境探测。
@@ -641,6 +754,101 @@ mod tests {
     struct FakeEnv {
         programs: Vec<&'static str>,
         paths: Vec<&'static str>,
+    }
+
+    #[test]
+    fn is_service_active_treats_unit_metacharacters_as_literals() {
+        let runner = StatusRunner::new(&[("pgrep", 1, "")]);
+        let env = FakeEnv::with(&[], &[]);
+
+        assert!(!is_service_active(&env, &runner, "postfix|bash"));
+        assert_eq!(
+            runner.calls.lock().unwrap()[0].1,
+            vec!["-f", ".*postfix\\|bash.*"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_resolution_rejects_non_executable_and_group_writable_commands() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "mailstack-exec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let command = dir.join("helper");
+        std::fs::write(&command, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(find_in_path("helper", dir.as_os_str()), None);
+
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(find_in_path("helper", dir.as_os_str()), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn command_execution_refuses_to_fall_back_to_an_unresolved_bare_name() {
+        let error =
+            resolve_program_for_execution("mailstack-no-such-command-2b3e35c1").unwrap_err();
+        assert!(matches!(error, CoreError::NotFound(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_execution_refuses_a_program_in_an_untrusted_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "mailstack-exec-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let command = dir.join("helper");
+        std::fs::write(&command, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = SystemCommandRunner
+            .run(command.to_str().unwrap(), &[])
+            .unwrap_err();
+
+        assert!(matches!(error, CoreError::Io { .. }));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_resolution_skips_commands_in_untrusted_writable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "mailstack-exec-unsafe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let unsafe_dir = dir.join("unsafe");
+        std::fs::create_dir(&unsafe_dir).unwrap();
+        std::fs::set_permissions(&unsafe_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let command = unsafe_dir.join("helper");
+        std::fs::write(&command, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(find_in_path("helper", unsafe_dir.as_os_str()), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     impl FakeEnv {

@@ -27,6 +27,24 @@ pub struct PinnedTarget {
     pub pinned: SocketAddr,
 }
 
+/// 判断一个地址是否属于明确的本地私网段（RFC 1918 / IPv6 ULA）。
+///
+/// 该判定刻意不包含 loopback、link-local、CGNAT、文档段或其他特殊用途地址；
+/// 对 IPv4-mapped、6to4 和 Teredo 地址也检查其中嵌入的 IPv4 地址。
+pub fn is_private_network_address(ip: IpAddr) -> bool {
+    if let IpAddr::V6(v6) = ip {
+        let embedded = embedded_ipv4_candidates(v6);
+        if !embedded.is_empty() {
+            return embedded
+                .iter()
+                .all(|v4| is_private_network_address(IpAddr::V4(*v4)));
+        }
+        return (v6.segments()[0] & 0xfe00) == 0xfc00;
+    }
+
+    is_private(ip)
+}
+
 impl PinnedTarget {
     /// 拨号字符串形式：`ip:port`。**故意不提供** `host:port` 形式。
     pub fn dial_addr(&self) -> SocketAddr {
@@ -394,6 +412,34 @@ mod tests {
         assert!(policy.accepts(ip("10.0.0.1")));
         assert!(!policy.accepts(ip("0.0.0.0")));
         assert!(!policy.accepts(ip("224.0.0.1")));
+    }
+
+    #[test]
+    fn private_network_address_policy_excludes_loopback_link_local_and_special_ranges() {
+        for allowed in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "fc00::1",
+            "fd12:3456::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(is_private_network_address(ip(allowed)), "{allowed}");
+        }
+
+        for blocked in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "192.0.2.1",
+            "::1",
+            "fe80::1",
+            "2001:db8::1",
+            "::ffff:169.254.169.254",
+            "2001:0000:4136:e378:8000:63bf:f5ff:fffe",
+        ] {
+            assert!(!is_private_network_address(ip(blocked)), "{blocked}");
+        }
     }
 
     #[test]

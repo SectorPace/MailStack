@@ -244,8 +244,7 @@ pub const ROUTES: &[RouteSpec] = &[
     // ── AI 子系统 ──
     r("GET", "/api/ai/config", Some("ai.config.get"), Required),
     r("POST", "/api/ai/config", Some("ai.config.set"), Required),
-    // 同一路径两个方法映射到**同一个只读动作**：前端用 GET 取模型列表，
-    // 既有 POST 端点是规格书 §5.2 的原始声明，保持不变。
+    // 模型列表会向外部发送已保存凭据，因此 GET/POST 都必须经特权动作路由。
     r("GET", "/api/ai/models", Some("ai.models.list"), Required),
     r("POST", "/api/ai/models", Some("ai.models.list"), Required),
     r("POST", "/api/ai/test", Some("ai.test"), Required),

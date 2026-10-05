@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-/// 只读动作（22 项）。这些动作可直连 `/run/mailstack/helper-ro.sock`。
+/// 只读动作（21 项）。这些动作可直连 `/run/mailstack/helper-ro.sock`。
 pub const ALLOWED_ACTIONS_RO: &[&str] = &[
     // 纯读聚合：status() 汇总 domains/users/aliases/queue/certs/logs 的只读列表。
     "snapshot",
@@ -34,8 +34,6 @@ pub const ALLOWED_ACTIONS_RO: &[&str] = &[
     "admin.get",
     // 读 ai-provider.json 的公开配置。
     "ai.config.get",
-    // 读配置 + 出站列模型，不写本机状态。
-    "ai.models.list",
     // 仅出站 TCP 端口探测，不写本机状态。
     "network.check_port",
     // ── 以下 8 项为管理前端（mailstack-admin-frontend）新增 ──
@@ -104,10 +102,11 @@ pub const ALLOWED_ACTIONS_RW: &[&str] = &[
     "admin.totp.disable",
     "admin.totp.consume_recovery",
     "admin.totp.verify",
-    // AI 配置写入与出站对话 / 诊断 / 解析（非只读白名单成员，保守归 RW）。
+    // AI 配置写入、出站对话 / 诊断 / 解析与模型枚举（出站携带受保护凭据）。
     "ai.config.set",
     "ai.test",
     "ai.chat",
+    "ai.models.list",
     "ai.diagnose",
     "ai.parse",
 ];
@@ -230,12 +229,18 @@ mod tests {
     }
 
     #[test]
-    fn read_only_set_has_exactly_twenty_two_actions() {
+    fn read_only_set_has_twenty_one_actions_after_moving_models_to_rw() {
         // 规格书 §5.4.1 明示 RO 为 14 项；数量漂移意味着归类纪律被破坏。
-        // 14 → 22：为管理前端扩展了 8 个纯读列表动作（users.list / aliases.list /
-        // queue.list / services.list / dkim.keys / dns.records / metrics.system /
-        // activity.list）。它们全部无副作用，符合「纯读者入 RO」的纪律。
-        assert_eq!(ALLOWED_ACTIONS_RO.len(), 22);
+        // 管理前端增加了 8 个纯读列表动作，随后 `ai.models.list` 因携带 API key
+        // 的出站请求从 RO 移到 RW；因此当前只读集合长度为 21 项。
+        assert_eq!(ALLOWED_ACTIONS_RO.len(), 21);
+    }
+
+    #[test]
+    fn model_listing_is_confined_to_the_privileged_channel() {
+        assert!(!is_ro("ai.models.list"));
+        assert!(is_rw("ai.models.list"));
+        assert_eq!(classify("ai.models.list"), Channel::Rw);
     }
 
     #[test]

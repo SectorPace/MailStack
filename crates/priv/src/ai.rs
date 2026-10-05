@@ -353,7 +353,12 @@ fn validate_endpoint(
     resolver: &dyn HostResolver,
 ) -> Result<Endpoint, String> {
     let raw_url = url.trim().trim_end_matches('/').to_string();
-    if raw_url.is_empty() || raw_url.len() > MAX_URL_LEN {
+    if raw_url.is_empty()
+        || raw_url.len() > MAX_URL_LEN
+        || raw_url
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+    {
         return Err("Invalid AI endpoint URL".to_string());
     }
     let parts = parse_url(&raw_url)?;
@@ -363,7 +368,7 @@ fn validate_endpoint(
     if parts.has_userinfo || parts.has_fragment {
         return Err("AI endpoint cannot include credentials or a URL fragment".to_string());
     }
-    if parts.scheme == "http" && !allow_private {
+    if parts.scheme == "http" {
         return Err("Public AI endpoints must use HTTPS".to_string());
     }
 
@@ -376,15 +381,20 @@ fn validate_endpoint(
             parts.host
         ));
     }
-    if !allow_private {
-        let policy = AddressPolicy::public_only();
-        for ip in &ips {
-            if !policy.accepts(*ip) {
+    let public_policy = AddressPolicy::public_only();
+    for ip in &ips {
+        if allow_private {
+            if !public_policy.accepts(*ip) && !mailstack_smtp::is_private_network_address(*ip) {
                 return Err(format!(
-                    "AI endpoint {} resolves to restricted address ({ip}); private-network access must be explicitly enabled to reduce SSRF risk",
+                    "AI endpoint {} resolves to a restricted address ({ip})",
                     parts.host
                 ));
             }
+        } else if !public_policy.accepts(*ip) {
+            return Err(format!(
+                "AI endpoint {} resolves to restricted address ({ip}); private-network access must be explicitly enabled to reduce SSRF risk",
+                parts.host
+            ));
         }
     }
 
@@ -419,12 +429,20 @@ fn build_request_bytes(
     method: &str,
     headers: &[(String, String)],
     body: Option<&[u8]>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, String> {
     let target = if endpoint.query.is_empty() {
         endpoint.path.clone()
     } else {
         format!("{}?{}", endpoint.path, endpoint.query)
     };
+    if [method, target.as_str()].iter().any(|value| {
+        value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+    }) || !method.bytes().all(|byte| byte.is_ascii_alphabetic())
+    {
+        return Err("AI request contains an invalid request line".to_string());
+    }
 
     let mut out = String::new();
     out.push_str(&format!("{method} {target} HTTP/1.1\r\n"));
@@ -439,6 +457,32 @@ fn build_request_bytes(
         out.push_str(&format!("Host: {host}\r\n"));
     }
     for (k, v) in headers {
+        if k.is_empty()
+            || !k.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+            || v.bytes()
+                .any(|byte| byte.is_ascii_control() && byte != b'\t')
+        {
+            return Err("AI request contains an invalid HTTP header".to_string());
+        }
         out.push_str(&format!("{k}: {v}\r\n"));
     }
     if !has("connection") {
@@ -453,7 +497,7 @@ fn build_request_bytes(
     if let Some(body) = body {
         bytes.extend_from_slice(body);
     }
-    bytes
+    Ok(bytes)
 }
 
 /// 解析后的 HTTP 响应。
@@ -695,7 +739,7 @@ impl SystemAiTransport {
             )
             .map_err(|e| e.to_string())?;
 
-            let bytes = build_request_bytes(&endpoint, &method, &request.headers, body.as_deref());
+            let bytes = build_request_bytes(&endpoint, &method, &request.headers, body.as_deref())?;
             let raw = self
                 .exchange(
                     &dialer,
@@ -878,10 +922,14 @@ impl Ai {
             "updatedAt": mailstack_core::now_iso8601_utc(),
         });
         let text = format!("{}\n", serde_json::to_string_pretty(&cfg)?);
-        atomic::atomic(&self.paths.ai_config, text.as_bytes(), 0o600)?;
+        atomic::atomic_as(&self.paths.ai_config, text.as_bytes(), 0o600, None)?;
         // 镜像一份到 `etc/ai.json`（0600）；失败只告警。
-        if let Err(error) = atomic::atomic(&self.paths.etc.join("ai.json"), text.as_bytes(), 0o600)
-        {
+        if let Err(error) = atomic::atomic_as(
+            &self.paths.etc.join("ai.json"),
+            text.as_bytes(),
+            0o600,
+            None,
+        ) {
             mailstack_core::warn::warn_with_detail(
                 "mirror AI config to ai.json",
                 &error.to_string(),
@@ -893,26 +941,22 @@ impl Ai {
     // ── ai.models.list ──
 
     /// `ai.models.list`：拉取供应商的模型清单。
-    pub async fn models_list(&self, data: &Value) -> Result<Value, HandlerError> {
-        let provider = str_field(data, "provider").trim();
-        let preset = preset(provider);
+    pub async fn models_list(&self, _data: &Value) -> Result<Value, HandlerError> {
         let cfg = read_ai_config(&self.paths);
-        let allow_private = self.effective_private(data, &cfg)?;
-        if truthy(data.get("insecureTls")) || truthy(cfg.get("insecureTls")) {
+        if truthy(cfg.get("insecureTls")) {
             return Err(HandlerError::new(
                 "TLS verification cannot be disabled for AI requests",
             ));
         }
 
-        let mut base_url = str_field(data, "baseUrl")
+        let provider = cfg_str(&cfg, "provider").and_then(|provider| preset(&provider));
+        let allow_private = self.effective_private(&json!({}), &cfg)?;
+        let base_url = cfg_str(&cfg, "baseUrl")
+            .or_else(|| provider.map(|p| p.base_url.to_string()))
+            .unwrap_or_default()
             .trim()
             .trim_end_matches('/')
             .to_string();
-        if base_url.is_empty() {
-            base_url = preset
-                .map(|p| p.base_url.trim_end_matches('/').to_string())
-                .unwrap_or_default();
-        }
         if base_url.is_empty() {
             return Err(HandlerError::new(
                 "AI provider API base URL is not configured",
@@ -921,9 +965,8 @@ impl Ai {
         validate_endpoint(&base_url, allow_private, self.resolver()).map_err(HandlerError::new)?;
 
         let api_key = first_truthy([
-            Some(str_field(data, "apiKey").trim().to_string()),
             cfg_str(&cfg, "apiKey"),
-            preset.map(|p| p.default_key.to_string()),
+            provider.map(|p| p.default_key.to_string()),
         ]);
 
         let mut headers = vec![
@@ -1715,6 +1758,29 @@ mod tests {
             .config_set(&json!({ "provider": "custom", "baseUrl": "https://internal.corp", "apiKey": "k123456789", "allowPrivateNetwork": true }))
             .unwrap();
         assert_eq!(out["allowPrivateNetwork"], true);
+
+        assert_eq!(
+            validate_endpoint(
+                "http://internal.corp",
+                true,
+                &FakeResolver::with("internal.corp", &["10.0.0.5"])
+            )
+            .unwrap_err(),
+            "Public AI endpoints must use HTTPS"
+        );
+        assert!(validate_endpoint(
+            "https://mixed.corp",
+            true,
+            &FakeResolver::with("mixed.corp", &["8.8.8.8", "10.0.0.5"])
+        )
+        .is_ok());
+        assert!(validate_endpoint(
+            "https://metadata.corp",
+            true,
+            &FakeResolver::with("metadata.corp", &["169.254.169.254"])
+        )
+        .unwrap_err()
+        .contains("restricted address"));
     }
 
     // ── 3. insecureTls 一律拒绝 ──
@@ -1740,12 +1806,9 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        assert_eq!(
-            rt.block_on(ai.models_list(&json!({ "provider": "deepseek", "insecureTls": true })))
-                .unwrap_err()
-                .to_string(),
-            expected
-        );
+        // 注意：`ai.models.list` 不在这里 —— 自 4.18 修复起它**完全忽略请求体**
+        // （`models_list(&self, _data)`），目标 URL 与凭据只来自持久化配置。
+        // 它的 insecureTls 判定改由 `models_list_reads_insecure_tls_only_from_config` 覆盖。
         assert_eq!(
             rt.block_on(ai.chat(
                 &json!({ "messages": [{ "role": "user", "content": "hi" }], "insecureTls": true })
@@ -1807,10 +1870,17 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
             let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode(&f.paths.ai_config), 0o600);
             assert_eq!(mode(&f.paths.etc.join("ai.json")), 0o600);
+            assert_eq!(fs::metadata(&f.paths.ai_config).unwrap().gid(), unsafe {
+                libc::getegid()
+            });
+            assert_eq!(
+                fs::metadata(f.paths.etc.join("ai.json")).unwrap().gid(),
+                unsafe { libc::getegid() }
+            );
         }
     }
 
@@ -1835,6 +1905,7 @@ mod tests {
     #[test]
     fn models_list_requires_a_configured_base_url() {
         let f = Fixture::new("modelsnourl");
+        f.write_config(json!({ "provider": "custom", "apiKey": "secret-key" }));
         let ai = f.ai(Arc::new(FakeResolver::default()), no_transport(), false);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1851,21 +1922,27 @@ mod tests {
     #[test]
     fn models_list_reports_a_non_200_and_parses_both_shapes() {
         let f = Fixture::new("models");
-        let resolver = Arc::new(FakeResolver::with("api.example.com", &["8.8.8.8"]));
+        let resolver = Arc::new(
+            FakeResolver::with("api.example.com", &["8.8.8.8"])
+                .add("attacker.example", &["9.9.9.9"]),
+        );
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
         // 非 200。
+        f.write_config(json!({
+            "provider": "custom",
+            "baseUrl": "https://api.example.com",
+            "apiKey": "stored-key",
+        }));
         let transport = FakeTransport::with(vec![Ok(json_response(500, "Boom", json!({})))]);
         let ai = f.ai(Arc::clone(&resolver), transport, false);
         assert_eq!(
-            rt.block_on(ai.models_list(
-                &json!({ "baseUrl": "https://api.example.com", "apiKey": "k123456789" })
-            ))
-            .unwrap_err()
-            .to_string(),
+            rt.block_on(ai.models_list(&json!({})))
+                .unwrap_err()
+                .to_string(),
             "AI model list request failed: HTTP 500 (Boom)"
         );
 
@@ -1876,11 +1953,7 @@ mod tests {
             json!({ "data": [{ "id": "b" }, "c", { "id": "a" }, { "id": "a" }] }),
         ))]);
         let ai = f.ai(Arc::clone(&resolver), transport, false);
-        let out = rt
-            .block_on(ai.models_list(
-                &json!({ "baseUrl": "https://api.example.com", "apiKey": "k123456789" }),
-            ))
-            .unwrap();
+        let out = rt.block_on(ai.models_list(&json!({}))).unwrap();
         assert_eq!(out["models"], json!(["a", "b", "c"]));
         assert_eq!(out["count"], 3);
         assert_eq!(out["baseUrl"], "https://api.example.com");
@@ -1892,11 +1965,7 @@ mod tests {
             json!([{ "id": "x" }, "y"]),
         ))]);
         let ai = f.ai(resolver, transport, false);
-        let out = rt
-            .block_on(ai.models_list(
-                &json!({ "baseUrl": "https://api.example.com", "apiKey": "k123456789" }),
-            ))
-            .unwrap();
+        let out = rt.block_on(ai.models_list(&json!({}))).unwrap();
         assert_eq!(out["models"], json!(["x", "y"]));
         assert_eq!(out["baseUrl"], "https://api.example.com");
     }
@@ -1905,6 +1974,11 @@ mod tests {
     fn models_list_sends_a_bearer_token_and_the_documented_headers() {
         let f = Fixture::new("modelsreq");
         let resolver = Arc::new(FakeResolver::with("api.example.com", &["8.8.8.8"]));
+        f.write_config(json!({
+            "provider": "custom",
+            "baseUrl": "https://api.example.com",
+            "apiKey": "stored-key",
+        }));
         let transport =
             FakeTransport::with(vec![Ok(json_response(200, "OK", json!({ "data": [] })))]);
         let ai = f.ai(resolver, Arc::clone(&transport), false);
@@ -1913,11 +1987,10 @@ mod tests {
             .build()
             .unwrap();
 
-        rt.block_on(
-            ai.models_list(
-                &json!({ "baseUrl": "https://api.example.com", "apiKey": "k123456789" }),
-            ),
-        )
+        rt.block_on(ai.models_list(&json!({
+            "baseUrl": "https://attacker.example",
+            "apiKey": "attacker-controlled",
+        })))
         .unwrap();
         let requests = transport.requests();
         assert_eq!(requests.len(), 1);
@@ -1926,12 +1999,100 @@ mod tests {
         assert!(requests[0]
             .headers
             .iter()
-            .any(|(k, v)| k == "authorization" && v == "Bearer k123456789"));
+            .any(|(k, v)| k == "authorization" && v == "Bearer stored-key"));
         assert!(requests[0]
             .headers
             .iter()
             .any(|(k, v)| k == "User-Agent" && v == "MailStack-AI-Hub/1.0"));
         assert_eq!(requests[0].timeout_secs, 15);
+        assert_eq!(requests[0].url, "https://api.example.com/models");
+    }
+
+    #[test]
+    fn models_list_rejects_a_persisted_private_endpoint_without_deployment_permission() {
+        let f = Fixture::new("modelsprivate");
+        f.write_config(json!({
+            "provider": "custom",
+            "baseUrl": "https://internal.example",
+            "apiKey": "stored-key",
+            "allowPrivateNetwork": true,
+        }));
+        let transport = FakeTransport::with(vec![]);
+        let ai = f.ai(
+            Arc::new(FakeResolver::with("internal.example", &["10.0.0.5"])),
+            Arc::clone(&transport),
+            false,
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            rt.block_on(ai.models_list(&json!({})))
+                .unwrap_err()
+                .to_string(),
+            "Private AI network access is disabled by deployment policy"
+        );
+        assert!(transport.requests().is_empty());
+    }
+
+    /// `insecureTls` 只认持久化配置：请求体里的同名字段既不能关掉 TLS 校验，
+    /// 也不会被当成拒绝理由（4.18 之后请求体整体不被信任）。
+    #[test]
+    fn models_list_reads_insecure_tls_only_from_config() {
+        let expected = "TLS verification cannot be disabled for AI requests";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // (a) 配置里的 insecureTls → 拒绝，且一次请求都不许发出去。
+        let configured = Fixture::new("modelstlsbad");
+        configured.write_config(json!({
+            "provider": "custom",
+            "baseUrl": "https://api.example.com",
+            "apiKey": "stored-key",
+            "insecureTls": true,
+        }));
+        let transport = FakeTransport::with(vec![]);
+        let ai = configured.ai(
+            Arc::new(FakeResolver::with("api.example.com", &["8.8.8.8"])),
+            Arc::clone(&transport),
+            false,
+        );
+
+        assert_eq!(
+            rt.block_on(ai.models_list(&json!({ "insecureTls": false })))
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        assert!(transport.requests().is_empty());
+
+        // (b) 请求体里的 insecureTls → 被忽略，正常出站（目标仍取自配置）。
+        let ignored = Fixture::new("modelstlsbody");
+        ignored.write_config(json!({
+            "provider": "custom",
+            "baseUrl": "https://api.example.com",
+            "apiKey": "stored-key",
+        }));
+        let transport =
+            FakeTransport::with(vec![Ok(json_response(200, "OK", json!({ "data": [] })))]);
+        let ai = ignored.ai(
+            Arc::new(FakeResolver::with("api.example.com", &["8.8.8.8"])),
+            Arc::clone(&transport),
+            false,
+        );
+
+        rt.block_on(ai.models_list(&json!({
+            "insecureTls": true,
+            "baseUrl": "https://attacker.example",
+        })))
+        .unwrap();
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url, "https://api.example.com/models");
     }
 
     // ── 6. ai.chat ──
@@ -2377,13 +2538,48 @@ mod tests {
             &[("content-type".to_string(), "application/json".to_string())],
             Some(b"{}"),
         );
-        let text = String::from_utf8(bytes).unwrap();
+        let text = String::from_utf8(bytes.unwrap()).unwrap();
         assert!(text.starts_with("POST /v1/chat?x=1 HTTP/1.1\r\n"));
         assert!(text.contains("Host: ai.example.com\r\n"));
         assert!(text.contains("content-type: application/json\r\n"));
         assert!(text.contains("Content-Length: 2\r\n"));
         assert!(text.contains("Connection: close\r\n"));
         assert!(text.ends_with("\r\n\r\n{}"));
+    }
+
+    #[test]
+    fn request_bytes_reject_crlf_injection_in_method_target_and_headers() {
+        let resolver = FakeResolver::with("ai.example.com", &["8.8.8.8"]);
+        let ep = endpoint("https://ai.example.com/v1/chat?x=1", &resolver);
+        let invalid_headers = [
+            vec![(
+                "authorization".to_string(),
+                "Bearer secret\r\nX-Evil: 1".to_string(),
+            )],
+            vec![("x-safe\r\nX-Evil".to_string(), "value".to_string())],
+            vec![("x-safe".to_string(), "value\nInjected: yes".to_string())],
+        ];
+        for headers in invalid_headers {
+            assert!(build_request_bytes(&ep, "GET", &headers, None).is_err());
+        }
+        assert!(build_request_bytes(&ep, "GET\r\nX-Evil: 1", &[], None).is_err());
+
+        let mut injected_target = ep;
+        injected_target.query = "x=1\r\nX-Evil: yes".to_string();
+        assert!(build_request_bytes(&injected_target, "GET", &[], None).is_err());
+    }
+
+    #[test]
+    fn endpoint_urls_reject_control_characters_and_spaces() {
+        let resolver = FakeResolver::with("ai.example.com", &["8.8.8.8"]);
+        for url in [
+            "https://ai.example.com/path\r\nX-Evil: 1",
+            "https://ai.example.com/path\nX-Evil: 1",
+            "https://ai.example.com/a path",
+            "https://ai.example.com/?key=value\tInjected",
+        ] {
+            assert!(validate_endpoint(url, false, &resolver).is_err(), "{url:?}");
+        }
     }
 
     // ── 10. 密钥不出现在错误文案里 ──

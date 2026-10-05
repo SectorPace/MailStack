@@ -56,6 +56,7 @@ pub const PROTECTED_USERS: &[&str] = &[
     "dovecot",
     "nobody",
     "mailstack-admin",
+    "mailstack-web",
 ];
 
 /// 注册表与纪元文件的权限位。
@@ -368,11 +369,23 @@ impl Users {
         if let Some(chpasswd) = self.env.programs.which("chpasswd") {
             let chpasswd = chpasswd.display().to_string();
             let stdin = format!("{user}:{password}\n");
-            self.runner.run_with_input(&chpasswd, &[], &stdin)?;
+            let result = self.runner.run_with_input(&chpasswd, &[], &stdin)?;
+            if !result.success() {
+                return Err(HandlerError::new(format!(
+                    "password change failed: {}",
+                    command_detail(&result)
+                )));
+            }
         } else {
             // 退回交互式 `passwd`：stdin 里喂两遍（提示两次输入）。
             let stdin = format!("{password}\n{password}\n");
-            self.runner.run_with_input("passwd", &[user], &stdin)?;
+            let result = self.runner.run_with_input("passwd", &[user], &stdin)?;
+            if !result.success() {
+                return Err(HandlerError::new(format!(
+                    "password change failed: {}",
+                    command_detail(&result)
+                )));
+            }
         }
         Ok(())
     }
@@ -541,6 +554,9 @@ impl Users {
             username_field
         };
 
+        if is_protected(&user) {
+            return Err(HandlerError::new("mailbox username is protected"));
+        }
         if !USER_RE.is_match(&user) || !ADDRESS_RE.is_match(&email) {
             return Err(HandlerError::new("invalid mailbox identity"));
         }
@@ -632,14 +648,30 @@ impl Users {
             let userdel = userdel.display().to_string();
             let result = self.runner.run(&userdel, &["-r", user])?;
             if !result.success() {
-                self.runner.run(&userdel, &[user])?;
+                let fallback = self.runner.run(&userdel, &[user])?;
+                if !fallback.success() {
+                    return Err(HandlerError::new(format!(
+                        "user deletion failed: {}",
+                        command_detail(&fallback)
+                    )));
+                }
             }
         } else if let Some(deluser) = self.env.programs.which("deluser") {
             let deluser = deluser.display().to_string();
             let result = self.runner.run(&deluser, &["--remove-home", user])?;
             if !result.success() {
-                self.runner.run(&deluser, &[user])?;
+                let fallback = self.runner.run(&deluser, &[user])?;
+                if !fallback.success() {
+                    return Err(HandlerError::new(format!(
+                        "user deletion failed: {}",
+                        command_detail(&fallback)
+                    )));
+                }
             }
+        } else {
+            return Err(HandlerError::new(
+                "Neither userdel nor deluser command found",
+            ));
         }
 
         let mut managed = self.read_managed_users();
@@ -672,7 +704,13 @@ impl Users {
         }
 
         let verb = if enabled { "-u" } else { "-l" };
-        self.runner.run("passwd", &[verb, user])?;
+        let result = self.runner.run("passwd", &[verb, user])?;
+        if !result.success() {
+            return Err(HandlerError::new(format!(
+                "account status change failed: {}",
+                command_detail(&result)
+            )));
+        }
         self.bump_session_epoch(user);
         Ok(Value::Array(self.list()))
     }
@@ -812,6 +850,7 @@ mod tests {
         calls: Mutex<Vec<Call>>,
         /// `useradd` 按顺序返回的状态码；用尽后一律 0。
         useradd_statuses: Mutex<VecDeque<i32>>,
+        command_statuses: Mutex<BTreeMap<String, VecDeque<i32>>>,
     }
 
     #[derive(Clone)]
@@ -828,6 +867,15 @@ mod tests {
 
         fn programs(&self) -> Vec<String> {
             self.calls().into_iter().map(|c| c.program).collect()
+        }
+
+        fn push_status(&self, program: &str, status: i32) {
+            self.command_statuses
+                .lock()
+                .unwrap()
+                .entry(program.to_string())
+                .or_default()
+                .push_back(status);
         }
 
         /// 调用过某程序（按文件名后缀匹配）时收到的 stdin。
@@ -857,7 +905,12 @@ mod tests {
                     .pop_front()
                     .unwrap_or(0)
             } else {
-                0
+                self.command_statuses
+                    .lock()
+                    .unwrap()
+                    .get_mut(program)
+                    .and_then(VecDeque::pop_front)
+                    .unwrap_or(0)
             };
             Ok(mailstack_core::exec::CommandOutput {
                 status,
@@ -881,10 +934,21 @@ mod tests {
                 args: args.iter().map(|a| a.to_string()).collect(),
                 stdin: Some(stdin.to_string()),
             });
+            let status = self
+                .command_statuses
+                .lock()
+                .unwrap()
+                .get_mut(program)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or(0);
             Ok(mailstack_core::exec::CommandOutput {
-                status: 0,
+                status,
                 stdout: String::new(),
-                stderr: String::new(),
+                stderr: if status == 0 {
+                    String::new()
+                } else {
+                    format!("{program} failed")
+                },
             })
         }
     }
@@ -1134,6 +1198,96 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0]["id"], "alice");
         assert_eq!(listed[0]["status"], "enabled");
+    }
+
+    #[test]
+    fn add_rejects_protected_service_users_before_running_commands() {
+        let f = Fixture::new("protectedadd");
+        let error = f
+            .users()
+            .add(&add_payload("web@example.com", "mailstack-web"))
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "mailbox username is protected");
+        assert!(f.runner.calls().is_empty());
+        assert!(!f.paths.managed_users.exists());
+        assert!(!f.paths.managed_mailboxes.exists());
+    }
+
+    #[test]
+    fn failed_chpasswd_does_not_report_mailbox_creation_as_success() {
+        let f = Fixture::new("chpasswdfail");
+        f.runner.push_status("/usr/sbin/chpasswd", 1);
+
+        let error = f
+            .users()
+            .add(&add_payload("alice@example.com", "alice"))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("password change failed"));
+        assert!(!f.paths.managed_users.exists());
+        assert!(!f.paths.managed_mailboxes.exists());
+    }
+
+    #[test]
+    fn failed_passwd_status_does_not_bump_session_epoch() {
+        let f = Fixture::new("statusfail");
+        f.write_managed_users(&["alice"]);
+        f.runner.push_status("passwd", 1);
+
+        let error = f
+            .users()
+            .status(&json!({ "id": "alice", "enabled": false }))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("account status change failed"));
+        assert_eq!(f.epoch_of("alice"), None);
+    }
+
+    #[test]
+    fn failed_userdel_fallback_preserves_both_managed_registries() {
+        let f = Fixture::new("deletefail");
+        f.write_managed_users(&["alice"]);
+        f.write_mailboxes(&[("alice@example.com", "alice")]);
+        f.runner.push_status("/usr/sbin/userdel", 1);
+        f.runner.push_status("/usr/sbin/userdel", 1);
+
+        let error = f.users().delete(&json!({ "id": "alice" })).unwrap_err();
+
+        assert!(error.to_string().contains("user deletion failed"));
+        assert!(f.users().read_managed_users().contains("alice"));
+        assert_eq!(f.users().read_mailboxes().len(), 1);
+        assert_eq!(
+            f.runner
+                .calls()
+                .iter()
+                .filter(|call| call.program.ends_with("userdel"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn delete_fails_closed_when_no_system_account_removal_program_exists() {
+        let f = Fixture::new("deletemissingprogram");
+        f.write_managed_users(&["alice"]);
+        f.write_mailboxes(&[("alice@example.com", "alice")]);
+        let users = Users::new(
+            f.paths.clone(),
+            UsersEnv {
+                passwd_root: f.passwd_root.clone(),
+                session_epoch_owner: None,
+                programs: Arc::new(FakePrograms::listing(&[])),
+            },
+            f.runner.clone(),
+            Arc::new(|| NOW),
+        );
+
+        let error = users.delete(&json!({ "id": "alice" })).unwrap_err();
+
+        assert!(error.to_string().contains("Neither userdel nor deluser"));
+        assert!(users.read_managed_users().contains("alice"));
+        assert_eq!(users.read_mailboxes().len(), 1);
     }
 
     #[test]

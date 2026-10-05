@@ -64,7 +64,15 @@ impl StoreError {
 
 impl From<CoreError> for StoreError {
     fn from(e: CoreError) -> Self {
-        StoreError::Invalid(e.to_string())
+        match e {
+            CoreError::Invalid(message) => StoreError::Invalid(message),
+            CoreError::NotFound(path) => StoreError::Io {
+                path,
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+            CoreError::Io { path, source } => StoreError::Io { path, source },
+            CoreError::Json(error) => StoreError::Invalid(error.to_string()),
+        }
     }
 }
 
@@ -83,6 +91,14 @@ mod tests {
         assert_eq!(
             StoreError::from(CoreError::invalid("core said no")).to_string(),
             "core said no"
+        );
+        assert_eq!(
+            StoreError::from(CoreError::io(
+                "/tmp/x",
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ))
+            .kind(),
+            "IoError"
         );
     }
 }
