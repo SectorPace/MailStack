@@ -574,6 +574,88 @@ pub enum Lookup { Known, Missing, Unavailable(String) }
 
 ---
 
+## 3B. 批 4（提交 `1ff8a7b`）：特权与密码学，§5.1 的 18 条全部修复
+
+> 本节是 §5.1 的完成态。§5.1 里那 18 行已被本节取代，只保留一条指针。
+> **零新依赖**：`regex` 本就是 workspace 既有依赖，`Cargo.toml` / `Cargo.lock`
+> 未因本批改动。
+>
+> **这一批此前从未验证过**：代码在 2026-10-04 22:45 → 10-05 10:56 之间陆续写入，
+> 但最近一次门禁是 10-04 18:04。本节所有「已修」结论都来自 `1ff8a7b` 上
+> **首次实跑**的三道门禁。
+
+### 3B.1 门禁结果（首次实跑）
+
+| 门禁 | 结果 |
+|---|---|
+| `deploy/wsl-quality-gate.sh`（rustfmt + clippy `-D warnings` + 全量测试） | **PASS** |
+| `deploy/verify-invariant-gate.sh` | **INVARIANT_GATE_OK**（`checked=277 missing=0`） |
+| `deploy/verify-deliverables.sh` | **DELIVERABLES_OK** |
+| 测试总数 | **1083 → 1111 passed / 0 failed** |
+
+> ⚠️ 复现环境与台账 §6.3 不同：原 Ubuntu 发行版的 `ext4.vhdx` 被 EFS
+> 「Application Protected」加密，WSL 挂载失败并**只读回退**（根分区只剩 952M）。
+> 本轮改用 **Debian 13 (trixie)** 重跑，生产目标平台仍是 Linux，结论不受影响。
+
+### 3B.2 fail-closed：拿不到锁 / 读不出来 → 报错，不降级
+
+| # | 原缺陷 | 修法 | 反例测试 |
+|---|---|---|---|
+| **4.1** | `locked()` 的锁是空壳 RAII：sidecar 打不开返回 `None`、`FileLock::acquire` 失败只 warn、`Drop` 什么都不做 | `core/atomic.rs` 两处入口改为 `FileLock::acquire(open_lock_sidecar(..)?, ..)?`；`FileLock` 改为**真正持有 `File`** 的 guard（原先是零字段 struct，句柄当场即丢） | `locked_fails_closed_when_the_sidecar_cannot_be_opened`、`atomic_fails_closed_when_the_sidecar_cannot_be_opened` |
+| **4.2** | `add_domain` / `add_alias` / `delete_domain` 纯 RMW 完全没用 `locked()` | 新增 `locked_with<T,E>`（错误类型由调用方给），三处变更全部持锁；`delete_domain` 对 domains+aliases **同时**持锁 | `table_mutations_wait_for_their_read_modify_write_locks`、`add_domain_refuses_to_replace_a_table_when_reading_it_fails`、`delete_domain_does_not_modify_either_table_when_alias_read_fails` |
+| **4.3** | `file_snapshot` 先 `exists()` 再读，EACCES 被当成「文件不存在」，随后的 `file_restore` 会 `remove_file` **销毁既存配置** | 改用 `symlink_metadata`，只把 `ErrorKind::NotFound` 当作不存在，其余一律 `Err` | `file_snapshot_reports_metadata_errors_instead_of_treating_them_as_missing` |
+
+**配套**：`store/error.rs` 的 `From<CoreError>` 原先把所有 `CoreError` 塌成
+`StoreError::Invalid` —— 锁失败会被伪装成「参数非法」。改为按变体分流，
+`CoreError::Io` 直通为 `StoreError::Io`。
+
+### 3B.3 命令执行：超时、正则、PATH 劫持
+
+| # | 原缺陷 | 修法 | 反例测试 |
+|---|---|---|---|
+| **4.4** | `service_ctl` 走的 `run` / `run_with_input` **完全无超时** | 改走 `run_with_timeout(..., SERVICE_COMMAND_TIMEOUT)` | `service_ctl_runs_its_command_with_a_bounded_timeout` |
+| **4.5** | `pgrep -f <unit>` 按**正则**解释单元名（`postfix\|bash` 会误判在运行） | `format!(".*{}.*", regex::escape(unit))` | 由既有的 `is_service_active_*` 系列覆盖 |
+| **4.6** | `resolve_program` 只判 `is_file()`，不判可执行位 → PATH 里可写目录可劫持 root 助手的 `postconf` / `systemctl` | 新增 `resolve_program_for_execution`：必须 root 或 euid 拥有、具备执行位、`mode & 0o022 == 0`，并**逐级向上检查整条父目录链**；`SystemCommandRunner` 的 `run` / `run_with_input` / `run_with_timeout` 三入口全部改用它 | `resolve_program_*` 系列 |
+
+### 3B.4 账号管理：三处忽略退出码 + 保留名
+
+| # | 原缺陷 | 修法 | 反例测试 |
+|---|---|---|---|
+| **4.7** | `set_password` 忽略 `chpasswd` 退出码 → **账号建了但口令没设上**，界面报成功 | `chpasswd` 与 `passwd` 降级路径都检查 `result.success()` | `failed_chpasswd_does_not_report_mailbox_creation_as_success` |
+| **4.8** | `users.status` 不看 `passwd` 的 status → 禁用邮箱可能没生效 | 检查退出码；失败时**不 bump session epoch**（否则已失效的会话反而被续命） | `failed_passwd_status_does_not_bump_session_epoch` |
+| **4.9** | `users.delete` 的 `userdel -r` 与降级路径都不看 status，照旧从注册表删除 → 系统账号带原口令留在机器上 | 两级降级都检查退出码 | `failed_userdel_fallback_preserves_both_managed_registries` |
+| **4.10** | `add` 不查 `PROTECTED_USERS`，且 `USER_RE` 允许保留名 | 在**跑任何命令之前**前置拒绝；`PROTECTED_USERS` 补入 `mailstack-web` | `add_rejects_protected_service_users_before_running_commands` |
+
+> **有意偏离（已登记）**：4.9 的降级链在 `userdel` 与 `deluser` 都不存在时，
+> 基线是「静默什么都不做（不是错误）」。现在改为
+> **返回错误** —— 因为「静默成功」正是本条要修的洞（注册表已删、系统账号还在）。
+> 见 `HANDOVER.md` §8.2。
+
+### 3B.5 RPC 连接与帧
+
+| # | 原缺陷 | 修法 | 反例测试 |
+|---|---|---|---|
+| **4.11** | `bind → set_permissions` 的 world-connectable 窗口；`chown` 失败仅 warn | 属组解析失败直接中止 bind，并确保失败的 bind 不留下可被抢占的 socket | `socket_group_resolution_failure_aborts_binding` |
+| **4.12** | RPC 连接无超时，`Semaphore::new(8)` → 8 个只连不发的客户端即可让助手不可用 | 单请求帧读取超时 30s；`try_acquire_owned`，无 permit 时**立即拒连接**而不是无限排队 | `idle_rpc_connections_are_closed_after_the_request_read_timeout` |
+| **4.13** | `MAX_REQUEST_BYTES = 256KB` 定义了但全仓无引用；`read_frame` 只比对 16MB，且先分配后读 | 新增 `read_json_request_frame`，请求面按 256KB **先校验后分配** | `rejects_requests_above_256_kib_before_reading_or_allocating_the_payload` |
+
+### 3B.6 AI 出站：三处一并收紧
+
+| # | 原缺陷 | 修法 | 反例测试 |
+|---|---|---|---|
+| **4.14** | AI 配置与 **TLS 私钥**用 `atomic::atomic()`（= 落进 `mailstack-admin` 组），Web 进程能直接读出 apiKey 与私钥 | 两处改 `atomic_as(..., 0o600, None)`；acme.sh 的输出先写进 **0700 私有暂存目录**，chmod 后再原子搬运，消除 world-readable 窗口 | `certificate_mode_failure_is_returned_instead_of_ignored` 等 |
+| **4.15** | `with_ai_outbound` 是生产可见的 pub 构造器，可硬覆盖 AI 出站总闸（INV-10） | 降为 `#[cfg(test)]` 私有 | 由既有 `assert_denied` 系列覆盖 |
+| **4.16** | `MAILSTACK_ALLOW_PRIVATE_AI=1` 时 IP 筛选与 HTTPS 强制**全部跳过** → `ai.chat` 的 `baseUrl` 可直指 `http://169.254.169.254/` | 开关不再等于「放行一切」：新增 `smtp::is_private_network_address`，**即便开启也只放行 RFC1918 / IPv6 ULA**；link-local、CGNAT、文档段、loopback 一律拒（含 IPv4-mapped、6to4、Teredo 里的内嵌地址） | `private_network_address_policy_excludes_loopback_link_local_and_special_ranges` |
+| **4.17** | 出站 HTTP 请求行/头直接 `format!` 拼接，`parse_url` 不拒 `\r\n` → **请求走私** | URL / 方法 / 目标 / 头名 / 头值**五处**全部拒控制字符与空格 | `request_bytes_reject_crlf_injection_in_method_target_and_headers`、`endpoint_urls_reject_control_characters_and_spaces` |
+| **4.18** | RO 面泄露 AI 密钥：`ai.models.list` 在 `ALLOWED_ACTIONS_RO`（免 sudo，0660 socket 直连），却用**请求体里的 `baseUrl`** 决定目标，并把配置中的 `apiKey` 作为 `Bearer` 发过去 | ① `models_list(&self, _data)` **整体忽略请求体**；② `actions.rs` 把该动作从 **RO 移到 RW**；③ `contract.rs` 注明 GET/POST 都必须经特权路由 | `models_list_sends_a_bearer_token_and_the_documented_headers`、`model_listing_is_confined_to_the_privileged_channel` |
+
+> **有意偏离（已登记）**：4.16 的修法让 `http://` 端点在**任何**配置下都被拒
+> （原先 `allow_private` 时放行 http）。因此**自托管本地模型**
+> （`http://127.0.0.1:11434` 之类）不再可用。这是收紧不是放宽，
+> 但确实砍掉了一条合法用法 —— 见 `HANDOVER.md` §8.2。
+
+---
+
 ## 4. 我**否掉**的报告结论（复核后未改代码）
 
 审查报告本身也有误报。**逐条回源码核实**是必要步骤 —— 否则会把有意选择
@@ -599,26 +681,22 @@ pub enum Lookup { Known, Missing, Unavailable(String) }
 
 ### 5.1 批 4：特权与密码学（`crates/core` / `crates/priv`）
 
-| # | 位置 | 缺陷 | 影响 |
-|---|---|---|---|
-| 4.1 | `core/atomic.rs:99-149` | `locked()` 的锁是**空壳 RAII**：sidecar 打开失败返回 `None`、`FileLock::acquire` 失败仅 `warn`、`Drop` 什么都不做 | INV-32 的全部保证（恢复码防双花、`admin.json` RMW、审计链串行化）在锁失败时**静默失效**。fail-closed 优先要求：拿不到锁就**报错**而不是继续 |
-| 4.2 | `store/tables.rs:115-218` | `add_domain` / `add_alias` / `delete_domain` 是**纯 RMW 却完全没用 `locked()`** | 并发管理动作互相覆盖，**别名被静默抹掉 = 收信路由改变** |
-| 4.3 | `core/atomic.rs:223` | `file_snapshot` 先 `exists()` 再读，**EACCES 被当成「文件不存在」** | 随后 `file_restore` 会 `remove_file` **销毁既存配置** |
-| 4.4 | `core/exec.rs:95-142` | `service_ctl` 走的 `run` / `run_with_input` **完全无超时**（同文件有 `run_with_timeout` 但此处未用） | 一个挂死的 `systemctl` 会**永久挂住特权面** |
-| 4.5 | `core/exec.rs:449` | `pgrep -f <unit>` 按**正则**解释单元名 | `postfix\|bash` 之类会误判服务在运行 |
-| 4.6 | `core/exec.rs:208` | `resolve_program` 只判 `is_file()` **不判可执行位** | PATH 里可写目录可劫持 root 助手的 `postconf` / `systemctl` |
-| 4.7 | `priv/users.rs:367-378` | `set_password` 忽略 `chpasswd` 退出码 | **账号建了但口令没设上**，界面报成功 |
-| 4.8 | `priv/users.rs:675` | `users.status` 不看 `passwd` 的 status | 「禁用邮箱」可能没生效（安全控件静默失败） |
-| 4.9 | `priv/users.rs:631-642` | `users.delete` 的 `userdel -r` 与降级路径都不看 status，**照旧从注册表删除** | 系统账号带着原口令留在机器上，界面显示已删除 |
-| 4.10 | `priv/users.rs:544` | **`add` 不查 `PROTECTED_USERS`**（`delete`/`status`/`password` 都查），且 `USER_RE` 允许保留名 | `users.add {"username":"mailstack-web"}` → `useradd` + `chpasswd` 设攻击者口令 + 递归 chown 其家目录 |
-| 4.11 | `priv/server.rs:212-231` | `bind` → `set_permissions` 之间存在 **world-connectable 窗口**；`chown` 失败仅 warn | 见 §4 的复核：实际风险低（umask 022 下被 EACCES 拒），**但 `chown` 失败应 fail 而非 warn** |
-| 4.12 | `priv/server.rs:125-146` | RPC 连接**无超时**，`Semaphore::new(8)` | 8 个只连接不发送的客户端即可让特权助手完全不可用 |
-| 4.13 | `priv/framing.rs:12-15 / 41-45` | `MAX_REQUEST_BYTES = 256KB` **定义了但全仓无引用**；`read_frame` 只比对 16MB，且**先分配后读** | 文档声称的 256KB 上限根本没实现；恶意对端发长度前缀 = 16MB 即让服务端先白分配 16MB |
-| 4.14 | `priv/ai.rs:881-889` / `acme.rs:243-244` | 用 `atomic::atomic()`（= `atomic_as(.., Some(ADMIN_GROUP))`）写 AI 配置与 **TLS 私钥** | 结果是 `0600 root:mailstack-admin`，Web 进程**能直接读出 AI apiKey 与 TLS 私钥** —— 与 `acme.rs` 自己强调的「私钥必须以受限属组落盘，Web 进程做不到」**直接矛盾** |
-| 4.15 | `priv/dispatch.rs:55-61` | `with_ai_outbound` 是**生产可见的 pub 构造器**，可硬覆盖 AI 出站总闸（INV-10） | 应加 `#[cfg(test)]` / feature 门 |
-| 4.16 | `priv/ai.rs:403-409` | `MAILSTACK_ALLOW_PRIVATE_AI=1` 时 IP 筛选与 HTTPS 强制**全部跳过** | `ai.chat` 的 `baseUrl` 可直接指向 `http://169.254.169.254/`。「部署开关即全局开关」 |
-| 4.17 | `priv/ai.rs:417-457` | 出站 HTTP 请求行/头直接 `format!` 拼接，`parse_url` 不拒绝 `\r\n` | 含 CRLF 的 `baseUrl`/`apiKey` 可注入任意头或第二个请求（**请求走私**） |
-| 4.18 | `ai.rs:907-934` + `core/actions.rs:38` | **RO 面泄露 AI 密钥**：`ai.models.list` 在 `ALLOWED_ACTIONS_RO`（免 sudo，0660 socket 直连），却用**请求体里的 `baseUrl`** 决定目标 URL，并把配置中的 `apiKey` 作为 `Bearer` 发过去 | 任何能连 RO socket 的本地用户可把密钥送到自己的公网主机（`ai.config.get` 刻意打码，此处绕过） |
+> ✅ **批 4 已于提交 `1ff8a7b` 全部修复**，逐条记录见 **§3B**。
+> 下表原 18 行已被取代，此处只留口径：
+>
+> - **4.1–4.18：已修**（含配套改动：store 错误分流、readers 的 runner 超时兜底、
+>   `smtp::is_private_network_address` 新导出、RO→RW 迁移带来的 `ALLOWED_ACTIONS_RO`
+>   22→21 与契约表注释更新）。
+> - **部分修需要特别注意**：`5.13` 与 4.2 是同一个文件的两个面。批 4 只修了
+>   `store/tables.rs` 的**变更路径**（新增 `read_rows_for_update`，读失败不再
+>   当成空表）；**读面未修** —— `core::atomic::rows()` 至今仍把 EACCES / IO 错 /
+>   坏 UTF-8 一律塌缩成「空表」，且仍有 4 个生产调用点
+>   （`priv/handlers.rs:480`、`priv/readers.rs:719`、`priv/readers.rs:2457`、
+>   `priv/users.rs:573`）。**这条仍算未修**，只是危险面从「一次读错误清空整张路由表」
+>   收窄到了「静默显示为空」。接续者若要彻底关掉它，需要给 `rows()` 加一个
+>   `Result` 版本并逐个改调用点 —— 会波及 RO 动作的返回形状，属于独立一轮。
+>
+> 批 4 修复过程中新登记的两条，见 §3B.4 与 §3B.6 的「有意偏离」两段。
 
 ### 5.2 批 5：Web 与队列
 
@@ -724,7 +802,7 @@ RCPT 名录的三态判定、A-R 的 RFC 8601 引用 —— 我逐条复核过�
 W='wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0'
 R=/mnt/e/MailStack/mailstack-rust
 
-# 1) 全量测试（应为 1083 passed / 0 failed）
+# 1) 全量测试（应为 1111 passed / 0 failed）
 $W bash $R/deploy/wsl-cargo.sh test --workspace --all-targets
 
 # 2) 三道门禁
@@ -733,16 +811,41 @@ $W bash $R/deploy/verify-invariant-gate.sh     # → INVARIANT_GATE_OK（277/277
 $W bash $R/deploy/verify-deliverables.sh       # → DELIVERABLES_OK
 ```
 
-**当前状态（2026-10-04）**：三道门禁全过，工作区干净，`main` 分支 10 个提交、**无远端**。
+**当前状态（2026-10-05，提交 `1ff8a7b` 之后）**：三道门禁全过，工作区干净，
+`main` 分支 11 个提交、**无远端**。
+
+> ⚠️ **复现环境已变更（2026-10-05）**：原 `Ubuntu` 发行版的 `ext4.vhdx` 被 EFS
+> 「Application Protected」加密（`cipher /c` 显示 `Compatibility Level: Application Protected`，
+> 而另外 7 个发行版的 vhdx 都是普通 `Archive`）。WSL 服务无法解密该卷，
+> 每次启动都**只读回退**，根分区只剩 952M —— 上面三条命令在 Ubuntu 下**跑不起来**。
+>
+> 现改用 **`Debian` 发行版**复现（同样在 WSL2 内、同样是 Linux 目标平台）：
+>
+> ```powershell
+> # 一次性准备
+> wsl -d Debian -e bash -lc "apt-get install -y pkg-config libssl-dev; curl -sSf -x http://127.0.0.1:7890 https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path"
+> wsl -d Debian -e bash -lc "export PATH=\$HOME/.cargo/bin:\$PATH; rustup component add clippy rustfmt"
+>
+> # 跑门禁（必须带代理，否则 cargo 会卡在 crates.io index 更新）
+> wsl -d Debian -e bash -lc "export MAILSTACK_USE_PROXY=1 HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=http://127.0.0.1:7890 http_proxy=http://127.0.0.1:7890 https_proxy=http://127.0.0.1:7890 NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1; bash /mnt/e/MailStack/mailstack-rust/deploy/wsl-quality-gate.sh"
+> ```
+>
+> 两个必须知道的坑：**①** `MAILSTACK_USE_PROXY=1` 不设的话 cargo 会在
+> 「Updating crates.io index」上静默挂几十分钟（`retry = 3` × 每次 10s 超时 ×
+> 几百个 index 条目）；**②** `--profile minimal` 装的 rustup **不含 clippy/rustfmt**，
+> 门禁会报 `'cargo-clippy' is not installed` 并计为 FAIL。
 
 ---
 
 ## 8. 一句话交接
 
-> 本轮把「审查报告独立收敛的 P0」与「出站侧 + 认证授权」三批修完并提交
-> （1018 → **1083** 测试，全部带反例守卫）。**批 4–6 的清单在 §5**，
-> 那是「已证实存在、尚未修复」的 45 条 —— 大多数是 1–20 行的局部修改，
-> 但**每条都必须配一个能真正失败的反例测试**，否则就是重复审查报告批评的那个错误。
+> 前四批已修完并提交（1018 → **1111** 测试，全部带反例守卫）：
+> 批 1–3 是「审查报告独立收敛的 P0」+「出站侧 + 认证授权」，
+> 批 4 是**特权与密码学**（`1ff8a7b`，§5.1 的 18 条全修，逐条记录见 **§3B**）。
+> 剩下 **批 5（Web 与队列，19 条）与批 6（工程化，16 条）的清单在 §5** ——
+> 其中 5.1 / 5.2 / 5.3 是真正会打死线上的（请求体无上限、用户名枚举预言机、
+> PBKDF2 阻塞 async worker），但**每条都必须配一个能真正失败的反例测试**，
+> 否则就是重复审查报告批评的那个错误。
 >
 > 修代码之前先读 §4（我否掉了哪些结论）与 `HANDOVER.md` §8.2（有意偏离），
 > **别把有意选择当成 bug 改回去**。

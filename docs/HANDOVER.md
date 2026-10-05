@@ -59,7 +59,7 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 
 | 维度 | 数值 | 说明 |
 |---|---|---|
-| 测试 | **1083 passed / 0 failed** | `cargo test --workspace --all-targets`；含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
+| 测试 | **1111 passed / 0 failed** | `cargo test --workspace --all-targets`；含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 | 不变量门禁 | **277 / 277 存在** | `deploy/verify-invariant-gate.sh`（从 `ci.yml` 动态取名单） |
 | 质量门禁 | `QUALITY_GATE=PASS` | rustfmt + clippy(`-D warnings`) + 全量测试 |
 | 交付物门禁 | `DELIVERABLES_OK` | `deploy/verify-deliverables.sh` |
@@ -99,7 +99,7 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 | `mailstack-web-bin` | 9 | **管理控制台服务入口**（`bin/mailstack-web`）：API + 前端产物托管、SPA 回退、`/api` 兜底保持 JSON、路径穿越拒绝、遥测后台采样宿主 |
 | `mailstackd` | 28 | 进程入口：fail-closed 装配、监听集中绑定、RPC 双通道、停机扇出、队列调度、封禁热重载 |
 | `mailstackctl` | 7 | CLI：参数→特权调用的翻译、退出码映射 |
-| **合计** | **1083** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
+| **合计** | **1111** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 
 ### 2.4 Phase 进度明细
 
@@ -241,14 +241,24 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 | 批 1 | ✅ 已提交 `075a86a` | 9 条多报告收敛的 P0（远程 abort、限流失效、空口令 fail-open、原子写权限窗口、未认证 OOM、TXT 缓存 TTL、client_ip 占位、认证失败不进封禁、命令未跑报成功） |
 | 批 2 | ✅ 已提交 `70b9c35` | 出站侧加固（响应限长、CRLF 注入、裸 LF 走私、SSRF IPv6 白名单、DNS 超时、LMTP 尾部空行） |
 | 批 3 | ✅ 已提交 `37ddfa1` | 认证与授权（DMARC 类型化、RCPT 枚举防护、A-R 注入、TOTP 重放、`totp.disable` 零验证、`revoke_user` 死代码、Cookie `__Host-`） |
-| 批 4 | ⏳ 未开始 | 特权与密码学：`locked()` 静默降级、`file_snapshot` 的 EACCES、`service_ctl` 无超时、`pgrep` 正则、`resolve_program` 执行位、`users` 三处忽略退出码、`PROTECTED_USERS`、socket 竞态、RPC 超时、`framing` 上限 |
+| 批 4 | ✅ 已提交 `1ff8a7b` | 特权与密码学：`locked()` fail-closed、`file_snapshot` 的 EACCES、`service_ctl` 超时、`pgrep` 正则转义、`resolve_program` 可执行位与父目录链、`users` 三处忽略退出码、`PROTECTED_USERS`、socket 属组失败即中止、RPC 读超时、`framing` 256KB 接线、AI 私钥/配置不落 `mailstack-admin` 组、CRLF 请求走私、`ai.models.list` 从 RO 挪到 RW。**逐条记录见 `REVIEW_FIXES.md` §3B** |
 | 批 5 | ⏳ 未开始 | Web 与队列：`RequestBodyLimitLayer` 接线、用户名枚举预言机、PBKDF2 阻塞 async、503 误锁管理员、`run_once` 排他、投递 lease、5xx 不计入出站健康、`tables` RMW 加锁 |
 | 批 6 | ⏳ 未开始 | 工程化：CI 供应链门禁转强制、不变量门禁验断言、`deploy` 脚本 `set -euo pipefail`、`build.sh` 补 `mailstack-web`、`panic = "abort"` 重评估、审计链 fsync |
 
-> ⚠️ **批 4 至批 6 是「已证实存在、尚未修复」的清单** —— 不是猜测。
+> ⚠️ **批 5 与批 6 是「已证实存在、尚未修复」的清单** —— 不是猜测。
 > 每一条都在 `REVIEW_FIXES.md` 的「未修项」表里，含位置与影响。
 > 规模上大多是 1–20 行的局部修改，但**必须逐条配反例测试**（审查报告的核心批评正是
 > 「测试擅长验证『我实现的是对的』，不擅长验证『我声称的性质没被破坏』」）。
+>
+> 📌 **批 4 的「已完成」有个必须交代的前提**：那 1239 行改动是在
+> 2026-10-04 22:45 → 10-05 10:56 之间陆续写入的，而最近一次门禁是 **10-04 18:04** ——
+> 也就是说它**提交前从未编译过**。`1ff8a7b` 是补跑门禁后修掉 3 个问题才提交的
+> （一个 `.unwrap()` 编译错、一条随 4.18 失效的陈旧测试断言、一个 clippy 告警）。
+> **这是台账 §6.3「子代理的收尾不可信」在时间维度上的又一次印证**：写得出来不等于跑得通。
+>
+> 🔧 **构建环境已换**：原 `Ubuntu` 发行版的 `ext4.vhdx` 被 EFS「Application Protected」
+> 加密，WSL 挂载失败并只读回退，门禁已在该发行版下**无法复现**。
+> 现在改用 `Debian` 发行版，命令与坑见 `REVIEW_FIXES.md` §7。
 
 ### 4.1 优先做（零新依赖、立刻让已有能力可见）
 
@@ -595,6 +605,9 @@ wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
 | `setup.mail.test` 不做「邮箱存在 / 账号锁定」检查 | `users.*` 未移植；响应用 `mailboxChecksSkipped: true` 明说 |
 | `backup.restore` 的家目录白名单为空集 | 同上：无法证明家目录归属就不写 |
 | `setup.mail.test` 的 `username`/`password` 接受但忽略 | 它们原本只服务于上面那条已缺失的检查；不假装校验过 |
+| **`users.delete` 在 `userdel` 与 `deluser` 都不存在时返回错误**（批 4 / `1ff8a7b`） | 基线是「静默什么都不做（不是错误）」。但那条「静默成功」正是 4.9 要修的洞本身 —— 注册表已删、系统账号带着原口令留在机器上、界面显示已删除。**把静默成功改成显式失败是这条修复的必要组成部分**，不是顺手改行为 |
+| **AI 端点在任何配置下都必须是 HTTPS**（批 4 / `1ff8a7b`） | 原实现在 `MAILSTACK_ALLOW_PRIVATE_AI=1` 时放行 `http://`，等于「部署开关即全局开关」，`baseUrl` 可直指 `http://169.254.169.254/`。收紧后 `http://` 一律拒。**代价**：自托管本地模型（`http://127.0.0.1:11434` 之类 Ollama / LM Studio）**不再可用** —— 因为该地址既非 RFC1918 也非 IPv6 ULA，`is_private_network_address` 也不放行。这是收紧而非放宽，但要重新引入本地模型必须另走一条**显式**的、绑定回环的部署通道，不能靠复用这个开关 |
+| **`ai.models.list` 从 `ALLOWED_ACTIONS_RO` 移到 `ALLOWED_ACTIONS_RW`**（批 4 / `1ff8a7b`） | 它把配置中的 `apiKey` 作为 `Bearer` 发往出站目标，属于写面性质（携带受保护凭据）。RO socket 免 sudo、0660 直连，放那里等于把密钥交给任何能连它的本地用户。**副作用**：`ALLOWED_ACTIONS_RO` 由 22 项减为 **21**，`crates/core/src/actions.rs` 里有测试钉住这个数字；直连 RO socket 调 `ai.models.list` 的旧脚本会开始被拒（走 Web API 仍有 Web 自己的认证，不受影响） |
 
 ### 8.3 未验证项（诚实披露，来自 `TEST_REPORT.md` §5）
 
@@ -633,7 +646,7 @@ wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
 | `deploy/*.sh` | 构建、质量门禁、不变量门禁、交付物门禁、容器 Postfix 测试、WSL 工具 |
 | `crates/web/src/contract.rs` | **路由唯一真相源**（72 条）；RPC 桥的动作允许集也从它推导 |
 | `crates/core/src/actions.rs` | **动作白名单唯一真相源**（RO 22 / RW 36 / 破坏性 4） |
-| `docs/REVIEW_FIXES.md` | **本轮外部审查加固的完整台账**（批 1–3 已修、批 4–6 未修项、被否掉的报告结论） |
+| `docs/REVIEW_FIXES.md` | **本轮外部审查加固的完整台账**（批 1–4 已修、批 5–6 未修项、被否掉的报告结论） |
 
 ### 9.2 仓库外（**只读对照，勿改**）
 
@@ -659,14 +672,14 @@ wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 \
 ### 9.3 建议的接续起点
 
 1. **先读 `docs/REVIEW_FIXES.md`** —— 本轮外部审查加固的完整台账。批 1–3 已提交，
-   批 4–6 的未修项（含位置与影响）全在里面。这是当前**最紧的线索**。
+   批 5–6 的未修项（含位置与影响）全在里面。这是当前**最紧的线索**。
 2. 再读 `docs/TEST_REPORT.md` §4（缺陷复盘）——**项目的隐性知识几乎都在那里**。
 3. 再读 §8.2 的偏离表，避免「把有意选择当成 bug 改回去」。
 4. **已收口的部分**：58/58 动作、72/72 路由、`bin/mailstack-web`、前端入仓（`webui/`）、
    `git` 历史 + `.gitattributes`、入站环路实跑验证（`deploy/verify-loopback-e2e.sh`）。
 5. **两条并行的下一步**，按你的优先级选：
 
-   **(A) 继续外部审查加固** —— 批 4（特权与密码学）→ 批 5（Web 与队列）→ 批 6（工程化）。
+   **(A) 继续外部审查加固** —— 批 5（Web 与队列）→ 批 6（工程化）。
    这批大多是 1–20 行的局部修改，风险低收益高；但**每条都要配能真正失败的反例测试**，
    否则就是重复审查报告批评的那个错误（「测试只验证已实现的分支」）。
 
