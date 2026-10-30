@@ -304,6 +304,184 @@ impl Counter {
     }
 }
 
+/// AI 路由的独立限流（`contract::AI_RATE_LIMIT_PER_MINUTE`，20 次/分/IP）。
+///
+/// ## 为什么必须存在
+///
+/// `AI_RATE_LIMIT_PER_MINUTE` 与 `contract::is_ai_path` 在本轮之前**定义了却
+/// 没有任何调用点** —— 「AI 路由独立限流 20 次/分」是一句纯粹的文档。
+/// 而 AI 路由背后是**出站付费 LLM 调用**：认证后的会话一旦被拿到（劫持、
+/// XSS、或用户自己写脚本），就能在几秒内把一整月的额度烧光，且这些请求
+/// 在服务端留下的痕迹与正常调用**没有区别**。
+///
+/// 复用 [`LoginLimiter`] 是不行的：它的三档桶与账号锁定语义都是登录专属的，
+/// 把 AI 流量塞进去会让「登录失败」与「AI 调用频繁」共用失败计数。
+///
+/// ## 语义
+///
+/// * 固定窗口 60 秒，按**传输层真实对端**分桶（与登录限流同一口径，不读 XFF）。
+/// * 判定不产生副作用：先 `peek`，只有全部通过才累加。
+/// * 表有上界并清扫，与登录限流同一套纪律，避免限流器自己成为内存增长来源。
+#[derive(Debug, Default)]
+pub struct AiRateLimiter {
+    by_ip: Mutex<HashMap<String, Counter>>,
+}
+
+impl AiRateLimiter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn check(&self, ip: &str) -> LimitVerdict {
+        self.check_at(ip, OffsetDateTime::now_utc())
+    }
+
+    pub fn check_at(&self, ip: &str, now: OffsetDateTime) -> LimitVerdict {
+        let mut map = self
+            .by_ip
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let window = Duration::minutes(1);
+        map.retain(|_, counter| now - counter.window_start < window);
+
+        let limit = crate::contract::AI_RATE_LIMIT_PER_MINUTE;
+        let key = sanitized(ip);
+
+        // 判决**不新建**条目：只有真的放行时才建。
+        if let Some(counter) = map.get_mut(key.as_ref()) {
+            if let LimitVerdict::Limited { retry_after_secs } = counter.peek(now, limit) {
+                return LimitVerdict::Limited { retry_after_secs };
+            }
+        }
+
+        // 累加之后才收缩上界 —— 先收缩再插入会留下 `MAX + 1` 条，
+        // 而「限流器自己有上界」正是这里要保证的性质。
+        map.entry(key.into_owned())
+            .or_insert_with(|| Counter::new(now))
+            .count += 1;
+
+        // 同窗口内的高基数来源：按最旧窗口淘汰，保证「最热」优先留下。
+        while map.len() > MAX_TRACKED_KEYS {
+            let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, c)| c.window_start)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            map.remove(&oldest);
+        }
+
+        LimitVerdict::Allow
+    }
+
+    /// 清除全部状态（仅供测试）。
+    #[doc(hidden)]
+    pub fn reset(&self) {
+        self.by_ip
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
+#[cfg(test)]
+mod ai_limiter_tests {
+    use super::*;
+
+    /// 5.6 的反例测试：配额必须在第 N+1 次调用上生效，且**按来源**分开计。
+    ///
+    /// 在接线之前，`AI_RATE_LIMIT_PER_MINUTE` 没有任何调用点，这个测试压根
+    /// 不存在 —— 「AI 路由独立限流 20 次/分」只是一句文档。
+    #[test]
+    fn the_ai_quota_is_enforced_and_scoped_per_source() {
+        let limiter = AiRateLimiter::new();
+        let limit = crate::contract::AI_RATE_LIMIT_PER_MINUTE;
+        let t0 = OffsetDateTime::now_utc();
+
+        for attempt in 0..limit {
+            assert!(
+                limiter.check_at("198.51.100.7", t0).is_allowed(),
+                "第 {attempt} 次必须在配额内"
+            );
+        }
+
+        let verdict = limiter.check_at("198.51.100.7", t0);
+        assert!(
+            !verdict.is_allowed(),
+            "第 {} 次必须被限流（AI 出站是付费调用）",
+            limit + 1
+        );
+        assert!(matches!(
+            verdict,
+            LimitVerdict::Limited {
+                retry_after_secs: 1..=60
+            }
+        ));
+
+        // 另一个来源不受牵连。
+        assert!(
+            limiter.check_at("203.0.113.9", t0).is_allowed(),
+            "限流必须按来源分桶，不能一个 IP 超量就把所有人一起封掉"
+        );
+
+        // 窗口推进后恢复。
+        let next_window = t0 + Duration::minutes(1) + Duration::seconds(1);
+        assert!(
+            limiter.check_at("198.51.100.7", next_window).is_allowed(),
+            "窗口推进后必须恢复放行"
+        );
+    }
+
+    /// 判定本身不得产生副作用，否则被限流的请求会持续消耗自己的窗口。
+    #[test]
+    fn a_rejected_ai_call_does_not_extend_its_own_window() {
+        let limiter = AiRateLimiter::new();
+        let limit = crate::contract::AI_RATE_LIMIT_PER_MINUTE;
+        let t0 = OffsetDateTime::now_utc();
+
+        for _ in 0..limit {
+            assert!(limiter.check_at("198.51.100.7", t0).is_allowed());
+        }
+        // 连续 5 次被拒：每次都必须返回**递减**的 retry-after，
+        // 若被拒时也在累加，窗口会被无限续期。
+        let mut previous = i64::MAX;
+        for _ in 0..5 {
+            match limiter.check_at("198.51.100.7", t0) {
+                LimitVerdict::Allow => panic!("超限后不得放行"),
+                LimitVerdict::Limited { retry_after_secs } => {
+                    assert!(
+                        retry_after_secs <= previous,
+                        "被拒的请求在续自己的窗口：{retry_after_secs} > {previous}"
+                    );
+                    previous = retry_after_secs;
+                }
+            }
+        }
+    }
+
+    /// 限流表自身不得成为未认证内存增长来源（与登录限流同一纪律）。
+    #[test]
+    fn the_ai_limiter_table_stays_bounded() {
+        let limiter = AiRateLimiter::new();
+        let t0 = OffsetDateTime::now_utc();
+        for i in 0..(MAX_TRACKED_KEYS * 2) {
+            limiter.check_at(&format!("198.51.100.{}", i % 256), t0);
+            // 高基数来源必须靠不同的 IP 区分，这里用序号拼出足够多的键。
+            limiter.check_at(&format!("10.0.{}.{}", i / 256, i % 256), t0);
+        }
+        let size = limiter
+            .by_ip
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        assert!(
+            size <= MAX_TRACKED_KEYS,
+            "限流表长到 {size} 条，超过上界 {MAX_TRACKED_KEYS}"
+        );
+    }
+}
+
 /// 固定的对外错误码（不得改动，前端依赖）。
 pub const ERR_INVALID_CREDENTIALS: &str = "INVALID_CREDENTIALS";
 /// 登录响应中「密码正确但需要 2FA」的唯一文档化例外。

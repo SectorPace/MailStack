@@ -174,6 +174,14 @@ pub struct QueueRunner {
     health: Mutex<OutboundHealthState>,
     /// 半开探测标记：快速失败期间每轮只放行一次远端尝试。
     half_open_used: AtomicBool,
+    /// 5.9：`run_once` 重入标记。
+    ///
+    /// 原实现没有任何排他：两轮重叠时双方都会 `load_all()` 到**同一批**条目，
+    /// 各自投递一次 → 收件人收到重复邮件，并且各自重置 `half_open_used`
+    /// （快速失败期间的「只放行一次探测」也跟着失效）。
+    /// store 侧没有 per-entry claim 标志，安全性此前完全依赖调用方（daemon）串行化 ——
+    /// 而那只是一句注释，没有任何东西强制它。
+    round_in_flight: AtomicBool,
     semaphore: Semaphore,
 }
 
@@ -203,6 +211,7 @@ impl QueueRunner {
             relay,
             health: Mutex::new(health),
             half_open_used: AtomicBool::new(false),
+            round_in_flight: AtomicBool::new(false),
             semaphore: Semaphore::new(permits),
         }
     }
@@ -232,6 +241,24 @@ impl QueueRunner {
     ///
     /// 需要 `Arc<Self>` 是因为各条目的投递要并发执行（受 `relayConcurrency` 约束）。
     pub async fn run_once(self: &Arc<Self>, now_unix: i64) -> QueueResult<QueueRunReport> {
+        // 5.9：同一时刻只允许一轮在跑。
+        //
+        // 两轮重叠的后果不是「慢一点」，而是**重复投递**：双方都 `load_all()` 到
+        // 同一批条目、都用同一份收件人列表去投，谁也看不见对方。
+        // `compare_exchange` 而不是 `swap`：必须能分辨「我拿到了」与「别人在跑」。
+        if self
+            .round_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(crate::error::QueueError::busy(
+                "overlapping run_once would re-deliver the same entries",
+            ));
+        }
+        // 用 guard 保证任何提前返回 / `?` 提前退出都会复位标记，
+        // 否则一次错误就能让队列**永久停摆**（比重复投递更糟）。
+        let _round_guard = RoundGuard(&self.round_in_flight);
+
         // 每轮重置半开标记：快速失败状态下也保留「一次探测机会」，否则出站恢复后
         // 队列会永远不再尝试，变成永久性停摆。
         self.half_open_used.store(false, Ordering::SeqCst);
@@ -310,6 +337,12 @@ impl QueueRunner {
     /// 处理一条条目。
     async fn process(&self, mut entry: QueueEntry, now_unix: i64) -> QueueResult<EntryOutcome> {
         let mut outcome = EntryOutcome::default();
+        // 5.15：这一轮是否真的改过条目。
+        //
+        // 原实现无条件 `store.enqueue(&entry)` —— 于是「出站被封、快速失败」期间
+        // 每一轮（10 秒）都会把**全部积压条目**原样重写一遍磁盘：内容一字未变，
+        // 而恰恰是出站被封、积压最大、I/O 压力最该省的时候。
+        let mut mutated = false;
         let route = self.outbound_route();
         let (local_recipients, remote_recipients) = self.partition(&entry);
 
@@ -323,13 +356,33 @@ impl QueueRunner {
                 .await
             {
                 Ok(receipt) => {
+                    // 5.12：回执必须覆盖**全部**被尝试的收件人，否则「移除」就会
+                    // 悄悄吞掉没被接受的那几个 —— 那些收件人既不会重试也不会退信，
+                    // 等于静默丢信。
+                    //
+                    // 现在三条生产传输（LMTP / SMTP 中继 / 直投 / 签名包装）在成功
+                    // 分支上都返回 `accepted == recipients.len()`，所以这个不变量今天
+                    // 成立；但此前**没有任何东西强制它**，一次「部分成功也返回 Ok」
+                    // 的实现改动就会变成静默丢信。这里把它钉成显式检查：
+                    // 不满足就报错停下，宁可见红也不要悄悄少投一个收件人。
+                    if receipt.accepted != local_recipients.len() {
+                        return Err(crate::error::QueueError::invalid(format!(
+                            "local transport reported {} accepted of {} attempted recipients \
+                             (entry {}); refusing to drop the remainder silently",
+                            receipt.accepted,
+                            local_recipients.len(),
+                            entry.id
+                        )));
+                    }
                     outcome.delivered += receipt.accepted;
                     remove_recipients(&mut entry, &local_recipients);
+                    mutated = true;
                     entry.last_error = None;
                     entry.last_code = None;
                 }
                 Err(failure) => {
                     // 本地投递失败**不**计入出站健康：LMTP 出问题不代表外发 25 被封。
+                    mutated = true;
                     self.apply_failure(
                         &mut entry,
                         &mut outcome,
@@ -353,14 +406,26 @@ impl QueueRunner {
                     .await
                 {
                     Ok(receipt) => {
+                        // 5.12：同本地分支，回执必须覆盖全部被尝试的收件人。
+                        if receipt.accepted != remote_recipients.len() {
+                            return Err(crate::error::QueueError::invalid(format!(
+                                "remote transport reported {} accepted of {} attempted \
+                                 recipients (entry {}); refusing to drop the remainder silently",
+                                receipt.accepted,
+                                remote_recipients.len(),
+                                entry.id
+                            )));
+                        }
                         outcome.delivered += receipt.accepted;
                         remove_recipients(&mut entry, &remote_recipients);
+                        mutated = true;
                         entry.last_error = None;
                         entry.last_code = None;
                         self.record_remote_success();
                     }
                     Err(failure) => {
                         self.record_remote_failure(&failure);
+                        mutated = true;
                         self.apply_failure(
                             &mut entry,
                             &mut outcome,
@@ -372,6 +437,9 @@ impl QueueRunner {
                 }
             } else {
                 // 快速失败：出站已判定不可用，本轮不再逐条重试（避免重试风暴）。
+                //
+                // 5.15：这一分支**不改动** `entry`，因此 `mutated` 保持 false ——
+                // 下面不会再把它原样重写一遍磁盘。
                 outcome.fast_failed = true;
                 outcome.deferred += 1;
             }
@@ -380,11 +448,13 @@ impl QueueRunner {
         if entry.recipients.is_empty() {
             // 全部收件人已投递或已退信 → 条目使命完成。
             self.store.remove(&entry.id)?;
-        } else {
+        } else if mutated {
             // 仍有未完成收件人（退避等待中，或本地/远端部分成功）→ 写回更新后的状态。
             entry.validate()?;
             self.store.enqueue(&entry)?;
         }
+        // 否则：这一轮什么都没改（例如出站被封时的快速失败）。
+        // 内容一字未变还去重写，只会在积压最大时制造无谓的 I/O 风暴。
         Ok(outcome)
     }
 
@@ -528,6 +598,19 @@ impl QueueRunner {
         if failure.local_fault {
             return;
         }
+        // 5.11：**永久失败不得计入出站健康**。
+        //
+        // 这个计数驱动的结论是「25 端口被封，请配置中继」。而一次永久失败
+        // （5xx：收件人不存在、邮箱已满、被策略拒收）恰恰说明**链路是通的** ——
+        // 对端已经明确回了码。把它计进去，10 封「收件人不存在」的正常退信就能
+        // 把整条出站链路判成「被封」，转入快速失败并停止全部外域投递，
+        // 也就是**用正常退信自造一次全站故障**。
+        //
+        // 只有 Transient（连接超时、对端 4xx 过载、TLS 握手失败）才说明链路本身
+        // 可能有问题，才该推进「被封」的判定。
+        if failure.class != crate::delivery::FailureClass::Transient {
+            return;
+        }
         if let Ok(mut guard) = self.health.lock() {
             guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
             guard.last_failure = Some(failure.message.clone());
@@ -549,6 +632,18 @@ impl QueueRunner {
 
 fn remove_recipients(entry: &mut QueueEntry, done: &[String]) {
     entry.recipients.retain(|r| !done.contains(r));
+}
+
+/// `run_once` 的重入标记守卫：任何退出路径都要复位。
+///
+/// 单独成类型而不是在函数末尾手动 store：`run_once` 里有多处 `?` 提前返回，
+/// 手写复位的正确性依赖「以后没有人再加一个 `?`」—— 那种依赖迟早会破。
+struct RoundGuard<'a>(&'a AtomicBool);
+
+impl Drop for RoundGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -1207,9 +1302,86 @@ mod tests {
         );
     }
 
+    /// 5.11：**永久失败（5xx）不得推进「出站被封」的判定**。
+    ///
+    /// 这个计数驱动的结论是「25 端口被封，请配置中继」，而一次 5xx 恰恰说明
+    /// 对端已经回了码 —— 链路是通的。原实现把永久失败也算进去，于是 10 封
+    /// 「收件人不存在」的正常退信就能把整条出站链路判成「被封」，转入快速失败
+    /// 并**停止全部外域投递**，等于用正常退信自造一次全站故障。
+    #[tokio::test]
+    async fn permanent_failures_never_trip_the_outbound_blocked_verdict() {
+        let harness = Harness::new(
+            ScriptedTransport::ok(),
+            ScriptedTransport::failing(DeliveryFailure::permanent(
+                "RcptRejected",
+                "550 5.1.1 no such user",
+            )),
+        );
+        let runner = harness.runner(config(), None);
+
+        // 远超阈值（默认 3）的永久失败次数。
+        for round in 0..12 {
+            enqueue_outbound(
+                &harness.store,
+                &format!("000000{:05}-0001", round + 1),
+                &[&format!("ghost{round}@example.net")],
+            );
+            runner
+                .run_once(1_000 + round as i64 * 1_000_000)
+                .await
+                .unwrap();
+        }
+
+        let health = runner.outbound_health();
+        assert_eq!(
+            health.consecutive_failures, 0,
+            "永久失败说明链路是通的，不得计入出站健康"
+        );
+        assert!(
+            !health.blocked,
+            "正常退信不得把出站判成被封（否则停止全部外域投递）"
+        );
+    }
+
+    /// 5.9：两轮重叠必须被拒绝，而不是各投一遍。
+    #[tokio::test]
+    async fn overlapping_rounds_are_refused_instead_of_double_delivering() {
+        let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
+        enqueue_outbound(&harness.store, "00000000001-0001", &["bob@example.net"]);
+        let runner = harness.runner(config(), None);
+
+        // 模拟「上一轮还没结束」：手工占住重入标记。
+        // 走真实的 compare_exchange 路径，而不是检查私有字段的初值。
+        use std::sync::atomic::Ordering;
+        assert!(runner
+            .round_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok());
+
+        let error = runner
+            .run_once(1_000)
+            .await
+            .expect_err("重叠轮次必须被拒绝");
+        assert!(
+            error.is_busy(),
+            "必须是可识别的「跳过」而不是普通故障：{error}"
+        );
+
+        // 队列里的条目一条都没被投递。
+        assert_eq!(
+            harness.remote.calls().len(),
+            0,
+            "被拒绝的那一轮不得投递任何条目"
+        );
+
+        // 标记释放后能正常跑，且**没有**因为上一轮卡死而永久停摆。
+        runner.round_in_flight.store(false, Ordering::SeqCst);
+        runner.run_once(1_000).await.unwrap();
+        assert_eq!(harness.remote.calls().len(), 1);
+    }
+
     #[tokio::test]
     async fn blocked_verdict_survives_restart() {
-        // 结论若只存在内存里，重启后运维看到的是「队列莫名在涨」，等于没有结论。
         let harness = Harness::new(
             ScriptedTransport::ok(),
             ScriptedTransport::failing(DeliveryFailure::transient(

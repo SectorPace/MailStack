@@ -165,7 +165,9 @@ pub async fn admin_set(
         return e500_missing_admin_config();
     };
     let mut response = revoke_sessions(&state, &username, serde_json::json!({ "ok": true }));
-    clear_session_cookie(&mut response, &state);
+    if let Some(error) = finish_after_revocation(&mut response, &state) {
+        return error;
+    }
     response
 }
 
@@ -192,7 +194,9 @@ pub async fn totp_enable(
                 return e500_missing_admin_config();
             };
             let mut response = revoke_sessions(&state, &username, value);
-            clear_session_cookie(&mut response, &state);
+            if let Some(error) = finish_after_revocation(&mut response, &state) {
+                return error;
+            }
             response
         }
         Err(e) => e.into_response(),
@@ -220,7 +224,9 @@ pub async fn totp_disable(
                 return e500_missing_admin_config();
             };
             let mut response = revoke_sessions(&state, &username, value);
-            clear_session_cookie(&mut response, &state);
+            if let Some(error) = finish_after_revocation(&mut response, &state) {
+                return error;
+            }
             response
         }
         Err(e) => e.into_response(),
@@ -268,7 +274,7 @@ fn revoke_sessions(state: &AppState, username: &str, mut value: serde_json::Valu
 /// 本函数在**响应**阶段，没有请求头也没有对端地址可用（处理器已消费掉）。
 /// 沿用 [`cookie_secure`] 的同一套判定：读显式配置项，读不到就不加 ——
 /// 与登录路径的默认行为一致，因此「下发」与「作废」必然配对。
-fn clear_session_cookie(response: &mut Response, state: &AppState) {
+fn clear_session_cookie(response: &mut Response, state: &AppState) -> Result<(), String> {
     let mut cookie = format!(
         "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
         crate::SESSION_COOKIE,
@@ -277,8 +283,25 @@ fn clear_session_cookie(response: &mut Response, state: &AppState) {
     if secure_cookie_from_env(state) {
         cookie.push_str("; Secure");
     }
-    if let Ok(value) = HeaderValue::from_str(&cookie) {
-        response.headers_mut().append(header::SET_COOKIE, value);
+    // 5.5：原先是 `if let Ok(value) = ..` —— 装不下就**什么也不做**，
+    // 响应仍是 200 且没有 Set-Cookie。那正是「登出了但立刻又自动登录」
+    // 这类现象的成因之一：服务端会话已删，浏览器那枚 cookie 却还在。
+    // 现在让它返回错误，由调用方改成显式失败。
+    let value = HeaderValue::from_str(&cookie).map_err(|error| {
+        format!("session invalidation cookie is not serializable: {error} (cookie={cookie})")
+    })?;
+    response.headers_mut().append(header::SET_COOKIE, value);
+    Ok(())
+}
+
+/// 吊销会话之后补上「立即作废」Cookie；装不下就把错误作为响应交给调用方。
+///
+/// 5.5：这三处原先都写 `clear_session_cookie(..); response` —— 返回值被丢弃，
+/// 作废失败会被静默吞掉。集中成一处，避免三份拷贝各自漂移。
+fn finish_after_revocation(response: &mut Response, state: &AppState) -> Option<Response> {
+    match clear_session_cookie(response, state) {
+        Ok(()) => None,
+        Err(message) => Some(ApiError::internal(message).into_response()),
     }
 }
 
@@ -366,7 +389,8 @@ pub async fn rpc_bridge(
 /// 但那属于部署层决策，且在本进程默认绑回环的前提下没有收益 —— 故不做。
 /// 真实来源仍然有效：SSH 隧道 / 本机 curl / 反代不隐藏时都能得到真实 IP，
 /// 且**伪造不了**。
-fn client_key(peer: Option<&SocketAddr>) -> String {
+/// 归一化 IP 的限流键（AI 限流中间件复用；不读 XFF，理由见上）。
+pub fn client_key(peer: Option<&SocketAddr>) -> String {
     match peer {
         Some(addr) => normalize_ip(addr.ip()),
         // 拿不到对端地址（测试里的 `oneshot`、未来的 in-process 调用）：
@@ -451,10 +475,36 @@ pub async fn login(
             .into_response();
     };
 
-    let password_ok = config.username == username
-        && mailstack_core::password::verify_password(&config.password_record(), &password);
+    // 5.3：PBKDF2 是 310k 次 HMAC 的纯 CPU 计算，耗时在百毫秒量级。
+    // 原实现在 **async worker 线程上同步跑完**（全仓生产代码一次都没出现过
+    // `spawn_blocking`）—— mailstackd 单进程同时承载 25/465/587、出站队列、
+    // RO/RW 两条特权面，一次登录就能把整个 worker 池占住并饿死收信与投递。
+    // 因此搬进 `spawn_blocking`：它占用的是阻塞线程池，与 async worker 解耦。
+    //
+    // 5.2：**用户名校验与口令校验都必须跑完**。原实现是
+    // `config.username == username && verify_password(..)`，用户名错误时
+    // `&&` 直接短路，PBKDF2 一次都不执行 —— 响应时间差几个数量级，
+    // 构成**用户名枚举预言机**，正好击穿 INV-23「同形错误体」的用意。
+    // 改写成两个独立布尔再合并，短路在语言层面就不可能发生。
+    let record = config.password_record();
+    let password_ok = match tokio::task::spawn_blocking({
+        let record = record.clone();
+        let password = password.clone();
+        move || mailstack_core::password::verify_password(&record, &password)
+    })
+    .await
+    {
+        Ok(verified) => verified,
+        Err(error) => {
+            // 阻塞任务本身崩了/被取消。这是**基础设施故障**，不是凭证失败 ——
+            // 因此不记失败次数（否则与 5.4 同样会把管理员锁死）。
+            return ApiError::internal(format!("password verification task failed: {error}"))
+                .into_response();
+        }
+    };
+    let username_ok = config.username == username;
 
-    if !password_ok {
+    if !(password_ok && username_ok) {
         state.inner.login_limiter.record_failure(&username);
         return ApiError::new(ERR_INVALID_CREDENTIALS, "invalid credentials")
             .with_status(StatusCode::UNAUTHORIZED)
@@ -494,20 +544,22 @@ pub async fn login(
             }
             Err(e) => {
                 // 助手不可达 → 503，绝不因基础设施故障而放行（INV-8）。
-                state.inner.login_limiter.record_failure(&username);
+                //
+                // 5.4：这里原先**也** `record_failure`。于是助手的一次瞬时不可达
+                // （助手重启、socket 短暂不可用、请求超时）会被记成一次口令错误，
+                // 连续几次基础设施抖动就把管理员账号锁死 —— 把「服务重启」升级成
+                // 「没人能登进去」，而攻击者一次都不用试。
+                // 失败计数只该由**真实的凭证失败**推进。
                 return e.into_response();
             }
         }
     }
 
     state.inner.login_limiter.record_success(&username);
-    let sid = state.inner.sessions.create(&username);
-    let csrf = state
-        .inner
-        .sessions
-        .touch(&sid)
-        .map(|s| s.csrf)
-        .unwrap_or_default();
+    // 5.5：`touch().map(|s| s.csrf).unwrap_or_default()` 在 `touch` 返回 `None`
+    // 时会交付一个**空串 CSRF**，而响应仍是 `200 {"ok":true}` —— 静默假成功。
+    // `create_session` 一次返回 id 与 csrf，「拿不到」从此不再是一个分支。
+    let (sid, csrf) = state.inner.sessions.create_session(&username);
 
     let cookie = build_session_cookie(
         &sid,
@@ -522,9 +574,21 @@ pub async fn login(
         "username": username,
     }))
     .into_response();
-    if let Ok(value) = HeaderValue::from_str(&cookie) {
-        response.headers_mut().append(header::SET_COOKIE, value);
-    }
+    // 同理：Cookie 头构造失败不能静默跳过 —— 那样会返回一个没有 Set-Cookie 的
+    // `200`，浏览器不存会话，用户表现为「登录成功但立刻又回到登录页」。
+    let cookie_value = match HeaderValue::from_str(&cookie) {
+        Ok(value) => value,
+        Err(error) => {
+            // Cookie 装不下说明会话 ID 或 cookie 属性被污染了；此时绝不能留下
+            // 一个「已认证」的会话记录 —— 撤销它，并如实报错。
+            state.inner.sessions.remove(&sid);
+            return ApiError::internal(format!("session cookie is not serializable: {error}"))
+                .into_response();
+        }
+    };
+    response
+        .headers_mut()
+        .append(header::SET_COOKIE, cookie_value);
     response
 }
 
@@ -961,6 +1025,203 @@ mod tests {
             state.inner.login_limiter.is_locked("admin"),
             "连续失败达阈值必须锁定账号"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 把已启用的 2FA 块注入 admin.json（`totp.enable` 之后的样子）。
+    fn enable_two_factor(state: &AppState) {
+        let path = &state.paths().admin_config;
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        value["totp"] = serde_json::json!({ "enabled": true });
+        std::fs::write(path, value.to_string()).unwrap();
+    }
+
+    // ── 5.2：用户名枚举预言机 ──
+
+    /// 用户名错误时**同样要跑完** PBKDF2 —— 否则响应时间差几个数量级。
+    ///
+    /// 原实现 `config.username == username && verify_password(..)` 里 `&&`
+    /// 会短路，PBKDF2 一次都不跑。
+    ///
+    /// ## 为什么这条测试必须测时间
+    ///
+    /// 被破坏的性质是「一次密码学运算有没有发生」，这是**副作用**而不是返回值。
+    /// 唯一能观察它的办法就是耗时。也正因如此，余量取得很宽（错用户名不得比
+    /// 错口令快一倍以上，而短路时它会快两个数量级）—— 宽余量是为了不把测试
+    /// 变成 flake，但它仍然足以在回归发生时立刻变红。
+    #[tokio::test]
+    async fn a_wrong_username_costs_the_same_as_a_wrong_password() {
+        let (root, state) = test_state("loginenum");
+
+        let measure = |username: &'static str, password: &'static str| {
+            let state = state.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let response = post_login(
+                    build_router(state),
+                    serde_json::json!({ "username": username, "password": password }),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                started.elapsed()
+            }
+        };
+
+        // 先各跑一次热身，避开首次调用的冷启动（JIT 之外的页分配 / 缓存）。
+        let _ = measure("nosuchuser", "Tr0ubadour9x").await;
+
+        let wrong_password = measure("admin", "Wr0ng1Password").await;
+        let wrong_username = measure("nosuchuser", "Tr0ubadour9x").await;
+
+        assert!(
+            wrong_username >= wrong_password / 2,
+            "错用户名耗时 {wrong_username:?} 明显短于错口令 {wrong_password:?} —— \
+             PBKDF2 很可能被短路了，用户名可枚举"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── 5.3：PBKDF2 不得占用 async worker ──
+
+    /// 一次登录的 PBKDF2 不得阻塞同 runtime 上的其它任务。
+    ///
+    /// 用 `worker_threads = 1` 把 worker 池压到最小：若 PBKDF2 直接跑在 worker
+    /// 线程上，这个「应当立刻完成」的任务会被整段 PBKDF2 顶住；搬进
+    /// `spawn_blocking` 之后它占用的是阻塞线程池，worker 始终空闲。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn password_hashing_does_not_block_the_async_worker() {
+        let (root, state) = test_state("loginblocking");
+        mailstack_core::config::admin_set(state.paths(), "admin", "Tr0ubadour9x").unwrap();
+
+        // 后台持续发起登录（每次都真的跑一遍 PBKDF2）。
+        let hammer = tokio::spawn({
+            let state = state.clone();
+            async move {
+                for _ in 0..3 {
+                    let _ = post_login(
+                        build_router(state.clone()),
+                        serde_json::json!({ "username": "admin", "password": "Wr0ng1Password" }),
+                    )
+                    .await;
+                }
+            }
+        });
+
+        // 与此同时，一个纯 I/O 任务必须能立刻取得时间片。
+        let started = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let elapsed = started.elapsed();
+
+        hammer.await.unwrap();
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "一个 1ms 的 sleep 花了 {elapsed:?} —— async worker 被 PBKDF2 占住了"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── 5.4：基础设施故障不得推进失败计数 ──
+
+    /// 助手不可达（503）**不得**记一次口令失败。
+    ///
+    /// 否则「助手重启一次」就等于「管理员失败一次」，连续几次抖动直接锁死账号 ——
+    /// 攻击者一次都不用试。
+    #[tokio::test]
+    async fn an_unreachable_helper_does_not_count_towards_account_lockout() {
+        let (root, state) = test_state("login503");
+        mailstack_core::config::admin_set(state.paths(), "admin", "Tr0ubadour9x").unwrap();
+        enable_two_factor(&state);
+
+        for attempt in 0..(crate::ratelimit::FAILURE_LOCKOUT_THRESHOLD + 2) {
+            let response = post_login(
+                build_router(state.clone()),
+                serde_json::json!({
+                    "username": "admin",
+                    "password": "Tr0ubadour9x",
+                    "code": "000000",
+                }),
+            )
+            .await;
+            assert!(
+                response.status() != StatusCode::UNAUTHORIZED,
+                "第 {attempt} 次：助手不可达必须报 503，绝不能变成凭证失败"
+            );
+        }
+
+        assert!(
+            !state.inner.login_limiter.is_locked("admin"),
+            "基础设施故障不得把管理员锁在门外"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── 5.5：不得静默交付空 CSRF / 缺 Set-Cookie 的 200 ──
+
+    /// 登录成功必须给出**非空**的 CSRF token 与一条 `Set-Cookie`。
+    ///
+    /// 原实现是 `touch(&sid).map(|s| s.csrf).unwrap_or_default()` + `if let Ok(..)`：
+    /// 任一环节退化都会得到一个 `200 {"ok":true}` 但**前端永远用不了**的会话。
+    #[tokio::test]
+    async fn a_successful_login_never_yields_an_empty_csrf_or_a_missing_cookie() {
+        let (root, state) = test_state("logincsrf");
+        mailstack_core::config::admin_set(state.paths(), "admin", "Tr0ubadour9x").unwrap();
+
+        for round in 0..8 {
+            let response = post_login(
+                build_router(state.clone()),
+                serde_json::json!({ "username": "admin", "password": "Tr0ubadour9x" }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let cookie = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .expect("登录成功必须下发 Set-Cookie")
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                cookie.starts_with(&format!("{}=", crate::SESSION_COOKIE)),
+                "第 {round} 轮：cookie 不可用"
+            );
+
+            let body = body_json(response).await;
+            let csrf = body["csrf"].as_str().unwrap_or_default().to_string();
+            assert_eq!(csrf.len(), 64, "第 {round} 轮：csrf 不是 32 字节 hex");
+            assert!(
+                csrf.chars().all(|c| c.is_ascii_hexdigit()),
+                "第 {round} 轮：csrf 含非 hex 字符：{csrf}"
+            );
+
+            // 该 csrf 必须真的能用：拿它通过一次 CSRF 校验（写操作）。
+            let sid = cookie
+                .split(';')
+                .next()
+                .unwrap()
+                .split_once('=')
+                .unwrap()
+                .1
+                .to_string();
+            let response = build_router(state.clone())
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(axum::http::Method::DELETE)
+                        .uri("/api/auth/sessions")
+                        .header(header::COOKIE, format!("{}={sid}", crate::SESSION_COOKIE))
+                        .header("x-csrf-token", csrf)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "第 {round} 轮：刚下发的 csrf 立刻被 CSRF 校验拒绝"
+            );
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 }

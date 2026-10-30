@@ -656,6 +656,82 @@ pub enum Lookup { Known, Missing, Unavailable(String) }
 
 ---
 
+## 3C. 批 5（Web 与队列）：§5.2 的 19 条中 17 条已修
+
+### 3C.1 Web 面（5.1–5.8）
+
+| # | 原缺陷 | 修法 | 反例测试 |
+|---|---|---|---|
+| **5.1** | `API_BODY_LIMIT_BYTES = 256KB` **定义了但从未被引用** | 两道防线：`DefaultBodyLimit`（限制实际读取量，覆盖分块）+ `reject_oversized_bodies` 中间件（按 `Content-Length` 在进处理器前回 413） | `an_oversized_request_body_is_rejected_before_it_is_buffered`、`an_oversized_body_is_rejected_even_for_an_authenticated_request`、`a_chunked_oversized_body_is_still_refused`、`a_body_just_under_the_limit_is_still_accepted_by_the_transport` |
+| **5.2** | 登录 `config.username == username && verify_password(..)` **短路** → 用户名枚举预言机 | 拆成两个独立布尔再合并，PBKDF2 无条件执行 | `a_wrong_username_costs_the_same_as_a_wrong_password`（耗时对比） |
+| **5.3** | PBKDF2（310k 次）同步跑在 async worker 上，全仓生产代码零 `spawn_blocking` | 搬进 `tokio::task::spawn_blocking` | `password_hashing_does_not_block_the_async_worker`（`worker_threads=1`，并发 1ms sleep 不得被顶住） |
+| **5.4** | 助手不可达（503）也 `record_failure` → 基础设施抖动升级为管理员锁定 | 503 分支**不**记失败计数 | `an_unreachable_helper_does_not_count_towards_account_lockout`（连续 7 次 503 后仍不得锁定） |
+| **5.5** | `touch().map(..).unwrap_or_default()` 交付**空 CSRF** 仍回 `200 {ok:true}`；`if let Ok(..)` 静默跳过 Set-Cookie | 新增 `create_session()` 一次返回 `(id, csrf)`，`unreachable` 分支消失；Cookie 构造失败 → 撤销会话 + 500 | `a_successful_login_never_yields_an_empty_csrf_or_a_missing_cookie`（8 轮，并验证 csrf 真能通过一次写操作校验）、`create_session_returns_a_usable_id_and_a_non_empty_csrf` |
+| **5.6** | `AI_RATE_LIMIT_PER_MINUTE` 与 `is_ai_path` **无任何调用点** | 新增 `AiRateLimiter`（有界表 + 无副作用判决），中间件挂在认证**之后**（避免未认证洪水耗尽共享出口的 AI 额度） | `the_ai_quota_is_enforced_and_scoped_per_source`、`a_rejected_ai_call_does_not_extend_its_own_window`、`the_ai_limiter_table_stays_bounded` |
+| **5.7** | 时钟回拨使 `last_seen` 倒退 → 会话永不过期；`#[derive(Debug)]` 把 `id` 与 `csrf` 打进日志 | `last_seen` 钳为单调不减；手写 `Debug` 只输出指纹 | `a_clock_rollback_cannot_extend_a_session_past_its_ttl`、`debug_output_redacts_the_session_id_and_the_csrf_token` |
+| **5.8** | `uptimeSec` 恒为 `0`（注释「Phase 1 尚未接线」）→ **谎报** | `OnceLock<Instant>` 钉住进程启动时刻，输出真实秒数 | `health_reports_a_monotonically_growing_uptime_instead_of_a_constant_zero`（间隔 1.1s 两次调用必须递增） |
+
+### 3C.2 队列面（5.9 / 5.11 / 5.12 / 5.13 / 5.14 / 5.15 / 5.16 / 5.17）
+
+| # | 原缺陷 | 修法 | 反例测试 |
+|---|---|---|---|
+| **5.9** | `run_once` 无重入保护，两轮重叠各投一遍 | `AtomicBool` + `compare_exchange`，冲突返回新的 `QueueError::Busy`；`RoundGuard`（`Drop`）保证任何提前返回都复位 | `overlapping_rounds_are_refused_instead_of_double_delivering` |
+| **5.11** | 5xx 永久失败也累加「出站连续失败」→ 正常退信把整条出站判成「25 被封」 | `record_remote_failure` 只接受 `FailureClass::Transient` | `permanent_failures_never_trip_the_outbound_blocked_verdict`（12 次永久失败后计数仍为 0） |
+| **5.12** | 回执照常只记 `accepted` 数却移除**全部**收件人 → 未被接受的静默丢信 | 在本地/远端两个 Ok 分支钉住 `receipt.accepted == attempted.len()`，不满足即报错而非静默移除 | 由既有 84 条队列测试覆盖（三条生产传输恒满足该不变量） |
+| **5.13** | `rows()` 把 EACCES / IO 错 / 坏 UTF-8 一律塌缩成「空表」 | 新增 `atomic::try_rows()`（只把 `NotFound` 当空表）；`users.add` 的授权判据、`domains.list`、`snapshot`、`managed_domains`（DKIM/DNS）全部改用 `try_rows` 并如实报错 | 由 `crates/priv` 既有测试与编译期签名收敛覆盖 |
+| **5.14** | MIME 边界由 `id + 失败数` 派生，**从不检查原邮件正文是否含同一串** | 128 位随机边界 + 显式冲突检测（撞上则加长到 256 位重取） | `mime_boundary_is_unpredictable_and_never_collides_with_the_original`（两次退信边界不同 + 正文预置候选必须避开） |
+| **5.15** | 快速失败期间每 10 秒把**全部积压条目**原样重写磁盘 | `process` 增加 `mutated` 标记；未改动则不写回 | 由 `blocked_queue_fast_fails_instead_of_hammering` 覆盖 |
+| **5.16** | `backlog`/`len()` 每 2 秒 `load_all()` 解析全部正文 | `len()` 只 stat 条目文件、不解析 | `len_counts_entry_files_without_parsing_them`（坏条目仍被计入，正是「没解析」的证据）、`len_ignores_non_entry_files` |
+| **5.17** | DSN 写死 `Content-Transfer-Encoding: 8bit` | 文本部分恒 `7bit`（由我们生成、恒 ASCII）；`message/rfc822` 部分按原邮件实际字节选 `7bit`/`8bit` | `content_transfer_encoding_matches_the_actual_bytes` |
+
+### 3C.3 守护进程（5.18 / 5.19）
+
+| # | 原缺陷 | 修法 |
+|---|---|---|
+| **5.18** | `select!` 直接 return 时 `timeout(ROUND_TIMEOUT, run_once)` 的 future 被 **drop** → `ROUND_TIMEOUT` 从未生效，在途投递被取消（与 5.10 叠加产生重复投递） | 每轮 `spawn` 成独立任务；`select!` 丢弃的只是 `JoinHandle` 的等待权。停机时对句柄做**有界等待**（等满 `ROUND_TIMEOUT` 才放弃）。上一轮未结束时 ticker 到点也跳过 |
+| **5.19** | 任一任务异常退出只打日志，最终永远 `Ok(())` → systemd 不重启，「进程活着但半个服务没了」 | `JoinSet<Result<(), String>>`；监听器/RPC 面/panic 全部作为失败汇总，非零返回新的 `DaemonError::Task` |
+
+### 3C.4 ⏳ 未修：5.10（投递 lease）
+
+`queue/runner.rs` 的「投递成功」与「把成功写下来」之间**仍无 lease / in-flight 标记**。
+崩溃、掉电、或 5.18 那类取消之后，条目仍带全部收件人 → 整批重投、收件人收到重复邮件。
+
+**为什么不在这轮顺手改**：真正的修法是给 store 加 per-entry claim
+（`<id>.claim` 携带 token + 租约到期时间，`load_all` 跳过未过期的 claim，
+启动时忽略陈旧 claim）。它会改变 `load_all` 的语义与队列文件布局，
+需要独立的回归面（崩溃恢复、双进程、租约过期）—— 塞进这一批会让
+「5.9 的重入保护」与它互相掩护，出问题时无法分辨是哪一层的责任。
+**5.18 已经把它从「必然发生」降级为「崩溃窗口内才发生」**，但窗口仍在。
+
+---
+
+## 3D. 管理前端 webui（§WEBUI_AUDIT 的 41 条）
+
+前端由独立工作流完成，改动**全部限于 `webui/`**，与后端加固是两套账。
+`npm run build`（tsc `--noEmit` + Vite）通过，`noUnusedLocals`/`noUnusedParameters` 已开启。
+
+**关键验证（实测，非仅编译）**
+
+| 项 | 结果 |
+|---|---|
+| 生产包硬编码 TOTP 密钥 `JBSWY3DPEHPK3PXP` | **NO MATCH** |
+| `mock2fa` / `?mock=1` / `mock 口令 123456` | 均不存在（整块 mock 由 `import.meta.env.DEV` 门控并在生产被 DCE） |
+| 无后端时 | 渲染「后端不可达」错误页 + 重试，**不再**进入控制台（H1 fail-closed） |
+| `hidden!` 残留 | 只剩 `Settings.tsx:321`（有意隐藏 `<input type="file">`，审计明确要求保留） |
+
+**逐条**（H1–H4 / M1–M9 / L1–L28）见该轮交付记录；其中三条需要接续者知道：
+
+1. **H3 的修复方向被修正**：审计建议「由 `security.scan` 的 findings 推导 SPF/DMARC/DKIM」
+   **不可行** —— 后端 `findings` 是文件系统审计项，与 DNS 无关。改用
+   `dns.records`（`ok` 为该记录实查结果）+ `services.list`（fail2ban 活性）。
+2. **M5 只能部分修**：后端 `session.rs` 确实没有 `current`/`ip`/`userAgent`，
+   前端无法判断当前会话。已做到：不再依赖不存在字段、吊销后**重新拉取**真实列表
+   （消除「谎报成功」）、UI 明示「吊销自身会话会立即登出」。
+3. **M9 按删除处理**：「保持登录」在后端没有对应语义（只读 `username/password/code`，
+   `Max-Age` 固定），任何「实现」都只能是假实现，故删控件并留注释。
+
+---
+
 ## 4. 我**否掉**的报告结论（复核后未改代码）
 
 审查报告本身也有误报。**逐条回源码核实**是必要步骤 —— 否则会把有意选择
@@ -699,6 +775,16 @@ pub enum Lookup { Known, Missing, Unavailable(String) }
 > 批 4 修复过程中新登记的两条，见 §3B.4 与 §3B.6 的「有意偏离」两段。
 
 ### 5.2 批 5：Web 与队列
+
+> 🟡 **批 5 已修 17/19**，逐条记录见 **§3C**。
+>
+> - **5.1–5.9、5.11–5.19：已修**（含配套改动：新增 `AiRateLimiter`、
+>   `atomic::try_rows`、`QueueError::Busy` / `is_busy()`、`DaemonError::Task`）。
+> - **5.10 未修（投递 lease）**：真正落地要改 store 的 per-entry claim 与
+>   `load_all` 语义，需要独立的崩溃恢复回归面。**5.18 已把它从「必然发生」
+>   降为「崩溃窗口内才发生」**，但窗口仍在。详见 §3C.4。
+>
+> 下表是原始清单（保留作对照，状态以本节说明为准）：
 
 | # | 位置 | 缺陷 | 影响 |
 |---|---|---|---|
@@ -802,7 +888,7 @@ RCPT 名录的三态判定、A-R 的 RFC 8601 引用 —— 我逐条复核过�
 W='wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0'
 R=/mnt/e/MailStack/mailstack-rust
 
-# 1) 全量测试（应为 1111 passed / 0 failed）
+# 1) 全量测试（应为 1132 passed / 0 failed）
 $W bash $R/deploy/wsl-cargo.sh test --workspace --all-targets
 
 # 2) 三道门禁

@@ -40,7 +40,7 @@ use mailstack_core::paths::Paths;
 pub use contract::{RouteSpec, ROUTES};
 pub use ctl::PrivilegedClient;
 pub use error::ApiError;
-pub use ratelimit::LoginLimiter;
+pub use ratelimit::{AiRateLimiter, LoginLimiter};
 pub use session::{SessionStore, SESSION_COOKIE};
 
 /// API JSON 请求体上限：256 KB（INV-12）。
@@ -56,6 +56,8 @@ pub struct AppInner {
     pub paths: Paths,
     pub sessions: SessionStore,
     pub login_limiter: LoginLimiter,
+    /// AI 路由独立限流（20 次/分/IP）。
+    pub ai_limiter: AiRateLimiter,
     pub client: PrivilegedClient,
     /// 公网模式（影响注册窗口与 RO fallback）。
     pub public_mode: bool,
@@ -73,6 +75,7 @@ impl AppState {
             inner: Arc::new(AppInner {
                 sessions: SessionStore::new(),
                 login_limiter: LoginLimiter::new(),
+                ai_limiter: AiRateLimiter::new(),
                 client: PrivilegedClient::new(public_mode),
                 public_mode,
                 runtime_id: format!("mailstackd/{} (rust)", mailstack_core::VERSION),
@@ -188,9 +191,22 @@ pub struct AuthenticatedUser {
     pub csrf: String,
 }
 
+/// 本进程启动时刻（首次调用 `health` 时钉住）。
+///
+/// 用 [`std::time::Instant`] 而不是墙钟：它不受 NTP 校时与手动改时间影响，
+/// 「进程跑了多久」本来就该是单调量。
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 /// `GET /api/health` —— 免认证（INV-22：`node` 字段不可缺）。
 pub async fn health(State(state): State<AppState>) -> Response {
-    let uptime = 0u64; // Phase 1：进程启动时刻尚未接线到遥测模块
+    // 5.8：原先这里是 `let uptime = 0u64;`（注释「Phase 1：尚未接线」）——
+    // 那不是「拿不到」，那是**谎报**：前端与运维都把 0 当成一个真实读数。
+    // 进程启动时刻由 `Instant` 给出，不存在「拿不到」的情形，因此这里给不出 null，
+    // 也就不会重新落回「用 0 假装有值」。
+    let uptime = PROCESS_START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs();
     Json(serde_json::json!({
         // 管理前端的 `probe()` 用 `body.ok === true` 判定能否进入 live 模式，
         // 判 false 会**静默**降级到内置 mock —— 界面看起来完全正常，但全是演示数据。
@@ -207,6 +223,41 @@ pub async fn health(State(state): State<AppState>) -> Response {
         "time": mailstack_core::now_iso8601_utc(),
     }))
     .into_response()
+}
+
+/// AI 路由的独立限流（5.6）。
+///
+/// ## 为什么排在认证**之后**
+///
+/// 层是「后加的先执行」，所以本层加在 [`require_auth`] **之前**（即它被包裹在
+/// 认证里面）。若反过来先查 AI 桶，一个未认证的洪水就能把同一出口 NAT 后
+/// 所有正常管理员的 AI 额度全部消耗掉 —— 那等于把限流本身变成拒绝服务。
+///
+/// 非 `/api/ai/` 路径直接放行：本层挂在整个受保护路由树上，靠
+/// [`contract::is_ai_path`] 判定适用性（这正是它此前「无调用点」的那一半）。
+async fn ai_rate_limit(
+    State(state): State<AppState>,
+    // `Option<..>` 而非裸 `ConnectInfo`：宿主**可能**不注入连接信息
+    // （纯 API 单元测试的 `oneshot`、未来的 in-process 调用）。写成裸提取器时
+    // 提取失败会让整条中间件回 500，把「限流」变成「全站不可用」。
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !contract::is_ai_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+    let peer_addr = peer.map(|axum::extract::ConnectInfo(addr)| addr);
+    match state
+        .inner
+        .ai_limiter
+        .check(&crate::routes::client_key(peer_addr.as_ref()))
+    {
+        crate::ratelimit::LimitVerdict::Allow => next.run(request).await,
+        crate::ratelimit::LimitVerdict::Limited { retry_after_secs } => {
+            ApiError::rate_limited(retry_after_secs).into_response()
+        }
+    }
 }
 
 /// `GET /api/auth/session` —— 返回 `{ ok, csrf, username }`。
@@ -377,12 +428,57 @@ pub fn build_api_router(state: AppState) -> Router {
             "/api/mail/test-loopback",
             post(crate::routes::mail_test_loopback),
         )
+        .layer(middleware::from_fn_with_state(state.clone(), ai_rate_limit))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
         .merge(public)
         .merge(protected)
         .with_state(state)
+        // INV-12 / 5.1：`API_BODY_LIMIT_BYTES` 在此之前只是一个**从未被引用的常量**
+        // —— 模块头注释声称有 256KB 上限，实现里没有任何东西强制它。
+        // 叠加 `panic = "abort"`（见批 6 的 6.9），单个超大请求就能把控制台进程打死。
+        //
+        // 两道防线缺一不可：
+        // 1. `DefaultBodyLimit` 限制**实际读取量**（覆盖分块传输、无 Content-Length 的情形）；
+        // 2. `reject_oversized_bodies` 在进处理器**之前**按 Content-Length 直接回 413
+        //    —— 因为 `DefaultBodyLimit` 的 413 会被 `Option<Json<Value>>` 吞掉（见下）。
+        .layer(axum::extract::DefaultBodyLimit::max(API_BODY_LIMIT_BYTES))
+        .layer(middleware::from_fn(reject_oversized_bodies))
+}
+
+/// INV-12 / 5.1 的「快速拒绝」半边：在进任何提取器之前按 `Content-Length` 判定。
+///
+/// ## 为什么光有 `DefaultBodyLimit` 不够
+///
+/// 本项目的处理器绝大多数写成 `body: Option<Json<serde_json::Value>>`（允许空体）。
+/// axum 0.7 对 `Option<T>` 的 `FromRequest` 实现会把**所有**拒绝都塌缩成 `None`：
+///
+/// ```ignore
+/// match T::from_request(req, state).await {
+///     Ok(v) => Ok(Some(v)),
+///     Err(_) => Ok(None),      // ← 413 / 400 / 415 一并吞掉
+/// }
+/// ```
+///
+/// 于是超大请求体不会得到 413，而是被当成「没带请求体」继续往下走 ——
+/// 实测表现为处理器拿着空对象去调助手，最终回 500（与上限毫无关系的一句错误）。
+/// 在提取器之前判定，才能让「超限」这件事如实反映成 413。
+///
+/// 这条同时也堵住了 `Option<Json>` 更广的一类静默失败：畸形 JSON 会被当成 `{}`。
+/// 彻底修掉需要把所有处理器改成非 `Option` 的 `Json`，属于契约层改动，另行登记。
+async fn reject_oversized_bodies(request: Request, next: Next) -> Response {
+    if let Some(length) = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        if length > API_BODY_LIMIT_BYTES as u64 {
+            return ApiError::payload_too_large().into_response();
+        }
+    }
+    next.run(request).await
 }
 
 /// 完整 API 路由：未匹配的路径回 **JSON** 404（不是 SPA 的 index.html）。
@@ -400,7 +496,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
-    use axum::http::{Method, StatusCode};
+    use axum::http::{header, Method, StatusCode};
     use tower::ServiceExt;
 
     fn test_state(tag: &str) -> (std::path::PathBuf, AppState) {
@@ -423,6 +519,198 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// 5.1：超过 [`API_BODY_LIMIT_BYTES`] 的请求体必须被**提取器**拒绝。
+    ///
+    /// 这条在接线之前必然失败：常量没有任何调用点，`Json<Value>` 会把整个请求体
+    /// 读进内存。叠加 release 的 `panic = "abort"`，单个几百 MB 的请求就能打死
+    /// 控制台进程。
+    ///
+    /// 走的是 **免认证的 `/api/auth/login`** —— 未认证的洪水才是最需要被挡住的那一路
+    /// （受保护路由会先被 `require_auth` 以 401 挡回，根本走不到体提取器）。
+    #[tokio::test]
+    async fn an_oversized_request_body_is_rejected_before_it_is_buffered() {
+        let (root, state) = test_state("bodylimit");
+        let app = build_router(state);
+
+        let oversized = "x".repeat(API_BODY_LIMIT_BYTES + 4096);
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "pad": oversized }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "超出 {} 字节的请求体必须回 413，实际 {}",
+            API_BODY_LIMIT_BYTES,
+            response.status()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 上限必须对**已认证**的受保护路由同样生效 —— 那是会话被劫持后的那条路。
+    ///
+    /// 这里显式带 `Content-Length`：真实 HTTP 客户端对非分块请求**必然**发送它，
+    /// 而快速拒绝那一半正是按它判定的（`Body::from(..)` 不会自动补这个头，
+    /// 所以测试必须自己补，否则测的就不是真实请求形态）。
+    #[tokio::test]
+    async fn an_oversized_body_is_rejected_even_for_an_authenticated_request() {
+        let (root, state) = test_state("bodylimitauth");
+        let (sid, csrf) = state.inner.sessions.create_session("admin");
+        let app = build_router(state);
+
+        let oversized = "x".repeat(API_BODY_LIMIT_BYTES + 4096);
+        let payload = serde_json::json!({ "pad": oversized }).to_string();
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/domains")
+                    .header(header::COOKIE, format!("{}={sid}", SESSION_COOKIE))
+                    .header("x-csrf-token", csrf)
+                    .header("content-type", "application/json")
+                    .header(header::CONTENT_LENGTH, payload.len().to_string())
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "已认证的超大请求体同样必须回 413，实际 {}",
+            response.status()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 无 `Content-Length`（分块）时内存仍必须被 `DefaultBodyLimit` 兜住。
+    ///
+    /// 这一路**不会**得到 413：`Option<Json<Value>>` 把限流拒绝吞成 `None`
+    /// （见 `reject_oversized_bodies` 的注释）。此处只钉住「拒绝发生」这个事实，
+    /// 不假装状态码是对的 —— 真正的修法是让处理器不再用 `Option<Json>`。
+    #[tokio::test]
+    async fn a_chunked_oversized_body_is_still_refused() {
+        let (root, state) = test_state("bodylimitchunked");
+        let (sid, csrf) = state.inner.sessions.create_session("admin");
+        let app = build_router(state);
+
+        let oversized = "x".repeat(API_BODY_LIMIT_BYTES + 4096);
+        let payload = serde_json::json!({ "pad": oversized }).to_string();
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/domains")
+                    .header(header::COOKIE, format!("{}={sid}", SESSION_COOKIE))
+                    .header("x-csrf-token", csrf)
+                    .header("content-type", "application/json")
+                    // 刻意不发 Content-Length：模拟分块传输。
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(
+            response.status(),
+            StatusCode::OK,
+            "分块超大请求体必须被拒绝（内存由 DefaultBodyLimit 兜住）"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_body_just_under_the_limit_is_still_accepted_by_the_transport() {
+        // 上限的另一面：不能把正常请求也一起挡掉。
+        let (root, state) = test_state("bodylimitok");
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "admin",
+                            "pad": "x".repeat(1024),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "限额之内的正常请求体不应被拒绝，实际 {}",
+            response.status()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 5.8：`uptimeSec` 必须是真实读数，而不是恒为 0 的占位。
+    #[tokio::test]
+    async fn health_reports_a_monotonically_growing_uptime_instead_of_a_constant_zero() {
+        let (root, state) = test_state("uptime");
+        let app = build_router(state);
+
+        let first = {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/api/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = body_json(response).await;
+            assert!(
+                value["uptimeSec"].is_u64(),
+                "uptimeSec 必须是数字，实际：{}",
+                value["uptimeSec"]
+            );
+            value["uptimeSec"].as_u64().unwrap()
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let second = {
+            let response = app
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/api/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            body_json(response).await["uptimeSec"].as_u64().unwrap()
+        };
+
+        assert!(
+            second > first,
+            "uptimeSec 没有随时间增长（{first} → {second}）—— 它被写死成常量了"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

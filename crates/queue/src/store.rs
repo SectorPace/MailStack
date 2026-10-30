@@ -165,12 +165,32 @@ impl QueueStore {
     }
 
     /// 待投递条目数量。
+    ///
+    /// 5.16：原实现是 `load_all()?.len()` —— `backlog` / `len()` 每 2 秒被遥测采样
+    /// 调用一次，于是**每 2 秒把全部邮件正文解析一遍**。千条积压时那是每 2 秒
+    /// 数百 MB 的解析开销，而且它跑在 tokio worker 上，会直接饿死收信与投递。
+    ///
+    /// 计数只需要知道「有几个条目文件」，不需要解析内容：这里只 stat 目录项，
+    /// 跳过非条目文件（锁 sidecar、健康状态文件等）。坏条目的隔离行为仍由
+    /// `load_all` 负责 —— 计数不值得为它做一次全量解析。
     pub fn len(&self) -> QueueResult<usize> {
-        Ok(self.load_all()?.len())
+        let dir = self.entries_dir();
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let read = fs::read_dir(&dir).map_err(|e| QueueError::io(&dir, e))?;
+        let mut count = 0usize;
+        for item in read {
+            let Ok(item) = item else { continue };
+            if is_queue_file(&item.path()) {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     pub fn is_empty(&self) -> QueueResult<bool> {
-        Ok(self.load_all()?.is_empty())
+        Ok(self.len()? == 0)
     }
 
     /// 读出站健康状态。文件缺失或损坏时返回 `None`（并 `warn`），
@@ -467,5 +487,42 @@ mod tests {
             ids,
             vec!["00000000001-000A", "00000000001-000B", "00000000001-000C"]
         );
+    }
+
+    /// 5.16：`len()` 只数条目文件，**不解析邮件正文**。
+    ///
+    /// 原实现是 `load_all()?.len()`。而 `backlog` / `len()` 每 2 秒被遥测采样
+    /// 调用一次 —— 千条积压时就是每 2 秒数百 MB 的解析，还跑在 tokio worker 上。
+    ///
+    /// 判据：一条**内容已损坏**的条目文件仍然被计入数量。`load_all()` 会把它
+    /// 移进 `corrupt/`（因此数不到它），而只 stat 目录项的 `len()` 必须数得到 ——
+    /// 这正是「不解析」的可观测证据。
+    #[test]
+    fn len_counts_entry_files_without_parsing_them() {
+        let (_d, store) = temp_store();
+        store.enqueue(&entry("0001")).unwrap();
+        store.enqueue(&entry("0002")).unwrap();
+        assert_eq!(store.len().unwrap(), 2);
+
+        // 塞一个坏条目进目录。
+        let broken = store.entries_dir().join("00000000001-0003.json");
+        fs::write(&broken, b"not a queue entry at all").unwrap();
+
+        assert_eq!(store.len().unwrap(), 3, "len() 必须只数文件，不解析内容");
+
+        // 对照：load_all 会隔离坏条目，因此只返回 2 条。
+        let parsed = store.load_all().unwrap();
+        assert_eq!(parsed.len(), 2, "load_all 应隔离坏条目");
+        assert!(!broken.exists(), "坏条目应已移入 corrupt/");
+    }
+
+    /// 健康状态文件与锁 sidecar 不得被算进条目数量。
+    #[test]
+    fn len_ignores_non_entry_files() {
+        let (_d, store) = temp_store();
+        store.enqueue(&entry("0001")).unwrap();
+        store.save_health(&OutboundHealthState::default()).unwrap();
+        fs::write(store.entries_dir().join(".hidden.lock"), b"").unwrap();
+        assert_eq!(store.len().unwrap(), 1);
     }
 }

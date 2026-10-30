@@ -197,7 +197,7 @@ impl Registry {
         // ── 表文件读取类 ──
         let p = paths.clone();
         registry.register("domains.list", move |_data| {
-            Ok(json!({ "domains": read_domain_table(&p) }))
+            Ok(json!({ "domains": read_domain_table(&p)? }))
         });
 
         // ── 管理员凭证（§5.4；INV-30） ──
@@ -475,16 +475,21 @@ fn required_str<'a>(data: &'a Value, key: &str) -> Result<&'a str, HandlerError>
 /// 读取域名表，返回结构化数组。
 ///
 /// 表文件格式沿用 postfix 风格：每行 `<domain> <target>`，`#` 为注释。
-/// 跳过空行与注释由 [`mailstack_core::atomic::rows`] 保证。
-fn read_domain_table(paths: &Paths) -> Vec<Value> {
-    mailstack_core::atomic::rows(&paths.domains)
+/// 跳过空行与注释由 [`mailstack_core::atomic::try_rows`] 保证。
+///
+/// 5.13：用 `try_rows` 而不是 `rows` —— 读失败（EACCES / IO 错 / 坏 UTF-8）
+/// 必须作为错误上报，否则「读不到」会被说成「一个域名都没有」，
+/// 管理员会以为域名全丢了。
+fn read_domain_table(paths: &Paths) -> Result<Vec<Value>, HandlerError> {
+    Ok(mailstack_core::atomic::try_rows(&paths.domains)
+        .map_err(|error| HandlerError::new(format!("domain table is unreadable: {error}")))?
         .into_iter()
         .filter_map(|row| {
             let name = row.first()?.clone();
             let target = row.get(1).cloned().unwrap_or_default();
             Some(json!({ "name": name, "target": target }))
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]

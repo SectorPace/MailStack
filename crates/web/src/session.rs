@@ -112,7 +112,15 @@ pub const SESSION_ABSOLUTE_MAX_SECONDS: i64 = 7 * 24 * 3600;
 pub const MAX_SESSIONS: usize = 5_000;
 
 /// 一条会话记录。
-#[derive(Debug, Clone)]
+///
+/// ## 为什么不用 `#[derive(Debug)]`
+///
+/// `id` 与 `csrf` 是**两个 bearer 凭据**：拿到任何一个都能直接冒用该会话
+/// （`id` 走 HttpOnly Cookie，`csrf` 由前端在请求头回传）。派生 `Debug` 会让
+/// `tracing` 的任何一条 `?session` / `%session` 把两者原样打进日志，
+/// 与本文件头部「会话 ID 只在 HttpOnly Cookie」的约定直接冲突。
+/// 因此这里手写 `Debug`，只暴露指纹与不含凭据的元信息。
+#[derive(Clone)]
 pub struct Session {
     /// 会话 ID（随机 32 字节 hex）。**绝不**通过 API 暴露。
     pub id: String,
@@ -125,6 +133,20 @@ pub struct Session {
     pub created_at: OffsetDateTime,
     /// 会话指纹（ID 的 SHA256 前 16 位 hex），对外暴露的就是它。
     pub fingerprint: String,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 刻意不输出 `id` 与 `csrf`，连长度都不给。
+        f.debug_struct("Session")
+            .field("fingerprint", &self.fingerprint)
+            .field("username", &self.username)
+            .field("last_seen", &self.last_seen)
+            .field("created_at", &self.created_at)
+            .field("id", &"<redacted>")
+            .field("csrf", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Session {
@@ -160,6 +182,44 @@ pub struct SessionStore {
 impl SessionStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 建立新会话，返回 `(会话 ID, CSRF token)`（调用方负责写入 Cookie）。
+    ///
+    /// ## 为什么必须一次返回两个值
+    ///
+    /// 原先登录路径是「建会话 → 再 `touch()` 一次把 csrf 读回来 →
+    /// `unwrap_or_default()`」。`touch()` 会**返回 `None`**（表被并发清理 /
+    /// 容量淘汰 / 未来引入的过期判定），而 `unwrap_or_default()` 会把 `None`
+    /// 变成**空串 CSRF token** —— 响应仍是 `200 {"ok":true}`，但这个会话的
+    /// CSRF 是空串。前端随后每一个写请求都会被 CSRF 校验拒绝，而用户看到的
+    /// 只是一句「missing or invalid CSRF token」，永远查不到是登录那一步就已经坏了。
+    /// 一次返回两个值让「取不到 csrf」变成**不可能发生**，而不是被默认值吞掉。
+    pub fn create_session(&self, username: &str) -> (String, String) {
+        self.create_session_at(username, OffsetDateTime::now_utc())
+    }
+
+    /// [`Self::create_session`] 的可注入时钟版本。
+    pub fn create_session_at(&self, username: &str, now: OffsetDateTime) -> (String, String) {
+        let id = random_token();
+        let csrf = random_token();
+        let session = Session {
+            fingerprint: fingerprint_of(&id),
+            csrf: csrf.clone(),
+            username: username.to_string(),
+            last_seen: now,
+            created_at: now,
+            id: id.clone(),
+        };
+
+        let mut map = self.lock();
+        // 先清理过期项，再在必要时淘汰最旧会话，保证容量上限不被突破。
+        map.retain(|_, s| !s.is_expired(now));
+        if map.len() >= MAX_SESSIONS {
+            evict_oldest(&mut map);
+        }
+        map.insert(id.clone(), session);
+        (id, csrf)
     }
 
     /// 建立新会话。返回会话 ID（调用方负责写入 Cookie）。
@@ -201,7 +261,14 @@ impl SessionStore {
             map.remove(id);
             return None;
         }
-        session.last_seen = now;
+        // 5.7：时钟回拨（NTP 校正、运维 `date -s`、虚拟机快照恢复）会让 `now`
+        // 小于上一次记录的 `last_seen`。直接赋值等于把活动时刻**往回拨**，
+        // 于是 `idle = now - last_seen` 变成负数，直到墙钟追上旧值为止，
+        // 这条会话**永不过期** —— 滑动 TTL 被彻底废掉。
+        // 正确做法是把活动时刻钳到单调不减：回拨不刷新寿命，也不倒退。
+        if now > session.last_seen {
+            session.last_seen = now;
+        }
         Some(session.clone())
     }
 
@@ -301,6 +368,77 @@ pub fn method_requires_csrf(method: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 5.7：时钟回拨不得让会话**永不过期**，也不得让活动时刻倒退。
+    ///
+    /// 原实现无条件 `session.last_seen = now`。墙钟往回拨之后，`idle = now -
+    /// last_seen` 变成负数，直到墙钟追上旧值为止这条会话都不会被判定过期 ——
+    /// 滑动 TTL 被彻底废掉。
+    #[test]
+    fn a_clock_rollback_cannot_extend_a_session_past_its_ttl() {
+        let store = SessionStore::new();
+        let t0 = OffsetDateTime::now_utc();
+        let id = store.create_at("admin", t0);
+
+        // 正常使用 1 小时后，墙钟被拨回 3 小时。
+        let used = t0 + Duration::hours(1);
+        let touched = store.touch_at(&id, used).expect("正常活动应有效");
+        assert_eq!(touched.last_seen, used);
+
+        let rolled_back = t0 + Duration::minutes(5);
+        let after = store
+            .touch_at(&id, rolled_back)
+            .expect("刚活动过，回拨不该立刻失效");
+        assert!(
+            after.last_seen >= used,
+            "活动时刻被拨回去了：{} → {}",
+            used,
+            after.last_seen
+        );
+
+        // 回拨之后照常按 TTL 过期：距「最后一次可信活动」满 TTL 即失效。
+        let past = after.last_seen + Duration::seconds(SESSION_TTL_SECONDS + 1);
+        assert!(
+            store.touch_at(&id, past).is_none(),
+            "回拨之后仍必须按滑动 TTL 过期"
+        );
+    }
+
+    /// 5.7：`Debug` 绝不能把两个 bearer 凭据打出来。
+    #[test]
+    fn debug_output_redacts_the_session_id_and_the_csrf_token() {
+        let store = SessionStore::new();
+        let (id, csrf) = store.create_session("admin");
+        let session = store.touch(&id).expect("刚建的会话应有效");
+
+        let rendered = format!("{session:?}");
+        assert!(
+            !rendered.contains(&id),
+            "Debug 泄露了会话 ID（拿到它即可冒用）：{rendered}"
+        );
+        assert!(
+            !rendered.contains(&csrf),
+            "Debug 泄露了 CSRF token：{rendered}"
+        );
+        assert!(
+            rendered.contains(&session.fingerprint),
+            "指纹是对外可暴露的那一份，应当仍在：{rendered}"
+        );
+    }
+
+    /// 5.5：`create_session` 一次返回 id 与 csrf，且两者都不是空串。
+    #[test]
+    fn create_session_returns_a_usable_id_and_a_non_empty_csrf() {
+        let store = SessionStore::new();
+        for _ in 0..64 {
+            let (id, csrf) = store.create_session("admin");
+            assert_eq!(id.len(), 64, "会话 ID 应为 32 字节 hex");
+            assert_eq!(csrf.len(), 64, "csrf 应为 32 字节 hex");
+            assert!(!csrf.is_empty());
+            let stored = store.touch(&id).expect("刚建的会话应有效");
+            assert_eq!(stored.csrf, csrf, "返回的 csrf 必须与表里那一份逐字一致");
+        }
+    }
 
     #[test]
     fn create_returns_an_id_and_registers_the_session() {

@@ -59,7 +59,7 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 
 | 维度 | 数值 | 说明 |
 |---|---|---|
-| 测试 | **1111 passed / 0 failed** | `cargo test --workspace --all-targets`；含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
+| 测试 | **1132 passed / 0 failed** | `cargo test --workspace --all-targets`；含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 | 不变量门禁 | **277 / 277 存在** | `deploy/verify-invariant-gate.sh`（从 `ci.yml` 动态取名单） |
 | 质量门禁 | `QUALITY_GATE=PASS` | rustfmt + clippy(`-D warnings`) + 全量测试 |
 | 交付物门禁 | `DELIVERABLES_OK` | `deploy/verify-deliverables.sh` |
@@ -99,7 +99,7 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 | `mailstack-web-bin` | 9 | **管理控制台服务入口**（`bin/mailstack-web`）：API + 前端产物托管、SPA 回退、`/api` 兜底保持 JSON、路径穿越拒绝、遥测后台采样宿主 |
 | `mailstackd` | 28 | 进程入口：fail-closed 装配、监听集中绑定、RPC 双通道、停机扇出、队列调度、封禁热重载 |
 | `mailstackctl` | 7 | CLI：参数→特权调用的翻译、退出码映射 |
-| **合计** | **1111** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
+| **合计** | **1132** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 
 ### 2.4 Phase 进度明细
 
@@ -242,10 +242,10 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 | 批 2 | ✅ 已提交 `70b9c35` | 出站侧加固（响应限长、CRLF 注入、裸 LF 走私、SSRF IPv6 白名单、DNS 超时、LMTP 尾部空行） |
 | 批 3 | ✅ 已提交 `37ddfa1` | 认证与授权（DMARC 类型化、RCPT 枚举防护、A-R 注入、TOTP 重放、`totp.disable` 零验证、`revoke_user` 死代码、Cookie `__Host-`） |
 | 批 4 | ✅ 已提交 `1ff8a7b` | 特权与密码学：`locked()` fail-closed、`file_snapshot` 的 EACCES、`service_ctl` 超时、`pgrep` 正则转义、`resolve_program` 可执行位与父目录链、`users` 三处忽略退出码、`PROTECTED_USERS`、socket 属组失败即中止、RPC 读超时、`framing` 256KB 接线、AI 私钥/配置不落 `mailstack-admin` 组、CRLF 请求走私、`ai.models.list` 从 RO 挪到 RW。**逐条记录见 `REVIEW_FIXES.md` §3B** |
-| 批 5 | ⏳ 未开始 | Web 与队列：`RequestBodyLimitLayer` 接线、用户名枚举预言机、PBKDF2 阻塞 async、503 误锁管理员、`run_once` 排他、投递 lease、5xx 不计入出站健康、`tables` RMW 加锁 |
+| 批 5 | 🟡 **17/19 已修**（5.10 未做） | Web 与队列：请求体 256KB 真正接线（双防线）、用户名枚举预言机、PBKDF2 搬进 `spawn_blocking`、503 不记失败、空 CSRF 静默假成功、AI 路由独立限流接线、会话时钟回拨、`uptimeSec` 谎报、`run_once` 重入保护、5xx 不计出站健康、`rows()` 读错误如实上报、DSN 随机 MIME 边界、DSN CTE 如实声明、快速失败不再全量重写、`len()` 不再全量解析、停机不再取消在途投递、任务异常退出非零返回。**逐条记录见 `REVIEW_FIXES.md` §3C**。⏳ **未做：5.10 投递 lease** —— 理由见 §3C.4 |
 | 批 6 | ⏳ 未开始 | 工程化：CI 供应链门禁转强制、不变量门禁验断言、`deploy` 脚本 `set -euo pipefail`、`build.sh` 补 `mailstack-web`、`panic = "abort"` 重评估、审计链 fsync |
 
-> ⚠️ **批 5 与批 6 是「已证实存在、尚未修复」的清单** —— 不是猜测。
+> ⚠️ **批 6 与 5.10 是「已证实存在、尚未修复」的清单** —— 不是猜测。
 > 每一条都在 `REVIEW_FIXES.md` 的「未修项」表里，含位置与影响。
 > 规模上大多是 1–20 行的局部修改，但**必须逐条配反例测试**（审查报告的核心批评正是
 > 「测试擅长验证『我实现的是对的』，不擅长验证『我声称的性质没被破坏』」）。

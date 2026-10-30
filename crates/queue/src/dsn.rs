@@ -62,14 +62,7 @@ pub fn build_dsn(req: &DsnRequest<'_>) -> String {
     let to = sanitize_header(dsn_recipient(req.original).unwrap_or_default());
     let subject = "Undelivered Mail Returned to Sender";
     let now = OffsetDateTime::now_utc();
-    let boundary = format!(
-        "=_MailStack_{}",
-        sanitize_boundary(&format!(
-            "{}-{}",
-            req.original.id,
-            req.failed_recipients.len()
-        ))
-    );
+    let boundary = fresh_boundary(&[req.original.data.as_str(), req.diagnostic]);
 
     let mut out = String::new();
     push(
@@ -97,7 +90,10 @@ pub fn build_dsn(req: &DsnRequest<'_>) -> String {
     // 第 1 部分：人类可读说明。
     push(&mut out, &format!("--{boundary}"));
     push(&mut out, "Content-Type: text/plain; charset=utf-8");
-    push(&mut out, "Content-Transfer-Encoding: 8bit");
+    // 5.17：这一部分由我们自己生成、恒为 ASCII，因此**恒为 7bit**。
+    // 原先无条件写 `8bit`，把一封纯 ASCII 的退信升格成 8 位报文，
+    // 对只通告 7BIT 的对端是 RFC 4155/6152 意义上的违规。
+    push(&mut out, "Content-Transfer-Encoding: 7bit");
     push(&mut out, "");
     push(&mut out, &format!("This is the mail system at host {mta}."));
     push(&mut out, "");
@@ -148,6 +144,14 @@ pub fn build_dsn(req: &DsnRequest<'_>) -> String {
     // 第 3 部分：原邮件（便于收件人重发或排查）。
     push(&mut out, &format!("--{boundary}"));
     push(&mut out, "Content-Type: message/rfc822");
+    // 5.17：原邮件原样转发（不能转码 —— 那会破坏它的 DKIM 签名与正文字节）。
+    // 因此这里的声明必须如实反映原邮件是不是 7-bit 干净：
+    // 干净就声明 7bit，含 8 位字节才声明 8bit。
+    let original_cte = cte_for(req.original.data.as_bytes());
+    push(
+        &mut out,
+        &format!("Content-Transfer-Encoding: {original_cte}"),
+    );
     push(&mut out, "");
     out.push_str(&normalize_crlf(&req.original.data));
     if !out.ends_with("\r\n") {
@@ -190,18 +194,65 @@ pub fn sanitize_header(value: &str) -> String {
         .to_string()
 }
 
-/// 边界串净化：只保留 ASCII 字母数字与 `-_.`。
-fn sanitize_boundary(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
+/// 生成一个 MIME 边界：128 位随机，并保证**不出现在**报文任何部分里。
+///
+/// ## 5.14：为什么不能用「条目 ID + 失败数」派生
+///
+/// 原实现的边界是 `entry.id + 失败数` 拼出来的：确定、可复现，而且
+/// **从不检查原邮件正文是否含同一串**。原邮件正文是发件人完全可控的，
+/// 只要他在正文里放一行 `--<边界>`，就能提前结束真正的 multipart，
+/// 让后面所有内容被解析成**额外的 MIME 部件** —— 而这封退信的
+/// `From:` 是 `Mail Delivery System <MAILER-DAEMON@…>`。
+/// 也就是说，攻击者可以借退信通道以系统退信人的名义向受害者投递伪造部件。
+///
+/// 随机边界让「猜中」不可行；再显式校验不冲突，则连「事先把常见边界写进正文」
+/// 这类预置攻击也一并关掉。
+fn fresh_boundary(parts: &[&str]) -> String {
+    for _ in 0..16 {
+        let candidate = format!("=_MailStack_{}", random_hex(16));
+        if !parts.iter().any(|part| part.contains(&candidate)) {
+            return candidate;
+        }
+    }
+    // 128 位随机连续撞 16 次只可能是被刻意构造的输入。此时把随机段加长到
+    // 256 位再取一次 —— 仍然校验，绝不复用已知会冲突的串。
+    loop {
+        let candidate = format!("=_MailStack_{}", random_hex(32));
+        if !parts.iter().any(|part| part.contains(&candidate)) {
+            return candidate;
+        }
+    }
+}
+
+/// 生成 `bytes` 字节的随机 hex 串。
+fn random_hex(bytes: usize) -> String {
+    use rand::RngCore;
+    let mut buf = vec![0u8; bytes];
+    rand::thread_rng().fill_bytes(&mut buf);
+    let mut out = String::with_capacity(bytes * 2);
+    for byte in buf {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// 内容是否 7-bit 干净（全部字节 < 0x80 且不含 NUL）。
+///
+/// 5.17：DSN 原先无条件声明 `Content-Transfer-Encoding: 8bit`。
+/// 对只通告 7BIT 的 MX，这是 RFC 6152 违规；而对**本来就是 7-bit** 的内容
+/// 声明 8bit 更是无谓地把报文升格成 8 位。这里按实际字节判定。
+fn is_7bit_clean(bytes: &[u8]) -> bool {
+    bytes.iter().all(|byte| *byte < 0x80)
+}
+
+/// 按内容选 `Content-Transfer-Encoding` 声明。
+fn cte_for(bytes: &[u8]) -> &'static str {
+    if is_7bit_clean(bytes) {
+        "7bit"
+    } else {
+        "8bit"
+    }
 }
 
 /// 追加一行（CRLF 结束）。
@@ -311,6 +362,76 @@ mod tests {
         assert!(
             message.contains("Auto-Submitted: auto-replied"),
             "退信必须声明 auto-replied，避免触发对方的自动回复回环"
+        );
+    }
+
+    /// 5.14：MIME 边界不得由可预测的输入派生，也不得与原邮件内容冲突。
+    ///
+    /// 原实现是 `=_MailStack_<entry.id>-<失败数>`：确定、可复现，且从不检查
+    /// 原邮件正文。发件人只要在正文里放一行 `--<边界>`，就能提前结束真正的
+    /// multipart，让后续内容变成额外的 MIME 部件 —— 而这封退信由
+    /// `Mail Delivery System <MAILER-DAEMON@…>` 署名。
+    #[test]
+    fn mime_boundary_is_unpredictable_and_never_collides_with_the_original() {
+        let original = original();
+        let first = dsn(&original, "550 nope", Some(550));
+        let second = dsn(&original, "550 nope", Some(550));
+
+        let boundary_of = |message: &str| -> String {
+            message
+                .lines()
+                .find(|line| line.starts_with("Content-Type: multipart/report"))
+                .and_then(|line| line.split("boundary=\"").nth(1))
+                .and_then(|rest| rest.split('"').next())
+                .expect("必须声明 boundary")
+                .to_string()
+        };
+
+        let a = boundary_of(&first);
+        let b = boundary_of(&second);
+        assert_ne!(
+            a, b,
+            "同一封邮件两次退信必须用不同边界 —— 否则正文可预置注入"
+        );
+        assert!(
+            !a.contains("missing@example.net") && !a.contains(&original.id),
+            "边界不得由条目身份派生：{a}"
+        );
+        assert!(a.len() >= 32, "边界应有足够随机性：{a}");
+
+        // 正文里预置候选边界时，生成的边界必须避开它。
+        let poisoned = original
+            .data
+            .replace("original body", "original body\r\n--=_MailStack_deadbeef");
+        let mut entry = original.clone();
+        entry.data = poisoned.clone();
+        let message = dsn(&entry, "550 nope", Some(550));
+        let chosen = boundary_of(&message);
+        assert!(
+            !poisoned.contains(&chosen),
+            "生成的边界出现在原邮件正文里，可被用来提前结束 multipart"
+        );
+    }
+
+    /// 5.17：CTE 声明必须反映**实际字节**，不能一律写 8bit。
+    #[test]
+    fn content_transfer_encoding_matches_the_actual_bytes() {
+        // 纯 ASCII 的原邮件 → 两个部分都必须是 7bit。
+        let ascii = original();
+        let message = dsn(&ascii, "550 nope", Some(550));
+        assert!(
+            !message.contains("Content-Transfer-Encoding: 8bit"),
+            "纯 ASCII 退信不得声明 8bit（对只通告 7BIT 的对端是违规）：\n{message}"
+        );
+        assert!(message.contains("Content-Transfer-Encoding: 7bit"));
+
+        // 含 8 位字节的原邮件 → message/rfc822 部分必须如实声明 8bit。
+        let mut binary = original();
+        binary.data = "Subject: hello\r\n\r\n正文含 8 位字节\r\n".to_string();
+        let message = dsn(&binary, "550 nope", Some(550));
+        assert!(
+            message.contains("Content-Transfer-Encoding: 8bit"),
+            "原邮件含 8 位字节时必须声明 8bit：\n{message}"
         );
     }
 

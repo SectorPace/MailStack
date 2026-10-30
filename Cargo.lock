@@ -1330,6 +1330,7 @@ dependencies = [
  "mailstack-auth",
  "mailstack-core",
  "mailstack-smtp",
+ "rand 0.8.8",
  "rcgen",
  "rustls",
  "rustls-pki-types",

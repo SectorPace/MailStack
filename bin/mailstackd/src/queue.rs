@@ -88,34 +88,87 @@ fn address_policy(config: &RuntimeConfig) -> AddressPolicy {
 }
 
 /// 按固定节奏驱动队列，直到收到停机信号。
+///
+/// ## 5.18：为什么在途轮次必须跑在**独立任务**里
+///
+/// 原实现把 `timeout(ROUND_TIMEOUT, runner.run_once(now))` 直接写在 `select!`
+/// 的分支里。`select!` 在另一个分支先完成时会**丢弃**未完成的 future ——
+/// 于是收到停机信号的那一刻，在途投递被就地取消：
+///
+/// * `ROUND_TIMEOUT` 这个「保证停机不会被在途投递卡死」的上限**从未生效** ——
+///   代码根本等不到它，取消是立刻发生的；
+/// * 被取消的条目已经部分投出、却还没把「投过了」写回磁盘，下一轮（或重启后）
+///   会**整批重投**，收件人收到重复邮件。
+///
+/// 因此这里把每一轮 `spawn` 成独立任务：`select!` 丢弃的只是 `JoinHandle`
+/// 的等待权，任务本身继续跑；停机时对句柄做**有界等待**，等满 `ROUND_TIMEOUT`
+/// 才放弃。这样「停机不让在途投递卡死」与「不让它被静默取消」同时成立。
 pub async fn schedule(runner: Arc<QueueRunner>, shutdown: impl std::future::Future<Output = ()>) {
     let mut shutdown = std::pin::pin!(shutdown);
     let mut ticker = tokio::time::interval(SCHEDULE_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // 在途轮次。`Option` 同时充当「本轮是否还在跑」的判据：
+    // 上一轮没结束时 ticker 到点也不开新的一轮（与队列侧的 5.9 重入保护双保险）。
+    let mut in_flight: Option<tokio::task::JoinHandle<()>> = None;
+
     loop {
+        // 先回收已完成的轮次，避免句柄堆积。
+        if in_flight
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            if let Some(handle) = in_flight.take() {
+                // `run_once` 的错误已在任务内部记日志；这里只需等它结束。
+                let _ = handle.await;
+            }
+        }
+
         tokio::select! {
             _ = &mut shutdown => {
-                tracing::info!("队列调度停止");
+                // 5.18：有界等待在途轮次，而不是丢弃它的 future。
+                if let Some(handle) = in_flight.take() {
+                    match tokio::time::timeout(ROUND_TIMEOUT, handle).await {
+                        Ok(_) => tracing::info!("队列调度停止（在途轮次已收尾）"),
+                        Err(_) => tracing::warn!(
+                            "队列调度停止：在途轮次超过 {:?} 仍未结束，放弃等待",
+                            ROUND_TIMEOUT
+                        ),
+                    }
+                } else {
+                    tracing::info!("队列调度停止");
+                }
                 return;
             }
             _ = ticker.tick() => {
-                let now = mailstack_queue::now_unix();
-                match tokio::time::timeout(ROUND_TIMEOUT, runner.run_once(now)).await {
-                    Ok(Ok(report)) => {
-                        tracing::debug!(
+                if in_flight.is_some() {
+                    // 上一轮还在跑。打开新的一轮会重复投递同一批条目 ——
+                    // 队列侧的 `run_once` 也会拒绝，但这里直接跳过更省一次日志。
+                    tracing::debug!("上一轮队列调度尚未结束，跳过本轮");
+                    continue;
+                }
+                let runner = Arc::clone(&runner);
+                in_flight = Some(tokio::spawn(async move {
+                    let now = mailstack_queue::now_unix();
+                    match runner.run_once(now).await {
+                        Ok(report) => tracing::debug!(
                             considered = report.considered,
                             delivered = report.delivered,
                             deferred = report.deferred,
                             bounced = report.bounced,
                             backlog = report.backlog,
                             "队列调度完成"
-                        );
+                        ),
+                        // 「上一轮还在跑」是可预期的跳过，不是故障；别把它刷成 warn。
+                        Err(error) if error.is_busy() => {
+                            tracing::debug!(error = %error, "队列轮次被跳过")
+                        }
+                        // 运行期失败只告警：一次目录抖动不应让整台服务器停止收信。
+                        Err(error) => {
+                            tracing::warn!(error = %error, "本轮队列调度失败，继续下一轮")
+                        }
                     }
-                    // 运行期失败只告警：一次目录抖动不应让整台服务器停止收信。
-                    Ok(Err(error)) => tracing::warn!(error = %error, "本轮队列调度失败，继续下一轮"),
-                    Err(_) => tracing::warn!("本轮投递超过 {:?}，放弃本轮", ROUND_TIMEOUT),
-                }
+                }));
             }
         }
     }

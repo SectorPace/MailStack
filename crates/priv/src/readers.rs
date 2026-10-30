@@ -716,7 +716,11 @@ impl Readers {
     /// （vmail 用户表）尚未移植，界面必须能区分「没有用户」与「读不到用户」。
     pub fn snapshot(&self, _data: &Value) -> Result<Value, HandlerError> {
         let tables = self.tables();
-        let domains = mailstack_core::atomic::rows(&self.paths.domains)
+        // 5.13：读不出来就报错，不要伪装成「没有域名」。
+        let domains = mailstack_core::atomic::try_rows(&self.paths.domains)
+            .map_err(|error| {
+                HandlerError::new(format!("managed domain table is unreadable: {error}"))
+            })?
             .into_iter()
             .filter_map(|row| {
                 let name = row.first()?.clone();
@@ -2248,7 +2252,7 @@ impl Readers {
     pub async fn dkim_keys(&self, _data: &Value) -> Result<Value, HandlerError> {
         let selector = self.setup_dkim_selector();
         let mut items: Vec<Value> = Vec::new();
-        for domain in self.managed_domains() {
+        for domain in self.managed_domains()? {
             let private = mailstack_auth::keys::private_key_path(&self.paths, &domain, &selector);
             let Ok(meta) = std::fs::metadata(&private) else {
                 // 没有密钥文件 —— 跳过该域名，而不是产出空条目。
@@ -2308,7 +2312,7 @@ impl Readers {
             }));
         }
 
-        for domain in self.managed_domains() {
+        for domain in self.managed_domains()? {
             // 该域名的邮件主机：优先用向导登记的主机（仅当它属于本域），否则按惯例 `mail.<domain>`。
             let host = setup
                 .as_ref()
@@ -2453,11 +2457,20 @@ impl Readers {
     }
 
     /// 受管域名表的第一列（与 `snapshot` 同源）。
-    fn managed_domains(&self) -> Vec<String> {
-        mailstack_core::atomic::rows(&self.paths.domains)
-            .into_iter()
-            .filter_map(|row| row.into_iter().next())
-            .collect()
+    ///
+    /// 5.13：返回 `Result` 而不是静默空集合 —— 这两个调用点（DKIM 密钥清单 /
+    /// DNS 记录清单）会据此**遍历域名**，空集合等于让它们报告「没有任何域名」，
+    /// 掩盖掉真正的读失败。
+    fn managed_domains(&self) -> Result<Vec<String>, HandlerError> {
+        mailstack_core::atomic::try_rows(&self.paths.domains)
+            .map_err(|error| {
+                HandlerError::new(format!("managed domain table is unreadable: {error}"))
+            })
+            .map(|rows| {
+                rows.into_iter()
+                    .filter_map(|row| row.into_iter().next())
+                    .collect()
+            })
     }
 
     /// DKIM 列表/ DNS 记录用的 selector：`setup.json` 的 `dkimSelector`，

@@ -17,6 +17,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 time.workspace = true
+# 5.14：MIME 边界必须是不可预测的随机串（原先由条目 ID 派生，正文可预置注入）。
+# 这不是新增 crate —— `rand` 早已在 workspace 里（core / web 都在用）。
+rand.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13"

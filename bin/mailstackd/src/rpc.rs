@@ -98,7 +98,7 @@ impl SecureFaces {
     /// `RoServer::serve` 是无限循环且**没有**停机参数，所以这里用 `select!` 包一层：
     /// 信号到达即 drop 掉 serve future（连带 drop listener），停止接受新连接。
     /// **在途连接不会被排空** —— 它们各自是 `tokio::spawn` 出来的独立任务，会自然跑完。
-    pub fn spawn(self, tasks: &mut JoinSet<()>, shutdown: &Shutdown) {
+    pub fn spawn(self, tasks: &mut JoinSet<Result<(), String>>, shutdown: &Shutdown) {
         for face in self.faces {
             let Face {
                 label,
@@ -112,9 +112,15 @@ impl SecureFaces {
                     result = server.serve(listener, channel) => {
                         if let Err(error) = result {
                             tracing::error!(face = label, error = %error, "RPC 面异常退出");
+                            // 5.19：异常退出要作为结果上报，不能只留一行日志。
+                            return Err(format!("rpc face {label} exited: {error}"));
                         }
+                        Ok(())
                     }
-                    _ = waiter => tracing::info!(face = label, "RPC 面停止接受新连接"),
+                    _ = waiter => {
+                        tracing::info!(face = label, "RPC 面停止接受新连接");
+                        Ok(())
+                    }
                 }
             });
         }

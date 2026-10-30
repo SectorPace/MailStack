@@ -84,17 +84,24 @@ pub async fn run(paths: Paths, ports: Vec<u16>) -> Result<(), DaemonError> {
     let rpc_faces = rpc::bind_all(&runtime_config.paths)?;
 
     let shutdown = shutdown::Shutdown::channel();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
 
     #[cfg(unix)]
     rpc_faces.spawn(&mut tasks, &shutdown);
 
     for (port, server) in servers {
         let waiter = shutdown.waiter();
+        // 5.19：把异常退出**变成返回值**，而不是只记一行日志。
         tasks.spawn(async move {
             match server.run(waiter).await {
-                Ok(()) => tracing::info!(port, "监听已停止"),
-                Err(error) => tracing::error!(port, error = %error, "监听异常退出"),
+                Ok(()) => {
+                    tracing::info!(port, "监听已停止");
+                    Ok(())
+                }
+                Err(error) => {
+                    tracing::error!(port, error = %error, "监听异常退出");
+                    Err(format!("listener on port {port} exited: {error}"))
+                }
             }
         });
     }
@@ -102,7 +109,10 @@ pub async fn run(paths: Paths, ports: Vec<u16>) -> Result<(), DaemonError> {
     {
         let waiter = shutdown.waiter();
         let runner = Arc::clone(&runner);
-        tasks.spawn(async move { queue::schedule(runner, waiter).await });
+        tasks.spawn(async move {
+            queue::schedule(runner, waiter).await;
+            Ok(())
+        });
     }
 
     // 手工封禁热重载：管理台改的是文件，这份循环把它对齐进上面那张内存表
@@ -111,17 +121,45 @@ pub async fn run(paths: Paths, ports: Vec<u16>) -> Result<(), DaemonError> {
         let waiter = shutdown.waiter();
         let ban_list = Arc::clone(&bans);
         let paths = runtime_config.paths.clone();
-        tasks.spawn(async move { manual_bans::watch(paths, ban_list, waiter).await });
+        tasks.spawn(async move {
+            manual_bans::watch(paths, ban_list, waiter).await;
+            Ok(())
+        });
     }
 
     // 最后接管信号源：`waiter()` 的借用到这里全部结束。
-    tasks.spawn(shutdown::watch_signals(shutdown));
+    tasks.spawn(async move {
+        shutdown::watch_signals(shutdown).await;
+        Ok(())
+    });
 
     tracing::info!("服务已就绪");
-    let mut task = tasks.join_next().await;
-    while task.is_some() {
-        task = tasks.join_next().await;
+
+    // 5.19：收齐**每一个**任务的结果。
+    //
+    // 原先这里只是 `join_next()` 到一个 None 就 `Ok(())` —— 任何一块服务
+    // 异常退出都只留下日志。systemd 看到的是正常退出，于是不重启：
+    // 「进程活着但半个服务没了」，退出码也看不出来。
+    // 现在把失败汇总成非零退出，让 supervisor 能真正接管。
+    let mut failures: Vec<String> = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => failures.push(message),
+            Err(join_error) => {
+                // panic / 被取消。同样属于「这一块服务没了」。
+                if join_error.is_panic() {
+                    failures.push(format!("task panicked: {join_error}"));
+                }
+            }
+        }
     }
-    tracing::info!("MailStack 守护进程已退出");
-    Ok(())
+
+    if failures.is_empty() {
+        tracing::info!("MailStack 守护进程已退出");
+        return Ok(());
+    }
+    let summary = failures.join("; ");
+    tracing::error!(failures = %summary, "MailStack 守护进程带着异常任务退出");
+    Err(DaemonError::Task(summary))
 }

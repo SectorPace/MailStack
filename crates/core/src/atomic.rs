@@ -347,17 +347,36 @@ fn current_mode(_path: &Path) -> Option<u32> {
 }
 
 /// 读表文件（`rows`）：跳过空行与 `#` 注释行，按空白分词。
+///
+/// ## ⚠️ 这是「读不到就当空表」的宽松版本
+///
+/// `fs::read_to_string` 失败（EACCES、IO 错、坏 UTF-8）一律返回空 `Vec`。
+/// 对**展示面**这是可接受的降级，但对**读改写路径**是致命的：
+/// `add_domain` 是 read → filter → write，一次读错误就会把整张 Postfix 路由表
+/// 清空（5.13）。凡是「读到的东西会被写回去」的地方，必须用 [`try_rows`]。
 pub fn rows(path: &Path) -> Vec<Vec<String>> {
-    let Ok(text) = fs::read_to_string(path) else {
-        return Vec::new();
+    try_rows(path).unwrap_or_default()
+}
+
+/// [`rows`] 的**如实报错**版本（5.13）。
+///
+/// 只把 `NotFound` 当作「空表」（文件确实不存在 = 尚无条目，这是合法状态）；
+/// EACCES、IO 错、坏 UTF-8 一律返回错误 —— 「读不出来」与「读到了但没有内容」
+/// 是两件事，把前者说成后者就是在拿故障冒充正常。
+pub fn try_rows(path: &Path) -> CoreResult<Vec<Vec<String>>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(CoreError::io(path, error)),
     };
-    text.lines()
+    Ok(text
+        .lines()
         .filter(|line| {
             let t = line.trim();
             !t.is_empty() && !t.starts_with('#')
         })
         .map(|line| line.split_whitespace().map(str::to_string).collect())
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]

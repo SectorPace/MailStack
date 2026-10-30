@@ -570,7 +570,13 @@ impl Users {
             .split_once('@')
             .map(|(_, domain)| domain)
             .unwrap_or("");
-        let managed_domains: BTreeSet<String> = atomic::rows(&self.paths.domains)
+        let managed_domains: BTreeSet<String> = atomic::try_rows(&self.paths.domains)
+            .map_err(|error| {
+                // 5.13：读不出来 ≠ 没有受管域名。原先这里退化成空集合，
+                // 结果是「表读不了」被报成「这个域名不受管」—— 运维会去查域名配置，
+                // 而真正的问题在权限或磁盘上。
+                HandlerError::new(format!("managed domain table is unreadable: {error}"))
+            })?
             .into_iter()
             .filter_map(|row| row.into_iter().next())
             .collect();
