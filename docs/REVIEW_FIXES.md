@@ -810,6 +810,21 @@ pub enum Lookup { Known, Missing, Unavailable(String) }
 
 ### 5.3 批 6：工程化（CI / deploy / 架构）
 
+> 🟡 **批 6 已修 5/16**：6.10、6.11、6.13、6.14、6.15 已修；6.16 在批 3 已修。
+> **未修：6.1–6.9（CI 供应链 / deploy 脚本）与 6.12（TOTP 主密钥竞态）。**
+>
+> 已修 5 条的修法与反例测试：
+>
+> | # | 修法 | 反例测试 |
+> |---|---|---|
+> | **6.10** | 新增 `read_last_audit_hash_strict`：文件不存在/为空 → 创世值；非空但读不出尾 hash → **报错**。原先 `unwrap_or_else(\|\| AUDIT_GENESIS)` 会把 truncate/权限错误伪装成「新链第一写」，静默分叉审计链 | `a_non_empty_but_unreadable_log_is_an_error_not_a_fresh_chain`、`an_absent_or_empty_log_still_starts_from_genesis` |
+> | **6.11** | 追加日志行后先 `sync_all` 再写 `.head` 锚。原先两者无序：掉电可能落成「锚已更新、日志行没落盘」，下次 `audit_verify` 就把**完好日志**判成截尾篡改（假告警） | 由既有 `detects_truncated_tail_via_anchor` / `chain_starts_from_genesis_and_advances` 覆盖 |
+> | **6.13** | `enabled` 键改为**整串**匹配（原先 `starts_with("enabled")`，`enabledx=1` 也会打开 AI 出站 —— 而这本该 fail-closed） | `only_an_exact_enabled_key_turns_ai_outbound_on` |
+> | **6.14** | `apply_settings_patch` 先反序列化再声称「已应用」：整包失败则回报空列表 + `warn`。原先「API 说 2 个键已应用 / 磁盘一字未变」且无告警 | `a_rejected_settings_patch_reports_no_applied_keys`、`a_valid_settings_patch_still_reports_its_keys` |
+> | **6.15** | 新增 `sanitized_domain`：去掉 `<>` 与空白、折叠小写，再用于 DMARC 对齐。原先裸 `rsplit_once('@')` 会让 `<User@Example.COM>` 切出 `Example.COM>`，对齐静默失败后被按 `p=reject` 处置 | `mail_from_domain_is_sanitised_before_dmarc_alignment` |
+>
+> 下表是原始清单（保留作对照，状态以本节说明为准）：
+
 | # | 位置 | 缺陷 | 影响 |
 |---|---|---|---|
 | 6.1 | `.github/workflows/ci.yml:52-58` | `cargo-deny` 用 `continue-on-error: true`，且仓库中**根本不存在 `deny.toml`**（该 step 必然失败，永远被吞掉）；`cargo audit \|\| true` | **供应链门禁实质失效**，有 RUSTSEC 通告也不拦 |
@@ -888,7 +903,7 @@ RCPT 名录的三态判定、A-R 的 RFC 8601 引用 —— 我逐条复核过�
 W='wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0'
 R=/mnt/e/MailStack/mailstack-rust
 
-# 1) 全量测试（应为 1132 passed / 0 failed）
+# 1) 全量测试（应为 1138 passed / 0 failed）
 $W bash $R/deploy/wsl-cargo.sh test --workspace --all-targets
 
 # 2) 三道门禁

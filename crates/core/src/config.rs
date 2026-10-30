@@ -103,22 +103,39 @@ pub fn apply_settings_patch(
     settings: &mut Settings,
     patch: &serde_json::Map<String, serde_json::Value>,
 ) -> Vec<String> {
-    let mut applied = Vec::new();
     let mut current = serde_json::to_value(&*settings).unwrap_or(serde_json::Value::Null);
     let Some(obj) = current.as_object_mut() else {
-        return applied;
+        return Vec::new();
     };
+    let mut accepted = Vec::new();
     for (key, value) in patch {
         if !SETTINGS_WRITE_WHITELIST.contains(&key.as_str()) {
             continue;
         }
         obj.insert(key.clone(), value.clone());
-        applied.push(key.clone());
+        accepted.push(key.clone());
     }
-    if let Ok(updated) = serde_json::from_value::<Settings>(current) {
-        *settings = updated;
-    }
-    applied
+
+    // 6.14：**先确认能反序列化，再声称「已应用」**。
+    //
+    // 原实现先把每个键名 push 进 `applied`，最后才 `if let Ok(updated) = ...`。
+    // 于是只要有一个键的值类型不对（例如把 `relayConcurrency` 传成字符串），
+    // 整包反序列化失败、磁盘上什么都没变，但 API 仍然把全部键名列成「已应用」——
+    // **API 说成功、磁盘没变**，而且没有任何告警。
+    //
+    // 现在的语义：要么整包生效并回报被接受的键，要么一个都不生效并回报空列表，
+    // 同时留一条 warn 供排查。
+    let updated = match serde_json::from_value::<Settings>(current) {
+        Ok(updated) => updated,
+        Err(error) => {
+            crate::warn::warn(&format!(
+                "settings patch rejected (no key was applied): {error}"
+            ));
+            return Vec::new();
+        }
+    };
+    *settings = updated;
+    accepted
 }
 
 /// 读取设置；文件缺失或损坏时回落默认值并 `warn` 一次。
@@ -526,6 +543,38 @@ mod tests {
     #[test]
     fn settings_write_whitelist_has_exactly_eleven_keys() {
         assert_eq!(SETTINGS_WRITE_WHITELIST.len(), 11);
+    }
+
+    /// 6.14：整包反序列化失败时**不得**声称任何键「已应用」。
+    ///
+    /// 原实现先把键名收进 `applied`，最后才 `if let Ok(..)`。于是把一个
+    /// 类型不对的值（这里 `transparency` 给了字符串）塞进 patch，会得到
+    /// 「API 说 2 个键已应用 / 磁盘一个字没变」的结果 —— 而且没有告警。
+    #[test]
+    fn a_rejected_settings_patch_reports_no_applied_keys() {
+        let mut s = Settings::default();
+        let before = s.clone();
+        let patch: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{ "transparency": "not-a-number", "colorTheme": "green" }"#)
+                .unwrap();
+
+        let applied = apply_settings_patch(&mut s, &patch);
+
+        assert!(
+            applied.is_empty(),
+            "反序列化失败时不得回报任何已应用键，实际：{applied:?}"
+        );
+        assert_eq!(s, before, "被拒绝的 patch 不得改动任何设置");
+    }
+
+    #[test]
+    fn a_valid_settings_patch_still_reports_its_keys() {
+        let mut s = Settings::default();
+        let patch: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{ "transparency": 42 }"#).unwrap();
+        let applied = apply_settings_patch(&mut s, &patch);
+        assert_eq!(applied, vec!["transparency".to_string()]);
+        assert_eq!(s.transparency, 42);
     }
 
     #[test]

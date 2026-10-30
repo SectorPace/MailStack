@@ -170,13 +170,18 @@ pub async fn evaluate(
         .await;
     let dkim = crate::dkim::verdicts_from(&dkim_outputs);
 
-    let mail_from_domain = sender.rsplit_once('@').map_or("", |(_, domain)| domain);
+    // 6.15：裸 `rsplit_once('@')` 不做任何清洗。上游传进来的 `sender` 可能是
+    // `MAIL FROM:<User@Example.COM>` 这类带尖括号/空白/大写的形态，
+    // 直接切出来的域名变成 `Example.COM>` —— DMARC 的对齐比较随后必然失败，
+    // 而且是**静默**失败（报文被判成不对齐，收件方直接按 p=reject 处置）。
+    // 与 `dkim::from_domain` 用同一套清洗语义，避免两条路径口径不一致。
+    let mail_from_domain = sanitized_domain(sender);
 
     let params = DmarcParameters {
         message: &parsed,
         dkim_output: &dkim_outputs,
         dkim2_output: None,
-        rfc5321_mail_from_domain: mail_from_domain,
+        rfc5321_mail_from_domain: mail_from_domain.as_str(),
         spf_output: &spf_output,
     };
     let output = resolver
@@ -225,6 +230,22 @@ impl DmarcCheck {
     pub fn policy_is_reject(&self) -> bool {
         self.policy_value.is_reject()
     }
+}
+
+/// 从信封发件人里取出可用于 DMARC 对齐的域名（6.15）。
+///
+/// 上游可能传 `alice@example.com`、`<alice@example.com>`、` alice@Example.COM ` 等
+/// 形态。裸 `rsplit_once('@')` 会把尖括号与空白一起带进域名，而 DMARC 的对齐比较
+/// 是**逐字**的 —— 于是对齐静默失败、报文被按 `p=reject` 处置，且日志里看不出原因。
+///
+/// 清洗规则与 `dkim::from_domain` 保持一致：去掉 `<>` 与空白、折叠小写；
+/// 取不到 `@` 时返回空串（= 无信封发件人身份，DMARC 按无对齐处理）。
+fn sanitized_domain(sender: &str) -> String {
+    let sender = sender.trim().trim_matches(|c| c == '<' || c == '>').trim();
+    sender
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.trim().trim_end_matches('>').to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -354,5 +375,27 @@ mod tests {
             "permerror"
         );
         assert_eq!(DmarcStatus::None.keyword(), "none");
+    }
+
+    /// 6.15：信封发件人域必须先清洗，再用于 DMARC 对齐比较。
+    ///
+    /// 原实现是裸 `sender.rsplit_once('@')`。上游传 `MAIL FROM:<User@Example.COM>`
+    /// 时会切出 `Example.COM>` —— 对齐比较**逐字**进行，于是静默失败，
+    /// 报文被按 `p=reject` 处置而日志里看不出原因。
+    #[test]
+    fn mail_from_domain_is_sanitised_before_dmarc_alignment() {
+        for (raw, expected) in [
+            ("alice@example.com", "example.com"),
+            ("<alice@example.com>", "example.com"),
+            ("  alice@Example.COM  ", "example.com"),
+            ("<Alice@Example.COM>", "example.com"),
+            ("alice@sub.example.com", "sub.example.com"),
+            // 没有 `@`：没有信封发件人身份，返回空串（按无对齐处理）。
+            ("<>", ""),
+            ("", ""),
+            ("postmaster", ""),
+        ] {
+            assert_eq!(sanitized_domain(raw), expected, "raw = {raw:?}");
+        }
     }
 }

@@ -74,16 +74,23 @@ pub fn ai_outbound_enabled_with(paths: &Paths, env_flag: Option<&str>) -> bool {
     };
     for line in text.lines() {
         let line = line.trim();
-        if line.starts_with("enabled") && line.contains('=') {
-            let value = line
-                .split_once('=')
-                .map(|(_, v)| v)
-                .unwrap_or("")
-                .trim()
-                .trim_matches(|c| c == '\'' || c == '"')
-                .to_lowercase();
-            return matches!(value.as_str(), "1" | "true" | "yes" | "on");
+        // 6.13：键名必须**整串**等于 `enabled`。
+        //
+        // 原先是 `line.starts_with("enabled") && line.contains('=')` ——
+        // 前缀匹配意味着 `enabledx=1`、`enabled_backup=yes` 之类也会被当成
+        // 出站开关。配置文件是运维可编辑的，任何同前缀的注释性条目都可能
+        // 意外把 AI 出站打开（而这是一个应当 fail-closed 的开关）。
+        let Some((key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "enabled" {
+            continue;
         }
+        let value = raw_value
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_lowercase();
+        return matches!(value.as_str(), "1" | "true" | "yes" | "on");
     }
     false
 }
@@ -205,5 +212,33 @@ mod tests {
         assert!(!ai_outbound_enabled_with(&f.paths, Some("OFF")));
         assert!(ai_outbound_enabled_with(&f.paths, Some("1")));
         assert!(ai_outbound_enabled_with(&f.paths, Some("yes")));
+    }
+
+    /// 6.13：键名必须**整串**等于 `enabled`，不能前缀匹配。
+    ///
+    /// 原实现 `line.starts_with("enabled")` 会让 `enabledx=1`、
+    /// `enabled_backup=yes` 之类同前缀的条目把 AI 出站打开 ——
+    /// 而这本该是 fail-closed 的开关。
+    #[test]
+    fn only_an_exact_enabled_key_turns_ai_outbound_on() {
+        let f = Fixture::new();
+        f.write(&f.paths.install_args_conf, "ACCESS_MODE=direct\n");
+
+        for decoy in [
+            "enabledx=1\n",
+            "enabled_backup=yes\n",
+            "ai_enabled=1\n",
+            "enabled-extra=on\n",
+        ] {
+            f.write(&f.paths.ai_outbound_conf, decoy);
+            assert!(
+                !ai_outbound_enabled_with(&f.paths, None),
+                "同前缀键 {decoy:?} 不得打开 AI 出站"
+            );
+        }
+
+        // 真正的键仍然生效（含空白与引号）。
+        f.write(&f.paths.ai_outbound_conf, "  enabled = \"yes\"  \n");
+        assert!(ai_outbound_enabled_with(&f.paths, None));
     }
 }

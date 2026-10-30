@@ -171,6 +171,68 @@ pub fn read_last_audit_hash(log_path: &Path) -> Option<String> {
     None
 }
 
+/// [`read_last_audit_hash`] 的**如实报错**版本（6.10）。
+///
+/// 语义严格区分三件事，这正是原实现混为一谈的地方：
+///
+/// * 文件**不存在** → `Ok(None)`：这是一条新链，用创世值合法。
+/// * 文件存在但**为空** → `Ok(None)`：同上。
+/// * 文件存在、非空，却**读不出可用的尾 hash** → `Err`：
+///   truncate、权限错误、尾部只剩半行、尾行 JSON 损坏 —— 都不能当成「新链」，
+///   否则审计链会在没有任何告警的情况下被分叉。
+pub fn read_last_audit_hash_strict(log_path: &Path) -> CoreResult<Option<String>> {
+    let mut file = match std::fs::File::open(log_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(CoreError::io(log_path, error)),
+    };
+    let len = file
+        .metadata()
+        .map_err(|e| CoreError::io(log_path, e))?
+        .len();
+    if len == 0 {
+        return Ok(None);
+    }
+    let start = len.saturating_sub(TAIL_READ_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| CoreError::io(log_path, e))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|e| CoreError::io(log_path, e))?;
+
+    // 尾部不完整（无结尾换行）时截掉它 —— 可能正有并发写入者。
+    let text = if buf.last() == Some(&b'\n') {
+        buf
+    } else {
+        match buf.iter().rposition(|&b| b == b'\n') {
+            Some(pos) => buf[..=pos].to_vec(),
+            // 整个 TAIL_READ_BYTES 窗口里一个换行都没有：这不是「空链」，
+            // 而是文件格式已经不可解释。
+            None => {
+                return Err(CoreError::invalid(format!(
+                    "{}: cannot locate a complete audit record within the tail window",
+                    log_path.display()
+                )))
+            }
+        }
+    };
+
+    let text = String::from_utf8_lossy(&text);
+    for line in text.lines().rev() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(h) = value.get("hash").and_then(|v| v.as_str()) {
+            return Ok(Some(h.to_string()));
+        }
+    }
+    // 非空文件里一条可用记录都没有 —— 绝不当成新链。
+    Err(CoreError::invalid(format!(
+        "{}: audit log is non-empty but no record with a `hash` field was found near the tail",
+        log_path.display()
+    )))
+}
+
 /// 追加一条审计记录（对应 `audit()`）。
 ///
 /// 整个「读尾 → 追加 → 重设锚」序列在 `locked()` 临界区内，避免并发的一次性 CLI
@@ -187,7 +249,18 @@ pub fn audit(
     }
 
     crate::atomic::locked(log_path, || {
-        let prev_hash = read_last_audit_hash(log_path).unwrap_or_else(|| AUDIT_GENESIS.to_string());
+        // 6.10：**区分「没有记录」与「读不出来」**。
+        //
+        // 原实现是 `read_last_audit_hash(..).unwrap_or_else(|| AUDIT_GENESIS)`：
+        // 只要读尾失败（文件被 truncate、权限错误、尾部只剩半行），就会**静默
+        // 从创世值重新开一条链**。结果是审计链被悄悄分叉成两条互不相连的链，
+        // 而表面上一切正常 —— 一次故障被伪装成了「新链的第一次写入」。
+        //
+        // 现在：文件不存在或长度为 0 才用创世值；其余任何读失败都如实报错。
+        let prev_hash = match read_last_audit_hash_strict(log_path)? {
+            Some(hash) => hash,
+            None => AUDIT_GENESIS.to_string(),
+        };
 
         // target 截断到 120 字符、error 截断到 500 字符（与原文一致）。
         let mut record = AuditRecord {
@@ -211,6 +284,14 @@ pub fn audit(
                 .map_err(|e| CoreError::io(log_path, e))?;
             f.write_all(line.as_bytes())
                 .map_err(|e| CoreError::io(log_path, e))?;
+            // 6.11：先 `sync_all` 再写 `.head` 锚。
+            //
+            // 原实现 `write_all` 之后直接去写锚文件，两边没有任何顺序保证：
+            // 掉电时可能落成「锚已更新、日志行没落盘」，下一次 `audit_verify`
+            // 就会把一份**完好的**日志判成**截尾篡改**（假告警）。
+            // 反过来（日志落了、锚没落）则是一次可容忍的滞后。
+            // 先把日志行刷到稳定介质，再更新锚，代价是一行 fsync，换掉一整类假篡改告警。
+            f.sync_all().map_err(|e| CoreError::io(log_path, e))?;
         }
 
         let head = audit_head_path(log_path);
@@ -623,6 +704,50 @@ mod tests {
             v["hash"].as_str().unwrap().to_string()
         };
         assert_eq!(last, verdict_first);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 6.10：非空但读不出尾 hash 时，**不得**把它当成新链。
+    ///
+    /// 原实现 `read_last_audit_hash(..).unwrap_or_else(|| AUDIT_GENESIS)` 会在
+    /// 读尾失败时静默从创世值重开一条链 —— 审计链被悄悄分叉成两条互不相连的链，
+    /// 表面上却一切正常。
+    #[test]
+    fn a_non_empty_but_unreadable_log_is_an_error_not_a_fresh_chain() {
+        let dir = temp_dir("unreadable-tail");
+        let log = dir.join("audit.log");
+
+        // 文件非空，但通篇没有一条可解析记录（模拟 truncate / 尾部损坏）。
+        fs::write(&log, b"\x00\x01\x02 not a json record \xff\xfe").unwrap();
+
+        let error = audit(&log, "a", true, "", "").expect_err("不得静默重开新链");
+        assert!(
+            error.to_string().contains("no record with a `hash` field")
+                || error.to_string().contains("complete audit record"),
+            "错误必须说明「读不出尾记录」，实际：{error}"
+        );
+
+        // 文件内容未被改动（没有追加一条基于创世值的记录）。
+        assert_eq!(
+            fs::read(&log).unwrap(),
+            b"\x00\x01\x02 not a json record \xff\xfe".to_vec(),
+            "失败的 audit 不得写入任何记录"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 空文件与不存在的文件仍然是合法的「新链」。
+    #[test]
+    fn an_absent_or_empty_log_still_starts_from_genesis() {
+        let dir = temp_dir("fresh-chain");
+        let log = dir.join("audit.log");
+        let first = audit(&log, "a", true, "", "").expect("不存在的日志应视作新链");
+        assert_eq!(first.prev_hash, AUDIT_GENESIS);
+
+        let empty = dir.join("empty.log");
+        fs::write(&empty, b"").unwrap();
+        let second = audit(&empty, "b", true, "", "").expect("空日志应视作新链");
+        assert_eq!(second.prev_hash, AUDIT_GENESIS);
         fs::remove_dir_all(&dir).ok();
     }
 }
