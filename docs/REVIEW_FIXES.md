@@ -934,8 +934,73 @@ $ cargo deny check
 advisories ok, bans ok, licenses ok, sources ok        # 退出码 0
 ```
 
-依赖升级后的全量回归：`QUALITY_GATE=PASS`（1145 passed / 0 failed）、
+依赖升级后的全量回归：`QUALITY_GATE=PASS`（1146 passed / 0 failed）、
 `INVARIANT_GATE_OK`（277）、`DELIVERABLES_OK`。
+
+---
+
+## 5.5 CI 等价的实跑（Ubuntu 26.04 + Rust 1.98.1，2026-10-31）
+
+此前所有门禁都是在 **Debian 13 + Rust 1.99.0** 上跑的，而 CI 是
+**ubuntu-24.04 + Rust 1.98.1**。这两个差异一直没有被验证过。这轮补上了。
+
+### 5.5.1 环境
+
+新建了一个干净的 **Ubuntu 26.04.1 LTS** WSL 发行版（`wsl --import` 官方
+`ubuntu-base-26.04.1` rootfs，SHA256 与发布值一致），装
+**rustc 1.98.1 / cargo 1.98.1 / rustfmt 1.9.0 / clippy 0.1.98** ——
+与 CI 的 `dtolnay/rust-toolchain@1.98.1` 完全对齐。
+
+门禁跑在 `git archive HEAD` 导出的**干净已提交快照**上，不受工作区里
+他人未提交改动的影响（当时工作区有 `crates/imappop3/` 的在途开发）。
+
+### 5.5.2 暴露的问题：两个 RPC 绑定测试隐含依赖宿主组
+
+```
+RpcBind { source: NotFound, error: "cannot resolve socket group mailstack-admin" }
+```
+
+`RoServerConfig::ro_socket()` 把 RO socket 定死为 `0660 root:mailstack-admin`，
+`bind` 时用 `gid_by_name` 解析，解析不到即失败（4.11 的 fail-closed，不能改）。
+两个绑定测试直接调 `bind_all(&paths)`（生产配置），于是隐含要求宿主已存在该组：
+
+| 环境 | 有 `mailstack-admin` 组？ | 结果 |
+|---|---|---|
+| 本机 Debian 13 | 有（早先环境建过） | 一直绿 |
+| 新建 Ubuntu 26.04 | **无** | **2 个测试失败** |
+| GitHub `ubuntu-24.04` runner | **无** | **CI 会红** |
+
+也就是说：一直以为"全绿"，其实是**只有那台 Debian 绿**。
+
+### 5.5.3 修法（不动生产 fail-closed）
+
+1. `bind_all` 抽出内部 `bind_all_with(paths, ro_group: Option<&str>)`；
+   生产路径显式传 `Some(ADMIN_GROUP)`，行为与原实现完全一致。
+2. 两个绑定测试传 `None`（不设属组），只验 mode（0660/0600）+ 可用性
+   —— 与宿主无关。*不用 `root` 组*：CI runner 是非 root，`chown` 到不属于
+   自己的组会 EPERM，同样不自洽。
+3. 新增纯单元测试 `production_ro_socket_config_names_the_admin_group_and_is_world_unreadable`
+   直接钉住生产契约（0660 + `mailstack-admin`、RW 0600 + 无属组），
+   替代原来"靠绑定成功间接验证组名"。
+4. 失败路径本来就有 `socket_group_resolution_failure_aborts_binding` 覆盖。
+5. `docs/DEPLOYMENT.md` §3.5 补上部署前置条件（安装脚本必须
+   `groupadd --system mailstack-admin`），这条此前既没文文档也没进测试。
+
+### 5.5.4 结果
+
+在**该组 ABSENT** 的 Ubuntu 26.04.1 上：
+
+```
+rustfmt: PASS
+clippy:  PASS（-D warnings）
+test:    PASS
+QUALITY_GATE=PASS
+TOTAL_PASSED=1146          # 比之前多 1 条：新增的契约测试
+INVARIANT_GATE_OK          checked=277 missing=0 not_a_test=0 no_assert=0
+DELIVERABLES_OK
+```
+
+同一份代码在「没有 mailstack-admin 组」的主机上全绿 —— 这正是 CI runner 的条件。
 
 ---
 
@@ -993,7 +1058,7 @@ RCPT 名录的三态判定、A-R 的 RFC 8601 引用 —— 我逐条复核过�
 W='wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0'
 R=/mnt/e/MailStack/mailstack-rust
 
-# 1) 全量测试（应为 1145 passed / 0 failed）
+# 1) 全量测试（应为 1146 passed / 0 failed）
 $W bash $R/deploy/wsl-cargo.sh test --workspace --all-targets
 
 # 2) 三道门禁

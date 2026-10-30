@@ -59,7 +59,7 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 
 | 维度 | 数值 | 说明 |
 |---|---|---|
-| 测试 | **1145 passed / 0 failed** | `cargo test --workspace --all-targets`；含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
+| 测试 | **1146 passed / 0 failed** | `cargo test --workspace --all-targets`；含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 | 不变量门禁 | **277 / 277 存在** | `deploy/verify-invariant-gate.sh`（从 `ci.yml` 动态取名单） |
 | 质量门禁 | `QUALITY_GATE=PASS` | rustfmt + clippy(`-D warnings`) + 全量测试 |
 | 交付物门禁 | `DELIVERABLES_OK` | `deploy/verify-deliverables.sh` |
@@ -99,7 +99,7 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 | `mailstack-web-bin` | 9 | **管理控制台服务入口**（`bin/mailstack-web`）：API + 前端产物托管、SPA 回退、`/api` 兜底保持 JSON、路径穿越拒绝、遥测后台采样宿主 |
 | `mailstackd` | 28 | 进程入口：fail-closed 装配、监听集中绑定、RPC 双通道、停机扇出、队列调度、封禁热重载 |
 | `mailstackctl` | 7 | CLI：参数→特权调用的翻译、退出码映射 |
-| **合计** | **1145** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
+| **合计** | **1146** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 
 ### 2.4 Phase 进度明细
 
