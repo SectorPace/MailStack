@@ -831,7 +831,7 @@ pub enum Lookup { Known, Missing, Unavailable(String) }
 >
 > | # | 修法 | 反例 / 验证 |
 > |---|---|---|
-> | **6.1** | 新增 `deny.toml`（advisories deny / 许可白名单 / 禁止通配依赖 / 只允许 crates.io）；`cargo-deny` 去掉 `continue-on-error`；`cargo audit` 去掉两处 `|| true` | 白名单由本机 **449 个 crate 的 32 种许可证表达式实测归纳**；CI YAML 结构由 python 脚本校验 |
+> | **6.1** | 新增 `deny.toml`（漏洞/许可/通配/来源四类检查）；`cargo-deny` 去掉 `continue-on-error`；`cargo audit` 去掉两处 `|| true` | **已用 cargo-deny 0.20.2 对真实依赖树实跑通过**（advisories/bans/licenses/sources 全 ok），并据此修掉 **7 条 RUSTSEC 漏洞**、收窄白名单 15→11、修正 4 处 0.20 已移除的配置键。详见 §5.4 |
 > | **6.2** | 门禁从 `grep -rq "fn $name"` 升级为三项校验：函数存在 + **带 `#[test]`/`#[tokio::test]`** + 函数体内**至少一个断言** | 负例实测：普通函数名 → `NOT_TEST`；测试掏空成空壳 → `NO_ASSERT`，两次都正确变红 |
 > | **6.3** | 四个 action 全部 pin 到 **40 位 commit SHA**；workflow 级 `permissions: contents: read`；三处 checkout 加 `persist-credentials: false` | 逐个核验 SHA 为 commit 对象（rust-cache v2=2.9.3 PGP 已验证；cargo-deny-action v2=2.1.1 **unsigned**，故 SHA 是唯一完整性依据）；`dtolnay` 的 tag 名即工具链选择器，改为 pin master commit + `with.toolchain: 1.98.1` |
 > | **6.4** | `wsl-install-rust.sh`：`mktemp -d` 私有目录（0700、不可预测）替代可预测的 `/tmp/rustup-init.sh`；支持 `MAILSTACK_RUSTUP_SHA256` 显式钉扎；升为 `set -euo pipefail` | `bash -n` 校验；未设哈希时**明确告警**「仅依赖 HTTPS，未做独立钉扎」而非假装安全 |
@@ -865,6 +865,77 @@ pub enum Lookup { Known, Missing, Unavailable(String) }
 
 > **NAT64 / `2000::/3` 白名单**已列入批 2 修复（§2.4）。
 > **`tables.rs` 的 RMW 无锁**属 4.2 与 5.13，是同一个文件的两个面。
+
+---
+
+## 5.4 供应链门禁的**实地验证**（2026-10-30，提交 `289afdf`）
+
+> 上一轮把 `cargo-deny` 从「被 `continue-on-error` 吞掉」改成强制，但**没有本地跑过**。
+> 这一轮用官方 **0.20.2** 预编译二进制（SHA256 与发布值一致：
+> `9f12ed4c…824c8d5f`）对**真实依赖树**实跑 `cargo deny check`。
+> 结论：原配置**根本跑不起来**，而且树里有 **7 条真实漏洞**。
+
+### 5.4.1 修掉的 7 条 RUSTSEC 漏洞
+
+| 通告 | crate | 问题 | 处理 |
+|---|---|---|---|
+| RUSTSEC-2026-0346 | rustls | `Debug` 实现把客户端会话值（含 TLS secrets）打出来 | 0.23.45 → **0.23.46** |
+| RUSTSEC-2026-0347 | rustls | ECH 被拒后仍把缓冲的应用数据发给外层服务器 | 同上 |
+| RUSTSEC-2026-0348 | rustls | Brotli 证书解压可在**认证前**分配最多 1 GiB | 同上 |
+| RUSTSEC-2026-0349 | rustls | 未认证的 ServerHello 可把后续连接降级到经典密钥交换 | 同上 |
+| RUSTSEC-2026-0382 | rustls-webpki | 证书校验可能接受已被 distrust 的中间证书 | 0.103.15 → **0.103.16** |
+| RUSTSEC-2026-0386 | tokio（unsound） | `AsyncFd::new` 等构造器违反 I/O safety | 1.53.1 → **1.54.1** |
+| RUSTSEC-2026-0381 | webpki-roots | 内置根证书仍信任已被 distrust 的 emSign 中间证书 | 1.0.9 → **1.0.11** |
+
+**唯一保留的 ignore**：`RUSTSEC-2023-0071`（`rsa 0.9.10`，Marvin Attack）——
+**没有安全升级可用**。该通告针对 RSA **解密**路径的时序侧信道；本项目 rsa 只经
+`mail-auth` 用于 DKIM **签名**，不存在「投喂密文给解密预言机」的路径。
+理由写在 `deny.toml` 的 `ignore` 条目里；上游出修复版时
+`unused-ignored-advisory = "warn"` 会提醒我们删掉它。
+
+### 5.4.2 原 `deny.toml` 里 4 处「照旧版文档写就会红」的配置
+
+| 问题 | 实情（0.20） |
+|---|---|
+| `advisories.vulnerability = "deny"` | **键已移除**。0.20 起漏洞通告一律报错 |
+| `advisories.notice = "warn"`、`severity-threshold` | **已移除**，notice 一律报错 |
+| `licenses.unlicensed = "deny"` | **已移除**；未声明许可证本来必然失败 |
+| `advisories.unmaintained = "warn"` | 它是**作用域**枚举（`all`/`workspace`/`transitive`/`none`），不是级别 |
+
+这些不会报「配置有问题」以外的东西 —— 但会让 CI **红在配置解析**，
+而不是红在「真的有问题」，等于门禁又换了一种失效方式。
+
+### 5.4.3 自有 crate 的许可证与通配依赖
+
+- **11 个 workspace crate 被判 `unlicensed`**：本仓库用
+  `license = "SEE LICENSE IN LICENSE"`（Cargo 合法、**非 SPDX**）。
+  修法是如实声明它们不对外发布 —— `[workspace.package] publish = false`
+  + 每个 crate `publish.workspace = true`，再配 `[licenses] private = { ignore = true }`。
+  **这不是放行外部依赖**：外部 crate 的许可证仍逐条按白名单校验。
+- **`wildcards = "deny"` 把内部 path 依赖全部误报**：workspace 里
+  `mailstack-core = { path = "crates/core" }` 被 `.workspace = true` 继承后没有版本
+  要求，cargo-deny 看到的就是 `*`。加 `allow-wildcard-paths = true` ——
+  路径依赖放行，其余通配仍然拒绝。
+- **许可白名单从 15 收窄到 11**：按实跑输出删掉从未出现的
+  `CC0-1.0` / `MPL-2.0` / `OpenSSL` / `Unicode-DFS-2016`。
+  原列表是从本机 registry 449 个 crate 归纳的偏宽集合。
+
+### 5.4.4 磁盘：增量编译曾把根分区撑满
+
+依赖升级触发的全量重建让 `target/debug/incremental` 涨到 **3.3G**，
+9.8G 根分区被撑满，报错是 `No space left on device (os error 28)` ——
+同样属于「报错不指向真因」。`deploy/wsl-cargo.sh` 现在默认
+`CARGO_INCREMENTAL=0`（可显式覆盖为 1）。
+
+### 5.4.5 最终结果
+
+```
+$ cargo deny check
+advisories ok, bans ok, licenses ok, sources ok        # 退出码 0
+```
+
+依赖升级后的全量回归：`QUALITY_GATE=PASS`（1145 passed / 0 failed）、
+`INVARIANT_GATE_OK`（277）、`DELIVERABLES_OK`。
 
 ---
 
