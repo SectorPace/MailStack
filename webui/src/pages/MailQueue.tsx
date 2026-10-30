@@ -7,7 +7,8 @@ import { rpc, type RpcResult } from "../api/client";
 import { RefreshContext } from "../App";
 import { PageHeader, DataPanel, QueueStatus, GlassSelect, ConfirmDialog, toast } from "../components/ui";
 import { DataTable, type Column } from "../components/DataTable";
-import { IconFilter, IconTrash, IconSend, IconSearch } from "../components/icons";
+import { IconFilter, IconTrash, IconSend } from "../components/icons";
+import { normalizeLog, type LogRow, type RawLog } from "../lib/logs";
 
 type QueueRow = {
   id: string;
@@ -19,63 +20,27 @@ type QueueRow = {
   time: string;
   service: string;
 };
-type LogRow = {
-  id: string;
-  time: string;
-  level: "info" | "warn" | "error";
-  service: string;
-  message: string;
-  from?: string;
-  to?: string;
-  domain?: string;
-  retry?: number;
+
+const RANGE_MS: Record<string, number> = {
+  "24h": 24 * 3600_000,
+  "7d": 7 * 24 * 3600_000,
+  "30d": 30 * 24 * 3600_000,
 };
 
-/** 后端 logs.list 的条目（journalctl JSON）：{ time, priority, level, unit, identifier, message }。 */
-export type RawLog = {
-  id?: string;
-  time?: string;
-  level?: string;
-  service?: string;
-  identifier?: string | null;
-  unit?: string | null;
-  message?: string;
-  from?: string;
-  to?: string;
-  domain?: string;
-  retry?: number;
-};
-
-/** syslog 级别名 → UI 三态；mock 已给 info/warn/error。 */
-function normLevel(level?: string): "info" | "warn" | "error" {
-  switch (level) {
-    case "err":
-    case "crit":
-    case "emerg":
-    case "alert":
-    case "error":
-      return "error";
-    case "warning":
-    case "warn":
-      return "warn";
-    default:
-      return "info";
-  }
+/** 解析后端 ISO8601 或 mock 的 "YYYY-MM-DD HH:mm:ss"；解析不了返回 null。 */
+function parseTime(s?: string): number | null {
+  if (!s) return null;
+  const raw = s.includes("T") ? s : s.replace(" ", "T");
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? ms : null;
 }
 
-/** 把后端/mock 两种日志形状统一成前端 LogRow（后端没有 service/from 等，取 identifier/unit）。 */
-export function normalizeLog(e: RawLog, i: number): LogRow {
-  return {
-    id: e.id ?? `${e.time ?? "log"}-${i}`,
-    time: e.time ?? "",
-    level: normLevel(e.level),
-    service: e.service ?? e.identifier ?? e.unit ?? "",
-    message: e.message ?? "",
-    from: e.from,
-    to: e.to,
-    domain: e.domain,
-    retry: e.retry,
-  };
+/** 时间范围过滤：解析失败时**保留**该行（宁可多显示，也不因时间格式差异误删数据）。 */
+function withinRange(time: string | undefined, range: string): boolean {
+  const windowMs = RANGE_MS[range];
+  const ts = parseTime(time);
+  if (!windowMs || ts == null) return true;
+  return Date.now() - ts <= windowMs;
 }
 
 export default function MailQueue({ initialTab = "queue" }: { initialTab?: "queue" | "logs" }) {
@@ -105,7 +70,7 @@ export default function MailQueue({ initialTab = "queue" }: { initialTab?: "queu
   async function doAction(id: string, op: string) {
     const r = await rpc("queue.action", { id, op });
     if (r.ok) {
-      toast(op === "delete" ? "OK" : "OK");
+      toast(op === "delete" ? t("deleted") : t("action_submitted"));
       setQueue((q) =>
         op === "delete" ? q.filter((x) => x.id !== id) : q.map((x) => (x.id === id ? { ...x, status: op === "hold" ? "hold" : "sending" } : x)),
       );
@@ -114,10 +79,17 @@ export default function MailQueue({ initialTab = "queue" }: { initialTab?: "queu
     }
   }
 
+  // 时间范围原先只是一个纯装饰性下拉框（state 从不参与查询）。这里让它真正过滤
+  // 队列与日志：后端 action 不接受 range 参数，按条目的时间戳在客户端裁剪。
   const filteredQueue = useMemo(
-    () => (statusFilter === "all" ? queue : queue.filter((x) => x.status === statusFilter)),
-    [queue, statusFilter],
+    () =>
+      queue.filter(
+        (x) => (statusFilter === "all" || x.status === statusFilter) && withinRange(x.time, timeRange),
+      ),
+    [queue, statusFilter, timeRange],
   );
+
+  const filteredLogs = useMemo(() => logs.filter((l) => withinRange(l.time, timeRange)), [logs, timeRange]);
 
   const qCols: Column<QueueRow>[] = [
     { key: "sender", header: t("sender"), render: (r) => r.sender, sortValue: (r) => r.sender, width: 190 },
@@ -233,7 +205,7 @@ export default function MailQueue({ initialTab = "queue" }: { initialTab?: "queu
           <DataPanel>
             <DataTable
               columns={logCols}
-              rows={logs}
+              rows={filteredLogs}
               rowKey={(r) => r.id}
               pageSize={12}
               filterKeys={(r) => `${r.message} ${r.service} ${r.level} ${r.domain ?? ""}`}

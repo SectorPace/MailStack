@@ -21,16 +21,18 @@ import {
 type LoginError = { code?: string; message?: string };
 
 async function doLogin(username: string, password: string, totp?: string): Promise<void> {
-  if (getMode() === "mock") {
+  // mock 分支只存在于开发构建：生产包中该块被 Vite 剔除，因此不存在“任意口令登录”。
+  if (import.meta.env.DEV && getMode() === "mock") {
     await new Promise((r) => setTimeout(r, 550));
     // 演示：密码 123456 → 触发两步验证；其他任意密码通过
     if (!totp && password === "123456") throw { code: "TOTP_REQUIRED" } as LoginError;
     if (username.trim().length === 0 || password.length === 0) throw { message: "invalid" } as LoginError;
     return;
   }
-  const res = await fetch("api/auth/login", {
+  const res = await fetch("/api/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
     body: JSON.stringify({ username, password, ...(totp ? { code: totp } : {}) }),
   });
   if (res.ok) {
@@ -60,7 +62,6 @@ export default function Login({ onOk }: { onOk: () => void }) {
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("");
   const [showPass, setShowPass] = useState(false);
-  const [keep, setKeep] = useState(true);
   const [busy, setBusy] = useState(false);
   const [totpStage, setTotpStage] = useState(false);
   const [totp, setTotp] = useState("");
@@ -231,11 +232,9 @@ export default function Login({ onOk }: { onOk: () => void }) {
             </>
           )}
 
-          {/* 保持登录 */}
-          <label className="flex cursor-pointer select-none items-center gap-2 pt-0.5 text-[12px] text-[var(--text-2)]">
-            <input type="checkbox" checked={keep} onChange={(e) => setKeep(e.target.checked)} className="h-3.5 w-3.5 accent-[rgb(var(--accent-rgb))]" />
-            {zh ? "保持登录" : "Keep me signed in"}
-          </label>
+          {/* 原先此处有「保持登录」复选框：后端 /api/auth/login 只接受
+              username/password/code，会话 TTL 固定（HttpOnly Cookie Max-Age），
+              勾选状态不参与任何请求构造 → 纯死控件，已删除。 */}
 
           {err && (
             <div className="rounded-[10px] px-3 py-2 text-[12px] leading-relaxed" style={{ color: "rgb(var(--err-rgb))", background: "rgb(var(--err-rgb) / 0.08)", boxShadow: "inset 0 0 0 1px rgb(var(--err-rgb) / 0.25)" }}>
@@ -255,7 +254,7 @@ export default function Login({ onOk }: { onOk: () => void }) {
             )}
           </button>
 
-          {getMode() === "mock" && (
+          {import.meta.env.DEV && getMode() === "mock" && (
             <p className="text-center text-[10.5px] text-[var(--text-3)]">
               {zh ? "演示模式：任意密码可登录；输入 123456 体验两步验证" : "Demo: any password signs in. Use 123456 to try 2FA."}
             </p>

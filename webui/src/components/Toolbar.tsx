@@ -2,9 +2,12 @@
 // 滚动边缘行为：内容滚动后获得更硬磨砂 + 1px 底部分隔线（.is-scrolled）。
 import * as RDropdown from "@radix-ui/react-dropdown-menu";
 import { motion, AnimatePresence } from "motion/react";
+import { useEffect, useState } from "react";
 import { useSettings } from "../store/settings";
+import { rpc, resetCsrf } from "../api/client";
 import type { RouteKey } from "../router";
 import type { DictKey } from "../i18n";
+import { DICT } from "../i18n";
 import {
   IconBell,
   IconMenu,
@@ -12,6 +15,7 @@ import {
   IconGlobe,
   IconMoon,
   IconRefresh,
+  IconSearch,
   IconSun,
   IconUser,
 } from "./icons";
@@ -35,6 +39,23 @@ const CRUMB: Record<RouteKey, { en: string; zhKey: DictKey }> = {
 };
 
 export type TimeRange = "24h" | "7d" | "30d" | "today";
+
+/** 后端 activity.list 的条目（审计日志折成的活动流）。 */
+type ActivityItem = { kind?: string; title?: string; sub?: string; time?: string };
+type ServiceSnapshot = { services?: { status?: string }[]; serviceDist?: { total?: number; running?: number } };
+const NOTIF_READ_KEY = "mailstack:notif-read";
+
+function actText(a: ActivityItem, t: (k: DictKey) => string): string {
+  const title = a.title ?? "";
+  const label = Object.prototype.hasOwnProperty.call(DICT, title) ? t(title as DictKey) : title || "—";
+  return a.sub ? `${label} · ${a.sub}` : label;
+}
+
+function actTime(a: ActivityItem): string {
+  const raw = a.time ?? "";
+  // 后端是 ISO8601（2026-09-29T14:22:10+00:00），mock 是 "14:22"；两种都取到分钟。
+  return raw.length > 10 ? raw.slice(11, 16) : raw;
+}
 
 export function Toolbar({
   route,
@@ -61,6 +82,74 @@ export function Toolbar({
 }) {
   const { t, prefs, resolvedTheme, setTheme, setLang } = useSettings();
 
+  /* ---- 真实数据：通知（activity.list）/ 系统状态（snapshot）/ 管理员名（admin.get） ---- */
+  const [activity, setActivity] = useState<ActivityItem[]>([]);
+  const [readKeys, setReadKeys] = useState<Set<string>>(() => {
+    try {
+      const raw = localStorage.getItem(NOTIF_READ_KEY);
+      return new Set(raw ? (JSON.parse(raw) as string[]) : []);
+    } catch {
+      return new Set();
+    }
+  });
+  const [health, setHealth] = useState<{ running: number; total: number } | null>(null);
+  const [adminName, setAdminName] = useState<string | null>(null);
+
+  const notifKey = (a: ActivityItem) => `${a.title ?? ""}|${a.time ?? ""}|${a.sub ?? ""}`;
+  const unreadCount = activity.filter((a) => !readKeys.has(notifKey(a))).length;
+
+  /** 「全部已读」：把当前活动流标记为已读（本地持久化），红点随之熄灭。原先该按钮没有 onClick。 */
+  function markAllRead() {
+    const next = new Set(readKeys);
+    activity.forEach((a) => next.add(notifKey(a)));
+    setReadKeys(next);
+    try {
+      localStorage.setItem(NOTIF_READ_KEY, JSON.stringify([...next]));
+    } catch {
+      /* 存储不可用时仅本会话生效 */
+    }
+  }
+
+  useEffect(() => {
+    let live = true;
+    rpc<ActivityItem[]>("activity.list").then((r) => {
+      if (live && r.ok) setActivity(r.data ?? []);
+    });
+    rpc<{ username?: string }>("admin.get").then((r) => {
+      if (live && r.ok) setAdminName((r.data as { username?: string } | undefined)?.username ?? null);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  // 系统状态徽标：读真实服务状态（原先是恒为 badge-ok 的「服务运行正常」）。
+  useEffect(() => {
+    let live = true;
+    async function load() {
+      const r = await rpc<ServiceSnapshot>("snapshot");
+      if (!live) return;
+      const d = (r.ok ? r.data : null) as ServiceSnapshot | null;
+      const svcs = d?.services;
+      if (Array.isArray(svcs) && svcs.length) {
+        setHealth({ running: svcs.filter((s) => s.status === "ACTIVE").length, total: svcs.length });
+      } else if (d?.serviceDist && typeof d.serviceDist.total === "number") {
+        setHealth({ running: d.serviceDist.running ?? 0, total: d.serviceDist.total });
+      } else {
+        setHealth(null);
+      }
+    }
+    void load();
+    const timer = setInterval(() => void load(), 60_000);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
+  }, []);
+
+  const healthKind = health == null ? "neutral" : health.running === health.total ? "ok" : health.running > 0 ? "warn" : "err";
+  const healthLabel = health == null ? "—" : health.running === health.total ? t("system_healthy") : t("system_degraded");
+
   function cycleTheme() {
     setTheme(resolvedTheme === "dark" ? "light" : "dark");
   }
@@ -74,10 +163,6 @@ export function Toolbar({
     { value: "7d", label: t("last_7d") },
     { value: "30d", label: t("last_30d") },
   ];
-
-  const now = new Date();
-  const pad = (n: number) => String(n).padStart(2, "0");
-  const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
 
   return (
     <div
@@ -114,19 +199,35 @@ export function Toolbar({
         <span className="truncate text-[13.5px] font-semibold text-[var(--text-1)]">{t(CRUMB[route].zhKey)}</span>
       </div>
 
+      {/* 2. 搜索（⌘K 命令面板入口；openPalette 此前是未使用的 prop） */}
+      <motion.button
+        whileTap={{ scale: 0.9 }}
+        transition={{ type: "spring", stiffness: 600, damping: 28 }}
+        className="icon-btn shrink-0"
+        onClick={openPalette}
+        aria-label={t("search_placeholder")}
+        title={t("search_placeholder")}
+      >
+        <IconSearch size={16} />
+      </motion.button>
+
       {/* 数据来源徽标：mock = 演示数据（琥珀），live = 已连接后端（绿） */}
       <span
-        className={`badge hidden! xl:inline-flex ${mode === "mock" ? "badge-warn" : "badge-ok"}`}
+        className={`badge hidden xl:inline-flex ${mode === "mock" ? "badge-warn" : "badge-ok"}`}
         title={mode === "mock" ? t("mock_data") : t("live_data")}
       >
         <span className="dot" />
         {mode === "mock" ? t("mock_data") : t("live_data")}
       </span>
 
-      {/* 3. 系统状态徽标 */}
-      <span className="badge badge-ok hidden! sm:inline-flex" role="status" title={t("system_healthy")}>
+      {/* 3. 系统状态徽标：由 snapshot 的真实服务状态推导；拿不到数据显示 — */}
+      <span
+        className={`badge badge-${healthKind} hidden sm:inline-flex`}
+        role="status"
+        title={health ? `${healthLabel} · ${health.running}/${health.total}` : healthLabel}
+      >
         <span className="dot" />
-        <span className="hidden md:inline">{t("system_healthy")}</span>
+        <span className="hidden md:inline">{healthLabel}</span>
       </span>
 
       <div className="ml-auto flex items-center gap-1.5">
@@ -136,7 +237,7 @@ export function Toolbar({
         </div>
 
         {/* 5. 刷新 */}
-        <motion.button whileTap={{ scale: 0.9 }} transition={{ type: "spring", stiffness: 600, damping: 28 }} className="icon-btn hidden! sm:inline-flex" onClick={onRefresh} aria-label={t("refresh")} title={t("refresh")}>
+        <motion.button whileTap={{ scale: 0.9 }} transition={{ type: "spring", stiffness: 600, damping: 28 }} className="icon-btn hidden sm:inline-flex" onClick={onRefresh} aria-label={t("refresh")} title={t("refresh")}>
           <IconRefresh size={16} />
         </motion.button>
 
@@ -145,38 +246,41 @@ export function Toolbar({
           <RDropdown.Trigger asChild>
             <motion.button whileTap={{ scale: 0.9 }} transition={{ type: "spring", stiffness: 600, damping: 28 }} className="icon-btn" aria-label={t("notifications")} title={t("notifications")}>
               <IconBell size={16} />
-              <span
-                className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full"
-                style={{ background: "rgb(var(--err-rgb))", boxShadow: "0 0 0 2px rgb(var(--glass-rgb) / 0.9)" }}
-              />
+              {unreadCount > 0 && (
+                <span
+                  className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full"
+                  style={{ background: "rgb(var(--err-rgb))", boxShadow: "0 0 0 2px rgb(var(--glass-rgb) / 0.9)" }}
+                />
+              )}
             </motion.button>
           </RDropdown.Trigger>
           <RDropdown.Portal>
             <RDropdown.Content align="end" sideOffset={8} className="glass--clear radix-pop edge-lens" style={{ width: 300 }}>
               <div className="flex items-center justify-between px-2.5 py-1.5 text-[12px] font-semibold text-[var(--text-2)]">
                 {t("notifications")}
-                <button className="text-[11.5px] font-normal text-[var(--accent)]">{t("mark_all_read")}</button>
+                <button className="text-[11.5px] font-normal text-[var(--accent)]" onClick={markAllRead} disabled={unreadCount === 0}>
+                  {t("mark_all_read")}
+                </button>
               </div>
               <div className="radix-sep" />
-              {[
-                { id: "n1", level: "warn", time: "14:22", text: t("cert_expiry_alert") },
-                { id: "n2", level: "info", time: "13:35", text: t("mail_queue_alert") },
-                { id: "n3", level: "err", time: "13:12", text: t("security_alert") },
-              ].map((n) => (
-                <div key={n.id} className="radix-item items-start" role="listitem">
-                  <span
-                    className="mt-1 h-2 w-2 shrink-0 rounded-full"
-                    style={{
-                      background:
-                        n.level === "err" ? "rgb(var(--err-rgb))" : n.level === "warn" ? "rgb(var(--warn-rgb))" : "rgb(var(--accent-rgb))",
-                    }}
-                  />
-                  <div className="min-w-0">
-                    <div className="text-[12.5px] leading-snug">{n.text}</div>
-                    <div className="text-[11px] text-[var(--text-3)]">{stamp.slice(0, 11)}{n.time}</div>
+              {activity.length === 0 && (
+                <div className="px-2.5 py-4 text-center text-[12px] text-[var(--text-3)]">{t("no_notifications")}</div>
+              )}
+              {activity.slice(0, 5).map((n) => {
+                const unread = !readKeys.has(notifKey(n));
+                return (
+                  <div key={notifKey(n)} className="radix-item items-start" role="listitem">
+                    <span
+                      className="mt-1 h-2 w-2 shrink-0 rounded-full"
+                      style={{ background: unread ? "rgb(var(--accent-rgb))" : "rgb(var(--text-1) / 0.18)" }}
+                    />
+                    <div className="min-w-0">
+                      <div className="text-[12.5px] leading-snug">{actText(n, t)}</div>
+                      <div className="text-[11px] text-[var(--text-3)]">{actTime(n)}</div>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </RDropdown.Content>
           </RDropdown.Portal>
         </RDropdown.Root>
@@ -208,7 +312,7 @@ export function Toolbar({
         <motion.button
           whileTap={{ scale: 0.9 }}
           transition={{ type: "spring", stiffness: 600, damping: 28 }}
-          className="icon-btn hidden! sm:inline-flex"
+          className="icon-btn hidden sm:inline-flex"
           onClick={cycleLang}
           aria-label={t("language")}
           title={t("language")}
@@ -221,7 +325,7 @@ export function Toolbar({
           <RDropdown.Trigger asChild>
             <button className="glass--control flex h-[34px] items-center gap-2 rounded-full py-0 pl-1 pr-2.5" aria-label={t("admin")}>
               <Avatar />
-              <span className="hidden text-[13px] font-medium text-[var(--text-1)] sm:inline">admin</span>
+              <span className="hidden text-[13px] font-medium text-[var(--text-1)] sm:inline">{adminName ?? "—"}</span>
               <IconChevronDown size={12} className="text-[var(--text-3)]" />
             </button>
           </RDropdown.Trigger>
@@ -230,8 +334,9 @@ export function Toolbar({
               <div className="flex items-center gap-2.5 px-2.5 py-2">
                 <Avatar size={34} />
                 <div>
-                  <div className="text-[13px] font-semibold text-[var(--text-1)]">admin</div>
-                  <div className="text-[11px] text-[var(--text-3)]">admin@example.com</div>
+                  {/* 管理员名读 admin.get；后端没有 email 字段，故不再硬编码 admin@example.com */}
+                  <div className="text-[13px] font-semibold text-[var(--text-1)]">{adminName ?? "—"}</div>
+                  <div className="text-[11px] text-[var(--text-3)]">{t("admin")}</div>
                 </div>
               </div>
               <div className="radix-sep" />
@@ -242,7 +347,7 @@ export function Toolbar({
                 <BrandLogo size={14} radius={4} /> MailStack {t("settings_title")}
               </RDropdown.Item>
               <div className="radix-sep" />
-              <RDropdown.Item className="radix-item" style={{ color: "rgb(var(--err-rgb))" }} onSelect={() => toastLogout()}>
+              <RDropdown.Item className="radix-item" style={{ color: "rgb(var(--err-rgb))" }} onSelect={() => void toastLogout()}>
                 <IconMoon size={14} /> {t("logout")}
               </RDropdown.Item>
             </RDropdown.Content>
@@ -253,7 +358,15 @@ export function Toolbar({
   );
 }
 
-function toastLogout() {
+/**
+ * 退出登录：**先**让服务端吊销会话，再回登录门。
+ *
+ * 原实现只 dispatchEvent 做本地跳转：HttpOnly 会话 Cookie（Max-Age 8h）仍然有效，
+ * 「退出」并不等于会话失效 —— 拿同一浏览器再进来（或点开 SPA 的登录页刷新）仍是已登录态。
+ */
+async function toastLogout() {
+  await rpc("auth.logout", {});
+  resetCsrf();
   window.dispatchEvent(new CustomEvent("mailstack:logout"));
 }
 

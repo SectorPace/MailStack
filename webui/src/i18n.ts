@@ -40,6 +40,11 @@ export const DICT = {
   mock_data: ["模拟数据", "Mock data"],
   live_data: ["已连接后端", "Live backend"],
   command_hint: ["快速跳转", "Quick jump"],
+  backend_unreachable: ["后端不可达，无法加载管理控制台", "Backend unreachable — the admin console cannot load"],
+  backend_unreachable_hint: [
+    "探活 /api/health 失败。控制台不会降级为演示数据；请确认 mailstack-web 正在运行、反向代理或 SSH 隧道可达后重试。",
+    "The /api/health probe failed. The console will not fall back to demo data. Verify mailstack-web is running and reachable through your proxy or SSH tunnel, then retry.",
+  ],
 
   // 页面标题 / 副标题
   dash_title: ["仪表盘", "Dashboard"],
@@ -118,6 +123,11 @@ export const DICT = {
   filter: ["筛选", "Filter"],
   total_items: ["共 {n} 条", "Total {n} items"],
   per_page: ["条/页", "/ page"],
+  prev_page: ["上一页", "Previous page"],
+  next_page: ["下一页", "Next page"],
+  page_number: ["第 {n} 页", "Page {n}"],
+  deleted: ["已删除", "Deleted"],
+  action_submitted: ["操作已提交", "Action submitted"],
   log_details: ["日志详情", "Log Details"],
   retry_count: ["重试次数", "Retry Count"],
   level: ["级别", "Level"],
@@ -263,7 +273,9 @@ export type DictKey = keyof typeof DICT;
 export function t(lang: Lang, key: DictKey, params?: Record<string, string | number>): string {
   let s: string = DICT[key][lang === "zh" ? 0 : 1];
   if (params) {
-    for (const [k, v] of Object.entries(params)) s = s.replace(`{${k}}`, String(v));
+    // 原先用 String.prototype.replace 只替换**首个**占位符：同一模板里出现两次
+    // {n} 时第二处会原样残留（WEBUI_AUDIT §3.4）。
+    for (const [k, v] of Object.entries(params)) s = s.replaceAll(`{${k}}`, String(v));
   }
   return s;
 }

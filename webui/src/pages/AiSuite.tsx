@@ -1,5 +1,5 @@
 // AI 智能中心 —— 助手对话 + 一键诊断 + 模型配置（ai.chat / ai.diagnose / ai.models.list / ai.config.*）
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { useSettings } from "../store/settings";
 import { rpc } from "../api/client";
@@ -43,7 +43,9 @@ export default function AiSuite() {
 
   // 后端 AI 预设键是 bigmodel/deepseek/openai/anthropic/custom；mock 的 provider
   // （如 openai-compatible）不在其中时，把当前值也补进选项，避免选择框显示空白。
-  const providerOptions = (() => {
+  // 用 useMemo 固定引用：原先是渲染期立即执行的 IIFE，每次 render 都给 GlassSelect
+  // 一个新数组（WEBUI_AUDIT §3.3）。
+  const providerOptions = useMemo(() => {
     const opts = [
       { value: "bigmodel", label: "GLM (BigModel)" },
       { value: "deepseek", label: "DeepSeek" },
@@ -53,7 +55,7 @@ export default function AiSuite() {
     ];
     if (cfg?.provider && !opts.some((o) => o.value === cfg.provider)) opts.push({ value: cfg.provider, label: cfg.provider });
     return opts;
-  })();
+  }, [cfg?.provider, zh]);
 
   useEffect(() => {
     rpc<{ models?: (string | AiModel)[] }>("ai.models.list").then((r) => {

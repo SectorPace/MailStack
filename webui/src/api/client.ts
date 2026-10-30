@@ -1,20 +1,23 @@
-// MailStack API 层 —— 与 Rust 后端 (crates/admin-web → helper.sock RPC) 衔接。
+// MailStack API 层 —— 与 Rust 后端（crates/web，crate 名 mailstack-web）衔接。
 //
-// 后端 RPC 协议（crates/common/src/rpc.rs）：
-//   请求  {"action": string, "data": object}
-//   响应  {"ok": bool, "data": any | "error": string}
-// HTTP 桥只需一个端点：POST /api/rpc，把请求体原样转发给 helper 的 RPC socket。
-// 另有 GET /api/health 探活、POST /api/auth/login 会话登录。
+// 契约真相源（前端不得凭空假设）：
+//   * 方法/路径/动作名：crates/web/src/contract.rs 的契约表
+//   * axum 路由注册：  crates/web/src/lib.rs（`/api/*`）
+// 传输层两种形态，由启动探测决定：
+//   * rest —— 契约表里的 REST 端点（写操作带 x-csrf-token；登录响应体携带 csrf）
+//   * rpc  —— POST /api/rpc 桥，帧协议透传 helper socket（crates/core/src/actions.rs 白名单）
 //
-// 后端不可达时自动降级到内置 mock（演示/评审模式），UI 行为完全一致。
+// **fail-closed**：后端不可达（探活失败）时 mode = "unreachable"，由 App 渲染明确的
+// 错误页 + 重试入口，绝不静默降级成假数据。mock 只存在于开发构建
+// （`import.meta.env.DEV`），生产包中被整块剔除 —— 见 WEBUI_AUDIT §1.1 / §2.8。
 
 export type RpcResult<T> = { ok: true; data: T } | { ok: false; error: string };
 
-export type Mode = "live" | "mock";
+/** live = 后端可用；mock = 仅开发构建的演示模式；unreachable = 探活失败（fail-closed）。 */
+export type Mode = "live" | "mock" | "unreachable";
 
-let mode: Mode = "mock";
-let modeReady = false;
-// 传输层：rest = 原版 admin-web REST 端点（CSRF 保护）；rpc = POST /api/rpc 桥（helper socket）
+let mode: Mode = "unreachable";
+// 传输层：rest = 后端 REST 端点（CSRF 保护）；rpc = POST /api/rpc 桥（helper socket）
 let transport: "rest" | "rpc" = "rpc";
 let csrf = "";
 const modeListeners = new Set<(m: Mode) => void>();
@@ -38,11 +41,15 @@ const urlParams =
     ? new URLSearchParams(location.search)
     : new URLSearchParams();
 
+/**
+ * 探活 `/api/health`。超时 6s（原 1.5s 在慢启动/高负载时会把可用后端误判为不可达，
+ * 再叠加静默 mock 就变成「故障时看起来一切正常」）。
+ */
 async function probe(): Promise<boolean> {
   try {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 1500);
-    const res = await fetch("api/health", { signal: ctrl.signal, cache: "no-store" });
+    const timer = setTimeout(() => ctrl.abort(), 6000);
+    const res = await fetch("/api/health", { signal: ctrl.signal, credentials: "same-origin", cache: "no-store" });
     clearTimeout(timer);
     if (!res.ok) return false;
     const body = (await res.json()) as { ok?: boolean };
@@ -52,15 +59,19 @@ async function probe(): Promise<boolean> {
   }
 }
 
-/** 启动时调用一次：决定 live / mock。?mock=1 强制 mock，?live=1 强制 live。 */
-/** 登录成功后捕获 CSRF token（原版后端约定：登录响应携带 csrf，写操作回传 x-csrf-token） */
+/** 登录 / 会话恢复成功后捕获 CSRF token（写操作回传 x-csrf-token 头）。 */
 export function captureCsrf(token?: string) {
   if (typeof token === "string") csrf = token;
 }
 
+/** 会话失效后必须清掉内存中的 CSRF，否则后续写操作仍会带一个已被吊销的 token。 */
+export function resetCsrf() {
+  csrf = "";
+}
+
 async function detectTransport() {
   try {
-    const res = await fetch("api/setup/status", { credentials: "same-origin", cache: "no-store" });
+    const res = await fetch("/api/setup/status", { credentials: "same-origin", cache: "no-store" });
     // 404/405 = 端点不存在 → 无 REST 后端，走 RPC 桥；200/401 等视为 REST 可用
     transport = res.status === 404 || res.status === 405 ? "rpc" : "rest";
   } catch {
@@ -68,26 +79,29 @@ async function detectTransport() {
   }
 }
 
+/**
+ * 启动时调用一次：决定 live / unreachable（开发构建额外允许 ?mock=1）。
+ * 探活失败 → unreachable，由 App 显示错误页，**不再降级到 mock**。
+ */
 export async function initApi(): Promise<Mode> {
-  if (urlParams.get("mock") === "1") {
+  if (import.meta.env.DEV && urlParams.get("mock") === "1") {
     setMode("mock");
-  } else if (urlParams.get("live") === "1") {
-    setMode((await probe()) ? "live" : "mock");
-  } else {
-    setMode((await probe()) ? "live" : "mock");
+    return mode;
   }
-  if (mode === "live") await detectTransport();
-  modeReady = true;
+  if (!(await probe())) {
+    setMode("unreachable");
+    return mode;
+  }
+  await detectTransport();
+  setMode("live");
   return mode;
 }
 
-export function isReady() {
-  return modeReady;
-}
-
-/** 核心 RPC 调用 —— action 名与 crates/common/src/actions.rs 白名单一致。 */
+/** 核心 RPC 调用 —— action 名与 crates/core/src/actions.rs 白名单一致。 */
 export async function rpc<T = unknown>(action: string, data?: object): Promise<RpcResult<T>> {
-  if (mode === "mock") {
+  // 生产构建里 import.meta.env.DEV 是 false，这一整支 + mockDispatch 全部被剔除
+  if (import.meta.env.DEV && mode === "mock") {
+    if (!mockDispatch) return { ok: false, error: "mock dispatcher is unavailable" };
     return (await mockDispatch(action, (data ?? {}) as Record<string, unknown>)) as RpcResult<T>;
   }
   const d = (data ?? {}) as Record<string, unknown>;
@@ -103,13 +117,16 @@ async function bridge<T>(action: string, data: object): Promise<RpcResult<T>> {
     // security.* / dkim.* / users.password 等）都会被拒。
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (csrf) headers["x-csrf-token"] = csrf;
-    const res = await fetch("api/rpc", {
+    const res = await fetch("/api/rpc", {
       method: "POST",
       headers,
+      // 与 restCall 保持一致：显式声明同源携带 Cookie（会话是 HttpOnly Cookie）
+      credentials: "same-origin",
       cache: "no-store",
       body: JSON.stringify({ action, data }),
     });
     if (res.status === 401 || res.status === 403) {
+      resetCsrf();
       window.dispatchEvent(new CustomEvent("mailstack:unauthorized"));
       return { ok: false, error: "unauthorized" };
     }
@@ -122,7 +139,7 @@ async function bridge<T>(action: string, data: object): Promise<RpcResult<T>> {
   }
 }
 
-/** REST 端点映射（对齐原版 MailStack beta.10 admin-web 契约，CSRF 保护） */
+/** REST 端点映射 —— 方法/路径逐条对齐 crates/web/src/contract.rs（axum 注册见 lib.rs）。 */
 type RestSpec = {
   method: "GET" | "POST" | "DELETE";
   path: (d: Record<string, unknown>) => string;
@@ -166,7 +183,8 @@ const REST: Record<string, RestSpec> = {
   "admin.2fa.enable": { method: "POST", path: () => "/api/admin/2fa/enable", body: (d) => ({ code: d.code }) },
   "admin.2fa.disable": { method: "POST", path: () => "/api/admin/2fa/disable", body: (d) => ({ code: d.code }) },
   "sessions.list": { method: "GET", path: () => "/api/auth/sessions", pick: pickList("sessions") },
-  "sessions.revoke": { method: "POST", path: () => "/api/auth/sessions/revoke", body: (d) => ({ id: d.id, all: d.all }) },
+  // 契约：revoke 只认单个指纹 `{id}`（routes.rs revoke_session）；吊销「其他」走 DELETE。
+  "sessions.revoke": { method: "POST", path: () => "/api/auth/sessions/revoke", body: (d) => ({ id: d.id }) },
   // 后端「注销其他会话」是 DELETE /api/auth/sessions（revoke 端点只认单个 id）。
   "sessions.revokeOthers": { method: "DELETE", path: () => "/api/auth/sessions" },
   "ai.config": { method: "POST", path: () => "/api/ai/config", body: (d) => d },
@@ -176,26 +194,23 @@ const REST: Record<string, RestSpec> = {
   "relay.test": { method: "POST", path: () => "/api/setup/relay/test", body: (d) => d },
   "relay.apply": { method: "POST", path: () => "/api/setup/relay/apply", body: (d) => d },
   "network.check_port": { method: "POST", path: () => "/api/network/check-port", body: (d) => ({ port: d.port, host: d.host }) },
-  "status.relay": { method: "GET", path: () => "/api/status" },
   "setup.identity.apply": { method: "POST", path: () => "/api/setup/identity", body: (d) => d },
   "setup.dns.verify": { method: "POST", path: () => "/api/setup/dns/verify", body: (d) => d },
   "setup.cert.issue": { method: "POST", path: () => "/api/setup/cert/issue", body: (d) => d },
   "setup.mail.test": { method: "POST", path: () => "/api/setup/mail/test", body: (d) => d },
   "mail.test_loopback": { method: "POST", path: () => "/api/mail/test-loopback", body: (d) => d },
-  "metrics.realtime": { method: "GET", path: () => "/api/metrics/realtime" },
-  "metrics.telemetry": { method: "GET", path: () => "/api/metrics/telemetry" },
   "metrics.system": { method: "GET", path: () => "/api/metrics/system" },
   "system.doctor": { method: "GET", path: () => "/api/system/doctor", pick: pickList("checks", "items") },
-  "security.scan": { method: "GET", path: () => "/api/security/scan" },
+  // 后端只注册了 POST（contract.rs:150-155 / lib.rs:394）；写成 GET 会拿到空 body 的 405。
+  "security.scan": { method: "POST", path: () => "/api/security/scan" },
   "security.ban": { method: "POST", path: () => "/api/security/ban", body: (d) => d },
   "security.unban": { method: "POST", path: () => "/api/security/unban", body: (d) => ({ ip: d.ip }) },
-  "backups.list": { method: "GET", path: () => "/api/backups", pick: pickList("backups") },
-  "backup.restore": { method: "POST", path: () => "/api/backups/restore", body: (d) => d },
   "users.password": { method: "POST", path: () => "/api/users/password", body: (d) => d },
   "admin.get": { method: "GET", path: () => "/api/admin" },
   "ai.chat": { method: "POST", path: () => "/api/ai/dns-chat", body: (d) => d },
   "ai.diagnose": { method: "POST", path: () => "/api/ai/diagnose-dns", body: (d) => d },
   "activity.list": { method: "GET", path: () => "/api/activity", pick: pickList("activity", "items") },
+  // 会话生命周期：GET 恢复 csrf/登录态，POST 让服务端吊销会话（否则「退出」只清前端）。
   "auth.session": { method: "GET", path: () => "/api/auth/session" },
   "auth.logout": { method: "POST", path: () => "/api/auth/logout" },
 };
@@ -204,7 +219,8 @@ async function restCall<T>(action: string, data: Record<string, unknown>): Promi
   const spec = REST[action];
   if (!spec) return bridge<T>(action, data); // 无映射的动作回退 RPC 桥
   try {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    // GET 不带 Content-Type（语义错误，跨域时还会触发预检）；写操作才带 CSRF 头。
+    const headers: Record<string, string> = spec.method === "GET" ? {} : { "Content-Type": "application/json" };
     if (spec.method !== "GET" && csrf) headers["x-csrf-token"] = csrf;
     const res = await fetch(spec.path(data), {
       method: spec.method,
@@ -213,7 +229,10 @@ async function restCall<T>(action: string, data: Record<string, unknown>): Promi
       cache: "no-store",
       body: spec.body ? JSON.stringify(spec.body(data)) : undefined,
     });
-    if (res.status === 401) {
+    // 401（会话失效）与 403（CSRF 失效 / 权限不足）都必须触发全局登出，
+    // 否则用户会被一句 "missing or invalid CSRF token" toast 卡死在页面内。
+    if (res.status === 401 || res.status === 403) {
+      resetCsrf();
       window.dispatchEvent(new CustomEvent("mailstack:unauthorized"));
       return { ok: false, error: "unauthorized" };
     }
@@ -230,7 +249,14 @@ async function restCall<T>(action: string, data: Record<string, unknown>): Promi
   }
 }
 
-/* ---------------- Mock 数据集（与产品示意图一致的演示数据） ---------------- */
+/* ---------------- Mock 数据集（仅开发构建存在） ---------------- */
+
+type MockDispatch = (action: string, data: Record<string, unknown>) => Promise<RpcResult<unknown>>;
+let mockDispatch: MockDispatch | null = null;
+
+// 生产构建中 import.meta.env.DEV === false，本块是死代码：连同硬编码 TOTP 密钥、
+// mock 登录分支与全部演示数据一起被剔除（WEBUI_AUDIT §1.1 / §2.8），`?mock=1` 同时失效。
+if (import.meta.env.DEV) {
 
 type DomainRow = {
   domain: string;
@@ -366,6 +392,7 @@ const db = {
     { key: "imap", running: true, detail: "dovecot" },
     { key: "lmtp", running: true, detail: "dovecot-lmtp" },
     { key: "dkim", running: true, detail: "rspamd dkim signer" },
+    { key: "fail2ban", running: true, detail: "fail2ban-server" },
     { key: "webmail", running: false, detail: "roundcube-fpm" },
     { key: "admin", running: true, detail: "mailstack-admin-web" },
   ] as ServiceRow[],
@@ -404,7 +431,7 @@ function str(v: unknown, d: string): string {
 }
 
 /** Mock 分发器 —— 与真实 action 语义一一对应（ mutations 同步内存库）。 */
-async function mockDispatch(action: string, data: Record<string, unknown>): Promise<RpcResult<unknown>> {
+async function dispatch(action: string, data: Record<string, unknown>): Promise<RpcResult<unknown>> {
   await new Promise((r) => setTimeout(r, 120 + Math.random() * 180)); // 真实网络感
   const d = data;
   switch (action) {
@@ -592,7 +619,8 @@ async function mockDispatch(action: string, data: Record<string, unknown>): Prom
     case "admin.get":
       return ok({ username: "admin", totp: false, createdAt: daysAgo(220) }) as RpcResult<unknown>;
     case "admin.set":
-      return ok({ updated: true, revokeSessions: true }) as RpcResult<unknown>;
+      // 与后端一致：admin.set 成功后会全量吊销会话并带 revokedSessions + reauthenticate
+      return ok({ updated: true, revokedSessions: 1, reauthenticate: true }) as RpcResult<unknown>;
     case "admin.2fa.status":
       return ok({ enabled: mock2fa.enabled, recoveryCodes: mock2fa.enabled ? mock2fa.codes : undefined }) as RpcResult<unknown>;
     case "admin.2fa.begin":
@@ -770,4 +798,8 @@ function latencySeries(): { t: string; v: number }[] {
     out.push({ t: `${String(d.getHours()).padStart(2, "0")}:00`, v: Math.max(4, Math.round((base + jitter) * 10) / 10) });
   }
   return out;
+}
+
+  // 把块内的分发器交给模块级句柄：生产构建里这一行与被引用的整块都不存在。
+  mockDispatch = dispatch;
 }

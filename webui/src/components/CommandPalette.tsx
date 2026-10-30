@@ -46,6 +46,10 @@ export function CommandPalette({
     }
   }, [open]);
 
+  // 列表为空时 idx 会被 ArrowDown 的 `Math.min(-1, i+1)` 写成 -1，`items[-1]` 是
+  // undefined → Enter 静默失效。这里统一收敛到一个安全下标。
+  const activeIdx = items.length === 0 ? -1 : Math.min(idx, items.length - 1);
+
   function go(key: RouteKey) {
     onOpenChange(false);
     nav(key);
@@ -54,12 +58,12 @@ export function CommandPalette({
   function onKeyDown(e: React.KeyboardEvent) {
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setIdx((i) => Math.min(items.length - 1, i + 1));
+      if (items.length > 0) setIdx((i) => Math.min(items.length - 1, i + 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setIdx((i) => Math.max(0, i - 1));
-    } else if (e.key === "Enter" && items[idx]) {
-      go(items[idx].key);
+    } else if (e.key === "Enter" && activeIdx >= 0) {
+      go(items[activeIdx].key);
     }
   }
 
@@ -93,7 +97,7 @@ export function CommandPalette({
             )}
             {items.map((it, i) => {
               const Icon = it.icon;
-              const active = i === idx;
+              const active = i === activeIdx;
               return (
                 <button
                   key={it.key}

@@ -38,6 +38,26 @@ type Scan = {
   failedLogins24h?: number;
 };
 
+/** 后端 dns.records 的条目：ok 是**实查**结果，value 是应发布值。 */
+type DnsRecord = { type?: string; name?: string; value?: string; ok?: boolean };
+/** 后端 services.list 的条目。 */
+type ServiceRow = { key?: string; running?: boolean; detail?: string };
+
+/** 三态：true = 已验证，false = 未验证，null = 后端没有该项数据（显示 —）。 */
+type CheckState = boolean | null;
+
+function recordsCheck(records: DnsRecord[] | null, match: (r: DnsRecord) => boolean): CheckState {
+  if (!records) return null;
+  const matched = records.filter(match);
+  if (matched.length === 0) return null; // 后端没列出该记录 → 未知，绝不当作已验证
+  return matched.every((r) => r.ok === true);
+}
+
+function failedOf(records: DnsRecord[] | null, match: (r: DnsRecord) => boolean): number {
+  if (!records) return 0;
+  return records.filter((r) => match(r) && r.ok !== true).length;
+}
+
 /** high/medium/info（后端）与 err/warn/info（mock）统一为 UI 三态。 */
 function sevKind(sev?: string): "err" | "warn" | "info" {
   switch (sev) {
@@ -56,9 +76,15 @@ export default function Security() {
   const { t } = useSettings();
   const refreshN = useContext(RefreshContext);
   const [scan, setScan] = useState<Scan | null>(null);
+  // SPF / DMARC / DKIM 只能从 dns.records 的**实查结果**得到（security.scan 的 findings
+  // 是文件系统审计项）；fail2ban 状态来自 services.list。两者都缺失时显示 —。
+  const [dns, setDns] = useState<DnsRecord[] | null>(null);
+  const [services, setServices] = useState<ServiceRow[] | null>(null);
 
   useEffect(() => {
     rpc<Scan>("security.scan").then((r) => r.ok && setScan(r.data));
+    rpc<DnsRecord[]>("dns.records").then((r) => r.ok && setDns(Array.isArray(r.data) ? r.data : null));
+    rpc<ServiceRow[]>("services.list").then((r) => r.ok && setServices(Array.isArray(r.data) ? r.data : null));
   }, [refreshN]);
 
   async function unban(ip: string) {
@@ -76,6 +102,17 @@ export default function Security() {
   // 后端不给「分数」；用「已扫描路径中没有问题的比例」作为唯一由真实数据推导的指标。
   const score = scan.score ?? (scan.scanned ? Math.round(((scan.scanned - findings.length) / scan.scanned) * 100) : null);
   const lastScan = scan.scannedAt ?? scan.lastScan ?? "";
+
+  const spfMatch = (r: DnsRecord) => (r.value ?? "").trim().startsWith("v=spf1");
+  const dmarcMatch = (r: DnsRecord) => (r.name ?? "").trim().startsWith("_dmarc.");
+  const dkimMatch = (r: DnsRecord) => (r.name ?? "").includes("._domainkey.");
+  const f2b = services?.find((s) => s.key === "fail2ban" || s.key === "fail2ban-server");
+  const rows: { label: string; state: CheckState; failed: number }[] = [
+    { label: "SPF", state: recordsCheck(dns, spfMatch), failed: failedOf(dns, spfMatch) },
+    { label: "DMARC", state: recordsCheck(dns, dmarcMatch), failed: failedOf(dns, dmarcMatch) },
+    { label: "DKIM", state: recordsCheck(dns, dkimMatch), failed: failedOf(dns, dkimMatch) },
+    { label: "fail2ban", state: f2b ? f2b.running === true : null, failed: 0 },
+  ];
 
   return (
     <div className="p-4">
@@ -97,22 +134,23 @@ export default function Security() {
           </Card>
           <Card>
             <div className="space-y-2.5 text-[12.5px]">
-              <div className="flex items-center justify-between">
-                <span className="text-[var(--text-2)]">SPF / DMARC</span>
-                <span className="inline-flex items-center gap-1 font-medium" style={{ color: "rgb(var(--ok-rgb))" }}>
-                  <IconCheck size={13} /> {t("verified")}
-                </span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-[var(--text-2)]">DKIM · test.org</span>
-                <span className="inline-flex items-center gap-1 font-medium" style={{ color: "rgb(var(--err-rgb))" }}>
-                  <IconX size={13} /> {t("unverified")}
-                </span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-[var(--text-2)]">fail2ban</span>
-                <StatusBadge kind="ok" label="active" />
-              </div>
+              {rows.map((row) => (
+                <div key={row.label} className="flex items-center justify-between">
+                  <span className="text-[var(--text-2)]">{row.label}</span>
+                  {row.state == null ? (
+                    <span className="text-[var(--text-3)]" title={t("unverified")}>—</span>
+                  ) : row.state ? (
+                    <span className="inline-flex items-center gap-1 font-medium" style={{ color: "rgb(var(--ok-rgb))" }}>
+                      <IconCheck size={13} /> {t("verified")}
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 font-medium" style={{ color: "rgb(var(--err-rgb))" }}>
+                      <IconX size={13} /> {t("unverified")}
+                      {row.failed > 0 && <span className="tnum text-[11px] text-[var(--text-3)]">({row.failed})</span>}
+                    </span>
+                  )}
+                </div>
+              ))}
             </div>
           </Card>
         </div>

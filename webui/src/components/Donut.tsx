@@ -56,14 +56,14 @@ export function DonutChart({
   );
 }
 
-/** 单值渐变环（综合健康度） */
+/** 单值渐变环（综合健康度）；value 为 null 时显示占位符 —（后端没给数据，绝不编造分数）。 */
 export function GaugeRing({
   value,
   size = 128,
   thickness = 12,
   label,
 }: {
-  value: number;
+  value: number | null;
   size?: number;
   thickness?: number;
   label: string;
@@ -71,7 +71,7 @@ export function GaugeRing({
   const gid = useId();
   const r = (size - thickness) / 2;
   const C = 2 * Math.PI * r;
-  const pct = Math.max(0, Math.min(100, value)) / 100;
+  const pct = value == null ? 0 : Math.max(0, Math.min(100, value)) / 100;
   return (
     <div className="relative" style={{ width: size, height: size }}>
       <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} role="img" aria-label={label}>
@@ -97,7 +97,7 @@ export function GaugeRing({
         </g>
       </svg>
       <div className="absolute inset-0 flex flex-col items-center justify-center">
-        <span className="tnum text-[26px] font-semibold leading-none text-[var(--text-1)]">{value}%</span>
+        <span className="tnum text-[26px] font-semibold leading-none text-[var(--text-1)]">{value == null ? "—" : `${value}%`}</span>
         <span className="mt-1 text-[10px] text-[var(--text-3)]">{label}</span>
       </div>
     </div>

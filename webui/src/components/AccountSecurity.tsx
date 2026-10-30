@@ -3,21 +3,34 @@
 //   2. 两步验证 TOTP：开始绑定 → Secret/OTPAuth（可复制）→ 6 位验证码启用 → 恢复码（复制全部/我已保存）
 //      已启用态：重新绑定（需验证码）/ 关闭两步验证（需验证码）
 //   3. 活跃会话：列表 + 当前标记 + 单会话吊销 + 注销其他会话
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useSettings } from "../store/settings";
-import { rpc, captureCsrf } from "../api/client";
+import { rpc, resetCsrf } from "../api/client";
 import { toast } from "./ui";
 import { IconCheck, IconKey, IconShield, IconUser } from "./icons";
 
 type TwoFactorStatus = { enabled?: boolean; recoveryCodes?: string[] };
 // 后端 admin.totp.begin 返回 otpauthUrl（不是 otpauthUri）；保留旧名作兼容。
 type TwoFactorBegin = { secret?: string; otpauthUri?: string; otpauthUrl?: string };
-// 后端 sessions.list 每项是 { id(指纹), username, createdAt, lastSeen }，
-// 没有 current/ip/userAgent/lastActive，故都按可选读取。
-type SessionRow = { id: string; current?: boolean; ip?: string; userAgent?: string; lastActive?: string; username?: string; createdAt?: string; lastSeen?: string };
+// 后端 sessions.list 每项是 `{ id(指纹), username, createdAt, lastSeen }`
+// （crates/web/src/session.rs list_public）——**没有** current/ip/userAgent/lastActive。
+type SessionRow = { id: string; username?: string; createdAt?: string; lastSeen?: string };
+/** admin.set / admin.totp.enable / disable 成功后会全量吊销会话并带这两个字段。 */
+type Revocation = { revokedSessions?: number; reauthenticate?: boolean };
+
+/** 后端在 admin.set / 2FA enable-disable 成功后**总是**吊销全部会话（含当前）。 */
+function needsReauth(r: Revocation | undefined): boolean {
+  return r?.reauthenticate === true || (r?.revokedSessions ?? 0) > 0;
+}
+
+function signOut() {
+  resetCsrf();
+  window.dispatchEvent(new CustomEvent("mailstack:logout"));
+}
+
 
 export default function AccountSecurity() {
-  const { t, prefs } = useSettings();
+  const { prefs } = useSettings();
   const zh = prefs.lang === "zh";
 
   /* ---- 1. 管理员账户 ---- */
@@ -42,15 +55,17 @@ export default function AccountSecurity() {
       return;
     }
     setSavingAcct(true);
-    const r = await rpc<{ revokeSessions?: boolean }>("admin.set", { username, password: pass1 || undefined });
+    const r = await rpc<Revocation>("admin.set", { username, password: pass1 || undefined });
     setSavingAcct(false);
     if (r.ok) {
       toast(zh ? "管理员账户已更新" : "Administrator updated");
       setPass1("");
       setPass2("");
-      if ((r.data as { revokeSessions?: boolean })?.revokeSessions) {
+      // 后端字段是 revokedSessions(number) + reauthenticate(bool)；原实现读 revokeSessions，
+      // 条件恒为 false，于是「已注销所有会话」的提示永远不出现，用户带着已死的会话继续操作。
+      if (needsReauth(r.data)) {
         toast(zh ? "所有会话已注销，请重新登录" : "All sessions were revoked. Sign in again.", "warn");
-        setTimeout(() => window.dispatchEvent(new CustomEvent("mailstack:logout")), 1200);
+        setTimeout(signOut, 1200);
       }
     } else toast(r.error, "err");
   }
@@ -61,6 +76,8 @@ export default function AccountSecurity() {
   const [begin, setBegin] = useState<{ secret: string; otpauthUri: string } | null>(null);
   const [enrollCode, setEnrollCode] = useState("");
   const [recovery, setRecovery] = useState<string[] | null>(null);
+  /** 启用 2FA 后会话已被服务端吊销：恢复码必须**先保存**，再回登录页。 */
+  const [reauthNeeded, setReauthNeeded] = useState(false);
   const [disableCode, setDisableCode] = useState("");
   const [disabling, setDisabling] = useState(false);
 
@@ -81,23 +98,42 @@ export default function AccountSecurity() {
   }
 
   async function confirmEnable() {
-    const r = await rpc<{ recoveryCodes?: string[] }>("admin.2fa.enable", { code: enrollCode.trim() });
+    const r = await rpc<{ recoveryCodes?: string[] } & Revocation>("admin.2fa.enable", { code: enrollCode.trim() });
     if (r.ok) {
-      setRecovery((r.data as { recoveryCodes?: string[] })?.recoveryCodes ?? []);
+      const d = r.data;
+      setRecovery(d?.recoveryCodes ?? []);
       setTotpEnabled(true);
       setEnrollCode("");
-      toast(zh ? "两步验证已启用" : "2FA enabled");
+      // 后端在 enable 成功后吊销**全部**会话并下发 Max-Age=0 cookie（routes.rs totp_enable）。
+      // 原实现忽略 reauthenticate：UI 停在「已启用」，下一次写操作才 401 弹回登录页，
+      // 且恢复码（只此一次）可能已被那次 401 冲掉。这里改为显式提示 + 保存后再登出。
+      if (needsReauth(d)) {
+        setReauthNeeded(true);
+        toast(
+          zh ? "两步验证已启用；所有会话已注销，请先保存恢复码，再重新登录" : "2FA enabled. All sessions were revoked — save the recovery codes, then sign in again.",
+          "warn",
+        );
+      } else {
+        toast(zh ? "两步验证已启用" : "2FA enabled");
+      }
     } else toast(zh ? "启用失败，验证码不正确" : "Enabling failed, invalid code", "err");
   }
 
   async function confirmDisable() {
-    const r = await rpc("admin.2fa.disable", { code: disableCode.trim() });
+    setDisabling(true);
+    const r = await rpc<Revocation>("admin.2fa.disable", { code: disableCode.trim() });
+    setDisabling(false);
     if (r.ok) {
       setTotpEnabled(false);
       setEnrolling(false);
       setBegin(null);
       setDisableCode("");
-      toast(zh ? "两步验证已关闭" : "Two-factor authentication disabled");
+      if (needsReauth(r.data)) {
+        toast(zh ? "两步验证已关闭，所有会话已注销，请重新登录" : "2FA disabled. All sessions were revoked — sign in again.", "warn");
+        setTimeout(signOut, 1200);
+      } else {
+        toast(zh ? "两步验证已关闭" : "Two-factor authentication disabled");
+      }
     } else toast(zh ? "关闭失败，验证码不正确" : "Disabling failed, invalid code", "err");
   }
 
@@ -114,16 +150,21 @@ export default function AccountSecurity() {
   /* ---- 3. 活跃会话 ---- */
   const [sessions, setSessions] = useState<SessionRow[] | null>(null);
 
-  useEffect(() => {
+  const loadSessions = useCallback(() => {
     rpc<SessionRow[]>("sessions.list").then((r) => {
-      if (r.ok) setSessions((r.data as SessionRow[]) ?? []);
+      if (r.ok) setSessions(Array.isArray(r.data) ? r.data : []);
     });
   }, []);
+
+  useEffect(() => {
+    loadSessions();
+  }, [loadSessions]);
 
   async function revoke(id: string) {
     const r = await rpc("sessions.revoke", { id });
     if (r.ok) {
-      setSessions((s) => (s ? s.filter((x) => x.id !== id) : s));
+      // 吊销后**重新拉取**真实列表，而不是本地猜「哪一行是当前会话」。
+      loadSessions();
       toast(zh ? "会话已吊销" : "Session revoked");
     } else toast(r.error, "err");
   }
@@ -132,7 +173,8 @@ export default function AccountSecurity() {
     // 后端对应的端点是 DELETE /api/auth/sessions（revoke 只认单个 id）。
     const r = await rpc("sessions.revokeOthers", {});
     if (r.ok) {
-      setSessions((s) => (s ? s.filter((x) => x.current) : s));
+      // 原实现 `filter(x => x.current)`：后端从不返回 current，一行都删不掉 → UI 谎报成功。
+      loadSessions();
       toast(zh ? "其他会话已注销" : "Other sessions revoked");
     } else toast(r.error, "err");
   }
@@ -234,12 +276,24 @@ export default function AccountSecurity() {
                   onClick={() => {
                     setRecovery(null);
                     setEnrolling(false);
+                    if (reauthNeeded) {
+                      // 会话已在服务端被吊销：保存好恢复码后回登录页（否则下一次请求才 401）
+                      signOut();
+                      return;
+                    }
                     toast(zh ? "绑定完成" : "Setup finished");
                   }}
                 >
                   {zh ? "我已保存恢复码，完成绑定" : "I have saved my recovery codes"}
                 </button>
               </div>
+              {reauthNeeded && (
+                <div className="mt-2 text-[11.5px] leading-relaxed" style={{ color: "rgb(var(--warn-rgb))" }}>
+                  {zh
+                    ? "所有会话已被注销（含当前会话）。请先保存恢复码，再点击完成并重新登录。"
+                    : "All sessions were revoked (including this one). Save the recovery codes, then finish and sign in again."}
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -269,7 +323,7 @@ export default function AccountSecurity() {
         title={zh ? "活跃会话" : "Active Sessions"}
         icon={<IconShield size={15} />}
         right={
-          sessions && sessions.some((s) => !s.current) ? (
+          sessions && sessions.length > 1 ? (
             <button className="btn glass--control" style={{ height: 26, fontSize: 11 }} onClick={revokeOthers}>
               {zh ? "注销其他会话" : "Sign out other sessions"}
             </button>
@@ -282,6 +336,11 @@ export default function AccountSecurity() {
         )}
         {sessions && sessions.length > 0 && (
           <div className="space-y-2">
+            <div className="text-[11px] leading-relaxed text-[var(--text-3)]">
+              {zh
+                ? "后端只返回 id（指纹）/ 用户名 / 创建时间 / 最近活动，不标记「当前会话」；吊销当前会话会立即登出。"
+                : "The backend returns id (fingerprint) / username / createdAt / lastSeen only and does not mark the current session. Revoking your own session signs you out."}
+            </div>
             {sessions.map((s) => (
               <div
                 key={s.id}
@@ -290,22 +349,18 @@ export default function AccountSecurity() {
               >
                 <div className="min-w-0 leading-tight">
                   <div className="flex items-center gap-2">
-                    <span className="truncate font-medium text-[var(--text-1)]">{s.ip ?? s.username ?? s.id.slice(0, 8)}</span>
-                    {s.current && (
-                      <span className="badge badge-ok" style={{ height: 18, fontSize: 10 }}>
-                        {zh ? "当前" : "Current"}
-                      </span>
-                    )}
+                    <span className="truncate font-medium text-[var(--text-1)]">{s.username ?? "—"}</span>
+                    <span className="mono shrink-0 text-[10.5px] text-[var(--text-3)]" title={s.id}>
+                      {s.id.slice(0, 12)}
+                    </span>
                   </div>
                   <div className="truncate text-[11px] text-[var(--text-3)]">
-                    {[s.userAgent, s.lastActive ?? s.lastSeen].filter(Boolean).join(" · ")}
+                    {zh ? "最近活动" : "Last seen"} {s.lastSeen || "—"} · {zh ? "创建" : "Created"} {s.createdAt || "—"}
                   </div>
                 </div>
-                {!s.current && (
-                  <button className="btn glass--control" style={{ height: 26, fontSize: 11, color: "rgb(var(--err-rgb))" }} onClick={() => revoke(s.id)}>
-                    {zh ? "吊销" : "Revoke"}
-                  </button>
-                )}
+                <button className="btn glass--control" style={{ height: 26, fontSize: 11, color: "rgb(var(--err-rgb))" }} onClick={() => revoke(s.id)}>
+                  {zh ? "吊销" : "Revoke"}
+                </button>
               </div>
             ))}
           </div>

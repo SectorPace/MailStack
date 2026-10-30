@@ -1,5 +1,5 @@
-// 共享 UI 元件：状态徽标 / 页头 / 分段控件 / 玻璃下拉 / 开关行 / 确认弹窗 / Toast
-import { useState, type ReactNode } from "react";
+// 共享 UI 元件：状态徽标 / 页头 / 玻璃下拉 / 开关行 / 确认弹窗 / Toast
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import * as RSelect from "@radix-ui/react-select";
 import * as RDialog from "@radix-ui/react-dialog";
 import * as RSwitch from "@radix-ui/react-switch";
@@ -70,61 +70,6 @@ export function PageHeader({
         <p className="mt-1 text-[13.5px] text-[var(--text-2)]">{sub}</p>
       </div>
       {right && <div className="flex items-center gap-2">{right}</div>}
-    </div>
-  );
-}
-
-/* ---------------- 玻璃分段控件（Motion 滑动胶囊） ---------------- */
-
-export function Segmented<T extends string>({
-  value,
-  onChange,
-  options,
-  ariaLabel,
-}: {
-  value: T;
-  onChange: (v: T) => void;
-  options: { value: T; label: string; icon?: ReactNode }[];
-  ariaLabel?: string;
-}) {
-  const id = useState(() => `seg-${Math.random().toString(36).slice(2)}`)[0];
-  return (
-    <div
-      role="tablist"
-      aria-label={ariaLabel}
-      className="glass--well relative flex h-10 items-center gap-1 rounded-[12px] p-1"
-      style={{ borderRadius: 12 }}
-    >
-      {options.map((o) => {
-        const active = o.value === value;
-        return (
-          <button
-            key={o.value}
-            role="tab"
-            aria-selected={active}
-            onClick={() => onChange(o.value)}
-            className="relative flex h-8 flex-1 items-center justify-center gap-1.5 rounded-[9px] px-3 text-[13px] font-medium outline-none"
-            style={{ color: active ? "var(--text-1)" : "var(--text-2)", minWidth: 76 }}
-          >
-            {active && (
-              <motion.span
-                layoutId={id}
-                className="absolute inset-0"
-                style={{
-                  borderRadius: 9,
-                  background: "linear-gradient(180deg, rgb(var(--glass-rgb) / calc(var(--glass-a) + 0.25)), rgb(var(--glass-rgb) / calc(var(--glass-a) + 0.08)))",
-                  boxShadow: "inset 0 1px 0 var(--edge-spec), 0 0 0 1px var(--edge-outer), 0 2px 8px rgba(15,32,60,0.10)",
-                }}
-                transition={{ type: "spring", stiffness: 520, damping: 38, mass: 0.9 }}
-              />
-            )}
-            <span className="relative z-10 flex items-center gap-1.5">
-              {o.icon}
-              {o.label}
-            </span>
-          </button>
-        );
-      })}
     </div>
   );
 }
@@ -265,12 +210,19 @@ export const toast: PushToast = (text, kind) => globalPush?.(text, kind);
 
 export function ToastHost() {
   const [items, setItems] = useState<ToastItem[]>([]);
-  const push: PushToast = (text, kind = "ok") => {
+  const push: PushToast = useCallback((text, kind = "ok") => {
     const id = toastSeq++;
     setItems((arr) => [...arr, { id, text, kind }]);
     setTimeout(() => setItems((arr) => arr.filter((x) => x.id !== id)), 3200);
-  };
-  globalPush = push;
+  }, []);
+  // 模块级 toast() 的出口必须在 effect 里挂接：渲染期赋值是渲染副作用，
+  // StrictMode 双渲染会重复执行（WEBUI_AUDIT §3.3）。
+  useEffect(() => {
+    globalPush = push;
+    return () => {
+      if (globalPush === push) globalPush = null;
+    };
+  }, [push]);
   return (
     <div className="pointer-events-none fixed bottom-6 left-1/2 z-[90] flex -translate-x-1/2 flex-col items-center gap-2">
       <AnimatePresence>

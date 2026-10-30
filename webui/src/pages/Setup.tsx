@@ -190,8 +190,6 @@ export default function Setup({ onDone }: { onDone: () => void }) {
     onDone();
   }
 
-  const inputCls = "input";
-
   const stepsZh = STEPS_ZH;
   const stepsEn = STEPS_EN;
 

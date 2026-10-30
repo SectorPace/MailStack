@@ -7,7 +7,7 @@ import { RefreshContext } from "../App";
 import { PageHeader, DataPanel, StatusBadge, ConfirmDialog, toast } from "../components/ui";
 import { DataTable, type Column } from "../components/DataTable";
 import { InputDialog } from "../components/InputDialog";
-import { IconPlus, IconTrash, IconGear } from "../components/icons";
+import { IconPlus, IconGear } from "../components/icons";
 
 type UserRow = { address: string; name: string; active: boolean; quotaUsed: number; quotaTotal: number; createdAt: string };
 

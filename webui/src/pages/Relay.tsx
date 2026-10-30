@@ -42,7 +42,8 @@ export default function Relay() {
 
   // 后端 setup.relay.test / setup.relay.apply 读取的是 host/port/tlsMode/username/
   // password（不是前端内部状态用的 relayHost/relayPort/relayAuthUser/relayPass），
-  // 且 tlsMode 只接受 STARTTLS / SSL-TLS（明文中继一律被拒）。
+  // 且 tlsMode 只接受 STARTTLS / SSL/TLS（后端枚举值带斜杠，见
+  // crates/smtp/src/validate.rs:16,82；明文中继一律被拒）。
   function relayPayload() {
     return {
       host: relayHost || "127.0.0.1",

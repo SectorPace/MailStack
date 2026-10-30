@@ -3,13 +3,12 @@ import { MotionConfig, motion } from "motion/react";
 import { SettingsProvider, useSettings } from "./store/settings";
 import { useRoute, type RouteKey } from "./router";
 import { useViewport } from "./hooks/useViewport";
-import { initApi, getMode, onModeChange, rpc } from "./api/client";
+import { initApi, getMode, onModeChange, rpc, captureCsrf, type Mode } from "./api/client";
 import { Sidebar } from "./components/Sidebar";
 import { Toolbar, type TimeRange } from "./components/Toolbar";
 import { CommandPalette } from "./components/CommandPalette";
-import { ToastHost, toast } from "./components/ui";
+import { ToastHost } from "./components/ui";
 import { IconUser, IconSearch, IconGear, IconChevronDown } from "./components/icons";
-import { BrandLogo } from "./components/BrandLogo";
 
 // 页面按路由分包，首屏只加载 Dashboard
 const Login = lazy(() => import("./pages/Login"));
@@ -97,7 +96,7 @@ function Shell() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [range, setRange] = useState<TimeRange>("24h");
   const [refreshN, refresh] = useRefreshSignal();
-  const [mode, setMode] = useState(getMode());
+  const [mode, setMode] = useState<Mode>(getMode());
   const [booted, setBooted] = useState(false);
   const [authed, setAuthed] = useState(false);
   const [setupDone, setSetupDone] = useState<boolean | null>(null);
@@ -109,13 +108,37 @@ function Shell() {
   const forceLogin = useMemo(() => new URLSearchParams(location.search).get("login") === "1", []);
 
   useEffect(() => onModeChange(setMode), []);
-  useEffect(() => {
-    initApi().then((m) => {
+
+  /**
+   * 启动流程（fail-closed）：
+   *   探活失败 → 后端不可达错误页（可重试），**不降级到 mock**；
+   *   探活成功 → GET /api/auth/session 恢复登录态与 CSRF token。
+   * 原先刷新页面必然重登：csrf 只来自登录响应体，内存变量随刷新丢失。
+   */
+  const boot = useCallback(async () => {
+    setBooted(false);
+    const m = await initApi();
+    if (m === "unreachable") {
       setBooted(true);
-      // mock 模式默认免登录；?login=1 可查看登录页演示
-      if (m === "mock") setAuthed(!forceLogin);
-    });
-  }, []);
+      return;
+    }
+    if (m === "mock") {
+      // 仅开发构建（import.meta.env.DEV）可能到达；生产包不含该分支
+      setAuthed(!forceLogin);
+      setBooted(true);
+      return;
+    }
+    const s = await rpc<{ csrf?: string; username?: string }>("auth.session");
+    if (s.ok) {
+      captureCsrf(((s.data ?? {}) as { csrf?: string }).csrf);
+      if (!forceLogin) setAuthed(true);
+    }
+    setBooted(true);
+  }, [forceLogin]);
+
+  useEffect(() => {
+    void boot();
+  }, [boot]);
 
   // 登录后检查初次设置是否完成（原版流程：setup.status → 向导 → 控制台）
   useEffect(() => {
@@ -188,6 +211,8 @@ function Shell() {
         <div className="relative z-10 flex h-full w-full items-center justify-center">
           <PageSkeleton />
         </div>
+      ) : mode === "unreachable" ? (
+        <BackendUnreachable onRetry={() => void boot()} />
       ) : !authed ? (
         <div className="relative z-10 h-full w-full overflow-y-auto">
           <Suspense fallback={<PageSkeleton />}>
@@ -287,6 +312,9 @@ function ScrollRail({
       role="toolbar"
       aria-label={t("command_hint")}
       aria-hidden={!visible}
+      // 隐藏时整体不可交互/不可聚焦：仅 pointerEvents:none 挡不住 Tab 键，
+      // 焦点会跑进一个视觉上并不存在的工具栏（WEBUI_AUDIT §3.2）。
+      inert={!visible}
       initial={false}
       animate={visible ? { opacity: 1, x: 0 } : { opacity: 0, x: 16 }}
       transition={{ type: "spring", stiffness: 420, damping: 34 }}
@@ -319,6 +347,43 @@ function PageSkeleton() {
         ))}
       </div>
       <div className="skeleton mt-3 h-64" />
+    </div>
+  );
+}
+
+/**
+ * 后端不可达页（fail-closed）。
+ *
+ * 原行为：探活失败即降级到内置 mock 并**跳过认证**，管理员在故障时看到的是一份
+ * 完整、自洽、数字漂亮但全部虚构的健康报告（WEBUI_AUDIT §1.1）。现在改为明确报错
+ * 并提供重试入口 —— 宁可什么都不显示，也不显示假数据。
+ */
+function BackendUnreachable({ onRetry }: { onRetry: () => void }) {
+  const { t, prefs } = useSettings();
+  return (
+    <div className="relative z-10 flex h-full w-full items-center justify-center overflow-y-auto p-4">
+      <div className="glass--clear edge-lens w-full max-w-[460px] rounded-[22px] p-6 text-center">
+        <div
+          className="mx-auto flex h-12 w-12 items-center justify-center rounded-full"
+          style={{ background: "rgb(var(--err-rgb) / 0.12)", color: "rgb(var(--err-rgb))" }}
+        >
+          <IconGear size={22} />
+        </div>
+        <h1 className="mt-3 text-[18px] font-semibold text-[var(--text-1)]">{t("error_title")}</h1>
+        <p className="mt-2 text-[13px] leading-relaxed text-[var(--text-2)]">{t("backend_unreachable")}</p>
+        <p className="mt-1 text-[11.5px] leading-relaxed text-[var(--text-3)]">{t("backend_unreachable_hint")}</p>
+        <button
+          className="btn btn-accent mx-auto mt-5"
+          onClick={onRetry}
+        >
+          {t("retry_op")}
+        </button>
+        {import.meta.env.DEV && (
+          <p className="mt-3 text-[10.5px] text-[var(--text-3)]">
+            {prefs.lang === "zh" ? "开发构建可用 ?mock=1 进入演示数据。" : "Dev build: append ?mock=1 for demo data."}
+          </p>
+        )}
+      </div>
     </div>
   );
 }

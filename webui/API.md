@@ -1,7 +1,10 @@
 # MailStack 前端 → 后端 交接文档（API 契约 v1）
 
-> 交接对象：`crates/admin-web`（axum）的实现者。
-> **契约的可执行定义**：`src/api/client.ts` 的 `mockDispatch()`（mock 数据分发器）——每个动作的请求/响应字段以它为准；本文档是其人类可读版 + 传输层语义。
+> 后端实现：`crates/web`（crate 名 `mailstack-web`，axum）。
+> **契约的唯一真相源**是 `crates/web/src/contract.rs` 的契约表（方法 / 路径 / 动作名）
+> 与 `crates/web/src/lib.rs` 的路由注册；本文档是人类可读版 + 传输层语义。
+> `src/api/client.ts` 的 `mockDispatch()` 只是**开发构建**的演示分支，不再是契约依据
+> （生产构建会把整个 mock 块剔除）。
 
 ---
 
@@ -30,10 +33,13 @@ REST 未映射的动作自动回退 RPC 桥 —— 因此后端**最小实现只
 
 ## 3. 认证 / CSRF / 错误语义
 
-- `POST /api/auth/login` `{ username, password, code? }` → `200 { csrf: string, ... }`；
-  失败 `401 { error: { code, message } }`；**`code === "TOTP_REQUIRED"`** 时前端切两步验证阶段并重发 `code` 字段。
-- 前端把 `csrf` 存内存，之后所有非 GET 请求带 `x-csrf-token` 头。
-- 任何端点 `401` → 前端全局弹回登录页（`HttpOnly` Cookie 会话）。
+- `POST /api/auth/login` `{ username, password, code? }` → `200 { ok, csrf, username }` 并下发
+  HttpOnly 会话 Cookie；失败 `401 { error: { code, message } }`；**`code === "TOTP_REQUIRED"`**
+  时前端切两步验证阶段并重发 `code` 字段。
+- `GET /api/auth/session` → `{ ok, csrf, username }`：前端**启动时**用它恢复登录态与 CSRF
+  （刷新页面不再强制重登）。CSRF 只存内存，登录/恢复时捕获，注销/401/403 时清空。
+- 任何端点 `401` **或 `403`** → 前端清空 CSRF 并弹回登录页（403 通常是 CSRF 失效，
+  原先只有 401 才登出，用户会被一句 toast 卡在页面内）。
 - 错误体约定：`{ error: { code, message } }` 或 `{ error: string }`，前端展示 `message`。
 
 ## 4. REST 端点契约（方法 / 路径 / 请求 / 响应）
@@ -43,21 +49,29 @@ REST 未映射的动作自动回退 RPC 桥 —— 因此后端**最小实现只
 ### 认证与会话
 | 端点 | 方法 | 请求 | 响应 |
 |---|---|---|---|
-| `/api/auth/login` | POST | `{username, password, code?}` | `{csrf, ...}` |
-| `/api/auth/session` | GET | — | 会话信息 |
-| `/api/auth/logout` | POST | — | `{}` |
-| `/api/auth/sessions` | GET | — | `[{id, current, ip, userAgent, lastActive}]` |
-| `/api/auth/sessions/revoke` | POST | `{id}` 或 `{all:true}` | `{revoked}` / `{revokedAll}` |
+| `/api/auth/login` | POST | `{username, password, code?}` | `{ok, csrf, username}` + Set-Cookie |
+| `/api/auth/session` | GET | — | `{ok, csrf, username}` |
+| `/api/auth/logout` | POST | — | `{ok}`（服务端删除会话；前端此前从不调用 → 已修） |
+| `/api/auth/sessions` | GET | — | `{ok, sessions:[{id(指纹), username, createdAt, lastSeen}]}` |
+| `/api/auth/sessions/revoke` | POST | `{id}`（指纹） | `{ok: bool}`；**只认单个 id，`{all:true}` 无效** |
+| `/api/auth/sessions` | DELETE | — | `{ok, revoked}`：吊销除当前外的全部会话 |
+
+> ⚠️ 会话列表**没有** `current` / `ip` / `userAgent` / `lastActive` 字段
+> （`crates/web/src/session.rs` 的 `list_public`）。前端据此不再假设「当前会话」，
+> 也不再靠 `current` 过滤列表 —— 吊销后重新拉取后端列表。
 
 ### 管理员
 | 端点 | 方法 | 请求 | 响应 |
 |---|---|---|---|
-| `/api/admin` | GET | — | `{username, totp, createdAt}` |
-| `/api/admin` | POST | `{username, password?}` | `{updated, revokeSessions:true}` → 前端注销所有会话 |
-| `/api/admin/2fa` | GET | — | `{enabled, recoveryCodes?}` |
-| `/api/admin/2fa/begin` | POST | `{code:""}` | `{secret, otpauthUri}` |
-| `/api/admin/2fa/enable` | POST | `{code}` | `{recoveryCodes:[8×"xxxxxxxx-xxxxxxxx"]}` |
-| `/api/admin/2fa/disable` | POST | `{code}` | `{disabled}` |
+| `/api/admin` | GET | — | `{username, passwordConfigured, twoFactorEnabled, recoveryCodesRemaining}` |
+| `/api/admin` | POST | `{username, password?}` | 助手返回值 + `{revokedSessions: number, reauthenticate: true}`；**总是**吊销全部会话（含当前） |
+| `/api/admin/2fa` | GET | — | `{enabled, state, recoveryCodesRemaining, algorithm, digits, period}` |
+| `/api/admin/2fa/begin` | POST | `{code:""}` | `{secret, otpauthUrl}` |
+| `/api/admin/2fa/enable` | POST | `{code}` | `{recoveryCodes:[8×"xxxxxxxx-xxxxxxxx"], revokedSessions, reauthenticate:true}` |
+| `/api/admin/2fa/disable` | POST | `{code}` | `{..., revokedSessions, reauthenticate:true}` |
+
+> 2FA 启用/关闭与改账号成功后会吊销全部会话并下发 `Max-Age=0` Cookie；前端必须处理
+> `reauthenticate`（恢复码只显示一次，所以先提示保存、再回登录页）。
 
 ### 仪表盘（★ snapshot 扩展字段）
 | 端点 | 方法 | 响应 |
@@ -109,7 +123,7 @@ REST 未映射的动作自动回退 RPC 桥 —— 因此后端**最小实现只
 ### 安全 / 备份 / DNS
 | 端点 | 方法 | 请求 | 响应 |
 |---|---|---|---|
-| `/api/security/scan` | GET | — | `{score, lastScan, findings[], bans[], failedLogins24h}` |
+| `/api/security/scan` | **POST** | — | `{ok, scannedAt, scanned, absent, findings:[{path,severity,issue,mode,maxMode,note,detail}], summary, highestSeverity, bannedIps, bannedIpScope}` |
 | `/api/security/ban` | POST | `{ip, reason?}` | `{}` |
 | `/api/security/unban` | POST | `{ip}` | `{}` |
 | `/api/backups` | GET | — | `[{name, size, time, kind}]` |
@@ -126,15 +140,21 @@ REST 未映射的动作自动回退 RPC 桥 —— 因此后端**最小实现只
 
 ## 5. RPC 桥（万能回退，前端已自动使用）
 
-REST 表中没有的动作（`queue.list`、`services.list`、`dkim.keys`、`dkim.rotate`、`dns.records`、`ai.config.get` 在 REST 表有 GET；`backup.create/delete`、`metrics.realtime` 等其余全部）会落到：
+REST 表中没有的动作（`queue.list`、`services.list`、`dkim.keys`、`dkim.rotate`、`dns.records`、`ai.config.get` 在 REST 表有 GET；`backup.create/delete` 等其余全部）会落到：
 
 ```
 POST /api/rpc
-请求体: {"action": string, "data": object}     ← 与 crates/common/src/rpc.rs 帧协议字段一致
+请求体: {"action": string, "data": object}     ← 与 helper socket 帧协议字段一致
 响应:   {"ok": true, "data": ...} | {"ok": false, "error": string}
 ```
 
-实现 = axum handler 校验 action ∈ `crates/common/src/actions.rs` 白名单 → 写帧到 `helper-ro.sock`（RO）/ `helper.sock`（RW）→ 读回帧原样返回。约 30 行。
+实现 = axum handler 校验 action ∈ `crates/core/src/actions.rs` 白名单（HTTP 面可达集由
+`crates/web/src/contract.rs` 的 `is_exposed_action` 收窄）→ 写帧到 `helper-ro.sock`（RO）/
+`helper.sock`（RW）→ 读回帧原样返回。
+
+> 无页面调用的映射已从 `REST` 表删除（`status.relay`、`metrics.realtime`、
+> `metrics.telemetry`、`backups.list`、`backup.restore`）：后端有完整 backup CRUD，
+> 但前端还没有备份页面，保留半截映射只会让「改后端契约时没人发现」。
 
 ## 6. 后端实现清单（按优先级）
 
@@ -156,7 +176,11 @@ POST /api/rpc
 
 ## 7. 验收方法
 
-1. 后端起在 `127.0.0.1:8080` → 直接打开前端（无参数）→ 探测 REST 成功 → 走 REST。
+1. 后端起在 `127.0.0.1:8080` → 直接打开前端（无参数）→ 探测 `/api/health` 成功 → 走 REST，
+   并调用 `GET /api/auth/session` 恢复登录态。
 2. 未实现 REST 时：实现 §5 的 `/api/rpc` 桥即可（前端自动回退）。
-3. 演示/评审：`?mock=1`（内置 mock，无需后端）；`?mock=1&login=1` 登录页；`?mock=1&setup=1` 向导回放。
-4. 任何字段拿不准 → 看 `src/api/client.ts` mock 分发器对应 case（契约的可执行定义）。
+3. **fail-closed**：探活失败时前端显示「后端不可达 + 重试」错误页，**不会**降级为演示数据。
+4. 演示/评审（**仅 `npm run dev` 开发构建**）：`?mock=1`（内置 mock，无需后端）；
+   `?mock=1&login=1` 登录页；`?mock=1&setup=1` 向导回放。生产构建中 mock 代码被整块剔除，
+   这些参数无效。
+5. 任何字段拿不准 → 以 `crates/web/src/contract.rs` 与 `crates/web/src/lib.rs` 为准。

@@ -5,7 +5,7 @@ import { useSettings } from "../store/settings";
 import { rpc } from "../api/client";
 import { RefreshContext } from "../App";
 import { PageHeader, Card, StatusBadge, ConfirmDialog, toast } from "../components/ui";
-import { IconPlay, IconStop, IconRestart, IconGear, IconSparkles } from "../components/icons";
+import { IconPlay, IconStop, IconRestart, IconGear } from "../components/icons";
 
 type ServiceRow = { key: string; running: boolean; detail: string };
 

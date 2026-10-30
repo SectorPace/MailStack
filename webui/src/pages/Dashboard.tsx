@@ -14,7 +14,7 @@ import { rpc } from "../api/client";
 import { Card, PageHeader, GlassSelect, StatusBadge } from "../components/ui";
 import { LineChart, type ChartPoint } from "../components/LineChart";
 import { DonutChart, GaugeRing } from "../components/Donut";
-import { normalizeLog, type RawLog } from "./MailQueue";
+import { normalizeLog, type RawLog, type LogRow } from "../lib/logs";
 import {
   IconCheck,
   IconGlobe,
@@ -24,7 +24,6 @@ import {
   IconMail,
   IconGear,
   IconShield,
-  IconPlus,
 } from "../components/icons";
 import type { DictKey } from "../i18n";
 import { DICT } from "../i18n";
@@ -60,7 +59,6 @@ type SnapRaw = {
 };
 
 type ActivityItem = { kind: string; title: string; sub: string; time: string };
-type LogRow = { id: string; time: string; level: string; message: string };
 type UserRow = { address: string; name: string; active: boolean };
 
 type VM = {
@@ -136,6 +134,8 @@ export default function Dashboard() {
   const [activity, setActivity] = useState<ActivityItem[]>([]);
   const [logs, setLogs] = useState<LogRow[]>([]);
   const [resRange, setResRange] = useState("7d");
+  // 延迟图与资源图原先共用 resRange：改一个连带另一个。拆成两个独立状态。
+  const [latencyRange, setLatencyRange] = useState("24h");
   const [err, setErr] = useState("");
 
   useEffect(() => {
@@ -210,15 +210,35 @@ export default function Dashboard() {
   // DICT[key] 未定义而抛错，故仅对已知词典键做翻译，其余原样展示。
   const actLabel = (title: string) => (Object.prototype.hasOwnProperty.call(DICT, title) ? t(title as DictKey) : title);
 
+  const dist = vm.dist;
+  const res = vm.resources;
+  // 系统健康卡与「服务状态分布」徽标都从真实服务状态推导：
+  // 原实现恒为「运行正常 / 所有服务运行正常」，与后端状态无关（WEBUI_AUDIT §1.3）。
+  // 后端没给服务清单（dist.total === 0）时显示 —，不编造。
+  const distKnown = dist.total > 0;
+  const distBad = dist.alert + dist.offline;
+  const healthOk = distKnown && distBad === 0;
+  const healthValue = !distKnown ? "—" : healthOk ? t("running_normal") : t("system_degraded");
+  const healthSub = distKnown ? `${t("svc_running")} ${dist.running}/${dist.total}` : "—";
+  // 队列占比条的时间范围：所有已知计数之和（后端只给 sending/pending 时其余显示 —）。
+  const queueTotal = [vm.queue.pending, vm.queue.sending, vm.queue.failed, vm.queue.delivered, vm.queue.bounced, vm.queue.hold].reduce<number>(
+    (sum, n) => sum + (n ?? 0),
+    0,
+  );
+
   const statCards = [
     {
       icon: <IconCheck size={22} />,
-      iconBg: "linear-gradient(180deg, rgb(var(--ok-rgb) / 0.96), rgb(var(--ok-rgb) / 0.8))",
+      iconBg: healthOk
+        ? "linear-gradient(180deg, rgb(var(--ok-rgb) / 0.96), rgb(var(--ok-rgb) / 0.8))"
+        : distKnown
+          ? "linear-gradient(180deg, rgb(var(--warn-rgb) / 0.96), rgb(var(--warn-rgb) / 0.8))"
+          : "linear-gradient(180deg, rgb(var(--text-3) / 0.55), rgb(var(--text-3) / 0.4))",
       iconColor: "#fff",
       label: t("system_health"),
-      value: t("running_normal"),
-      valueStyle: { color: "rgb(var(--ok-rgb))" } as React.CSSProperties,
-      sub: t("all_services_running"),
+      value: healthValue,
+      valueStyle: { color: healthOk ? "rgb(var(--ok-rgb))" : distKnown ? "rgb(var(--warn-rgb))" : "var(--text-3)" } as React.CSSProperties,
+      sub: healthSub,
       smallValue: false,
     },
     {
@@ -249,9 +269,6 @@ export default function Dashboard() {
       smallValue: true,
     },
   ];
-
-  const dist = vm.dist;
-  const res = vm.resources;
 
   return (
     <div className="grid grid-cols-1 gap-3 p-4 xl:grid-cols-[minmax(0,1fr)_312px]">
@@ -299,7 +316,10 @@ export default function Dashboard() {
           <Card>
             <div className="mb-2 flex items-center justify-between">
               <h2 className="text-[13.5px] font-semibold text-[var(--text-1)]">{t("service_distribution")}</h2>
-              <StatusBadge kind="ok" label={t("running_normal")} />
+              <StatusBadge
+                kind={!distKnown ? "neutral" : distBad === 0 ? "ok" : dist.running > 0 ? "warn" : "err"}
+                label={!distKnown ? "—" : distBad === 0 ? t("running_normal") : t("system_degraded")}
+              />
             </div>
             <div className="flex items-center gap-5">
               <DonutChart
@@ -407,8 +427,8 @@ export default function Dashboard() {
             <div className="mb-1 flex items-center justify-between">
               <h2 className="text-[13.5px] font-semibold text-[var(--text-1)]">{t("delivery_latency")}</h2>
               <GlassSelect
-                value={resRange === "30d" ? "7d" : resRange}
-                onChange={setResRange}
+                value={latencyRange}
+                onChange={setLatencyRange}
                 options={[
                   { value: "24h", label: t("last_24h") },
                   { value: "7d", label: t("last_7d") },
@@ -460,9 +480,9 @@ export default function Dashboard() {
               ]}
             />
             <div className="mt-3 space-y-2.5">
-              <QueueBar label={t("delivered")} n={vm.queue.delivered} cls="ok" />
-              <QueueBar label={t("bounced")} n={vm.queue.bounced} cls="warn" />
-              <QueueBar label={t("hold")} n={vm.queue.hold} cls="err" />
+              <QueueBar label={t("delivered")} n={vm.queue.delivered} total={queueTotal} cls="ok" />
+              <QueueBar label={t("bounced")} n={vm.queue.bounced} total={queueTotal} cls="warn" />
+              <QueueBar label={t("hold")} n={vm.queue.hold} total={queueTotal} cls="err" />
             </div>
           </Card>
         </div>
@@ -523,16 +543,20 @@ export default function Dashboard() {
         <Card>
           <h2 className="mb-3 text-[13.5px] font-semibold text-[var(--text-1)]">{t("system_health")}</h2>
           <div className="flex items-center gap-4">
-            <GaugeRing value={vm.healthPanel?.overall ?? 98} label={t("overall_health")} size={118} />
+            {/* 后端不提供 overall 时传 null → 环显示 —（原实现 `?? 98` 会凭空显示 98 分） */}
+            <GaugeRing value={vm.healthPanel?.overall ?? null} label={t("overall_health")} size={118} />
             <div className="min-w-0 flex-1 space-y-2">
               {healthItems.map((it) => (
                 <div key={it.key} className="leading-tight">
                   <div className="flex items-center justify-between gap-2 text-[12px]">
                     <span className="truncate text-[var(--text-1)]">{dictItemLabel(it.key, t)}</span>
                     {it.key === "disk" ? (
-                      <span className="tnum text-[var(--text-2)]">{it.value}%</span>
+                      <span className="tnum text-[var(--text-2)]">{it.value == null ? "—" : `${it.value}%`}</span>
                     ) : (
-                      <span className="text-[11.5px] font-medium" style={{ color: "rgb(var(--ok-rgb))" }}>
+                      <span
+                        className="text-[11.5px] font-medium"
+                        style={{ color: it.status === "ok" ? "rgb(var(--ok-rgb))" : "rgb(var(--err-rgb))" }}
+                      >
                         {it.status === "ok" ? t("running_normal") : t("stopped")}
                       </span>
                     )}
@@ -627,15 +651,17 @@ function TripleStat({ cols }: { cols: { v: string; l: string; color: string }[] 
 }
 
 /** 队列占比条；后端没有该计数时显示占位符与空条，而不是编造一个比例。 */
-function QueueBar({ label, n, cls }: { label: string; n: Num; cls: "ok" | "warn" | "err" }) {
+function QueueBar({ label, n, total, cls }: { label: string; n: Num; total: number; cls: "ok" | "warn" | "err" }) {
+  // 原实现宽度恒为 0%、右侧百分比恒为 100%，两个都是占位符；现在按真实计数计算。
+  const pct = n == null || total <= 0 ? null : Math.round((n / total) * 100);
   return (
     <div className="flex items-center gap-2 text-[12px]">
       <span className="w-[104px] shrink-0 truncate text-[var(--text-1)]">{label}</span>
       <span className="tnum w-10 shrink-0 text-right text-[var(--text-2)]">{n ?? "—"}</span>
       <div className="bar min-w-0 flex-1">
-        <i style={{ width: "0%" }} className={cls === "err" ? "err" : cls === "warn" ? "warn" : ""} />
+        <i style={{ width: pct == null ? "0%" : `${pct}%` }} className={cls === "err" ? "err" : cls === "warn" ? "warn" : ""} />
       </div>
-      <span className="tnum w-11 shrink-0 text-right text-[var(--text-3)]">{n == null ? "—" : "100%"}</span>
+      <span className="tnum w-11 shrink-0 text-right text-[var(--text-3)]">{pct == null ? "—" : `${pct}%`}</span>
     </div>
   );
 }

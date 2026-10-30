@@ -1,6 +1,6 @@
 // 高密度运营表格：排序 / 过滤 / 分页（行为对齐 TanStack Table 参考实现）
 // 数据面保持中性、可读；玻璃只出现在表头磨砂与工具区。
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useSettings } from "../store/settings";
 import { GlassSelect } from "./ui";
 import { IconChevronDown, IconSearch } from "./icons";
@@ -13,6 +13,21 @@ export type Column<T> = {
   width?: number | string;
   align?: "left" | "right" | "center";
 };
+
+/** 分页窗口：`« ‹ 1 … 5 6 7 … 125 › »`，避免把全部页码铺满页脚。 */
+function pageWindow(current: number, total: number): (number | "gap")[] {
+  if (total <= 7) return Array.from({ length: total }, (_, i) => i);
+  const out: (number | "gap")[] = [];
+  const add = (n: number) => {
+    if (!out.includes(n)) out.push(n);
+  };
+  add(0);
+  if (current > 3) out.push("gap");
+  for (let i = Math.max(1, current - 1); i <= Math.min(total - 2, current + 1); i++) add(i);
+  if (current < total - 4) out.push("gap");
+  add(total - 1);
+  return out;
+}
 
 export function DataTable<T extends object>({
   columns,
@@ -44,14 +59,23 @@ export function DataTable<T extends object>({
   const [page, setPage] = useState(0);
   const [size, setSize] = useState(pageSize);
 
+  // `columns` / `filterKeys` 在各页面每次 render 都是**新建的数组/闭包**，直接放进
+  // useMemo 依赖等于让缓存永久失效。用 ref 保存最新值，依赖改为数据本身 + 列签名。
+  const latest = useRef({ columns, filterKeys });
+  useEffect(() => {
+    latest.current = { columns, filterKeys };
+  });
+  const columnsSig = columns.map((c) => c.key).join("|");
+
   const filtered = useMemo(() => {
+    const { columns: cols, filterKeys: filterFn } = latest.current;
     let out = rows;
-    if (query.trim() && filterKeys) {
+    if (query.trim() && filterFn) {
       const q = query.trim().toLowerCase();
-      out = out.filter((r) => filterKeys(r).toLowerCase().includes(q));
+      out = out.filter((r) => filterFn(r).toLowerCase().includes(q));
     }
     if (sort) {
-      const col = columns.find((c) => c.key === sort.key);
+      const col = cols.find((c) => c.key === sort.key);
       if (col?.sortValue) {
         out = [...out].sort((a, b) => {
           const va = col.sortValue!(a);
@@ -63,11 +87,18 @@ export function DataTable<T extends object>({
       }
     }
     return out;
-  }, [rows, query, sort, columns, filterKeys]);
+  }, [rows, query, sort, columnsSig]);
 
   const pages = Math.max(1, Math.ceil(filtered.length / size));
+
+  // 行数据变少（删除末页最后一条）时显式收敛页码，而不是只靠 safePage 兜底。
+  useEffect(() => {
+    setPage((p) => Math.min(p, pages - 1));
+  }, [pages]);
+
   const safePage = Math.min(page, pages - 1);
   const pageRows = filtered.slice(safePage * size, safePage * size + size);
+  const pageItems = pageWindow(safePage, pages);
 
   function toggleSort(col: Column<T>) {
     if (!col.sortValue) return;
@@ -106,15 +137,33 @@ export function DataTable<T extends object>({
                   key={c.key}
                   className={c.sortValue ? "sortable" : ""}
                   style={{ width: c.width, textAlign: c.align }}
-                  onClick={() => toggleSort(c)}
                   aria-sort={sort?.key === c.key ? (sort.dir === 1 ? "ascending" : "descending") : undefined}
                 >
-                  <span className="inline-flex items-center gap-1">
-                    {c.header}
-                    {c.sortValue && sort?.key === c.key && (
-                      <IconChevronDown size={12} style={{ transform: sort.dir === -1 ? "rotate(180deg)" : undefined }} />
-                    )}
-                  </span>
+                  {c.sortValue ? (
+                    // 排序入口必须可聚焦 + 可键盘触发；直接绑在 <th> 上只有鼠标可达。
+                    <button
+                      type="button"
+                      onClick={() => toggleSort(c)}
+                      className="inline-flex items-center gap-1"
+                      style={{
+                        background: "none",
+                        border: 0,
+                        padding: 0,
+                        color: "inherit",
+                        font: "inherit",
+                        cursor: "pointer",
+                        width: "100%",
+                        justifyContent: c.align === "right" ? "flex-end" : c.align === "center" ? "center" : "flex-start",
+                      }}
+                    >
+                      {c.header}
+                      {sort?.key === c.key && (
+                        <IconChevronDown size={12} style={{ transform: sort.dir === -1 ? "rotate(180deg)" : undefined }} />
+                      )}
+                    </button>
+                  ) : (
+                    <span className="inline-flex items-center gap-1">{c.header}</span>
+                  )}
                 </th>
               ))}
             </tr>
@@ -156,22 +205,42 @@ export function DataTable<T extends object>({
         <div className="flex items-center gap-2">
           {footerRight}
           <div className="flex items-center gap-1">
-            {Array.from({ length: pages }, (_, i) => i).map((i) => (
-              <button
-                key={i}
-                onClick={() => setPage(i)}
-                aria-label={`page ${i + 1}`}
-                aria-current={safePage === i ? "page" : undefined}
-                className="flex h-7 min-w-7 items-center justify-center rounded-full px-2 text-[12px] transition-colors"
-                style={
-                  safePage === i
-                    ? { background: "rgb(var(--accent-rgb))", color: "#fff" }
-                    : { color: "var(--text-2)", background: "rgb(var(--text-1) / 0.05)" }
-                }
-              >
-                {i + 1}
-              </button>
-            ))}
+            <PageBtn
+              label={t("prev_page")}
+              disabled={safePage === 0}
+              onClick={() => setPage(Math.max(0, safePage - 1))}
+            >
+              ‹
+            </PageBtn>
+            {pageItems.map((item, idx) =>
+              item === "gap" ? (
+                <span key={`gap-${idx}`} className="px-1 text-[var(--text-3)]" aria-hidden>
+                  …
+                </span>
+              ) : (
+                <button
+                  key={item}
+                  onClick={() => setPage(item)}
+                  aria-label={t("page_number", { n: item + 1 })}
+                  aria-current={safePage === item ? "page" : undefined}
+                  className="flex h-7 min-w-7 items-center justify-center rounded-full px-2 text-[12px] transition-colors"
+                  style={
+                    safePage === item
+                      ? { background: "rgb(var(--accent-rgb))", color: "#fff" }
+                      : { color: "var(--text-2)", background: "rgb(var(--text-1) / 0.05)" }
+                  }
+                >
+                  {item + 1}
+                </button>
+              ),
+            )}
+            <PageBtn
+              label={t("next_page")}
+              disabled={safePage >= pages - 1}
+              onClick={() => setPage(Math.min(pages - 1, safePage + 1))}
+            >
+              ›
+            </PageBtn>
           </div>
           <GlassSelect
             value={String(size)}
@@ -180,15 +249,40 @@ export function DataTable<T extends object>({
               setPage(0);
             }}
             options={[
-              { value: "10", label: "10 / page" },
-              { value: "20", label: "20 / page" },
-              { value: "50", label: "50 / page" },
+              { value: "10", label: `10 ${t("per_page")}` },
+              { value: "20", label: `20 ${t("per_page")}` },
+              { value: "50", label: `50 ${t("per_page")}` },
             ]}
-            ariaLabel="page size"
+            ariaLabel={t("per_page")}
             width={104}
           />
         </div>
       </div>
     </div>
+  );
+}
+
+function PageBtn({
+  label,
+  disabled,
+  onClick,
+  children,
+}: {
+  label: string;
+  disabled: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      title={label}
+      className="flex h-7 w-7 items-center justify-center rounded-full text-[12px] transition-colors disabled:opacity-40"
+      style={{ color: "var(--text-2)", background: "rgb(var(--text-1) / 0.05)" }}
+    >
+      {children}
+    </button>
   );
 }

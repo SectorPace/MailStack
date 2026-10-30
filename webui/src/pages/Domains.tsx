@@ -3,7 +3,7 @@ import { useEffect, useContext, useState } from "react";
 import { useSettings } from "../store/settings";
 import { rpc } from "../api/client";
 import { RefreshContext } from "../App";
-import { PageHeader, DataPanel, StatusBadge, ConfirmDialog, toast } from "../components/ui";
+import { PageHeader, DataPanel, ConfirmDialog, toast } from "../components/ui";
 import { DataTable, type Column } from "../components/DataTable";
 import { InputDialog } from "../components/InputDialog";
 import { IconPlus, IconTrash } from "../components/icons";

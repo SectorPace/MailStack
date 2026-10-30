@@ -75,7 +75,7 @@ export function Sidebar({
   onClose?: () => void;
   onSearch?: () => void;
 }) {
-  const { t, prefs } = useSettings();
+  const { prefs } = useSettings();
   const zh = prefs.lang === "zh";
   const rail = variant === "rail";
   const drawer = variant === "drawer";
