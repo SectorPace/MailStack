@@ -263,14 +263,29 @@ impl QueueRunner {
         // 队列会永远不再尝试，变成永久性停摆。
         self.half_open_used.store(false, Ordering::SeqCst);
 
+        // 5.10：先清掉过期租约，再排除仍被有效租约持有的条目。
+        //
+        // 一条条目在「开始投递」与「把结果写回」之间，磁盘上没有任何它的状态
+        // 变化。这段窗口里崩溃/掉电/停机取消，重启后它仍带全部收件人 —— 下一轮
+        // 会整批重投。租约把这段窗口显式化：仍在租约内的条目**先跳过**，
+        // 等租约过期再重试。
+        self.store.prune_claims(now_unix)?;
+        let claimed = self.store.claimed_ids(now_unix)?;
+
         let entries = self.store.load_all()?;
         let due: Vec<QueueEntry> = entries
             .into_iter()
-            .filter(|entry| entry.is_due(now_unix))
+            .filter(|entry| entry.is_due(now_unix) && !claimed.contains(&entry.id))
             .collect();
 
         let mut tasks = JoinSet::new();
         for entry in due.iter().cloned() {
+            // 认领必须在**这里**（spawn 之前）完成，而不是在任务内部：
+            // 任务一多，两个任务并发认领同一条时就都拿到了。
+            // `try_claim` 用 O_EXCL，只有一方能成功。
+            if !self.store.try_claim(&entry.id, now_unix)? {
+                continue;
+            }
             let runner = Arc::clone(self);
             tasks.spawn(async move { runner.process(entry, now_unix).await });
         }
@@ -336,6 +351,14 @@ impl QueueRunner {
 
     /// 处理一条条目。
     async fn process(&self, mut entry: QueueEntry, now_unix: i64) -> QueueResult<EntryOutcome> {
+        // 5.10：无论正常返回、提前 `?`、还是任务被取消/panic，租约都必须释放 ——
+        // 否则该条目会被自己的租约挡住整整 CLAIM_TTL_SECONDS（默认 15 分钟）。
+        // 用 Drop guard 而不是在函数末尾手写 release：`process` 里有多处 `?`。
+        let _claim = ClaimGuard {
+            store: self.store.clone(),
+            id: entry.id.clone(),
+        };
+
         let mut outcome = EntryOutcome::default();
         // 5.15：这一轮是否真的改过条目。
         //
@@ -643,6 +666,23 @@ struct RoundGuard<'a>(&'a AtomicBool);
 impl Drop for RoundGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 投递租约守卫（5.10）：离开作用域即释放该条目的 claim。
+///
+/// `Drop` 不能返回错误，因此失败只记 warn —— 但**必须**留下痕迹：
+/// 释放失败意味着这条条目要被自己的租约挡到过期，属于可观测异常。
+struct ClaimGuard {
+    store: QueueStore,
+    id: String,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.store.release_claim(&self.id) {
+            mailstack_core::warn::warn_with_detail("release queue claim", &error.to_string());
+        }
     }
 }
 
@@ -1340,6 +1380,52 @@ mod tests {
         assert!(
             !health.blocked,
             "正常退信不得把出站判成被封（否则停止全部外域投递）"
+        );
+    }
+
+    /// 5.10：被有效租约持有的条目不得被本轮投递。
+    ///
+    /// 这条模拟的是「上一个进程在投递中途崩溃」：条目文件完好、收件人齐全，
+    /// 但磁盘上留着一份未过期的 claim。没有租约时，重启后第一轮就会把它
+    /// **整批重投** —— 收件人收到重复邮件，而运维完全看不出为什么。
+    #[tokio::test]
+    async fn an_entry_under_a_live_claim_is_skipped_and_delivered_after_expiry() {
+        let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
+        let entry = enqueue_outbound(&harness.store, "00000000001-0001", &["bob@example.net"]);
+        let runner = harness.runner(config(), None);
+
+        // 「上一个进程」留下的有效租约。
+        let claimed_at = 1_000;
+        assert!(harness.store.try_claim(&entry.id, claimed_at).unwrap());
+
+        let report = runner
+            .run_once(claimed_at + 60)
+            .await
+            .expect("本轮应当正常完成（只是跳过被租约持有的条目）");
+        assert_eq!(report.considered, 0, "被租约持有的条目不应被处理");
+        assert!(
+            harness.remote.calls().is_empty(),
+            "被租约持有的条目不得被投递 —— 否则就是重复投递"
+        );
+        assert_eq!(
+            harness.store.load_all().unwrap().len(),
+            1,
+            "条目本身必须原样留在队列里，不能因为跳过而被删"
+        );
+
+        // 租约过期后（例如原持有者确实崩了），必须能正常接手投递。
+        let after_expiry = claimed_at + crate::store::CLAIM_TTL_SECONDS + 1;
+        let report = runner.run_once(after_expiry).await.unwrap();
+        assert_eq!(report.considered, 1, "租约过期后应正常处理");
+        assert_eq!(harness.remote.calls().len(), 1);
+        assert!(
+            harness.store.load_all().unwrap().is_empty(),
+            "投递成功后条目应被移除"
+        );
+        // 处理结束后租约也要清掉，不能留孤儿。
+        assert!(
+            harness.store.claimed_ids(after_expiry).unwrap().is_empty(),
+            "投递完成后租约必须被释放"
         );
     }
 

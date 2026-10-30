@@ -691,18 +691,35 @@ pub enum Lookup { Known, Missing, Unavailable(String) }
 | **5.18** | `select!` 直接 return 时 `timeout(ROUND_TIMEOUT, run_once)` 的 future 被 **drop** → `ROUND_TIMEOUT` 从未生效，在途投递被取消（与 5.10 叠加产生重复投递） | 每轮 `spawn` 成独立任务；`select!` 丢弃的只是 `JoinHandle` 的等待权。停机时对句柄做**有界等待**（等满 `ROUND_TIMEOUT` 才放弃）。上一轮未结束时 ticker 到点也跳过 |
 | **5.19** | 任一任务异常退出只打日志，最终永远 `Ok(())` → systemd 不重启，「进程活着但半个服务没了」 | `JoinSet<Result<(), String>>`；监听器/RPC 面/panic 全部作为失败汇总，非零返回新的 `DaemonError::Task` |
 
-### 3C.4 ⏳ 未修：5.10（投递 lease）
+### 3C.4 投递租约（5.10）
 
-`queue/runner.rs` 的「投递成功」与「把成功写下来」之间**仍无 lease / in-flight 标记**。
-崩溃、掉电、或 5.18 那类取消之后，条目仍带全部收件人 → 整批重投、收件人收到重复邮件。
+原状：`runner.rs` 的「投递成功」与「把成功写下来」之间**没有任何 in-flight 标记**。
+崩溃 / 掉电 / 停机取消之后，条目仍带全部收件人 → 下一轮**整批重投**，收件人收到重复邮件，
+而运维看不出原因。
 
-**为什么不在这轮顺手改**：真正的修法是给 store 加 per-entry claim
-（`<id>.claim` 携带 token + 租约到期时间，`load_all` 跳过未过期的 claim，
-启动时忽略陈旧 claim）。它会改变 `load_all` 的语义与队列文件布局，
-需要独立的回归面（崩溃恢复、双进程、租约过期）—— 塞进这一批会让
-「5.9 的重入保护」与它互相掩护，出问题时无法分辨是哪一层的责任。
-**5.18 已经把它从「必然发生」降级为「崩溃窗口内才发生」**，但窗口仍在。
+修法（两层）：
 
+1. **租约文件**：`queue/claims/<id>.claim`，内容是取得时刻。开始投递前用
+   `OpenOptions::create_new`（`O_EXCL`）创建 —— 不是 `exists()` 再写，
+   否则判存在与建文件之间的空隙正是原竞态本身。结束后由 `ClaimGuard`（`Drop`）
+   释放，因此正常返回、`?` 提前返回、任务 panic/取消都会释放。
+2. **跳过与接管**：`run_once` 先把仍有效的租约对应的条目排除，并在 spawn 前
+   `try_claim` 兜底；租约过期（`CLAIM_TTL_SECONDS = 900s`，必须大于
+   `ROUND_TIMEOUT = 600s`）后可被接管。`remove()` 会一并清掉租约，避免孤儿文件。
+
+**语义变化（要说清楚）**：崩溃后的在途条目不再「重启即刻重投」，而是
+**先等至多一个 TTL 再重试** —— 重复投递从「必然发生」变成「只有在租约过期后
+才可能发生」。真正的 exactly-once 需要把每个收件人的 ack 在事务中途落盘，
+那是投递协议层重新设计，不在本项范围内。
+
+反例测试：`an_entry_under_a_live_claim_is_skipped_and_delivered_after_expiry`
+（被持有 → `considered=0` 且零投递；过期后 → 正常投递并释放租约）、
+`a_claim_is_exclusive_until_released`、`an_expired_claim_can_be_taken_over`、
+`claimed_ids_reflects_only_live_leases`、`removing_an_entry_releases_its_claim`、
+`a_corrupt_claim_timestamp_falls_back_to_mtime_not_to_a_deadlock`。
+
+**负向验证**：把「排除被租约持有的条目」与 `try_claim` 兜底**两道都去掉**后，
+上面那条行为测试精确变红（`left: 1, right: 0`，断言文案「被租约持有的条目不应被处理」）。
 ---
 
 ## 3D. 管理前端 webui（§WEBUI_AUDIT 的 41 条）
@@ -776,11 +793,11 @@ pub enum Lookup { Known, Missing, Unavailable(String) }
 
 ### 5.2 批 5：Web 与队列
 
-> 🟡 **批 5 已修 17/19**，逐条记录见 **§3C**。
+> ✅ **批 5 已全部修复（19/19）**，逐条记录见 **§3C**。
 >
-> - **5.1–5.9、5.11–5.19：已修**（含配套改动：新增 `AiRateLimiter`、
+> - **5.1–5.19：已修**（含配套改动：新增 `AiRateLimiter`、
 >   `atomic::try_rows`、`QueueError::Busy` / `is_busy()`、`DaemonError::Task`）。
-> - **5.10 未修（投递 lease）**：真正落地要改 store 的 per-entry claim 与
+> - **5.10 投递 lease**：`claims/<id>.claim` + `O_EXCL` 认领 + TTL 接管，详见 §3C.4。（原计划说明：
 >   `load_all` 语义，需要独立的崩溃恢复回归面。**5.18 已把它从「必然发生」
 >   降为「崩溃窗口内才发生」**，但窗口仍在。详见 §3C.4。
 >
@@ -905,7 +922,7 @@ RCPT 名录的三态判定、A-R 的 RFC 8601 引用 —— 我逐条复核过�
 W='wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0'
 R=/mnt/e/MailStack/mailstack-rust
 
-# 1) 全量测试（应为 1139 passed / 0 failed）
+# 1) 全量测试（应为 1145 passed / 0 failed）
 $W bash $R/deploy/wsl-cargo.sh test --workspace --all-targets
 
 # 2) 三道门禁

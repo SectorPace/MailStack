@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! queue/entries/<id>.json   —— 每条消息一个文件
+//! queue/claims/<id>.claim   —— 投递租约（5.10：标记「这条正在被投递」）
 //! queue/corrupt/            —— 解析失败的条目（隔离，绝不静默丢弃）
 //! queue/outbound-health.json —— 出站健康状态（重试风暴的结论要跨重启保留）
 //! ```
@@ -29,6 +30,20 @@ use crate::error::{QueueError, QueueResult};
 
 /// 队列文件权限：报文含用户邮件正文，仅属主可读。
 const QUEUE_FILE_MODE: u32 = 0o600;
+
+/// 投递租约时长（5.10）。
+///
+/// 一条条目从「开始投递」到「把结果写回磁盘」之间，磁盘上没有它的任何状态变化。
+/// 这段窗口里崩溃 / 掉电 / 停机取消，重启后条目仍带全部收件人 —— 下一轮会**整批
+/// 重投**，收件人收到重复邮件。
+///
+/// 租约把这段窗口显式化：开始投递前写一个 claim 文件，结束后删除。重启后
+/// 仍在租约内的条目**先跳过**，等租约过期再重试 —— 于是「重启即重投」变成
+/// 「只有确实超过了投递时长的条目才会被重试」。
+///
+/// 取值必须 **大于** 单轮调度的上限（`mailstackd` 的 `ROUND_TIMEOUT = 600s`），
+/// 否则还在正常投递的条目会被自己人抢走。这里取 900s（15 分钟）。
+pub const CLAIM_TTL_SECONDS: i64 = 900;
 
 /// 出站健康状态（持久化）。
 ///
@@ -84,6 +99,132 @@ impl QueueStore {
     /// 损坏条目隔离目录。
     pub fn corrupt_dir(&self) -> PathBuf {
         self.root.join("corrupt")
+    }
+
+    /// 投递租约目录（5.10）。
+    pub fn claims_dir(&self) -> PathBuf {
+        self.root.join("claims")
+    }
+
+    fn claim_path(&self, id: &str) -> QueueResult<PathBuf> {
+        if !crate::entry::is_safe_id(id) {
+            return Err(QueueError::invalid(format!("unsafe queue id: {id:?}")));
+        }
+        Ok(self.claims_dir().join(format!("{id}.claim")))
+    }
+
+    /// 尝试为某条目取得投递租约（5.10）。
+    ///
+    /// 返回 `true` 表示拿到（可以投递）；`false` 表示已有**未过期**的租约
+    /// （别的轮次/进程正在投它以跳过）。
+    ///
+    /// 用 `create_new`（`O_EXCL`）而不是 `exists()` + 写：判存在与建文件之间
+    /// 若有空隙，两个执行者会同时拿到租约 —— 那正是本项要消除的竞态。
+    pub fn try_claim(&self, id: &str, now_unix: i64) -> QueueResult<bool> {
+        let dir = self.claims_dir();
+        fs::create_dir_all(&dir).map_err(|e| QueueError::io(&dir, e))?;
+        let path = self.claim_path(id)?;
+
+        // 先清理过期租约：过期即视为「上一个持有者已经没了」。
+        if !self.claim_is_fresh(&path, now_unix) {
+            let _ = fs::remove_file(&path);
+        }
+
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                // 内容 = 取得时刻（unix 秒）。写失败也不影响正确性：文件存在本身
+                // 就是「已认领」；时间戳只是为了让过期判定不依赖 mtime。
+                let _ = writeln!(file, "{now_unix}");
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(QueueError::io(&path, error)),
+        }
+    }
+
+    /// 释放租约（投递结束，无论成功失败）。
+    pub fn release_claim(&self, id: &str) -> QueueResult<()> {
+        let path = self.claim_path(id)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(QueueError::io(&path, error)),
+        }
+    }
+
+    /// 当前仍有效的租约对应的条目 id 集合。
+    pub fn claimed_ids(&self, now_unix: i64) -> QueueResult<std::collections::HashSet<String>> {
+        let dir = self.claims_dir();
+        let mut claimed = std::collections::HashSet::new();
+        if !dir.exists() {
+            return Ok(claimed);
+        }
+        let read = fs::read_dir(&dir).map_err(|e| QueueError::io(&dir, e))?;
+        for item in read {
+            let Ok(item) = item else { continue };
+            let path = item.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".claim") else {
+                continue;
+            };
+            if self.claim_is_fresh(&path, now_unix) {
+                claimed.insert(id.to_string());
+            }
+        }
+        Ok(claimed)
+    }
+
+    /// 清理所有过期租约，返回清理数量。
+    pub fn prune_claims(&self, now_unix: i64) -> QueueResult<usize> {
+        let dir = self.claims_dir();
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut removed = 0usize;
+        let read = fs::read_dir(&dir).map_err(|e| QueueError::io(&dir, e))?;
+        for item in read {
+            let Ok(item) = item else { continue };
+            let path = item.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("claim") {
+                continue;
+            }
+            if !self.claim_is_fresh(&path, now_unix) && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// 租约是否仍在有效期内。
+    ///
+    /// 以**文件内容**的时间戳为准（而不是 mtime）：mtime 会被 touch、备份还原、
+    /// 文件系统复制改变，而内容是我们自己写的。内容读不出来时退化为 mtime，
+    /// 再不行就当作**过期** —— 宁可多投一次，也不要让一条条目被永久卡住。
+    fn claim_is_fresh(&self, path: &Path, now_unix: i64) -> bool {
+        let claimed_at = match fs::read_to_string(path) {
+            Ok(text) => text.trim().parse::<i64>().ok(),
+            Err(_) => None,
+        };
+        let claimed_at = match claimed_at {
+            Some(ts) => ts,
+            None => match fs::metadata(path).and_then(|m| m.modified()) {
+                Ok(modified) => modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                Err(_) => return false,
+            },
+        };
+        // 时间戳来自未来（时钟回拨过）也按「刚取得」处理：宁可多等一个 TTL，
+        // 也不要因为时钟问题把正在投递的条目抢过来重投。
+        now_unix.saturating_sub(claimed_at) < CLAIM_TTL_SECONDS
     }
 
     fn health_path(&self) -> PathBuf {
@@ -150,6 +291,9 @@ impl QueueStore {
     /// 删除一条条目（投递完成或已退信后）。返回是否确实删除了文件。
     pub fn remove(&self, id: &str) -> QueueResult<bool> {
         let path = self.entry_path(id)?;
+        // 5.10：条目消失时必须把租约一起清掉，否则 claim 目录会永久留下孤儿文件
+        // （它的 id 已经不在了，只会让 `claimed_ids` 越来越大）。
+        let _ = self.release_claim(id);
         let existed = match fs::remove_file(&path) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -524,5 +668,108 @@ mod tests {
         store.save_health(&OutboundHealthState::default()).unwrap();
         fs::write(store.entries_dir().join(".hidden.lock"), b"").unwrap();
         assert_eq!(store.len().unwrap(), 1);
+    }
+
+    // ── 5.10：投递租约 ──
+
+    /// 同一时刻只有一方能拿到租约（`O_EXCL`，不是 `exists()` + 写）。
+    #[test]
+    fn a_claim_is_exclusive_until_released() {
+        let (_d, store) = temp_store();
+        store.enqueue(&entry("0001")).unwrap();
+        let id = "00000000001-0001";
+        let now = 1_700_000_100;
+
+        assert!(store.try_claim(id, now).unwrap(), "首次认领必须成功");
+        assert!(
+            !store.try_claim(id, now + 1).unwrap(),
+            "未释放前第二次认领必须失败 —— 否则两个执行者会同时投递"
+        );
+
+        store.release_claim(id).unwrap();
+        assert!(store.try_claim(id, now + 2).unwrap(), "释放后应可再次认领");
+    }
+
+    /// 过期租约必须能被接管：否则一次崩溃就让条目卡死到 TTL 之后（且无人清理）。
+    #[test]
+    fn an_expired_claim_can_be_taken_over() {
+        let (_d, store) = temp_store();
+        store.enqueue(&entry("0001")).unwrap();
+        let id = "00000000001-0001";
+        let now = 1_700_000_000;
+
+        assert!(store.try_claim(id, now).unwrap());
+        // TTL 之内：仍然是别人的。
+        assert!(!store.try_claim(id, now + CLAIM_TTL_SECONDS - 1).unwrap());
+        // 恰好过期：可接管。
+        assert!(
+            store.try_claim(id, now + CLAIM_TTL_SECONDS).unwrap(),
+            "超过 TTL 的租约必须可被接管"
+        );
+    }
+
+    /// `claimed_ids` 只返回仍有效的租约；`prune_claims` 清掉过期的。
+    #[test]
+    fn claimed_ids_reflects_only_live_leases() {
+        let (_d, store) = temp_store();
+        for suffix in ["0001", "0002"] {
+            store.enqueue(&entry(suffix)).unwrap();
+        }
+        let fresh = "00000000001-0001";
+        let stale = "00000000001-0002";
+        let now = 1_700_000_000;
+        assert!(store.try_claim(fresh, now).unwrap());
+        assert!(store
+            .try_claim(stale, now - CLAIM_TTL_SECONDS - 10)
+            .unwrap());
+
+        let claimed = store.claimed_ids(now).unwrap();
+        assert!(claimed.contains(fresh), "未过期的租约必须可见");
+        assert!(!claimed.contains(stale), "过期的租约不得把条目挡在队列外");
+
+        let pruned = store.prune_claims(now).unwrap();
+        assert_eq!(pruned, 1, "只应清掉那条过期的");
+        assert!(
+            !store.claim_path(stale).unwrap().exists(),
+            "过期租约文件应已被清理"
+        );
+    }
+
+    /// 条目被删除时租约必须一起消失，否则 claim 目录会留下永久孤儿。
+    #[test]
+    fn removing_an_entry_releases_its_claim() {
+        let (_d, store) = temp_store();
+        store.enqueue(&entry("0001")).unwrap();
+        let id = "00000000001-0001";
+        let now = 1_700_000_000;
+
+        assert!(store.try_claim(id, now).unwrap());
+        assert!(store.claim_path(id).unwrap().exists());
+
+        store.remove(id).unwrap();
+        assert!(
+            !store.claim_path(id).unwrap().exists(),
+            "条目已删除，租约必须一并清理"
+        );
+        assert!(store.claimed_ids(now).unwrap().is_empty());
+    }
+
+    /// 租约内容损坏时按 mtime 兜底；mtime 也拿不到则视为过期（宁可多投一次，
+    /// 也不要让条目被永久卡住）。
+    #[test]
+    fn a_corrupt_claim_timestamp_falls_back_to_mtime_not_to_a_deadlock() {
+        let (_d, store) = temp_store();
+        let id = "00000000001-0001";
+        store.enqueue(&entry("0001")).unwrap();
+        let now = 1_700_000_000;
+        assert!(store.try_claim(id, now).unwrap());
+
+        // 把内容写坏，但文件刚创建 —— mtime 是「现在」，仍应视为有效。
+        fs::write(store.claim_path(id).unwrap(), b"garbage").unwrap();
+        let fresh = store.claimed_ids(now).unwrap();
+        assert!(
+            fresh.contains(id),
+            "时间戳损坏时应退化为 mtime 判定，而不是立刻放开"
+        );
     }
 }
