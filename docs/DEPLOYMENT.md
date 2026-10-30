@@ -11,7 +11,13 @@
 | `mailstackctl` | CLI：`mailstackctl <action> [JSON] [--confirm]`。只读动作直连 RO socket，变更动作经 `sudo` 包装器（见 §3.5） |
 | `mailstack-web` | 管理控制台服务：管理 API 的全部路由 + 前端产物托管 + 遥测后台采样（见 §3.7）。**可选**：不给 `--dist` 就只提供 API |
 | `dist/SHA256SUMS` | 全部产物校验和 |
-| `dist/sbom.spdx.json` | SBOM（依赖清单） |
+| `dist/sbom.spdx.json` | SBOM（依赖清单）。`cargo-sbom` 未安装时退化为 `dist/dependency-inventory.txt`（外部依赖逐条 `name version license`） |
+| `dist/*-musl` | **可选**：`deploy/build.sh --musl` 产出的全静态二进制。用于 glibc 过旧或 musl 的目标平台，见 §6 |
+
+> ⚠️ **libc 兼容性（2026-10-30 实测，见 §6）**：默认产物是动态链接 glibc，
+> **下限 glibc 2.39**。本项目声明的安装矩阵里有 Rocky Linux 9 / Oracle Linux 9（glibc 2.34）
+> 和 Alpine（musl）—— **这些平台必须用 `*-musl` 静态产物**，否则启动即
+> `GLIBC_2.39 not found` / not found。
 
 > `mailstackd` 的参数：`--port <PORT>`（可重复，缺省 25 465 587）、`--config-dir <DIR>`
 > （把 `/etc/mailstack` 视作 `<DIR>/etc/mailstack`，供测试与旁路部署）、`--log <LEVEL>`
@@ -320,7 +326,53 @@ mailstack-web 未被改动。审计链未被改写（这两个二进制均不含
 | Phase 4 写面切换 | ✅ 动作面完成 | **已完成**：2FA 全生命周期（AES-256-GCM 信封 + RFC 6238 + 恢复码持锁消费，INV-5/29/32）；写面动作 `admin.set`、`settings.set`、域名/别名表写入、`dkim.rotate`；**只读聚合面** `snapshot`、`logs.list`、`metrics.realtime`、`certs.list`、`network.check_port`、`system.doctor`、`security.scan`、`backup.list`（读不到的子项一律显式上报，不静默省略）；控制台写面 `services.action`、`queue.action`、`security.ban/unban`；备份 `backup.create/restore/delete`；**初始化向导** `setup.identity.apply`、`setup.dns.verify`、`setup.relay.test`、`setup.relay.apply`、`setup.mail.test`、`mail.test_loopback`（见 §3.6）。白名单动作**已全部实现（58/58，RO 22/22 + RW 36/36）**；契约路由**已全部注册（72/72）**，**没有任何路由落到 `/api` 兜底**，由 `every_implemented_action_route_is_wired_and_behind_auth` 守门。最后补齐的动作族：ACME 证书（`setup.cert.issue` / `certs.renew`，调 `acme.sh`，见 TEST_REPORT §3.8）、AI 出站（`ai.*`，含 SSRF / DNS-rebinding 防护，见 §3.9）、以及为前端新增的 8 个只读列表动作（见 §3.10）—— **三者均零新依赖**。**未完成**：真实环境验证与审计链的**真实升级演练** |
 | Phase 5 组件下线 | ⏳ 待办 | 停用 Postfix/OpenDKIM/fail2ban/Node |
 
-## 6. 已知环境事实（开发机）
+## 6. 发行包的 libc 兼容性（2026-10-30 实测）
+
+> 这一节是**打包成可发行文件之后实测出来的**，不是推断。
+> 做法：在 Ubuntu 26.04（Rust 1.98.1，与 CI 钉的版本一致）上跑
+> `deploy/build.sh --musl`，把 `dist/` 复制到 7 个发行版里逐个执行
+> `--version` / `--help`，并做平台侧 `sha256sum -c`。
+
+### 6.1 兼容性矩阵
+
+| 平台 | glibc | glibc 动态产物 | musl 全静态产物 |
+|---|---:|---|---|
+| Ubuntu 26.04.1 | 2.43 | ✅ | ✅ |
+| Debian 13 (trixie) | 2.41 | ✅ | ✅ |
+| Arch Linux | 2.44 | ✅ | ✅ |
+| AlmaLinux 10.1 | 2.39 | ✅ | ✅ |
+| openSUSE Tumbleweed | 2.43 | ✅ | ✅ |
+| **Oracle Linux 9.5** | **2.34** | ❌ `GLIBC_2.39 not found` | ✅ |
+| **Alpine 3.24**（musl） | 无 glibc | ❌ not found | ✅ `statically linked` |
+
+### 6.2 结论
+
+1. **glibc 动态产物的下限是 2.39**（等于 CI 的 `ubuntu-24.04` 宿主）。
+   这个下限不是「构建机的 glibc 版本」，而是产物**实际引用到的最高符号版本**；
+   在 26.04（2.43）上构建，实测 `objdump -T` 的最大符号仍是 `GLIBC_2.39`。
+2. **安装矩阵里的 Rocky Linux 9 / Oracle Linux 9（glibc 2.34）与 Alpine（musl）
+   不能用默认产物**。这是此前**没有声明过的**兼容性缺口 ——
+   `crates/core/src/exec.rs` 的注释写着「安装矩阵含 Rocky Linux 9 与 Alpine」，
+   但发行包在这些平台上一启动就失败。
+3. 解法是 `--musl`：全静态、不依赖 glibc，实测在 glibc 2.34 与 musl-only 的
+   Alpine 上均可运行。**GitHub Release 应同时上传两套产物**，并在下载页注明
+   「glibc < 2.39 或 Alpine 请用 `*-musl`」。
+
+### 6.3 复现
+
+```bash
+# 构建宿主需 Rust 1.98.1 + musl-gcc + x86_64-unknown-linux-musl target
+deploy/build.sh --musl
+ls dist/          # 6 个二进制 + SHA256SUMS + dependency-inventory.txt
+
+# 在目标平台验证（示例）
+sha256sum -c SHA256SUMS
+./mailstackd-musl --version     # 任意 Linux 都应成功
+```
+
+---
+
+## 7. 已知环境事实（开发机）
 
 - Windows 开发机 rustup default 为 msvc 但**无 link.exe**；可用的链接器只随
   `stable-x86_64-pc-windows-gnu` 提供。**任何 tokio 异步测试在该 mingw 工具链上
