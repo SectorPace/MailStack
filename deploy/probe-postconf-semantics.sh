@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 核实 postconf -h 的语义：返回「有效值（含默认）」还是「仅 main.cf 里显式设置的值」。
-set -u
+set -uo pipefail
 export PATH="/usr/sbin:/sbin:$PATH"
 
 echo "=== main.cf 中显式设置的行 ==="

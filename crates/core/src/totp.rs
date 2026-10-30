@@ -161,16 +161,30 @@ pub fn load_master_key(paths: &Paths) -> CoreResult<[u8; TOTP_KEY_BYTES]> {
 /// 加载主密钥，缺失则生成并以 `0600 root:root` 落盘。
 ///
 /// 只在**写路径**（`begin` / `enable`）使用：那里确实需要一把密钥。
+///
+/// ## 6.12：为什么整段必须在 `locked()` 里
+///
+/// 原实现是「`exists()`？→ 否则生成 → `atomic_as` 写」。两个并发 `begin()`
+/// 会同时看到「文件不存在」、各自生成一把密钥、各自覆盖写 —— **后写者胜**，
+/// 于是先写者已经封装好的信封**永久解不开**：管理员被锁在 2FA 之外，
+/// 而且现象是「恢复码和动态码都不对」，很难归因到一次并发点击。
+///
+/// `atomic_as` 用 `File::create`（非 `O_EXCL`），本身不提供排他性，
+/// 所以这里用 `locked()` 的侧车 flock 把整个「检查 + 生成 + 落盘」串行化：
+/// 第二个调用者进临界区时已经能看到文件，直接读赢家那一把。
 pub fn load_or_create_master_key(paths: &Paths) -> CoreResult<[u8; TOTP_KEY_BYTES]> {
-    if paths.totp_key.exists() {
-        return load_master_key(paths);
-    }
-    let key = random_bytes::<TOTP_KEY_BYTES>();
-    let body = format!("{}\n", BASE64.encode(key));
-    // group = None ⇒ 只 chown 到 root（不落到 mailstack-admin）：这个密钥的读者
-    // 只有特权进程，web 进程读不到它正是 INV-5 的立足点。
-    crate::atomic::atomic_as(&paths.totp_key, body.as_bytes(), 0o600, None)?;
-    Ok(key)
+    crate::atomic::locked(&paths.totp_key, || {
+        // 双检：拿到锁时文件可能已经被前一个持锁者写好了。
+        if paths.totp_key.exists() {
+            return load_master_key(paths);
+        }
+        let key = random_bytes::<TOTP_KEY_BYTES>();
+        let body = format!("{}\n", BASE64.encode(key));
+        // group = None ⇒ 只 chown 到 root（不落到 mailstack-admin）：这个密钥的读者
+        // 只有特权进程，web 进程读不到它正是 INV-5 的立足点。
+        crate::atomic::atomic_as(&paths.totp_key, body.as_bytes(), 0o600, None)?;
+        Ok(key)
+    })
 }
 
 fn decode_master_key(text: &str) -> CoreResult<[u8; TOTP_KEY_BYTES]> {
@@ -985,6 +999,61 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "主密钥必须 0600");
         }
+    }
+
+    /// 6.12：并发 `load_or_create_master_key` 必须**只产生一把**密钥。
+    ///
+    /// 原实现「检查存在 → 生成 → 写」之间没有互斥，两个并发 `begin()` 会各自
+    /// 生成并覆盖写，先写者已封装好的信封永久解不开（管理员被锁在 2FA 之外，
+    /// 现象是「恢复码和动态码都不对」，极难归因到一次并发点击）。
+    #[test]
+    fn concurrent_master_key_creation_yields_one_shared_key() {
+        use std::sync::{Arc, Barrier};
+
+        let f = Fixture::new("masterkeyrace");
+        assert!(!f.paths.totp_key.exists());
+
+        const THREADS: usize = 8;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let paths = f.paths.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                // 尽量让所有线程同时冲进临界区。
+                barrier.wait();
+                load_or_create_master_key(&paths).expect("并发创建主密钥不应失败")
+            }));
+        }
+
+        let keys: Vec<[u8; TOTP_KEY_BYTES]> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("线程不应 panic"))
+            .collect();
+
+        let first = keys[0];
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                *key, first,
+                "第 {index} 个线程拿到了不同的主密钥 —— 说明发生了覆盖写"
+            );
+        }
+
+        // 落盘的那一把必须与所有调用者拿到的一致，且能读回。
+        let on_disk = load_master_key(&f.paths).expect("密钥文件应可读回");
+        assert_eq!(on_disk, first, "磁盘上的密钥与调用者拿到的必须一致");
+
+        // 只有一把密钥文件（没有残留的并发产物）。
+        let leftovers: Vec<String> = fs::read_dir(f.paths.totp_key.parent().unwrap())
+            .unwrap()
+            .filter_map(|item| item.ok())
+            .map(|item| item.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("totp.key"))
+            .collect();
+        assert!(
+            leftovers.iter().any(|name| name == "totp.key"),
+            "主密钥文件必须存在，实际：{leftovers:?}"
+        );
     }
 
     // ── 生命周期 ──

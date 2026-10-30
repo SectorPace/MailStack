@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # 追查 C 依赖链（规格书 §3.4 禁止）是从哪条路径进来的，并看能否用 feature 剪掉。
-set -u
+set -uo pipefail
 
-SRC_DIR="/mnt/e/MailStack/mailstack-rust"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SRC_DIR="$ROOT"
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR="$HOME/.cache/mailstack-target"
 cd "$SRC_DIR" || exit 1

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 汇总测试规模与不变量覆盖，产出 TEST_REPORT.md 所需的事实数据。
-set -u
-cd /mnt/e/MailStack/mailstack-rust || exit 1
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
 
 echo "### 每 crate 测试数"
 total=0

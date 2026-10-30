@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 复现「写入 noanonymous 后 -n 读回空值」的怪现象。
-set -u
+set -uo pipefail
 export PATH="/usr/sbin:/sbin:$PATH"
 
 K=smtp_sasl_security_options

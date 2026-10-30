@@ -65,5 +65,22 @@ webpki-roots = "0.26"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# 6.9：`abort` → `unwind`（**有前置条件，见下**）。
+#
+# `abort` 会把**每一个** panic 放大成进程死亡，并让 `core/src/warn.rs` 的
+# `catch_unwind`（"warn 永不抛出"）在 release 下完全失效 —— 一句日志格式化里的
+# panic 就足以打死整个守护进程。
+#
+# 但单纯改成 `unwind` 同样不可接受：tokio 会在任务边界吞掉 panic，
+# 而 `bin/mailstackd` 原先忽略 `JoinError`，结果是「进程活着、出站调度永久死掉」，
+# 表现为静默停投。这正是本项此前一直未被处理的原因（`REVIEW_FIXES.md` §1.10）。
+#
+# 现在那个前置障碍已经修掉：批 5 的 **5.19** 把 `JoinSet` 的结果收成
+# `Result<(), String>`，任务 panic / 异常退出都会汇总并**非零退出**，
+# 由 supervisor 重启。于是一整块服务崩掉不再被吞 —— 这才使 `unwind` 成为正确选择：
+#   * 任务内 panic 被隔离在任务边界，不再瞬间带走收信与投递；
+#   * 隔离之后的「重启」由 5.19 的非零退出 + systemd 保证，而不是静默继续。
+#
+# ⚠️ 若将来有人把 5.19 的结果汇总改回「只记日志」，必须同时把这里改回 `abort`。
+panic = "unwind"
 strip = "symbols"

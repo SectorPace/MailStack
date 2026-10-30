@@ -4,7 +4,7 @@
 - 规格书：`docs/REWRITE_TO_RUST.md` **v3**（本仓库外的源码包内）
 - 平台：WSL Ubuntu 24.04 / `x86_64-unknown-linux-gnu`（生产目标平台）
 - 工具链：rustc 1.98.1（`deploy/build.sh` 与 CI 双重固定）
-- 结论：**1138 个测试全部通过**（含 `mailstackd` / `mailstackctl` / `mailstack-web` 二进制与 4 组真实集成套件）；rustfmt 与 clippy(`-D warnings`) 全绿；277/277 不变量测试存在
+- 结论：**1139 个测试全部通过**（含 `mailstackd` / `mailstackctl` / `mailstack-web` 二进制与 4 组真实集成套件）；rustfmt 与 clippy(`-D warnings`) 全绿；277/277 不变量测试存在
 - 58 条白名单动作**已全部实现**，72 条契约路由**已全部接线**
   - 另 34 个集成测试需真实环境（TLS 握手 / TCP / unix socket / 容器内 Postfix）
 
@@ -31,7 +31,7 @@ deploy/verify-invariant-gate.sh   # 确认 CI 列出的不变量测试名都真�
 | `mailstackd` | 28 | **进程入口**：`Paths`→运行期配置的 fail-closed 装配、三端口共用准入状态、监听集中绑定、**特权 RPC 双通道绑定与门控**、停机信号扇出、出站队列调度（详见 §3.1.5） |
 | `mailstackctl` | 7 | **CLI**：参数→特权调用的翻译（`--confirm` 必须是真布尔）、退出码映射（详见 §3.1.6） |
 | `mailstack-smtp`（真实 Postfix） | 6 | 需显式开启；在一次性容器中对 Postfix 3.8.6 运行 |
-| **合计** | **1138** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
+| **合计** | **1139** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 
 ## 2. 门禁结果
 
@@ -39,7 +39,7 @@ deploy/verify-invariant-gate.sh   # 确认 CI 列出的不变量测试名都真�
 |---|---|---|
 | 格式 | `cargo fmt --all -- --check` | ✅ PASS |
 | Lint | `cargo clippy --all-targets -- -D warnings` | ✅ PASS（warnings 即失败） |
-| 单元/集成测试 | `cargo test` | ✅ 1138 passed / 0 failed |
+| 单元/集成测试 | `cargo test` | ✅ 1139 passed / 0 failed |
 | 真实 Postfix 集成 | `deploy/test-relay-postfix-in-container.sh` | ✅ 6/6 passed（Postfix 3.8.6） |
 | 不变量存在性 | `verify-invariant-gate.sh` | ✅ 277/277 存在（扫描范围含 `bin/`） |
 | 交付物 | `deploy/verify-deliverables.sh` | ✅ `DELIVERABLES_OK` |

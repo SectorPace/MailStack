@@ -12,9 +12,10 @@
 #     把 target/ 放在上面会让每次增量构建慢一个数量级；
 #   * 代理：本机 WSL 必须走 Clash 混合端口 7890（7897 会接受连接但不可代理）。
 #     仅在需要访问网络时导出，且 NO_PROXY 覆盖本地，避免本地回环请求被劫持。
-set -u
+set -uo pipefail
 
-SRC_DIR="/mnt/e/MailStack/mailstack-rust"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SRC_DIR="$ROOT"
 NATIVE_TARGET="${HOME}/.cache/mailstack-target"
 
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -34,7 +35,8 @@ fi
 
 # 仅当显式需要网络时启用代理（vendor 构建/离线场景不应依赖它）。
 if [ "${MAILSTACK_USE_PROXY:-0}" = "1" ]; then
-  export HTTP_PROXY="http://127.0.0.1:7890"
+  # 6.7：代理不再写死开发机地址，默认值可被 MAILSTACK_PROXY 覆盖。
+  export HTTP_PROXY="${MAILSTACK_PROXY:-http://127.0.0.1:7890}"
   export HTTPS_PROXY="$HTTP_PROXY"
   export http_proxy="$HTTP_PROXY"
   export https_proxy="$HTTP_PROXY"

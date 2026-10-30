@@ -4,7 +4,7 @@
 # 刻意不碰的东西：
 #   * Docker 基础镜像 ubuntu:24.04 / rockylinux:9-ci / alpine:3.20（后续 install-matrix 要用）
 #   * ~/.cache/mailstack-target 整体（那是编译缓存，删了要全量重建）
-set -u
+set -euo pipefail
 
 echo "=== 清理前 ==="
 df -h / | tail -1

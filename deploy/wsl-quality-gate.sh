@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # 完整质量门禁：格式 + lint（warnings 即错误）+ 测试。
 # 与 CI 使用同一条命令链，确保本地与 CI 判定一致。
-set -u
+set -euo pipefail
 
-cd /mnt/e/MailStack/mailstack-rust || exit 1
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
 export PATH="$HOME/.cargo/bin:$PATH"
 
 RUNNER="bash deploy/wsl-cargo.sh"

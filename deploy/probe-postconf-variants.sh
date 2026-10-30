@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 探测 postconf 各变体的语义差异，为「快照/回滚需要知道是否显式设置」找到正确读法。
-set -u
+set -uo pipefail
 export PATH="/usr/sbin:/sbin:$PATH"
 
 echo "=== A) postconf -h <key>：有效值（含默认）==="

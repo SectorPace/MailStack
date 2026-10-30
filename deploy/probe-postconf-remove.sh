@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 探测 postconf -X（移除参数）是否可用，以及 -e key=（设为空）与「从未设置」的差异。
-set -u
+set -uo pipefail
 export PATH="/usr/sbin:/sbin:$PATH"
 
 WORK=/tmp/pfx-test.cf

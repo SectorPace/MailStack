@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # 用受限特性引入 mail-auth 后，验证依赖树里没有 C 依赖链（规格书 §3.4 硬约束）。
-set -u
+set -euo pipefail
 
-SRC_DIR="/mnt/e/MailStack/mailstack-rust"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SRC_DIR="$ROOT"
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR="$HOME/.cache/mailstack-target"
-export HTTP_PROXY="http://127.0.0.1:7890"
+# 6.7：代理不再写死开发机地址，默认值可被 MAILSTACK_PROXY 覆盖。
+export HTTP_PROXY="${MAILSTACK_PROXY:-http://127.0.0.1:7890}"
 export HTTPS_PROXY="$HTTP_PROXY"
 export http_proxy="$HTTP_PROXY"
 export https_proxy="$HTTP_PROXY"

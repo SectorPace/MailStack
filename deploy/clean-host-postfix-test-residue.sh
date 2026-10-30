@@ -4,7 +4,7 @@
 # 背景：第一版测试没有「必须显式开启」的守卫，只要环境里有 Postfix 就会执行，
 # 因而在本机 WSL 的真实 /etc/postfix/main.cf 上写入过测试键。
 # 本脚本移除这些键，使其回到 Postfix 默认状态。
-set -u
+set -euo pipefail
 export PATH="/usr/sbin:/sbin:$PATH"
 
 MAIN=/etc/postfix/main.cf

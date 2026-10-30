@@ -6,6 +6,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# 6.3：最小权限。原先三个 job 都没有 `permissions:` 声明 ——
+# 无声明时 GitHub 会授予仓库/组织默认的 GITHUB_TOKEN 权限，对本工作流远超所需
+# （我们只读代码）。声明为只读后，即使某个 action 被投毒也拿不到写权限。
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # 可复现构建锚点（与 deploy/build.sh 一致）
@@ -17,14 +23,22 @@ jobs:
     name: fmt + clippy + test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-
-      # 工具链在此固定（仓库根刻意不放 rust-toolchain.toml，原因见 TOOLCHAIN.md）
-      - uses: dtolnay/rust-toolchain@1.98.1
+      # 6.3：pin 到 commit SHA（v4 = actions/checkout@v4 的 tag 解析结果）。
+      # tag 可被上游重新指向，SHA 不能。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # 6.3：不把凭证留在 .git/config 里（后续任何一步都能读到它）。
+          persist-credentials: false
+
+      # 工具链在此固定（仓库根刻意不放 rust-toolchain.toml，原因见 TOOLCHAIN.md）。
+      # 6.3：该 action 的 tag 名**本身就是工具链选择器**，直接 pin SHA 会丢掉版本语义；
+      # 因此 pin 到 master 的 commit，并用 with.toolchain 显式钉住 1.98.1 —— 效果等价且不可被重指向。
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-10-16
+        with:
+          toolchain: 1.98.1
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 (2.9.3, PGP 已校验)
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -40,476 +54,53 @@ jobs:
     name: locked build + audit + deny
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-10-16
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 (2.9.3, PGP 已校验)
 
       - name: 锁定构建必须成功（AC-7）
         run: cargo build --release --locked --all-targets
 
-      - name: cargo-deny（重复依赖 / 许可白名单 / 来源白名单）
+      # 6.1：这个 step 原先带 `continue-on-error: true`，而仓库里**根本没有
+      # deny.toml** —— 也就是说它必然失败、失败又被永久吞掉，供应链门禁实质失效。
+      # 现在 deny.toml 已入库（白名单来自本机 449 个 crate 的许可证实测归纳），
+      # 并且不再允许失败。
+      - name: cargo-deny（漏洞 / 许可白名单 / 来源白名单 / 通配依赖）
         uses: EmbarkStudios/cargo-deny-action@v2
-        continue-on-error: true   # 首次接入：deny.toml 需按实际依赖收敛后再设为强制
+        with:
+          command: check
 
+      # 6.1：原先 `cargo install ... || true` + `cargo audit || true` —— 装不上也过、
+      # 有漏洞也过。现在两步都必须是真成功。
       - name: cargo-audit（RUSTSEC 漏洞库）
         run: |
-          cargo install cargo-audit --locked || true
-          cargo audit || true
+          set -euo pipefail
+          cargo install cargo-audit --locked
+          cargo audit
 
   # ── 不变量门禁：确认安全关键断言未被删除或弱化 ──
   invariants:
     name: security invariants present
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: 关键不变量测试必须存在
         run: |
-          set -e
-          # 这些测试名对应规格书 §8 的安全不变量。
-          # 有人删掉断言或改成 #[ignore] 时，本 job 必须变红。
-          required=(
-            "unknown_action_defaults_to_read_only_surface"    # INV-24
-            "lock_sidecar_names_never_collide"                # INV-31
-            "atomic_applies_mode_before_rename"               # INV-33
-            "detects_truncated_tail_via_anchor"               # INV-4
-            "admin_password_change_preserves_totp_block"      # INV-30
-            "rejects_control_characters_including_nul"        # INV-35
-            "legacy_path_is_laxer_but_still_blocks_control_chars" # INV-36
-            "settings_write_whitelist_rejects_unknown_keys"   # INV-43
-            "destructive_action_requires_explicit_confirmation" # INV-2
-            "read_only_channel_refuses_mutating_actions"      # INV-24
-            "ro_surface_rejects_mutating_action"              # INV-24 线上形态（真实 unix socket）
-            "unknown_actions_default_to_the_read_only_channel" # INV-24 静默提权防护
-            "an_unreachable_socket_is_classified_as_a_transport_failure" # INV-8 失败分类
-            "helper_unavailable_and_operation_failure_get_different_exit_codes" # INV-8 退出码可区分
-            "login_with_wrong_password_returns_indistinguishable_401" # INV-23
-            "public_mode_reads_never_fall_back_to_sudo"       # INV-26
-            "business_error_never_falls_back"                 # INV-25
-            # ── Phase 2：中继 SSRF 与开放中继 ──
-            "dials_the_pinned_ip_while_verifying_the_original_hostname" # INV-14
-            "certificate_verification_is_actually_enforced"   # INV-14 反例守卫
-            "wrong_sni_fails_verification"                    # INV-14 反例守卫
-            "pinned_target_never_carries_a_hostname_into_the_dial_path" # INV-14
-            "transparent_proxy_fake_ip_range_is_not_routable" # INV-14/INV-19
-            # 内嵌 IPv4 的 IPv6 形式（mapped / 6to4 / Teredo）里藏着一个 v4 地址，
-            # 而 v6 的属性判定看不见它：`::ffff:127.0.0.1` 既不是 v6 loopback，
-            # `is_private()` 也是 false，不拆就一路穿过全部 v4 规则打到本机。
-            "an_ipv4_mapped_address_is_screened_as_the_address_it_embeds" # INV-14/INV-15
-            "six_to_four_and_teredo_addresses_are_screened_through_their_embedded_ipv4" # INV-14/INV-15
-            "empty_domain_table_fails_closed"                 # INV-17
-            "unauthenticated_foreign_recipient_is_rejected"   # INV-17
-            "rejects_plaintext_relay_with_the_documented_message" # INV-13
-            "port_465_with_starttls_still_requires_wrappermode" # INV-20
-            "port_465_relay_enables_wrappermode_on_the_route" # INV-20
-            "direct_route_is_never_used_as_a_fallback_when_relay_exists" # INV-21
-            "direct_verdict_follows_the_probe_not_the_local_submission_endpoint" # INV-19
-            # ── Phase 2：落地顺序、回读校验与回滚 ──
-            "refuses_to_write_anything_when_the_test_did_not_pass" # §5.9.5 第 1 步
-            "readback_mismatch_is_reported_and_rolled_back"        # INV-16
-            "write_failure_triggers_rollback_to_previous_values"   # INV-16
-            "persistent_storage_failure_reports_rollback_as_incomplete" # INV-16 诚实上报
-            "wrappermode_is_written_for_465_during_apply"          # INV-20
-            # ── Phase 2：真实落盘载体 ──
-            "native_store_end_to_end_apply_and_readback"           # INV-16 真实落盘
-            "native_store_end_to_end_writes_wrappermode_for_465"   # INV-20 真实落盘
-            "native_store_rollback_restores_the_file_on_disk"      # INV-16 真实回滚
-            "native_store_writes_0600_because_it_holds_credentials" # 凭证权限
-            "native_store_reports_corrupt_file_instead_of_treating_it_as_empty"
-            "postfix_store_full_apply_sequence_is_correct"         # §5.9.5 顺序
-            "postfix_store_readback_mismatch_triggers_rollback"    # INV-16
-            "postfix_store_writes_credentials_0600"                # key_permission_scan 要求
-            "postfix_store_writes_credentials_atomically_then_runs_postmap" # §5.9.6 顺序
-            "rollback_removes_keys_that_were_originally_absent"    # 安全：回滚不得写空串
-            # ── Phase 2：投递队列（§5.8；风险表「队列原子性 / 重试风暴 / 退信语义」） ──
-            "queue_survives_restart_without_losing_entries"        # §5.8 持久化，重启不丢
-            "queue_writes_are_atomic_and_leave_no_partial_files"   # 队列原子性（fsync+rename）
-            "queue_files_are_owner_only"                           # 队列含邮件正文 → 0600
-            "corrupt_queue_files_are_quarantined_not_dropped"      # 坏条目隔离而非静默丢弃
-            "nominal_delay_grows_exponentially_and_is_capped"      # §5.8 指数退避
-            "different_entries_do_not_retry_in_lockstep"           # 重试风暴：退避去共振
-            "permanent_failure_bounces_immediately_without_retry"  # 5xx 不重试
-            "transient_failures_retry_then_bounce_after_the_retry_limit" # §5.8 超阈值退信
-            "bounce_is_never_generated_for_a_null_sender"          # 双退信回环防护
-            "dsn_entries_are_never_bounced_again"                  # 双退信回环防护
-            "bounces_use_the_same_outbound_route_as_user_mail"     # INV-21
-            "dsn_sanitises_server_text_against_header_injection"   # 退信头注入防护
-            "consecutive_outbound_failures_produce_the_blocked_verdict" # R-25-3 明确结论
-            "blocked_queue_fast_fails_instead_of_hammering"        # R-25-3 快速失败
-            "blocked_verdict_survives_restart"                     # R-25-3 结论跨重启
-            "concurrency_is_bounded_by_relay_concurrency"          # §5.9.8 并发上限
-            "default_concurrency_matches_the_settings_schema"      # §2.6 relayConcurrency=20
-            "metrics_snapshot_exposes_backlog_concurrency_and_health" # §5.9.8 指标可见
-            "direct_route_fails_loudly_and_never_falls_back_to_the_relay" # INV-18/INV-21
-            # ── Phase 2：直投（MX 解析；RFC 5321 §5.1、RFC 7505） ──
-            # 优先级只决定尝试顺序；同优先级必须稳定可复现
-            "records_are_ordered_by_preference_not_left_in_answer_order"
-            # null MX（`MX 0 .`）是「本域不收信」的明确声明，必须退信而不是重试
-            "a_null_mx_is_permanent_and_reported_as_such"
-            "a_null_mx_is_a_permanent_failure_not_a_retry"
-            # INV-15 的直投侧：收件域不能用 MX 记录把本机变成内网扫描器
-            "an_unroutable_mx_is_rejected_by_the_address_policy"
-            "direct_delivery_is_refused_when_the_mx_points_into_private_space"
-            # 一台 MX 不可用不影响其余的
-            "one_unusable_mx_does_not_hide_the_next_one"
-            # 直投链路上没有凭证：即便被误配了也绝不能发出去
-            "direct_delivery_follows_the_mx_and_never_sends_credentials"
-            # DATA 终止符必须是 CRLF.CRLF（少一个 CRLF 会导致永久投递超时），
-            # 且正文已以 CRLF 结尾时不得多补空行（否则改写正文、破坏上游 DKIM）
-            "data_is_terminated_with_crlf_dot_crlf_and_the_body_is_never_rewritten"
-            "unknown_transport_errors_are_retryable_never_bounces" # 未知结果不得退信
-            "recipients_accepted_by_a_partial_delivery_are_not_retried_or_bounced" # 部分成功不得重放
-            # ── Phase 2：数据层 store（§2.5 表文件、§3.5 LMTP；INV-11） ──
-            "domain_add_rejects_newline_injection"                 # 表文件注入
-            "alias_add_rejects_newline_injection_into_the_table"   # 基线点名的注入（换行）
-            "alias_add_rejects_space_separated_injection"          # 基线点名的注入（空格）
-            "delete_alias_validates_the_id_before_writing"         # 删除路径同样要校验
-            "delete_domain_also_removes_its_aliases"               # 不留孤儿路由
-            "domain_add_writes_the_postfix_hash_format_and_runs_postmap" # §2.5 格式 + postmap
-            "reads_one_reply_per_recipient_after_data"             # LMTP 特有：DATA 后逐收件人应答
-            "connection_failure_is_reported_as_an_error_not_a_silent_success" # INV-11：非 250 即失败
-            "transport_reports_partial_success_so_nothing_is_delivered_twice" # 防重复投递
-            # ── §5.7.4：服务控制的降级链（非 systemd 主机上静默不重载的防护） ──
-            "service_ctl_prefers_systemctl_when_systemd_is_present"
-            "service_ctl_does_not_use_systemctl_without_the_systemd_runtime_dir"
-            "service_ctl_falls_back_to_rc_service_and_maps_reload_to_restart"
-            "service_ctl_falls_back_to_the_init_script"
-            "service_ctl_is_a_no_op_when_nothing_applies"
-            "is_service_active_keeps_probing_after_a_failed_backend"
-            "postmap_sequence_matches_the_python_order"            # 写表后必须编译 hash 表并重载
-            # ── Phase 2：认证与签名（§3.3、§5.8；替代 OpenDKIM） ──
-            # p= 必须是 SPKI：mail-auth 验签侧两种都容忍，错了本地自检照样绿（见 §5.2.1）
-            "public_key_is_spki_not_pkcs1"
-            "spki_wrapping_is_exactly_the_pkcs1_plus_a_fixed_header"
-            # .txt 是多行带引号的 zone 片段，拼接必须还原完整公钥（network.py:115 的截断事故）
-            "zone_fragment_round_trips_after_stripping_quotes_and_whitespace"
-            # 私钥加固：0640 root:opendkim，且绝不 world-readable
-            "rotated_private_key_is_never_world_readable"
-            # 本阶段验收：同一密钥对发出的邮件必须自验通过；改动正文必须验不过
-            "a_message_signed_with_a_key_pair_verifies_with_the_same_pair"
-            "a_tampered_body_fails_verification"
-            # SPF / DMARC / ARC 的 fail-closed 判据
-            "a_matching_ip_passes_and_a_stranger_ip_does_not"
-            "an_unaligned_source_fails_a_reject_policy"
-            "a_message_without_arc_headers_reports_none_rather_than_pass"
-            "a_truncated_arc_header_is_rejected_instead_of_being_ignored"
-            # ARC 封印（RFC 8617 §5）：自封必须能自验；二次封印必须递增 i= 且 cv=pass
-            "a_sealed_message_verifies_as_an_arc_pass_and_keeps_the_original_bytes"
-            "sealing_twice_extends_the_chain_instead_of_replacing_it"
-            # 反例守卫：篡改正文后不得判 pass
-            "a_tampered_body_fails_arc_verification_after_sealing"
-            # 失败关闭：私钥不可用 / 报文不可解析一律拒绝，不产出半成品
-            "an_unusable_key_or_message_is_refused_rather_than_half_sealed"
-            # 防漂移：MS 的 h= 必须是 DKIM 默认集 + DKIM-Signature，且不含任何 ARC-*
-            "the_arc_header_set_is_the_dkim_set_plus_the_dkim_signature_header"
-            # 对外契约：域名 / selector 的报错文案与 Python 基线逐字一致
-            "domain_and_selector_validation_uses_the_python_contract"
-            "from_domain_handles_display_names_brackets_and_folding"
-            # ── Phase 2：DKIM 签名接进出站路径（§5.8） ──
-            # 结构性保证：远端传输被无条件套上签名装饰器，未签名的出站路径不可表达
-            "the_signed_bytes_are_what_the_inner_transport_receives"
-            "not_applicable_passes_the_entry_through_unchanged"
-            "an_uninitialised_host_reports_not_applicable_rather_than_failing"
-            # 失败关闭：该签却没签成时绝不发出未签名邮件，且必须算作本机故障
-            "a_signing_failure_is_fail_closed_and_marked_as_a_local_fault"
-            "a_broken_key_fails_instead_of_silently_sending_unsigned"
-            "a_signing_failure_defers_without_tripping_the_outbound_verdict"
-            # 只签本机负责的域，不替别人的域背书
-            "a_real_key_signs_covered_senders_and_leaves_foreign_senders_unsigned"
-            # ── Phase 2：入站 SMTP 服务端（§5.10；INV-17） ──
-            # 反中继 fail-closed（服务端落点）
-            "unauthenticated_foreign_recipient_is_rejected_with_the_policy_text"
-            "an_empty_domain_table_rejects_rather_than_relaying"
-            # SMTP 走私：事务边界不得比上游更宽松
-            "normalization_rejects_a_bare_lf_that_would_create_the_terminator"
-            "a_bare_line_feed_is_rejected_under_the_reject_policy"
-            "the_terminator_is_recognised_across_any_chunk_boundary"
-            "a_split_crlf_dot_crlf_is_not_mistaken_for_body_content"
-            # 注入与资源耗尽
-            "crlf_inside_a_command_cannot_smuggle_a_second_command"
-            "control_characters_in_text_cannot_forge_a_second_reply"
-            "an_endless_line_cannot_exhaust_memory"
-            # 会话错位（超限 / 流水线）
-            "oversized_messages_are_reported_once_then_drained"
-            "an_oversized_message_is_refused_and_the_session_stays_in_sync"
-            "commands_pipelined_after_the_data_terminator_are_not_lost"
-            # 先落盘再回 250
-            "the_sink_runs_before_the_250_is_sent"
-            # 事务序列与命令语义
-            "commands_before_helo_are_out_of_sequence"
-            "vrfy_is_always_refused"
-            "auth_over_a_plaintext_session_is_refused"
-            # ── Phase 2：提交端口 SASL（§3.5、RFC 4954；INV-17 的提交侧） ──
-            # 明文连接上不得认证（否则口令明文上路）
-            "sasl_is_an_esmtp_extension_so_helo_sessions_cannot_authenticate"
-            # 只有认证明白地翻转了「能不能中继」，587 才不是空壳
-            "authentication_is_what_unlocks_relaying_to_a_foreign_domain"
-            "an_authenticated_submission_may_relay_to_a_foreign_domain"
-            "a_rejected_credential_does_not_grant_relay"
-            # 认证成功后不得再次认证（RFC 4954 §4）
-            "a_successful_auth_sets_the_identity_and_a_second_attempt_is_refused"
-            # 凭据应答会被拼进 Dovecot 的**制表符分隔**协议行：非 base64 一律不得转发
-            "a_sasl_response_that_is_not_base64_never_reaches_the_auth_backend"
-            "a_bare_auth_gets_an_empty_challenge_and_the_continuation_must_be_base64"
-            # 后端抖动（454）与凭据错（535）必须可区分，否则客户端会去改密码
-            "an_unreachable_auth_backend_yields_454_and_never_535"
-            "a_dovecot_temporary_failure_surfaces_as_454_and_keeps_the_peer_unauthenticated"
-            # 真实 TCP + TLS + auth socket 的完整链路
-            "a_submission_over_implicit_tls_authenticates_against_a_dovecot_auth_socket"
-            # ── Phase 2：入站 TLS（§5.10；TLS 1.2 起） ──
-            "only_tls_12_and_13_are_offered"                    # 版本策略：无 1.0/1.1
-            "a_client_that_only_speaks_tls12_can_still_connect" # 真实握手证明下界可用
-            "missing_material_is_refused_instead_of_starting_without_tls"
-            "an_empty_certificate_file_is_refused"
-            "cert_paths_reject_traversal_domains"               # 证书路径不得被穿越
-            "contradictory_tls_configuration_is_refused_at_construction"
-            "starttls_returns_the_upgrade_outcome_and_discards_pipelined_plaintext" # 明文注入
-            "an_upgraded_session_never_repeats_the_220_greeting"
-            "starttls_upgrades_in_place_and_the_session_restarts_at_ehlo"
-            "implicit_tls_handshakes_before_the_greeting"
-            # ── Phase 2：连接限速（替代 fail2ban 的限速半边） ──
-            "a_burst_is_allowed_then_the_bucket_runs_dry"
-            "a_backwards_clock_does_not_grant_tokens"           # 时钟回拨不得白送额度
-            "the_table_is_bounded_by_max_entries"               # 限速表自身不得被撑爆
-            "connections_beyond_the_burst_are_refused_with_421"
-            # ── Phase 2：IP 自动封禁（替代 fail2ban 的封禁半边） ──
-            "reaching_the_threshold_issues_a_temporary_ban"
-            "repeated_offences_escalate_to_a_permanent_ban_that_never_expires"
-            "failures_while_already_banned_do_not_self_escalate" # 不得自我叠加成永久
-            "the_table_is_bounded_and_never_drops_a_permanent_ban"
-            "repeated_rate_limit_triggers_ban_the_address"
-            "tls_handshake_failures_accumulate_into_a_ban"
-            # ── Phase 2：入站认证与入队（SPF / DKIM / DMARC） ──
-            "crlf_in_injected_values_cannot_forge_a_new_header"  # Authentication-Results 头注入
-            "a_control_character_in_the_hostname_cannot_break_framing"
-            "a_dmarc_fail_under_a_reject_policy_is_refused_and_not_enqueued" # DMARC 策略
-            "a_non_utf8_body_is_refused_rather_than_silently_corrupted"      # 不得有损转换
-            "a_dmarc_aligned_message_is_enqueued_with_an_authentication_results_header"
-            "a_verified_message_enters_the_queue_end_to_end"    # 全链路：TCP→认证→入队
-            # ── Phase 2：守护进程装配（bin/mailstackd） ──
-            # 25/465/587 三个监听必须共用**同一份**限速配额与封禁表；
-            # 各端口各记一份账的话，轮换端口就能绕过限速、strike 也永远攒不满。
-            "servers_sharing_a_limiter_use_one_budget_across_listeners"
-            # ── Phase 4：2FA（§5.5；INV-5 / INV-29 / INV-32） ──
-            # INV-5：secret 只以 AES-256-GCM 信封落盘，明文绝不出现
-            "begin_writes_a_pending_envelope_and_never_the_plaintext_secret"
-            "envelope_round_trips_and_binds_to_the_master_key"   # 换密钥必须解不开
-            "envelope_rejects_tampering_of_any_component"        # 密文/tag/nonce 任一被改即失败
-            "master_key_is_created_once_and_only_readable_by_its_owner" # 0600 且读路径不造密钥
-            "unknown_envelope_version_is_refused_instead_of_guessed"    # 不做「尽力解析」
-            # 正确性锚：RFC 4226 Appendix D 的十条向量
-            "hotp_matches_the_rfc4226_vectors"
-            # INV-29：一张恢复码只能被消费一次
-            "a_recovery_code_can_only_be_consumed_once"
-            "malformed_recovery_input_never_touches_the_stored_codes"
-            # INV-32：整个读-改-写在同一把锁内 ⇒ 并发只能花掉一张
-            "concurrent_recovery_consumption_spends_exactly_one"
-            # 失败关闭：确认码不对就不置位、也不签发恢复码（否则账号被锁死）
-            "enable_requires_a_correct_code_and_only_then_issues_recovery_codes"
-            "begin_is_refused_while_already_enabled"
-            # 未启用 / pending 一律不得放行
-            "verify_rejects_everything_when_two_factor_is_not_enabled"
-            # 「码不对」是结论而不是错误，否则登录侧会误报 503（INV-23 的配套）
-            "totp_verify_reports_a_wrong_code_as_a_conclusion_not_an_error"
-            # 用户抄录的格式差异（空格/连字符/小写）不得让正确的码失效
-            "recovery_codes_tolerate_human_formatting"
-            # INV-30 的另一面：改密不得让 2FA 失效
-            "changing_the_password_keeps_two_factor_working"
-            # 2FA 的 HTTP 面已接线（404 表示路由没挂上）
-            "two_factor_state_is_served_in_process_and_the_write_routes_are_wired"
-            # 全表守卫：**每一个已实现的特权动作**都必须有已接线的契约路由，
-            # 且该路由必须落在认证层之后（未带会话时回 401，而不是 404 或其他）。
-            # 前者防「已实现却点不到」，后者防「动作路由被误挂到免认证面」。
-            "every_implemented_action_route_is_wired_and_behind_auth"
-            # 进程内遥测路由（action 为 None）不在上面那条守卫的覆盖范围里，
-            # 这条单独钉住它：同样受认证保护，且响应是遥测对象本身。
-            "telemetry_is_served_in_process_and_returns_the_raw_object"
-            # ── Phase 4：写面（特权动作真正的落点） ──
-            # INV-43 在**动作面**的落点：白名单之外的键绝不写入
-            "settings_set_applies_only_the_whitelisted_keys"
-            "settings_set_refuses_a_patch_that_is_not_an_object"
-            # INV-30 在动作面的落点：普通改密不得静默关掉 2FA
-            "admin_set_preserves_two_factor_through_the_registry"
-            # 表写入的对外形态：写表 → postmap → 重载；删域名不留孤儿别名
-            "domain_and_alias_writes_round_trip_through_the_registry"
-            # 基线缺陷守卫：裸字符串目标**不得**被逐字符展开成多个目标
-            "a_single_string_destination_is_never_expanded_into_characters"
-            "alias_add_rejects_a_non_string_destination"
-            # 失败关闭：参数缺失/非法时明确报错且**不产生副作用**
-            "write_actions_report_missing_fields_instead_of_guessing"
-            "dkim_rotate_validates_before_generating_anything"
-            # ── Phase 4：只读聚合面（snapshot / logs / metrics / certs / probe / doctor） ──
-            # 读不到的部分必须**显式出现**在结果里；静默省略会被界面渲染成「没有数据」，
-            # 而真相是「读不到」—— 这两者对运维的含义正好相反。
-            "snapshot_reports_what_it_cannot_read_instead_of_omitting_it"
-            "metrics_realtime_marks_missing_proc_entries_rather_than_reporting_zero"
-            "logs_list_says_unavailable_instead_of_returning_an_empty_list"
-            # MemFree 顶替 MemAvailable 会低估可用内存；宁可报「读不到」
-            "missing_mem_available_is_reported_rather_than_guessed"
-            # 出站结论必须与管理台共用同一份算法（含持久化的失败计数）
-            "snapshot_surfaces_the_persisted_outbound_verdict"
-            "snapshot_counts_backlog_and_quarantined_entries"
-            # 证书：到期天数是这张表存在的理由；解析不了必须说明原因
-            "a_certificate_reports_its_expiry_in_days"
-            "certs_list_flags_the_soon_expiring_ones"
-            "an_unparseable_certificate_reports_why_instead_of_pretending_it_is_fine"
-            "a_group_or_world_readable_private_key_is_flagged"
-            "name_attributes_use_openssl_style_short_names"
-            # 只读接口不得被用来探测任意主机（SSRF）；端口与行数都要夹取
-            "network_check_port_never_accepts_targets_from_the_request"
-            "network_check_port_rejects_out_of_range_ports"
-            "logs_lines_are_clamped_at_both_ends"
-            # 诊断必须无副作用：封禁探针跑在新建的内存表上
-            "system_doctor_probes_the_ban_list_and_leaves_no_trace"
-            "system_doctor_reports_each_broken_precondition"
-            "system_doctor_passes_when_the_host_is_fully_configured"
-            # ── Phase 4：敏感文件权限体检（security.scan；基线的 key_permission_scan） ──
-            "security_scan_flags_a_world_readable_secret_as_high"
-            # 判据是「超出**这份文件该有的**权限」，不是「有没有 world 位」——
-            # 否则 0644 的域名表会天天报 world_readable，噪音一多就没人看了
-            "a_file_that_stays_within_its_policy_is_clean"
-            # 可写比可读严重：攻击者不必读走机密就能篡改内容
-            "a_world_writable_file_outranks_being_world_readable"
-            "a_world_readable_secret_is_high_severity"
-            "group_writable_is_reported_explicitly"
-            # 未配置的组件（中继、证书、主密钥）是正常状态，不是问题；但要能被区分
-            "a_missing_path_is_listed_as_absent_not_as_a_finding"
-            "security_scan_is_clean_when_every_permission_matches_the_policy"
-            "security_scan_reports_the_config_directory_itself"
-            # 明文中继口令必须在清单里（基线点名要求扫它）
-            "the_inventory_covers_the_plaintext_relay_password_and_every_key_kind"
-            "findings_are_ordered_most_severe_first"
-            # 备份：0 字节的归档必须被标出来，否则一次失败的备份看起来是成功的
-            "backup_list_reports_size_and_flags_an_empty_archive"
-            "backup_list_on_a_missing_directory_is_empty_not_an_error"
-            # ── Phase 4：让安全测试不再依赖网络（DMARC 的 DNS 树走查，RFC 9989 §4.10） ──
-            # mail-auth 0.13 会从 From 域逐级向上查到顶级域；只缓存首级的话，
-            # 走查到 `_dmarc.<tld>` 时缓存未命中就去发真实 DNS，网络抖动时
-            # 整条 DMARC 判定退化成 temperror —— 这些安全测试必须完全离线可跑。
-            "pinning_the_dmarc_walk_blocks_every_ancestor_level"
-            "pinning_never_overwrites_an_explicit_record"
-            # SPF 是「EHLO + MAIL FROM 双身份」语义，**先查 HELO 域**（`Sender::Full`）；
-            # 只注入 MAIL FROM 域的记录时，HELO 域那一次仍会去打真实 DNS —— 收信侧
-            # 的入队集成测试因此会在 Clash fake-IP 下随机 5 秒读超时。
-            "pinning_a_name_absent_terminates_spf_and_dmarc_lookups_in_cache"
-            # ── Phase 4：控制台的写面（services.action / queue.action） ──
-            # 安全：控制台不得停掉承载自己的服务 —— 停了之后没有任何途径再拉起来。
-            "services_action_refuses_to_stop_the_console_from_itself"
-            # 安全：队列 id 同时是文件名，路径穿越必须在拼路径之前就被挡死。
-            "queue_action_rejects_traversing_ids_and_unknown_verbs"
-            # ── Phase 4：手工封禁（文件持久化 + 守护进程热重载） ──
-            # 安全：一次重载若顺手清掉自动封禁，等于把正在攻击的地址全部放行。
-            "reloading_the_file_never_lifts_automatic_bans"
-            # 安全：封禁文件读失败时必须保持现状 —— 当成空集合就是静默解封。
-            "a_corrupt_file_leaves_the_current_bans_untouched"
-            # 安全：损坏的封禁文件绝不能被当成空列表，更不能被覆盖写。
-            "a_corrupt_file_is_never_treated_as_empty_and_is_never_overwritten"
-            # 安全：封禁表决定谁可以连 SMTP，权限放宽必须被体检报出来。
-            "security_scan_flags_a_world_readable_ban_file"
-            # 安全：封禁入力必须能拒绝一切非地址，避免把垃圾写进封禁表。
-            "security_ban_rejects_anything_that_is_not_an_address"
-            # ── Phase 4：备份恢复（归档是不可信输入） ──
-            # 路径穿越：成员名里的 `..` / 绝对路径 / 空分量必须全部挡在落地之前。
-            "archive_members_outside_the_allowlist_are_rejected"
-            "resolve_refuses_names_that_escape_the_backup_directory"
-            # 链接攻击：归档里夹带符号链接，就是让后续成员顺着它写出去。
-            "a_symbolic_link_inside_the_archive_is_refused"
-            # 元数据攻击：设备节点与 setuid 位不该出现在备份里。
-            "a_character_device_inside_the_archive_is_refused"
-            "a_member_with_a_setuid_bit_is_refused"
-            # 家目录白名单为空时必须全拒（用户模型未落地前的 fail-closed）。
-            "home_members_are_rejected_until_a_user_model_exists"
-            # 篡改与确认：校验和不符不得落地任何文件；恢复必须显式确认。
-            "a_tampered_archive_fails_the_checksum_before_anything_lands"
-            "backup_restore_requires_explicit_confirmation_and_a_known_filename"
-            # 没要求含机密时，明文凭证不得进入归档。
-            "backup_create_excludes_secrets_unless_explicitly_asked"
-            # ── Phase 4：初始化向导（setup.*） ──
-            # 校验必须发生在**任何副作用之前**：被拒的请求不得留下 setup.json 或密钥目录。
-            "setup_identity_apply_rejects_bad_input_without_any_side_effect"
-            # 返回的公钥必须与落盘的 .txt 里的 p= 一致，否则向导展示的是一份对不上号的记录。
-            "setup_identity_apply_writes_setup_json_and_returns_the_publishable_key"
-            # 「先测后写」的动作面落点（§5.9.5 第 1 步）：测试不过一行配置都不写。
-            "setup_relay_apply_leaves_the_config_untouched_when_the_test_fails"
-            "setup_relay_apply_never_overwrites_the_previous_config_when_the_test_fails"
-            # 参数校验在任何网络行为之前；被拒的请求不得触碰探针。
-            "setup_relay_test_rejects_malformed_requests_before_any_probe"
-            # INV-15 的动作面落点：公网档下私网中继一律拒绝。
-            "setup_relay_test_refuses_a_private_relay_when_the_deployment_disallows_it"
-            # 「DNS 里没有」是结论，「查询故障」才是错误；两者不得互相冒充。
-            "setup_dns_verify_reports_missing_records_as_unverified_not_as_an_error"
-            "setup_dns_verify_surfaces_a_resolver_failure_instead_of_calling_it_unpublished"
-            # 两条 v=spf1 会被收信方按 RFC 7208 判 permerror，必须被挡在向导里。
-            "setup_dns_verify_rejects_a_second_spf_record"
-            # 回归守卫：截断的 DKIM 公钥不得被判为「已发布」（network.py:115 的事故）。
-            "a_truncated_dkim_key_is_not_accepted_as_published"
-            # ── Phase 4：邮件环路自检（setup.mail.test / mail.test_loopback） ──
-            # 提交目标只能是硬编码常量，不得来自请求体（否则就是一个任意主机的发信器）。
-            "the_submission_endpoint_is_the_hardcoded_loopback_constant"
-            # 反中继（基线 CHANGELOG 记录的 P0）：空域名表必须直接拒绝，不得对互联网投信。
-            "mail_test_loopback_requires_a_managed_domain"
-            "mail_test_loopback_refuses_a_foreign_recipient"
-            # 没被接受就绝不报成功；被拒的请求不得发出任何邮件。
-            "mail_test_loopback_never_reports_success_when_the_submission_fails"
-            "setup_mail_test_never_reports_queued_when_the_mta_rejects_it"
-            "setup_mail_test_rejects_malformed_addresses_before_submitting"
-            # 受管邮箱存在性 / 锁定检查真实执行（`users.*` 已移植），且正文必须是 CRLF。
-            "setup_mail_test_submits_with_crlf_and_enforces_the_mailbox_checks"
-            # Maildir 找不到是「没有额外证据」，不是投递失败。
-            "a_missing_maildir_is_not_found_rather_than_an_error"
-            "mail_test_loopback_reports_a_missing_maildir_as_absent_evidence_not_failure"
-            # ── Phase 3：管理前端接入（响应形状、RPC 桥、列表动作、静态托管） ──
-            # 成功响应必须是**裸对象**。套 `{ok,data}` 会让前端对非列表动作（snapshot /
-            # settings.get / users.status…）一个字段都读不到，而界面上看不出异常。
-            "success_body_is_the_bare_object_without_an_ok_wrapper"
-            # 桥的形状与 REST 相反且必须相反：前端 bridge() 按 body.ok / body.data 拆包。
-            "rpc_bridge_shapes_are_the_opposite_of_the_rest_routes"
-            # RPC 桥的动作名来自请求体，是本项目唯一的例外；允许集必须严于助手白名单，
-            # 只被登录流程内部使用的 admin.totp.verify 不得从 HTTP 面可达。
-            "the_rpc_bridge_only_exposes_actions_that_already_have_a_route"
-            # 新增的 8 个列表动作必须真的是纯读，不得落进变更面（那等于给列表开特权通道）。
-            "every_added_list_action_is_pure_read"
-            "the_frontend_list_actions_are_registered"
-            # 前端按 `{id, op}` 提交队列动作：少认一个 `op`，`delete` 会静默退化成
-            # 「立刻重新投递」—— 一次「删除邮件」变成「把邮件发出去」，且两边都不报错。
-            "queue_action_accepts_the_frontend_field_names"
-            "queue_action_maps_deliver_to_retry_and_refuses_hold"
-            "services_action_accepts_the_frontend_field_names"
-            # 前端用 address/name/active 称呼邮箱三要素；认不出时给的是「不是受管用户」，
-            # 看起来像权限问题而不是参数问题。
-            "the_frontend_field_names_address_and_name_are_understood"
-            "add_accepts_the_frontend_address_field"
-            # ── Phase 3：`mailstack-web` 服务入口与前端产物托管 ──
-            # `/api` 的兜底永远不能是 SPA 的 index.html，否则「接口不存在」会被前端
-            # 报成「解析失败 / 服务端坏了」。
-            "an_unknown_api_path_is_json_404_and_never_the_spa"
-            "api_paths_are_never_served_as_spa"
-            # 产物目录下的路径来自 URL：`..` 与绝对路径必须挡死。
-            "traversal_and_odd_segments_are_rejected"
-            # 「没部署前端」是 503（服务不可用），不是空白 200。
-            "a_missing_bundle_reports_503_instead_of_a_blank_page"
-            # 这个进程返回的大多数响应都是静态文件，安全响应头漏掉它们等于没加。
-            "static_responses_still_carry_the_security_headers"
-            # 内容类型必须按**解析后的文件名**判定：按 URL 判会让首页（`/` 无扩展名）
-            # 拿到 application/octet-stream，浏览器把整个管理界面下载下来而不是渲染。
-            # 这条是端到端冒烟测出来的，单元测试曾因「URL 与文件名都带 .js」而掩盖它。
-            "the_bundle_entry_is_served_as_html_not_octet_stream"
-          )
-          missing=0
-          # 扫描范围含 bin/：那里也承载安全断言（如 mailstackctl 的退出码契约）。
-          # 只扫 crates/ 会让 bin/ 下的断言「加了等于没加」。
-          for name in "${required[@]}"; do
-            if grep -rq "fn $name" crates/ bin/; then
-              echo "OK   $name"
-            else
-              echo "MISS $name"
-              missing=1
-            fi
-          done
-          if [ "$missing" -ne 0 ]; then
-            echo "::error::关键不变量测试缺失，门禁失败"
-            exit 1
-          fi
+          # 6.8：清单与判定逻辑都只有一份 —— deploy/required-invariants.txt +
+          # deploy/verify-invariant-gate.sh。原先这里内联了 277 条名字和一份
+          # 独立的 grep 判定，与本地脚本必然漂移。
+          #
+          # 6.2：判定已加强 —— 名字必须落在真正带 #[test] / #[tokio::test]
+          # 的函数上，且函数体内至少有一个断言。原先的 `grep -rq "fn $name"`
+          # 是子串匹配、不要求是测试、不检查断言，把测试掏空成空壳也照样通过。
+          bash deploy/verify-invariant-gate.sh
 
       - name: 不变量测试必须真正通过（不允许 ignore）
         run: |

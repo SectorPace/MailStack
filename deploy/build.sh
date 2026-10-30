@@ -74,18 +74,28 @@ cargo "${CARGO_ARGS[@]}"
 
 step "4/6 收集产物"
 mkdir -p "$DIST_DIR"
-BINS=(target/release/mailstackd target/release/mailstackctl)
+# 6.6：原先这里漏了 `mailstack-web`，而它明确是 workspace 的一个 bin（`bin/mailstack-web`，
+# 包名 `mailstack-web-bin`、产物名 `mailstack-web`）。后果不只是「少复制一个文件」：
+# 产物清单、`SHA256SUMS`、SBOM 会随之缺项，而发布包看起来仍然「构建成功」。
+BINS=(target/release/mailstackd target/release/mailstackctl target/release/mailstack-web)
 FOUND=0
+MISSING=()
 for bin in "${BINS[@]}"; do
   if [ -f "$bin" ]; then
     cp -f "$bin" "$DIST_DIR/"
     echo "已收集 $(basename "$bin") ($(stat -c%s "$bin") 字节)"
     FOUND=$((FOUND + 1))
   else
-    echo "未构建：$bin（该 bin 目标尚未加入 workspace）"
+    echo "未构建：$bin" >&2
+    MISSING+=("$bin")
   fi
 done
-[ "$FOUND" -gt 0 ] || die "没有任何二进制产物；请检查 workspace members"
+# 6.6：原来的判定是 `FOUND -gt 0` —— 只要**任意一个**产物存在就算通过，
+# 于是漏掉一个 bin 也能「构建成功」。交付物清单必须逐个齐全。
+if [ "${#MISSING[@]}" -ne 0 ]; then
+  die "产物不齐，缺少：${MISSING[*]}（workspace 的每个 bin 都必须产出）"
+fi
+[ "$FOUND" -eq "${#BINS[@]}" ] || die "产物数量不符"
 
 step "5/6 SHA256SUMS"
 ( cd "$DIST_DIR" && sha256sum ./* > SHA256SUMS )

@@ -810,20 +810,22 @@ pub enum Lookup { Known, Missing, Unavailable(String) }
 
 ### 5.3 批 6：工程化（CI / deploy / 架构）
 
-> 🟡 **批 6 已修 5/16**：6.10、6.11、6.13、6.14、6.15 已修；6.16 在批 3 已修。
-> **未修：6.1–6.9（CI 供应链 / deploy 脚本）与 6.12（TOTP 主密钥竞态）。**
+> ✅ **批 6 已全部修复（16/16）**；6.16 早在批 3 修完。
 >
-> 已修 5 条的修法与反例测试：
->
-> | # | 修法 | 反例测试 |
+> | # | 修法 | 反例 / 验证 |
 > |---|---|---|
-> | **6.10** | 新增 `read_last_audit_hash_strict`：文件不存在/为空 → 创世值；非空但读不出尾 hash → **报错**。原先 `unwrap_or_else(\|\| AUDIT_GENESIS)` 会把 truncate/权限错误伪装成「新链第一写」，静默分叉审计链 | `a_non_empty_but_unreadable_log_is_an_error_not_a_fresh_chain`、`an_absent_or_empty_log_still_starts_from_genesis` |
-> | **6.11** | 追加日志行后先 `sync_all` 再写 `.head` 锚。原先两者无序：掉电可能落成「锚已更新、日志行没落盘」，下次 `audit_verify` 就把**完好日志**判成截尾篡改（假告警） | 由既有 `detects_truncated_tail_via_anchor` / `chain_starts_from_genesis_and_advances` 覆盖 |
-> | **6.13** | `enabled` 键改为**整串**匹配（原先 `starts_with("enabled")`，`enabledx=1` 也会打开 AI 出站 —— 而这本该 fail-closed） | `only_an_exact_enabled_key_turns_ai_outbound_on` |
-> | **6.14** | `apply_settings_patch` 先反序列化再声称「已应用」：整包失败则回报空列表 + `warn`。原先「API 说 2 个键已应用 / 磁盘一字未变」且无告警 | `a_rejected_settings_patch_reports_no_applied_keys`、`a_valid_settings_patch_still_reports_its_keys` |
-> | **6.15** | 新增 `sanitized_domain`：去掉 `<>` 与空白、折叠小写，再用于 DMARC 对齐。原先裸 `rsplit_once('@')` 会让 `<User@Example.COM>` 切出 `Example.COM>`，对齐静默失败后被按 `p=reject` 处置 | `mail_from_domain_is_sanitised_before_dmarc_alignment` |
+> | **6.1** | 新增 `deny.toml`（advisories deny / 许可白名单 / 禁止通配依赖 / 只允许 crates.io）；`cargo-deny` 去掉 `continue-on-error`；`cargo audit` 去掉两处 `|| true` | 白名单由本机 **449 个 crate 的 32 种许可证表达式实测归纳**；CI YAML 结构由 python 脚本校验 |
+> | **6.2** | 门禁从 `grep -rq "fn $name"` 升级为三项校验：函数存在 + **带 `#[test]`/`#[tokio::test]`** + 函数体内**至少一个断言** | 负例实测：普通函数名 → `NOT_TEST`；测试掏空成空壳 → `NO_ASSERT`，两次都正确变红 |
+> | **6.3** | 四个 action 全部 pin 到 **40 位 commit SHA**；workflow 级 `permissions: contents: read`；三处 checkout 加 `persist-credentials: false` | 逐个核验 SHA 为 commit 对象（rust-cache v2=2.9.3 PGP 已验证；cargo-deny-action v2=2.1.1 **unsigned**，故 SHA 是唯一完整性依据）；`dtolnay` 的 tag 名即工具链选择器，改为 pin master commit + `with.toolchain: 1.98.1` |
+> | **6.4** | `wsl-install-rust.sh`：`mktemp -d` 私有目录（0700、不可预测）替代可预测的 `/tmp/rustup-init.sh`；支持 `MAILSTACK_RUSTUP_SHA256` 显式钉扎；升为 `set -euo pipefail` | `bash -n` 校验；未设哈希时**明确告警**「仅依赖 HTTPS，未做独立钉扎」而非假装安全 |
+> | **6.5** | 24 个脚本按用途分级：门禁/安装/清理类 → `set -euo pipefail`；探查/诊断类 → `set -uo pipefail`（某条探测失败是预期内的，不能中断） | `bash -n` 全绿；两道门禁在 `set -eo pipefail` 下仍通过 |
+> | **6.6** | `build.sh` 的 `BINS` 补上 `mailstack-web`；判定从 `FOUND -gt 0`（任一产物存在即通过）改为**逐个齐全**，缺一个就 `die` | 产物清单 / SHA256SUMS / SBOM 不再随发布包缺项 |
+> | **6.7** | 6 处硬编码 `/mnt/e/MailStack/mailstack-rust` 全部改为脚本相对路径；代理改为 `${MAILSTACK_PROXY:-...}` | `deploy/` 下 `grep /mnt/e/MailStack` **零命中** |
+> | **6.8** | 277 条清单抽到 `deploy/required-invariants.txt`（唯一数据源），CI 直接调用共享脚本，内联拷贝删除 | python 校验器断言「CI 里不得再出现 `required=(`」 |
+> | **6.9** | `panic = "abort"` → **`unwind`**，并把两处依赖写进 Cargo.toml 注释：① `warn()` 的 `catch_unwind` 只在 unwind 下有效；② **必须**配合 5.19 的非零退出，否则任务 panic 会被 tokio 吞掉变成静默停投 | 注明「若把 5.19 的结果汇总改回只记日志，必须同时改回 abort」 |
+> | **6.10–6.15** | 见 §3B.6 与上一轮记录（审计链严格读尾、fsync、`enabled` 整串匹配、settings patch 静默丢弃、DMARC 信封域清洗、TOTP 主密钥竞态） | 各自配反例测试 |
 >
-> 下表是原始清单（保留作对照，状态以本节说明为准）：
+> 下表是原始清单（保留作对照）：
 
 | # | 位置 | 缺陷 | 影响 |
 |---|---|---|---|
@@ -903,7 +905,7 @@ RCPT 名录的三态判定、A-R 的 RFC 8601 引用 —— 我逐条复核过�
 W='wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0'
 R=/mnt/e/MailStack/mailstack-rust
 
-# 1) 全量测试（应为 1138 passed / 0 failed）
+# 1) 全量测试（应为 1139 passed / 0 failed）
 $W bash $R/deploy/wsl-cargo.sh test --workspace --all-targets
 
 # 2) 三道门禁

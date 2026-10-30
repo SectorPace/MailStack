@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 核实集成测试是否把宿主（WSL）的真实 postfix 配置还原干净。
-set -u
+set -euo pipefail
 export PATH="/usr/sbin:/sbin:$PATH"
 
 echo "=== 测试涉及的键当前值 ==="

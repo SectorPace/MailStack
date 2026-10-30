@@ -1,0 +1,74 @@
+# cargo-deny 配置（6.1）
+#
+# 背景：本项此前是「`cargo-deny` 用 `continue-on-error: true`，且仓库里根本
+# 不存在 `deny.toml`」—— 那个 step 必然失败，而失败被永久吞掉；`cargo audit`
+# 也写成 `|| true`。结果是**供应链门禁实质失效**：有 RUSTSEC 通告也不拦。
+#
+# 现在的策略：
+#   * advisories  —— 漏洞一律 **deny**（这是门禁存在的理由）
+#   * licenses    —— 白名单，未列入即 deny
+#   * bans        —— 禁止通配版本依赖与重复的多数版本
+#   * sources     —— 只允许 crates.io（与规格书 §7「禁止 git 依赖」一致）
+#
+# ⚠️ allow 列表的来源要交代清楚：它由本机 cargo registry 里 **449 个已下载 crate
+# 的 32 种许可证表达式**实测归纳得到（方法：扫描每个 crate 的 Cargo.toml 的
+# `license` 字段并去重）。这是一个**偏宽**的集合 —— 它覆盖的是「本机出现过的
+# 全部许可证」，而不是「本仓库依赖树实际需要的那些」。
+# 首次在 CI 上跑通后，应当用 `cargo deny check licenses` 的实际输出把它收窄到
+# 真正需要的最小集；**收窄是后续动作，不能反过来把门禁继续关掉**。
+
+[graph]
+# 只检查目标平台实际会构建的依赖，避免把 Windows/macOS 专属依赖的许可证
+# 也算进来（那会让白名单被迫越放越宽）。
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+]
+
+[advisories]
+# 有 RUSTSEC 通告就失败。这正是本门禁的目的。
+vulnerability = "deny"
+unmaintained = "warn"
+yanked = "deny"
+notice = "warn"
+ignore = []
+
+[licenses]
+# 未列入的许可证一律拒绝（默认就是 deny，显式写出来避免误读）。
+unlicensed = "deny"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "OpenSSL",
+]
+# 许可证推断的置信度阈值：低于它的只告警不拦（版权头缺失很常见，
+# 但会出现在 CI 输出里，便于逐条补 clarify）。
+confidence-threshold = 0.8
+
+# 刻意**不**写 `name = "*"` 的通配 clarify。
+# 那样做会把所有「无法判定许可证」的 crate 一律当成 MIT 放行，
+# 等于把刚修好的门禁又拆掉一次。历史式 `MIT/Apache-2.0` 写法确实存在，
+# 但正确做法是让 CI 报出来、逐条补具体 crate 的 clarify，而不是一刀切。
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# 禁止把同一 crate 同时拉进两个不兼容的来源。
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
