@@ -211,6 +211,17 @@ RO action  → 直连 /run/mailstack/helper-ro.sock（服务进程属 mailstack-
 RW action  → sudo /usr/local/libexec/mailstack-privileged（恒走变更面）
 ```
 
+> **⚠️ 部署前置条件：`mailstack-admin` 组必须存在。**
+> RO socket 是 `0660 root:mailstack-admin`；`bind` 时会解析该组名，
+> **解析不到就拒绝启动**（4.11 的 fail-closed，刻意不降级为 0600/0666）。
+> 安装脚本必须先 `groupadd --system mailstack-admin` 并把管理台进程加入该组。
+>
+> 这条前置条件此前**既没写进文档、也没在测试里体现** —— 2026-10-30 在干净的
+> Ubuntu 26.04 上跑 `cargo test` 才发现两个 RPC 绑定测试因此失败。
+> 现在测试已改成不自洽依赖（绑定测试传 `None` 不设属组，只验 mode；
+> 组名契约由纯单元测试 `production_ro_socket_config_names_the_admin_group_and_is_world_unreadable`
+> 钉住），并有 `tests/` 里的 `socket_group_resolution_failure_aborts_binding` 覆盖失败路径。
+
 `mailstackctl` 的用法：
 
 ```bash
