@@ -835,7 +835,7 @@ pub enum Lookup { Known, Missing, Unavailable(String) }
 > | **6.2** | 门禁从 `grep -rq "fn $name"` 升级为三项校验：函数存在 + **带 `#[test]`/`#[tokio::test]`** + 函数体内**至少一个断言** | 负例实测：普通函数名 → `NOT_TEST`；测试掏空成空壳 → `NO_ASSERT`，两次都正确变红 |
 > | **6.3** | 四个 action 全部 pin 到 **40 位 commit SHA**；workflow 级 `permissions: contents: read`；三处 checkout 加 `persist-credentials: false` | 逐个核验 SHA 为 commit 对象（rust-cache v2=2.9.3 PGP 已验证；cargo-deny-action v2=2.1.1 **unsigned**，故 SHA 是唯一完整性依据）；`dtolnay` 的 tag 名即工具链选择器，改为 pin master commit + `with.toolchain: 1.98.1` |
 > | **6.4** | `wsl-install-rust.sh`：`mktemp -d` 私有目录（0700、不可预测）替代可预测的 `/tmp/rustup-init.sh`；支持 `MAILSTACK_RUSTUP_SHA256` 显式钉扎；升为 `set -euo pipefail` | `bash -n` 校验；未设哈希时**明确告警**「仅依赖 HTTPS，未做独立钉扎」而非假装安全 |
-> | **6.5** | 24 个脚本按用途分级：门禁/安装/清理类 → `set -euo pipefail`；探查/诊断类 → `set -uo pipefail`（某条探测失败是预期内的，不能中断） | `bash -n` 全绿；两道门禁在 `set -eo pipefail` 下仍通过 |
+> | **6.5** | 23 个脚本按用途分级：门禁/安装/清理类 → `set -euo pipefail`；探查/诊断类 → `set -uo pipefail`（某条探测失败是预期内的，不能中断） | `bash -n` 全绿；两道门禁在 `set -eo pipefail` 下仍通过 |
 > | **6.6** | `build.sh` 的 `BINS` 补上 `mailstack-web`；判定从 `FOUND -gt 0`（任一产物存在即通过）改为**逐个齐全**，缺一个就 `die` | 产物清单 / SHA256SUMS / SBOM 不再随发布包缺项 |
 > | **6.7** | 6 处硬编码 `/mnt/e/MailStack/mailstack-rust` 全部改为脚本相对路径；代理改为 `${MAILSTACK_PROXY:-...}` | `deploy/` 下 `grep /mnt/e/MailStack` **零命中** |
 > | **6.8** | 277 条清单抽到 `deploy/required-invariants.txt`（唯一数据源），CI 直接调用共享脚本，内联拷贝删除 | python 校验器断言「CI 里不得再出现 `required=(`」 |
