@@ -25,6 +25,13 @@ rust-version = "1.85"
 license = "SEE LICENSE IN LICENSE"
 repository = "https://github.com/SectorPace/MailStack"
 authors = ["SectorPace"]
+# 6.1 配套：本项目的 crate **不发布到 crates.io**（自托管应用，不是库）。
+# 声明 `publish = false` 有两个实际作用：
+#   1. 语义上如实说明「这些包不对外分发」；
+#   2. 让 `cargo-deny` 的 `[licenses.private] ignore = true` 能正确跳过它们 ——
+#      否则 `license = "SEE LICENSE IN LICENSE"` 这种**Cargo 合法但非 SPDX** 的写法
+#      会被判成 unlicensed，11 个自有 crate 一起把许可门禁刷红。
+publish = false
 
 [workspace.dependencies]
 mailstack-core = { path = "crates/core" }

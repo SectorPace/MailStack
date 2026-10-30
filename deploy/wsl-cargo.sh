@@ -33,6 +33,17 @@ if [ "${MAILSTACK_FULL_DEBUG:-0}" != "1" ]; then
   export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-line-tables-only}"
 fi
 
+# 增量编译默认**关闭**。
+#
+# 实测（2026-10-30）：一次依赖升级（rustls/tokio 等）触发的全量重建让
+# `target/debug/incremental` 单独涨到 **3.3G**，把 9.8G 的根分区直接撑满，
+# 报错是 `No space left on device (os error 28)` —— 同样是「报错不指向真因」。
+# 增量编译对这台机器（每次门禁都是全量跑 completement）收益很小，
+# 代价却是把本已紧张的磁盘再吃掉三分之一。
+#
+# 需要增量编译时显式设 CARGO_INCREMENTAL=1。
+export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+
 # 仅当显式需要网络时启用代理（vendor 构建/离线场景不应依赖它）。
 if [ "${MAILSTACK_USE_PROXY:-0}" = "1" ]; then
   # 6.7：代理不再写死开发机地址，默认值可被 MAILSTACK_PROXY 覆盖。

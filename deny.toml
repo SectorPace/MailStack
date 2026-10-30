@@ -25,16 +25,47 @@ targets = [
 ]
 
 [advisories]
-# 有 RUSTSEC 通告就失败。这正是本门禁的目的。
-vulnerability = "deny"
-unmaintained = "warn"
+# 0.20 起：**漏洞通告一律报错**，不再有 `vulnerability` 这个键
+# （`notice` / `severity-threshold` 同样已移除）。
+# 这些字段名是本机用 cargo-deny 0.20.2 实跑校验出来的 —— 照旧版文档写会让
+# 整个配置反序列化失败，CI 直接红在「配置错误」而不是「真的有问题」。
+#
+# `unmaintained` / `unsound` 是**作用域**枚举（all / workspace / transitive / none），
+# 不是告警级别。取 `workspace`：只对直接依赖发难，不把整棵传递依赖树的历史
+# 包袱一次性刷成红灯。
+unmaintained = "workspace"
+unsound = "workspace"
 yanked = "deny"
-notice = "warn"
-ignore = []
+unused-ignored-advisory = "warn"
+ignore = [
+    # RUSTSEC-2023-0071（rsa v0.9.10，Marvin Attack）——**没有安全升级可用**。
+    #
+    # 该通告针对 RSA **解密**路径的时序侧信道（PKCS#1 v1.5 解密，
+    # 攻击者提供密文即可逐字节恢复明文）。本项目的 rsa 只经由 `mail-auth`
+    # 用于 DKIM **签名**（对本地私钥做运算，输入是信头哈希），不存在
+    # 「攻击者提交任意密文给解密预言机」这条路径。
+    #
+    # 仍然记在这里而不是静默放过：一旦上游发布修复版，应立刻去掉这条 ignore
+    # ——`unused-ignored-advisory = "warn"` 会在那时提醒我们。
+    { id = "RUSTSEC-2023-0071", reason = "rsa is only used for DKIM signing (mail-auth), not for RSA decryption oracles; no fixed release exists" },
+]
 
 [licenses]
-# 未列入的许可证一律拒绝（默认就是 deny，显式写出来避免误读）。
-unlicensed = "deny"
+# 0.20 移除了 `unlicensed` 键（未声明许可证本来就必然失败）。
+#
+# 自有 workspace crate 不发布（见 `[workspace.package] publish = false`），
+# 其 `license = "SEE LICENSE IN LICENSE"` 是 Cargo 合法但**非 SPDX** 的写法，
+# cargo-deny 解析不了。用 `private.ignore` 跳过它们 —— 这是该字段的设计用途，
+# 而不是全局放行：外部依赖的许可证仍然逐条按下面的白名单校验。
+private = { ignore = true }
+# 白名单已按**实跑结果**收窄：原先是本机 registry 里 449 个 crate 的 32 种表达式
+# 归纳出来的偏宽集合；这里只保留 `cargo deny check licenses` 在**本仓库真实依赖树**
+# 上实际遇到的 11 种。
+#
+# 删掉了 4 个「从未被用到」的条目（实跑输出 `license-not-encountered` 逐条点名）：
+#   CC0-1.0 / MPL-2.0 / OpenSSL / Unicode-DFS-2016
+# 留 `unused-allowed-license` 为默认的 `warn`：将来依赖变动让某个条目失效时，
+# CI 会提示但不会误拦 —— 收窄是持续动作，不该变成噪音源。
 allow = [
     "MIT",
     "Apache-2.0",
@@ -45,12 +76,8 @@ allow = [
     "Zlib",
     "0BSD",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
-    "MPL-2.0",
-    "CC0-1.0",
     "BSL-1.0",
     "CDLA-Permissive-2.0",
-    "OpenSSL",
 ]
 # 许可证推断的置信度阈值：低于它的只告警不拦（版权头缺失很常见，
 # 但会出现在 CI 输出里，便于逐条补 clarify）。
@@ -63,6 +90,12 @@ confidence-threshold = 0.8
 
 [bans]
 multiple-versions = "warn"
+# 6.1 实跑修正：`wildcards = "deny"` 会把**内部 path 依赖**全部误报成通配依赖
+# —— workspace 里 `mailstack-core = { path = "crates/core" }` 被各 crate 用
+# `.workspace = true` 继承后没有版本要求，cargo-deny 看到的就是 `*`。
+# 那是内部路径依赖，不是「从 crates.io 拉一个任意版本」的风险。
+# `allow-wildcard-paths` 就是为这种情形提供的：路径依赖放行，其余通配仍然拒绝。
+allow-wildcard-paths = true
 wildcards = "deny"
 # 禁止把同一 crate 同时拉进两个不兼容的来源。
 deny = []
