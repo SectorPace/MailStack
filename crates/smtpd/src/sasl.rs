@@ -37,7 +37,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use mailstack_core::mailbox_passwords::MailboxPasswords;
-use mailstack_core::password::{password_record, verify_password, PasswordRecord};
+use mailstack_core::password::{
+    verify_password, PasswordRecord, HASH_LEN, PBKDF2_ITERATIONS, SALT_LEN,
+};
 
 /// Dovecot auth-client 的默认 socket 路径。
 ///
@@ -138,15 +140,20 @@ impl std::fmt::Debug for AuthBackend {
 pub struct MailboxPasswordsAuthenticator {
     passwords: MailboxPasswords,
     /// 未知用户也要付一次 PBKDF2 —— 否则响应时间会泄露「账号是否存在」。
-    dummy: Option<PasswordRecord>,
+    ///
+    /// 用「合法形状的全零记录」而不是真的生成一条：构造是零成本（debug 档下
+    /// `password_record` 的一次 31 万轮迭代按秒计，而装配点运行在异步任务里，
+    /// 多账号测试会因此饿死 runtime），`verify_password` 仍会跑满迭代再返回
+    /// false，等时目标不变。
+    dummy: PasswordRecord,
 }
 
 impl MailboxPasswordsAuthenticator {
     pub fn new(passwords: MailboxPasswords) -> Self {
-        // 常量输入构造 PBKDF2 记录是纯函数；万一核心库坏了也只退化为「无 dummy」，
-        // 不让认证后端在启动时 panic。口令满足强度策略且不含账号名。
-        let dummy = password_record("mailstackauthdummy", "Zq7-Kx9-DummyCost").ok();
-        Self { passwords, dummy }
+        Self {
+            passwords,
+            dummy: dummy_record(),
+        }
     }
 
     /// 生产构造：读 `<Paths::mailbox_passwords>`。
@@ -160,9 +167,7 @@ impl MailboxPasswordsAuthenticator {
 
     /// 未知用户/存储故障时也消耗一次 PBKDF2，抹平响应时间差异。
     fn pay_dummy_cost(&self, password: &str) {
-        if let Some(dummy) = &self.dummy {
-            let _ = verify_password(dummy, password);
-        }
+        let _ = verify_password(&self.dummy, password);
     }
 }
 
@@ -228,6 +233,19 @@ fn decode_plain(response: &str) -> Option<(String, String)> {
         return None;
     }
     Some((user, String::from_utf8_lossy(password).to_string()))
+}
+
+/// 固定形状的假记录：salt 与摘要都是 0，但长度合法，因此 `verify_password`
+/// 会真的跑满迭代次数再返回 `false`（与 `crates/imappop3` 的等时做法一致）。
+fn dummy_record() -> PasswordRecord {
+    PasswordRecord {
+        username: "invalid".to_string(),
+        algorithm: "pbkdf2-sha256".to_string(),
+        iterations: PBKDF2_ITERATIONS,
+        salt: "00".repeat(SALT_LEN),
+        hash: "00".repeat(HASH_LEN),
+        updated_at: String::new(),
+    }
 }
 
 /// 严格 base64 校验（RFC 4648 标准字母表 + `=` 填充）。
@@ -519,6 +537,7 @@ fn protocol_error(message: &'static str) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mailstack_core::password::password_record;
 
     #[test]
     fn base64_validation_rejects_anything_that_could_inject_a_protocol_field() {

@@ -24,6 +24,9 @@ pub mod error;
 pub mod listeners;
 pub mod manual_bans;
 pub mod queue;
+// 本地投递的落箱面（LMTP + Sieve）用 Unix socket；非 Unix 目标不提供。
+#[cfg(unix)]
+pub mod lmtp;
 // 特权 RPC 面用 Unix socket；生产目标为 Linux，非 Unix 目标不提供。
 #[cfg(unix)]
 pub mod rpc;
@@ -79,6 +82,10 @@ pub async fn run(paths: Paths, ports: Vec<u16>) -> Result<(), DaemonError> {
     .await?;
     let runner = queue::build_runner(&runtime_config)?;
 
+    // 本地投递的落箱服务：队列的 LmtpClient 连到这里，Sieve 在这里生效。
+    let lmtp_server = lmtp::build_server(&runtime_config)?;
+    let lmtp_socket = lmtp::socket_file(&runtime_config.paths)?;
+
     // RPC 面在启动阶段就绑定：socket 建不起来必须现在报错，而不是让后台任务悄悄失败。
     #[cfg(unix)]
     let rpc_faces = rpc::bind_all(&runtime_config.paths)?;
@@ -88,6 +95,17 @@ pub async fn run(paths: Paths, ports: Vec<u16>) -> Result<(), DaemonError> {
 
     #[cfg(unix)]
     rpc_faces.spawn(&mut tasks, &shutdown);
+
+    #[cfg(unix)]
+    {
+        let receiver = shutdown.receiver();
+        tasks.spawn(async move {
+            lmtp_server
+                .serve_unix(lmtp_socket, 0o660, receiver)
+                .await
+                .map_err(|error| format!("LMTP 落箱监听异常退出：{error}"))
+        });
+    }
 
     for (port, server) in servers {
         let waiter = shutdown.waiter();

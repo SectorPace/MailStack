@@ -32,13 +32,19 @@
 //! 客户端把同一封信重复拉一遍。用 `mailstack_imappop3::migrate_maildir`，
 //! 且切换期间**只能有一个实现**在写。
 //!
-//! ## 尚未接线（诚实披露）
+//! ## 监听口
 //!
-//! * LMTP / ManageSieve 的监听器：`mailstack-imappop3` 已实现，但 MailStack 的
-//!   入站仍走 SMTP + 队列，接管需要同时改 `mailstackd` 的投递路径，属 Phase 5。
-//! * `metrics` 的 `/metrics` HTTP 端点：由 `mailstack-web` 抓取，尚未接。
+//! IMAP 143/993、POP3 110/995、ManageSieve 4190（RFC 5804：脚本上传/管理，
+//! 脚本落在用户 Maildir，LMTP 投递时立即生效）。LMTP 落箱服务在 `mailstackd`
+//! 侧装配（队列 → 自有 LMTP socket → Sieve → Maildir），见
+//! `bin/mailstackd/src/lmtp.rs`。
+//!
+//! `/metrics`（Prometheus 文本）由 [`metrics_http::serve`] 暴露，可在
+//! `mailstack-imap --metrics 127.0.0.1:9100` 打开；它汇总 IMAP/POP3/ManageSieve
+//! 三份注册表（渲染时带 `protocol` 标签），供 Prometheus 或 `mailstack-web` 抓取。
 
 pub mod directory;
+pub mod metrics_http;
 pub mod resolver;
 pub mod servers;
 

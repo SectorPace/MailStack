@@ -164,6 +164,11 @@ pub fn assemble(paths: Paths, ports: &[u16]) -> Result<RuntimeConfig, DaemonErro
         ..QueueConfig::default()
     };
 
+    // 本地投递默认落箱到**自己的** LMTP 服务端（Sieve 在那里生效）；
+    // 显式设置 MAILSTACK_LMTP_SOCKET/ADDR 才指向别的实现（如仍在运行的 Dovecot）。
+    let lmtp_endpoint =
+        LmtpEndpoint::from_env_with_default(LmtpEndpoint::unix(paths.run_dir.join("lmtp.sock")));
+
     Ok(RuntimeConfig {
         paths,
         mail_host: setup.mail_host,
@@ -176,7 +181,7 @@ pub fn assemble(paths: Paths, ports: &[u16]) -> Result<RuntimeConfig, DaemonErro
         ban: BanConfig::default(),
         queue_config,
         queue_root,
-        lmtp_endpoint: LmtpEndpoint::from_env(),
+        lmtp_endpoint,
         relay_endpoint,
         allow_private_network,
     })

@@ -128,9 +128,18 @@ passwd 解析、TLS 配置校验等）；`crates/core` 有 10 个（口令库）
    的提交端口现在用 `mailstack_smtpd::MailboxPasswordsAuthenticator` 直连本套口令库
    （`mailbox-passwords.json`），与 IMAP/POP3/ManageSieve 同源；`DovecotAuthClient`
    保留但默认不装配。
-2. **LMTP / ManageSieve 监听器未装配**：`imappop3` 已实现，但 MailStack 的入站
-   仍是 SMTP + 队列，接管要同时改投递路径。
-3. **`/metrics` HTTP 端点未接**：需要 `mailstack-web` 抓
-   `Metrics::render_prometheus`。
-4. **真实 Dovecot 数据迁移未演练**：`migrate_maildir` 有单测，但没在真实
-   `dovecot-uidlist` 上跑过。
+2. ~~LMTP / ManageSieve 监听器未装配~~ **已装配**：`mailstack-imap --managesieve`
+   开 4190（脚本上传即生效）；本地投递由 `mailstackd` 的**自有** LMTP unix socket
+   落箱（`<run_dir>/lmtp.sock`），队列 `LmtpClient` 连它，Sieve 在这一层生效
+   （`redirect`/`vacation` 产物回到同一条出站队列）。
+3. ~~`/metrics` HTTP 端点未接~~ **已接**：`mailstack-imap --metrics <ADDR>` 暴露
+   Prometheus 文本端点，按协议各持一份注册表（imap/pop3/managesieve）一次抓全。
+4. ~~真实 Dovecot 数据迁移未演练~~ **已演练**：
+   `crates/imappop3/tests/dovecot_cutover.rs` 用真实布局夹具（v3 uidlist、
+   leading-colon、关键字表、已删除记录、uidlist 外文件、子文件夹）验证
+   UID/UIDVALIDITY 保留、关键字接管、重复运行幂等；入口是
+   `mailstack-imap --migrate-maildir <DIR>`。
+
+**仍然未做**：在**真实 Dovecot 生产数据**上跑一次迁移（当前演练用的是合成夹具）；
+`mailstack-web` 对 `/metrics` 的抓取展示；停用 Postfix / OpenDKIM / fail2ban / Node
+（组件下线的其余部分）。

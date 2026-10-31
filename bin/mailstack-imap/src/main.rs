@@ -20,7 +20,7 @@ use mailstack_imapd::servers::{run, CertPair, Config, Listeners};
 #[derive(Debug, Parser)]
 #[command(
     name = "mailstack-imap",
-    about = "MailStack IMAP/POP3 守护进程：IMAP 143/993、POP3 110/995，多账号共用一个监听器",
+    about = "MailStack IMAP/POP3/ManageSieve 守护进程：IMAP 143/993、POP3 110/995、Sieve 4190，多账号共用一个监听器",
     version
 )]
 struct Cli {
@@ -39,6 +39,19 @@ struct Cli {
     /// POP3 隐式 TLS 口（995）。
     #[arg(long = "pop3s", value_name = "ADDR")]
     pop3s: Vec<SocketAddr>,
+
+    /// ManageSieve 口（通常 4190，配 STARTTLS）。脚本存进用户 Maildir，上传即生效。
+    #[arg(long = "managesieve", value_name = "ADDR")]
+    managesieve: Vec<SocketAddr>,
+
+    /// `/metrics`（Prometheus 文本）监听地址；不设则不暴露。建议只绑回环。
+    #[arg(long = "metrics", value_name = "ADDR")]
+    metrics: Vec<SocketAddr>,
+
+    /// 离线迁移一个 Dovecot Maildir（接管 dovecot-uidlist 与关键字表）后退出。
+    /// 切换期间只能有一个实现写该 Maildir —— Dovecot 必须先停。
+    #[arg(long = "migrate-maildir", value_name = "DIR")]
+    migrate_maildir: Option<PathBuf>,
 
     /// 证书链（PEM，含中间证书）。默认从 `--letsencrypt` 推导。
     #[arg(long = "cert", value_name = "FILE")]
@@ -142,12 +155,35 @@ async fn main() -> ExitCode {
         None => Paths::production(),
     };
 
+    // 一次性迁移：跑完就退出，不需要任何监听口或证书。
+    if let Some(root) = &cli.migrate_maildir {
+        return match mailstack_imapd::servers::migrate_dovecot_maildir(root) {
+            Ok(report) => {
+                println!(
+                    "迁移完成：{} 个文件夹 / 导入 UID 映射 {} 份（{} 封）/ 丢弃 {} 条记录 / 关键字 {} 个 / 回退磁盘重建 {} 个",
+                    report.folders,
+                    report.uidlists_imported,
+                    report.messages_mapped,
+                    report.messages_unresolved,
+                    report.keywords_imported,
+                    report.rebuilt_from_disk
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("迁移失败：{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let listeners = match (|| {
         Ok::<_, String>(Listeners {
             imap: single(&cli.imap, "imap")?,
             imaps: single(&cli.imaps, "imaps")?,
             pop3: single(&cli.pop3, "pop3")?,
             pop3s: single(&cli.pop3s, "pop3s")?,
+            managesieve: single(&cli.managesieve, "managesieve")?,
         })
     })() {
         Ok(listeners) => listeners,
@@ -165,6 +201,14 @@ async fn main() -> ExitCode {
         }
     };
 
+    let metrics_bind = match single(&cli.metrics, "metrics") {
+        Ok(bind) => bind,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
+
     let config = Config {
         server_name: cli.server_name.clone(),
         listeners,
@@ -173,6 +217,7 @@ async fn main() -> ExitCode {
         passwd_root: cli.passwd_root.clone(),
         maildir_name: cli.maildir.clone(),
         max_connections: cli.max_connections,
+        metrics_bind,
     };
 
     // 停机：SIGTERM（systemd）与 Ctrl-C 都当作优雅停机信号。

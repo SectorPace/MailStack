@@ -20,6 +20,9 @@ use std::time::Duration;
 use mailstack_imappop3::imap::server::{ImapServer, ImapServerConfig};
 use mailstack_imappop3::imap::session::{ImapConfig, ImapSessionContext};
 use mailstack_imappop3::maildir::{MailStore, SystemClock};
+use mailstack_imappop3::managesieve::{
+    ManageSieveContext, ManageSieveServer, ManageSieveServerConfig,
+};
 use mailstack_imappop3::metrics::Metrics;
 use mailstack_imappop3::pop3::server::{Pop3Server, Pop3ServerConfig};
 use mailstack_imappop3::pop3::session::{Pop3Config, Pop3SessionContext};
@@ -57,6 +60,9 @@ pub struct Listeners {
     pub imaps: Option<SocketAddr>,
     pub pop3: Option<SocketAddr>,
     pub pop3s: Option<SocketAddr>,
+    /// ManageSieve（RFC 5804，通常 4190，配 STARTTLS）。脚本存在目标用户的
+    /// Maildir 里，与 LMTP 投递共享同一份文件，上传即生效。
+    pub managesieve: Option<SocketAddr>,
 }
 
 /// 装配参数。
@@ -74,6 +80,8 @@ pub struct Config {
     /// 家目录下的 Maildir 目录名，生产为 `Maildir`。
     pub maildir_name: String,
     pub max_connections: usize,
+    /// `/metrics`（Prometheus 文本）监听地址；`None` 不暴露。
+    pub metrics_bind: Option<SocketAddr>,
 }
 
 impl Default for Config {
@@ -87,6 +95,7 @@ impl Default for Config {
             passwd_root: PathBuf::from("/etc"),
             maildir_name: "Maildir".to_string(),
             max_connections: 512,
+            metrics_bind: None,
         }
     }
 }
@@ -95,12 +104,20 @@ impl Default for Config {
 pub struct Assembly {
     pub imap: ImapSessionContext,
     pub pop3: Pop3SessionContext,
+    pub managesieve: ManageSieveContext,
     /// 保留一份解析器引用，便于部署层做健康检查/用户枚举。
     pub resolver: Arc<dyn MailboxResolver>,
 }
 
 /// 按 `Config` 组装认证、解析器、TLS 与两个会话上下文。
 pub fn assemble(paths: &mailstack_core::Paths, config: &Config) -> Result<Assembly, ImapdError> {
+    // ManageSieve 的明文口令校验要给出**具体端口**的提示，因此排在通用校验之前。
+    if config.listeners.managesieve.is_some() && config.require_tls && config.tls.is_none() {
+        return Err(ImapdError::Config(
+            "4190（ManageSieve）要收明文口令：要么给证书走 STARTTLS，要么显式关掉 require_tls"
+                .into(),
+        ));
+    }
     if config.require_tls && config.tls.is_none() {
         return Err(ImapdError::Config(
             "require_tls 为 true 但没有配置证书：要么给证书，要么显式关掉 require_tls".into(),
@@ -141,6 +158,8 @@ pub fn assemble(paths: &mailstack_core::Paths, config: &Config) -> Result<Assemb
         resolver: Some(Arc::clone(&resolver)),
     };
 
+    let managesieve = ManageSieveContext::new(auth.clone(), Arc::clone(&resolver));
+
     let pop3 = Pop3SessionContext {
         store: placeholder,
         auth,
@@ -155,6 +174,7 @@ pub fn assemble(paths: &mailstack_core::Paths, config: &Config) -> Result<Assemb
     Ok(Assembly {
         imap,
         pop3,
+        managesieve,
         resolver,
     })
 }
@@ -196,6 +216,17 @@ fn pop3_server_config(
     }
 }
 
+/// ManageSieve 走 STARTTLS（RFC 5804 §2.1 的常规形态），不做隐式 TLS 口。
+fn managesieve_server_config(bind: SocketAddr, max_connections: usize) -> ManageSieveServerConfig {
+    ManageSieveServerConfig {
+        bind,
+        implicit_tls: false,
+        max_connections,
+        handshake_timeout: Duration::from_secs(15),
+        ..ManageSieveServerConfig::default()
+    }
+}
+
 /// 绑定并运行全部已配置的监听器，直到 `shutdown` 被触发。
 ///
 /// 任何一个监听器启动失败都会让整个调用返回错误（半启动的守护进程最难排障）。
@@ -208,6 +239,7 @@ pub async fn run(
         && config.listeners.imaps.is_none()
         && config.listeners.pop3.is_none()
         && config.listeners.pop3s.is_none()
+        && config.listeners.managesieve.is_none()
     {
         return Err(ImapdError::Config("没有启用任何监听口".into()));
     }
@@ -215,6 +247,10 @@ pub async fn run(
     let assembly = assemble(paths, &config)?;
     let tls = acceptor(&config)?;
     let grace = config.listeners;
+    // 每个协议一份注册表；/metrics 一次抓取全部，渲染时带 protocol 标签。
+    let imap_metrics = Arc::clone(&assembly.imap.metrics);
+    let pop3_metrics = Arc::new(Metrics::new("pop3"));
+    let sieve_metrics = Arc::new(Metrics::new("managesieve"));
 
     let mut tasks: tokio::task::JoinSet<std::io::Result<()>> = tokio::task::JoinSet::new();
 
@@ -223,7 +259,8 @@ pub async fn run(
             assembly.imap.clone(),
             imap_server_config(bind, false, config.max_connections),
             tls.clone(),
-        )?;
+        )?
+        .with_metrics(Arc::clone(&imap_metrics));
         let shutdown = shutdown.clone();
         tasks.spawn(async move { server.serve(shutdown).await });
     }
@@ -232,7 +269,8 @@ pub async fn run(
             assembly.imap.clone(),
             imap_server_config(bind, true, config.max_connections),
             tls.clone(),
-        )?;
+        )?
+        .with_metrics(Arc::clone(&imap_metrics));
         let shutdown = shutdown.clone();
         tasks.spawn(async move { server.serve(shutdown).await });
     }
@@ -241,7 +279,8 @@ pub async fn run(
             assembly.pop3.clone(),
             pop3_server_config(bind, false, config.max_connections),
             tls.clone(),
-        )?;
+        )?
+        .with_metrics(Arc::clone(&pop3_metrics));
         let shutdown = shutdown.clone();
         tasks.spawn(async move { server.serve(shutdown).await });
     }
@@ -249,10 +288,30 @@ pub async fn run(
         let server = Pop3Server::new(
             assembly.pop3.clone(),
             pop3_server_config(bind, true, config.max_connections),
-            tls,
-        )?;
+            tls.clone(),
+        )?
+        .with_metrics(Arc::clone(&pop3_metrics));
         let shutdown = shutdown.clone();
         tasks.spawn(async move { server.serve(shutdown).await });
+    }
+    if let Some(bind) = grace.managesieve {
+        let server = ManageSieveServer::new(
+            assembly.managesieve,
+            managesieve_server_config(bind, config.max_connections),
+            tls,
+        )?
+        .with_metrics(Arc::clone(&sieve_metrics));
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move { server.serve(shutdown).await });
+    }
+    if let Some(bind) = config.metrics_bind {
+        let registries = vec![
+            Arc::clone(&imap_metrics),
+            Arc::clone(&pop3_metrics),
+            Arc::clone(&sieve_metrics),
+        ];
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move { crate::metrics_http::serve(bind, registries, shutdown).await });
     }
 
     // 等第一个「停机信号 / 监听器自己结束 / 监听器出错」，三者都是终止条件，
@@ -276,6 +335,17 @@ pub async fn run(
     // 让各监听器在自己的 grace 内收尾。
     while tasks.join_next().await.is_some() {}
     Ok(())
+}
+
+/// 对一个 Dovecot Maildir 跑离线 UID/关键字迁移（切换前的一次性操作）。
+///
+/// 必须在 Dovecot 与 MailStack 都**不写**该 Maildir 时运行；重复运行是幂等的
+/// （已迁移的文件夹会被 `migrate_maildir` 跳过）。返回逐文件夹的计数，供运维核对。
+pub fn migrate_dovecot_maildir(
+    root: &Path,
+) -> Result<mailstack_imappop3::migration::MigrationReport, ImapdError> {
+    let store = Arc::new(MailStore::new(root.to_path_buf(), Arc::new(SystemClock))?);
+    Ok(mailstack_imappop3::migration::migrate_maildir(&store)?)
 }
 
 /// 从证书目录推导一对证书（Let's Encrypt 布局）。
@@ -334,5 +404,72 @@ mod tests {
         let assembly = assemble(&paths, &config).expect("明文部署必须能装配起来");
         assert!(assembly.imap.resolver.is_some(), "必须注入多用户解析器");
         assert!(assembly.pop3.resolver.is_some());
+    }
+
+    #[test]
+    fn managesieve_with_require_tls_needs_a_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = mailstack_core::Paths::rooted(dir.path());
+        let config = Config {
+            require_tls: true,
+            listeners: Listeners {
+                managesieve: Some("127.0.0.1:4190".parse().unwrap()),
+                ..Listeners::default()
+            },
+            ..Config::default()
+        };
+        let error = assemble(&paths, &config)
+            .err()
+            .expect("ManageSieve 要收明文口令，没证书必须拒绝");
+        assert!(format!("{error}").contains("4190"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn managesieve_listener_greets_with_its_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = mailstack_core::Paths::rooted(dir.path());
+        let config = Config {
+            require_tls: false,
+            listeners: Listeners {
+                managesieve: Some("127.0.0.1:0".parse().unwrap()),
+                ..Listeners::default()
+            },
+            ..Config::default()
+        };
+        let assembly = assemble(&paths, &config).expect("装配");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = ManageSieveServer::new(
+            assembly.managesieve,
+            managesieve_server_config(address, 16),
+            None,
+        )
+        .expect("服务端配置合法");
+        let (_tx, rx) = watch::channel(false);
+        tokio::spawn(async move { server.serve_on(listener, rx).await });
+
+        use tokio::io::AsyncBufReadExt;
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut lines = tokio::io::BufReader::new(stream).lines();
+        let mut greeting = String::new();
+        loop {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("读超时")
+                .expect("读取失败")
+                .expect("连接被关闭");
+            greeting.push_str(&line);
+            greeting.push('\n');
+            if line.starts_with("OK") {
+                break;
+            }
+        }
+        assert!(greeting.contains("\"IMPLEMENTATION\""), "{greeting}");
+        assert!(
+            greeting.contains("\"SIEVE\""),
+            "必须通告 SIEVE 扩展集：{greeting}"
+        );
+        assert!(greeting.contains("\"SASL\" \"PLAIN\""), "{greeting}");
     }
 }

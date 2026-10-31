@@ -59,6 +59,14 @@ impl LmtpEndpoint {
     ///
     /// 都没有则回落到 [`LmtpEndpoint::default_unix`]。
     pub fn from_env() -> Self {
+        Self::from_env_with_default(Self::default_unix())
+    }
+
+    /// 同 [`LmtpEndpoint::from_env`]，但把「都没有」的回落目标换成调用方给的默认。
+    ///
+    /// MailStack 自带 LMTP 服务端之后，`mailstackd` 的默认对端是**自己的** socket；
+    /// 只有显式设置环境变量才指向别的实现（例如仍在运行的 Dovecot）。
+    pub fn from_env_with_default(default: Self) -> Self {
         if let Ok(path) = std::env::var("MAILSTACK_LMTP_SOCKET") {
             if !path.trim().is_empty() {
                 return LmtpEndpoint::Unix(PathBuf::from(path.trim()));
@@ -71,7 +79,7 @@ impl LmtpEndpoint {
                 }
             }
         }
-        LmtpEndpoint::default_unix()
+        default
     }
 
     /// 便于日志与错误文案的展示形式。

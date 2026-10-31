@@ -324,15 +324,18 @@ WantedBy=multi-user.target
 ```ini
 # /etc/systemd/system/mailstack-imap.service
 [Unit]
-Description=MailStack IMAP/POP3 (replaces dovecot imap/pop3)
+Description=MailStack IMAP/POP3/ManageSieve (replaces dovecot imap/pop3)
 After=network.target
 
 [Service]
 Type=simple
-# 993/995 隐式 TLS；143/110 配 STARTTLS/STLS。
+# 993/995 隐式 TLS；143/110 配 STARTTLS/STLS；4190 ManageSieve 配 STARTTLS。
+# /metrics 只绑回环，供 Prometheus 或 mailstack-web 抓取。
 ExecStart=/usr/local/bin/mailstack-imap \
     --imap 0.0.0.0:143 --imaps 0.0.0.0:993 \
     --pop3 0.0.0.0:110 --pop3s 0.0.0.0:995 \
+    --managesieve 0.0.0.0:4190 \
+    --metrics 127.0.0.1:9100 \
     --cert-domain mail.example.com \
     --server-name mail.example.com
 # 需要读 /etc/mailstack/mailbox-passwords.json 与各账号 ~/Maildir；
@@ -356,16 +359,36 @@ WantedBy=multi-user.target
 `users.add` / `users.password` 现在会同时写系统口令与协议面记录；**任何一边写失败
 都会如实报错**，不会出现"系统口令改了、IMAP 还是旧口令"。`users.delete` 连带删记录。
 
+**本地投递与脚本**
+
+* 本地邮件由 `mailstackd` 的**自有** LMTP socket（`<run_dir>/lmtp.sock`）落箱，
+  队列的 `LmtpClient` 把邮件交给它；Sieve 的 `fileinto` / `reject` / `redirect` /
+  `vacation` 都在这一层生效（`redirect`/`vacation` 产物回到同一条出站队列）。
+  可用 `MAILSTACK_LMTP_SOCKET` 指向别的实现（例如仍在运行的 Dovecot）。
+* ManageSieve 4190 让客户端上传脚本；脚本存进 `<maildir>/sieve/` 并由
+  `.active` 标记生效，LMTP 下一次投递即使用它。
+* `/metrics` 汇总 IMAP/POP3/ManageSieve 三份注册表（Prometheus 文本，带
+  `protocol` 标签）；只监听回环，由 Prometheus 或 `mailstack-web` 抓取。
+
 **从 Dovecot 切换（必须离线，且只能有一个实现写同一个 Maildir）**
 
 1. `systemctl stop dovecot`（停掉所有 imap/pop3 会话）；
-2. 逐账号跑 UID 迁移 `mailstack_imappop3::migrate_maildir`，把
-   `dovecot-uidlist` 的 UID 与 `.dovecot-keywords` 的关键字接管成
-   `.mailstack-uidlist` / `.mailstack-keywords` —— **不迁移则所有客户端整体重新同步**；
+2. 逐账号跑离线 UID 迁移（**先停 Dovecot，再迁移**）：
+
+   ```sh
+   mailstack-imap --migrate-maildir /home/alice/Maildir
+   ```
+
+   它把 `dovecot-uidlist` 的 UID 与 `.dovecot-keywords` 的关键字接管成
+   `.mailstack-uidlist` / `.mailstack-keywords`，并打印逐文件夹计数；重复运行是
+   幂等的（已迁移的文件夹会跳过）。**不迁移则所有客户端整体重新同步**。
+   `crates/imappop3/tests/dovecot_cutover.rs` 用一份真实布局的夹具演练了这套不变量
+   （UID/UIDVALIDITY 保留、已删除记录丢弃、uidlist 之外的邮件分配新 UID、关键字
+   字母表接管、重复运行幂等）。
 3. 确认每个账号在 `mailbox-passwords.json` 里都有记录（`users.password` 会写）；
-4. 启动 `mailstack-imap`，验证 143/993/110/995 与多账号隔离；
-5. 停用 Dovecot 的 imap/pop3 服务（**保留**其 auth-client 直到 §3.2 的提交端口
-   SASL 也切换 —— 那一步属 Phase 5）。
+4. 启动 `mailstack-imap`，验证 143/993/110/995/4190 与多账号隔离；
+5. 停用 Dovecot 的 imap/pop3 与 **auth-client**：提交端口 SASL 已改读
+   `mailbox-passwords.json`（§3.2），不再需要 Dovecot 的任何组件。
 
 > ⚠️ **两套 UID 映射不能同时写**：同一封邮件被分配两套 UID 会让客户端重复拉信。
 

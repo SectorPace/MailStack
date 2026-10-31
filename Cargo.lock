@@ -1501,6 +1501,8 @@ version = "0.8.1-beta1"
 dependencies = [
  "clap",
  "mailstack-core",
+ "mailstack-imapd",
+ "mailstack-imappop3",
  "mailstack-priv",
  "mailstack-queue",
  "mailstack-smtp",

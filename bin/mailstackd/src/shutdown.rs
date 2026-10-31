@@ -35,6 +35,14 @@ impl Shutdown {
         }
     }
 
+    /// 取一份原始的 `watch::Receiver<bool>`。
+    ///
+    /// 给需要 receiver 本体（而不是「停机后完成」的 future）的组件用：
+    /// `mailstack-imappop3` 的监听器都以它作为优雅停机的信号源。
+    pub fn receiver(&self) -> watch::Receiver<bool> {
+        self.tx.subscribe()
+    }
+
     /// 触发停机。
     ///
     /// 必须用 `send_replace` 而不是 `send`：`send` 在**没有任何接收者**时是空操作

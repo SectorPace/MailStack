@@ -17,6 +17,9 @@ mailstack-smtp.workspace = true
 mailstack-queue.workspace = true
 mailstack-store.workspace = true
 mailstack-smtpd.workspace = true
+# 本地投递的落箱服务（LMTP + Sieve）与多用户解析器。
+mailstack-imappop3.workspace = true
+mailstack-imapd.workspace = true
 clap.workspace = true
 # RPC 请求/应答与测试夹具都以 JSON 表达。
 serde_json.workspace = true
