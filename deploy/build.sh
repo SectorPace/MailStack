@@ -88,7 +88,7 @@ mkdir -p "$DIST_DIR"
 # 6.6：原先这里漏了 `mailstack-web`，而它明确是 workspace 的一个 bin（`bin/mailstack-web`，
 # 包名 `mailstack-web-bin`、产物名 `mailstack-web`）。后果不只是「少复制一个文件」：
 # 产物清单、`SHA256SUMS`、SBOM 会随之缺项，而发布包看起来仍然「构建成功」。
-BINS=(target/release/mailstackd target/release/mailstackctl target/release/mailstack-web)
+BINS=(target/release/mailstackd target/release/mailstackctl target/release/mailstack-web target/release/mailstack-imap)
 FOUND=0
 MISSING=()
 for bin in "${BINS[@]}"; do
@@ -123,7 +123,7 @@ if [ "$DO_MUSL" -eq 1 ]; then
   rustup target list --installed 2>/dev/null | grep -qx "$MUSL_TARGET" \
     || rustup target add "$MUSL_TARGET"
   cargo build --release --locked --target "$MUSL_TARGET"
-  for name in mailstackd mailstackctl mailstack-web; do
+  for name in mailstackd mailstackctl mailstack-web mailstack-imap; do
     src="target/$MUSL_TARGET/release/$name"
     [ -f "$src" ] || die "musl 产物缺失：$src"
     cp -f "$src" "$DIST_DIR/$name-musl"

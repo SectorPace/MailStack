@@ -9,11 +9,16 @@ members = [
     "crates/store",
     "crates/auth",
     "crates/smtpd",
+    "crates/imappop3",
+    # IMAP/POP3 装配层：把 imappop3 接到 MailStack 的账号/Maildir/证书上。
+    "crates/imapd",
     "bin/mailstackd",
     "bin/mailstackctl",
     # 管理控制台服务：把 crates/web 的 API 与前端产物组装成一个可运行的进程。
     # 在此之前 `crates/web` 只有 `build_router`，没有任何二进制在跑它。
     "bin/mailstack-web",
+    # IMAP/POP3 守护进程：替代 Dovecot 的协议面入口。
+    "bin/mailstack-imap",
 ]
 # 后续加入（按规格书 §6 迁移路线逐 Phase 解锁）：
 #   "crates/webmail"
@@ -42,15 +47,21 @@ mailstack-queue = { path = "crates/queue" }
 mailstack-store = { path = "crates/store" }
 mailstack-auth = { path = "crates/auth" }
 mailstack-smtpd = { path = "crates/smtpd" }
+mailstack-imappop3 = { path = "crates/imappop3" }
+mailstack-imapd = { path = "crates/imapd" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
+base64 = "0.22"
 regex = "1"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
 fs2 = "0.4"
+# IMAP COMPRESS=DEFLATE（RFC 4978）。刻意只用纯 Rust 后端（miniz_oxide），
+# 与 TLS 选 ring 同样的理由：构建不引入 C/cmake/nasm 依赖，可离线复现。
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }

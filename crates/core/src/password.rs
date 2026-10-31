@@ -148,6 +148,34 @@ pub struct PasswordRecord {
     pub updated_at: String,
 }
 
+/// 邮箱账号的口令记录：用户名可以是**完整地址**（`alice@example.com`）。
+///
+/// [`password_record`] 只接受 3–32 个安全字符（管理员/unix 账号名），带 `@`
+/// 会被拒。而 `users.create` 的账号标识是邮箱地址，IMAP/POP3 的口令库
+/// （[`crate::mailbox_passwords`]）以地址为键 —— 因此需要这个入口。
+///
+/// 规则：
+/// * 地址必须形如 `local@domain`，本地部分满足 [`ADMIN_RE`]（防止把奇怪字符
+///   写进键里造成查找歧义），域名非空；
+/// * 口令仍走 [`validate_mailbox_password`]，上下文包含**地址与本地部分**，
+///   避免口令就是自己的邮箱/账号名。
+pub fn mailbox_password_record(address: &str, password: &str) -> CoreResult<PasswordRecord> {
+    let address = address.trim().to_ascii_lowercase();
+    let (local, domain) = address
+        .split_once('@')
+        .ok_or_else(|| CoreError::invalid("mailbox address must be local@domain"))?;
+    if !ADMIN_RE.is_match(local) || domain.is_empty() {
+        return Err(CoreError::invalid(
+            "mailbox address local part must be 3-32 safe characters and the domain must be non-empty",
+        ));
+    }
+    validate_mailbox_password(password, [address.as_str(), local])?;
+
+    let mut record = password_record(local, password)?;
+    record.username = address;
+    Ok(record)
+}
+
 /// 生成管理员口令记录。算法与迭代数与现状逐字一致（INV-37）。
 pub fn password_record(username: &str, password: &str) -> CoreResult<PasswordRecord> {
     if !ADMIN_RE.is_match(username) {

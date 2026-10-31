@@ -1,0 +1,22 @@
+[package]
+name = "mailstack-imapd"
+description = "MailStack IMAP/POP3 装配层：把 imappop3 的协议面接到 MailStack 的账号、Maildir 与证书上（替代 Dovecot）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# 不发布到 crates.io（见 workspace [package] publish）。
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+# 账号口令记录（INV-37 的 PBKDF2 唯一真相源）与 `Paths`。
+mailstack-core.workspace = true
+# 协议面本体：IMAP4rev1 / POP3 / TLS / 指标。
+mailstack-imappop3.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

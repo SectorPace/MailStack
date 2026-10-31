@@ -36,6 +36,7 @@ use std::sync::Arc;
 use mailstack_core::atomic;
 use mailstack_core::error::CoreResult;
 use mailstack_core::exec::CommandRunner;
+use mailstack_core::mailbox_passwords::MailboxPasswords;
 use mailstack_core::password::validate_mailbox_password;
 use mailstack_core::paths::Paths;
 use mailstack_core::validate::{ADDRESS_RE, USER_RE};
@@ -537,6 +538,45 @@ impl Users {
         self.account_locked(username)
     }
 
+    /// 写 IMAP/POP3 的口令记录（`mailbox-passwords.json`，INV-37）。
+    ///
+    /// 为什么必须与系统口令**并写**：系统口令给 PAM/Postfix 用，协议面
+    /// （`mailstack-imap`）用 PBKDF2 记录。只写一边的结果是「webmail 能登、
+    /// 客户端说密码错」，或被反过来；两种都属最难排障的故障。
+    ///
+    /// 记录键优先用**邮箱地址**（客户端登录名），拿不到地址时退回 unix 账号名。
+    fn save_mailbox_password(&self, identity: &str, password: &str) -> Result<(), HandlerError> {
+        let record = if identity.contains('@') {
+            mailstack_core::password::mailbox_password_record(identity, password)
+        } else {
+            mailstack_core::password::password_record(identity, password)
+        }
+        .map_err(|error| HandlerError::new(format!("mailbox password record rejected: {error}")))?;
+        MailboxPasswords::at(&self.paths)
+            .upsert(&record)
+            .map_err(|error| {
+                HandlerError::new(format!("cannot persist mailbox password record: {error}"))
+            })
+    }
+
+    /// 按 unix 账号名找它的邮箱地址（`managed-mailboxes.json` 的反查）。
+    fn address_of(&self, user: &str) -> Option<String> {
+        self.read_mailboxes()
+            .iter()
+            .find(|item| mailbox_str(item, "unixUser") == user)
+            .map(|item| mailbox_str(item, "email"))
+            .filter(|email| !email.is_empty())
+    }
+
+    /// 删掉某个账号的口令记录；返回是否真的删掉了。
+    fn drop_mailbox_password(&self, user: &str, address: Option<&str>) {
+        let store = MailboxPasswords::at(&self.paths);
+        if let Some(address) = address {
+            let _ = store.remove(address);
+        }
+        let _ = store.remove(user);
+    }
+
     /// `users.add`：建系统账号、设口令、建 Maildir、登记两份注册表。
     pub fn add(&self, data: &Value) -> Result<Value, HandlerError> {
         // `address` 是管理前端的字段名，`email` 是基线与控制台的字段名。
@@ -601,6 +641,8 @@ impl Users {
         let nologin = self.nologin_shell();
         self.create_account(&user, group, &nologin)?;
         self.set_password(&user, password)?;
+        // 并写 IMAP/POP3 口令记录：协议面不读 /etc/shadow（见 INV-37）。
+        self.save_mailbox_password(&email, password)?;
 
         match self.lookup_user(&user) {
             Some(entry) => self.ensure_maildir(&entry, &user),
@@ -684,12 +726,16 @@ impl Users {
         managed.remove(user);
         self.save_managed_users(&managed)?;
 
+        // 地址要在从注册表里删掉**之前**取，否则只能按 unix 账号名删记录，
+        // 而记录通常是以邮箱地址为键的 —— 会留下一份谁也删不掉的僵尸口令。
+        let address = self.address_of(user);
         let boxes: Vec<Value> = self
             .read_mailboxes()
             .into_iter()
             .filter(|item| mailbox_str(item, "unixUser") != user)
             .collect();
         self.save_mailboxes(&boxes)?;
+        self.drop_mailbox_password(user, address.as_deref());
 
         Ok(Value::Array(self.list()))
     }
@@ -735,6 +781,9 @@ impl Users {
             .map_err(|error| HandlerError::new(error.to_string()))?;
 
         self.set_password(user, password)?;
+        // 并写 IMAP/POP3 口令记录 —— 只改系统口令会让客户端继续用旧口令。
+        let identity = self.address_of(user).unwrap_or_else(|| user.to_string());
+        self.save_mailbox_password(&identity, password)?;
         self.bump_session_epoch(user);
         Ok(json!({ "updated": true }))
     }
@@ -1531,5 +1580,109 @@ mod tests {
         assert_eq!(listed[0]["id"], "alice");
         assert_eq!(listed[0]["domain"], "example.com");
         assert_eq!(listed[0]["role"], "mailbox");
+    }
+
+    // ─────────── IMAP/POP3 口令记录（mailbox-passwords.json）───────────
+
+    /// 建号必须**同时**写系统口令与 IMAP 口令记录。
+    ///
+    /// 只写系统的后果：客户端（走协议面）永远登不上；只写记录的后果：
+    /// PAM/Postfix 侧认不出。两边都要有，且键是**邮箱地址**。
+    #[test]
+    fn add_also_writes_the_imap_password_record_keyed_by_address() {
+        let f = Fixture::new("imaprecord");
+        f.add_passwd("alice", 1001, &f.home);
+        f.users()
+            .add(&add_payload("alice@example.com", "alice"))
+            .unwrap();
+
+        let record = MailboxPasswords::at(&f.paths)
+            .get("alice@example.com")
+            .unwrap()
+            .expect("必须写入以邮箱地址为键的口令记录");
+        assert!(
+            mailstack_core::password::verify_password(&record, GOOD_PASSWORD),
+            "记录里的哈希必须能验过建号时给的口令"
+        );
+        assert_eq!(record.username, "alice@example.com");
+    }
+
+    /// 改密必须同时更新协议面的记录，否则客户端会继续用旧口令。
+    #[test]
+    fn password_change_updates_the_imap_record_too() {
+        let f = Fixture::new("imaprecordpw");
+        f.add_passwd("alice", 1001, &f.home);
+        f.write_managed_users(&["alice"]);
+        f.write_mailboxes(&[("alice@example.com", "alice")]);
+
+        f.users()
+            .password(&json!({ "id": "alice", "password": "Battery-Staple-7" }))
+            .unwrap();
+
+        let record = MailboxPasswords::at(&f.paths)
+            .get("alice@example.com")
+            .unwrap()
+            .expect("改密后必须仍有记录");
+        assert!(
+            mailstack_core::password::verify_password(&record, "Battery-Staple-7"),
+            "协议面必须认新口令"
+        );
+        assert!(
+            !mailstack_core::password::verify_password(&record, GOOD_PASSWORD),
+            "旧口令不得仍然有效"
+        );
+    }
+
+    /// 删号必须把记录一起删掉；否则那个地址会留一份「谁也管不到」的口令。
+    #[test]
+    fn delete_drops_the_imap_record() {
+        let f = Fixture::new("imaprecorddel");
+        f.add_passwd("alice", 1001, &f.home);
+        f.write_managed_users(&["alice"]);
+        f.write_mailboxes(&[("alice@example.com", "alice")]);
+        MailboxPasswords::at(&f.paths)
+            .upsert(
+                &mailstack_core::password::mailbox_password_record(
+                    "alice@example.com",
+                    GOOD_PASSWORD,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        f.users().delete(&json!({ "id": "alice" })).unwrap();
+
+        assert!(
+            MailboxPasswords::at(&f.paths)
+                .get("alice@example.com")
+                .unwrap()
+                .is_none(),
+            "删号后不得残留口令记录"
+        );
+    }
+
+    /// 反例：记录写不进去时必须**报错**，不能"系统口令改成了、协议面还是旧口令"。
+    #[test]
+    fn a_failed_imap_record_write_is_reported_instead_of_silently_half_done() {
+        let f = Fixture::new("imaprecordfail");
+        f.add_passwd("alice", 1001, &f.home);
+        f.write_managed_users(&["alice"]);
+        f.write_mailboxes(&[("alice@example.com", "alice")]);
+        // 把记录文件的位置变成一个目录 → 原子写必然失败。
+        fs::create_dir_all(&f.paths.mailbox_passwords).unwrap();
+
+        let error = f
+            .users()
+            .password(&json!({ "id": "alice", "password": "Battery-Staple-7" }))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot persist mailbox password record"),
+            "必须明确指出口令记录写失败：{error}"
+        );
+        // 系统口令那边已经改过了 —— 这正是「不能静默半成功」的理由：
+        // 报错让上层知道要回滚/重试，而不是以为改成功。
     }
 }

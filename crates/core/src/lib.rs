@@ -28,6 +28,7 @@ pub mod certs;
 pub mod config;
 pub mod error;
 pub mod exec;
+pub mod mailbox_passwords;
 pub mod mode;
 pub mod password;
 pub mod paths;

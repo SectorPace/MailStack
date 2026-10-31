@@ -10,6 +10,7 @@
 | `mailstackd` | 主服务二进制：**入站 SMTP（25/465/587）+ 出站队列调度 + 特权 RPC 的两个 Unix socket**。尚未承载 webmail |
 | `mailstackctl` | CLI：`mailstackctl <action> [JSON] [--confirm]`。只读动作直连 RO socket，变更动作经 `sudo` 包装器（见 §3.5） |
 | `mailstack-web` | 管理控制台服务：管理 API 的全部路由 + 前端产物托管 + 遥测后台采样（见 §3.7）。**可选**：不给 `--dist` 就只提供 API |
+| `mailstack-imap` | IMAP4rev1 / POP3 守护进程（143/993/110/995），替代 **Dovecot 的 imap/pop3**。口令来自 `mailbox-passwords.json`，邮箱来自 `/etc/passwd` + `~/Maildir`（见 §3.8） |
 | `dist/SHA256SUMS` | 全部产物校验和 |
 | `dist/sbom.spdx.json` | SBOM（依赖清单）。`cargo-sbom` 未安装时退化为 `dist/dependency-inventory.txt`（外部依赖逐条 `name version license`） |
 | `dist/*-musl` | **可选**：`deploy/build.sh --musl` 产出的全静态二进制。用于 glibc 过旧或 musl 的目标平台，见 §6 |
@@ -310,6 +311,62 @@ WantedBy=multi-user.target
   绝大多数响应都是静态文件，漏掉它们等于没加。
 * 服务会启动**遥测后台采样**（2 秒一次）。没有它，`/api/metrics/telemetry` 只有
   「按需采样」兜底 —— `current` 有值但 `points` 永远不会自己增长，仪表盘曲线是平的。
+
+### 3.8 IMAP/POP3 服务（`mailstack-imap`，替代 Dovecot 的 imap/pop3）
+
+自研协议面（`crates/imappop3`）由 `bin/mailstack-imap` 承载，装配层在
+`crates/imapd`。**一个监听器服务全部账号**：会话在认证成功后按登录名经
+`MailboxResolver` 切到本人 Maildir；解析不到邮箱就拒绝登录，绝不退回默认邮箱。
+
+```ini
+# /etc/systemd/system/mailstack-imap.service
+[Unit]
+Description=MailStack IMAP/POP3 (replaces dovecot imap/pop3)
+After=network.target
+
+[Service]
+Type=simple
+# 993/995 隐式 TLS；143/110 配 STARTTLS/STLS。
+ExecStart=/usr/local/bin/mailstack-imap \
+    --imap 0.0.0.0:143 --imaps 0.0.0.0:993 \
+    --pop3 0.0.0.0:110 --pop3s 0.0.0.0:995 \
+    --cert-domain mail.example.com \
+    --server-name mail.example.com
+# 需要读 /etc/mailstack/mailbox-passwords.json 与各账号 ~/Maildir；
+# **不需要读 /etc/shadow** —— 口令来自 PBKDF2 记录。
+User=root
+Restart=on-failure
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**口令来源（与 Dovecot 的关键差异）**
+
+| | Dovecot | `mailstack-imap` |
+|---|---|---|
+| passdb | PAM / `/etc/shadow` 的 crypt 哈希 | `/etc/mailstack/mailbox-passwords.json`（PBKDF2-SHA256，0600 root:root） |
+| 写入时机 | `chpasswd`（只写系统口令） | `users.create` / `users.password` **并写**系统口令 + 该记录 |
+| 用户目录 | `userdb static` / `mail_location` | `/etc/passwd` 家目录 + `~/Maildir`（`crates/store` 已定死的布局） |
+
+`users.add` / `users.password` 现在会同时写系统口令与协议面记录；**任何一边写失败
+都会如实报错**，不会出现"系统口令改了、IMAP 还是旧口令"。`users.delete` 连带删记录。
+
+**从 Dovecot 切换（必须离线，且只能有一个实现写同一个 Maildir）**
+
+1. `systemctl stop dovecot`（停掉所有 imap/pop3 会话）；
+2. 逐账号跑 UID 迁移 `mailstack_imappop3::migrate_maildir`，把
+   `dovecot-uidlist` 的 UID 与 `.dovecot-keywords` 的关键字接管成
+   `.mailstack-uidlist` / `.mailstack-keywords` —— **不迁移则所有客户端整体重新同步**；
+3. 确认每个账号在 `mailbox-passwords.json` 里都有记录（`users.password` 会写）；
+4. 启动 `mailstack-imap`，验证 143/993/110/995 与多账号隔离；
+5. 停用 Dovecot 的 imap/pop3 服务（**保留**其 auth-client 直到 §3.2 的提交端口
+   SASL 也切换 —— 那一步属 Phase 5）。
+
+> ⚠️ **两套 UID 映射不能同时写**：同一封邮件被分配两套 UID 会让客户端重复拉信。
+
+---
 
 ## 4. 回滚
 

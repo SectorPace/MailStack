@@ -1,0 +1,18 @@
+[package]
+name = "mailstack-imap"
+description = "MailStack IMAP/POP3 守护进程入口：把 imappop3 协议面接到账号、Maildir 与证书上（替代 Dovecot）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# 不发布到 crates.io（见 workspace [package] publish）。
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+mailstack-core.workspace = true
+mailstack-imapd.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

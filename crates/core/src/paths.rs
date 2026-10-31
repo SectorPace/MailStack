@@ -18,6 +18,16 @@ pub struct Paths {
     pub aliases: PathBuf,
     /// `/etc/mailstack/admin.json`
     pub admin_config: PathBuf,
+    /// `/etc/mailstack/mailbox-passwords.json` —— 邮箱口令记录库（PBKDF2，INV-37）
+    ///
+    /// IMAP/POP3（`mailstack-imap`）的**唯一**口令来源。此前该职责由 Dovecot 的
+    /// PAM passdb 承担；换成自研协议面后，口令记录必须由 MailStack 自己持有，
+    /// 否则协议面只能去解析 `/etc/shadow` 的 crypt 格式（yescrypt/$6$ 多套算法，
+    /// 且与 INV-37 的「PBKDF2-SHA256 唯一真相源」冲突）。
+    ///
+    /// 文件为 `0600 root:root`（含可离线爆破的口令哈希），内容见
+    /// [`crate::mailbox_passwords`]。
+    pub mailbox_passwords: PathBuf,
     /// `/etc/mailstack/settings.json`
     pub settings_config: PathBuf,
     /// `/etc/mailstack/setup.json`
@@ -75,6 +85,7 @@ impl Paths {
             domains: postfix.join("mailstack_domains"),
             aliases: postfix.join("mailstack_aliases"),
             admin_config: etc.join("admin.json"),
+            mailbox_passwords: etc.join("mailbox-passwords.json"),
             settings_config: etc.join("settings.json"),
             setup_config: etc.join("setup.json"),
             ai_config: etc.join("ai-provider.json"),
@@ -108,6 +119,7 @@ impl Paths {
             domains: postfix.join("mailstack_domains"),
             aliases: postfix.join("mailstack_aliases"),
             admin_config: etc.join("admin.json"),
+            mailbox_passwords: etc.join("mailbox-passwords.json"),
             settings_config: etc.join("settings.json"),
             setup_config: etc.join("setup.json"),
             ai_config: etc.join("ai-provider.json"),

@@ -1,0 +1,38 @@
+[package]
+name = "mailstack-imappop3"
+description = "MailStack IMAP4rev1 / POP3 服务端：Maildir 后端、UID 稳定映射、TLS 与认证（替代 Dovecot 的协议面）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# 不发布到 crates.io（见 workspace [package] publish）。
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+# 口令记录与常量时间校验的唯一真相源（PBKDF2-SHA256，INV-37）。
+mailstack-core.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# AUTHENTICATE PLAIN / LOGIN / SCRAM-SHA-256 的 SASL 应答解码。
+base64.workspace = true
+# SCRAM 的 HMAC/SHA-256 与服务端 nonce。
+sha2.workspace = true
+rand.workspace = true
+# 口令记录里的 salt/hash 是 hex 编码。
+hex.workspace = true
+# uidlist / 关键字表 / POP3 独占锁的文件锁。
+fs2.workspace = true
+# IMAP COMPRESS=DEFLATE（RFC 4978）的纯 Rust 压缩后端。
+flate2.workspace = true
+# Sieve redirect/vacation 的外发出口：投递到外发队列（带重试/退避/DSN）。
+mailstack-queue.workspace = true
+# 与 smtpd 同一套 TLS 策略：rustls + ring，TLS 1.2 起。
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+rcgen = "0.13"
