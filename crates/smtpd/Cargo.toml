@@ -22,6 +22,8 @@ mailstack-store.workspace = true
 mailstack-queue.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# 直接校验 mailbox-passwords.json 时解码 SASL PLAIN 的 base64 应答。
+base64.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -157,15 +157,18 @@ WantedBy=multi-user.target
 | 587 | 提交 | STARTTLS | 是（且仅在 TLS 之上） |
 
 * 凭据**只**在 TLS 之上接收：明文连接上的 `AUTH` 一律 `538 5.7.11`。
-* 口令的真相源只有一份 —— Dovecot 的 passdb。`mailstackd` 通过 Dovecot 的
-  **auth-client 协议 v1.2** 校验，默认连 `/run/dovecot/auth-client`。
-* 覆盖路径：环境变量 `MAILSTACK_DOVECOT_AUTH_SOCKET=/path/to/auth-client`。
-  Dovecot 侧需要一个可被 `mailstackd` 读到该 socket 的 `unix_listener auth-client`
-  （默认配置已具备）。
-* 认证结果与响应码：`235` 成功 / `535` 凭据错 / `454` 后端暂时不可用。**535 与 454
-  刻意分开**：前者让客户端提示重新输入口令，后者让它稍后重试。
-* 连接失败（Dovecot 未运行）**不会**阻止 `mailstackd` 启动，只会让 AUTH 回 454 —— 
-  Dovecot 重启不该连带停掉收信。反之，**通告 AUTH 却没有任何后端**会在启动时被拒绝。
+* 口令的真相源只有一份 —— `/etc/mailstack/mailbox-passwords.json`（INV-37 的
+  PBKDF2-SHA256 记录）。提交端口的 SASL 与 IMAP/POP3/ManageSieve 校验的是
+  **同一份**记录，`users.password` 改密后所有协议面同时生效。
+* 登录名兼容：完整地址（`alice@example.com`）与本地部分（`alice`）都可登录，
+  但**不做跨域猜测**（`bob@other.example` 不会命中 `bob@example.com`）。
+  库缺失视为空库；**库损坏/版本不符时 AUTH 一律拒绝**（fail closed），日志给出原因。
+* 认证结果与响应码：`235` 成功 / `535` 凭据错。未知用户同样回 `535` —— 服务端会先
+  付一次 PBKDF2 再拒绝，避免用响应时间枚举账号。
+* **通告 AUTH 却没有任何后端**会在启动时被拒绝。
+* 仍在使用 Dovecot passdb 的部署可以注入 `mailstack_smtpd::DovecotAuthClient`
+  （auth-client v1.2，`MAILSTACK_DOVECOT_AUTH_SOCKET` 覆盖 socket 路径）——
+  但 `mailstackd` 默认不再装配它。
 * 认证成功后会话即被允许提交（可向任意域中继，INV-17 的 submission 语义）；
   未认证会话仍只能投递本机纳管域。
 

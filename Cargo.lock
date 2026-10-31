@@ -1414,6 +1414,7 @@ dependencies = [
 name = "mailstack-smtpd"
 version = "0.8.1-beta1"
 dependencies = [
+ "base64",
  "mailstack-auth",
  "mailstack-core",
  "mailstack-queue",

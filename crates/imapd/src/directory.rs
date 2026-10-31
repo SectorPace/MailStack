@@ -39,18 +39,10 @@ impl MailboxDirectory {
 
     /// 登录名 → 可能的记录键，按优先级排列。
     ///
-    /// 客户端可能用**完整地址**（`alice@example.com`）或**本地部分**（`alice`）登录：
-    /// 前者是 `users.create` 默认写入的键，后者是 unix 账号名。两种都试，
-    /// 但都不做跨域名猜测（`bob@other.example` 不会命中 `bob@example.com`）。
+    /// 规则与提交端口 SASL 共用 [`mailstack_core::mailbox_passwords::candidate_keys`]，
+    /// 避免两处认证对同一登录名给出不同答案。
     fn candidate_keys(user: &str) -> Vec<String> {
-        let normalized = mailstack_core::mailbox_passwords::key(user);
-        let mut keys = vec![normalized.clone()];
-        if let Some((local, _)) = normalized.split_once('@') {
-            if !local.is_empty() && local != normalized {
-                keys.push(local.to_string());
-            }
-        }
-        keys
+        mailstack_core::mailbox_passwords::candidate_keys(user)
     }
 }
 

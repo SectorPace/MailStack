@@ -25,9 +25,7 @@ use mailstack_smtp::{
     parse_sasl_passwd, validate_relay, AddressPolicy, NativeRelayStore, RelayConfigStore,
     RelayEndpoint, RelayPolicy, RelayValidationRequest,
 };
-use mailstack_smtpd::{
-    BanConfig, CertPaths, DovecotAuthClient, RateLimitConfig, SessionConfig, TlsMode,
-};
+use mailstack_smtpd::{BanConfig, CertPaths, RateLimitConfig, SessionConfig, TlsMode};
 use mailstack_store::{LmtpEndpoint, TableStore};
 
 use crate::error::DaemonError;
@@ -107,11 +105,6 @@ pub struct RuntimeConfig {
     pub queue_config: QueueConfig,
     pub queue_root: PathBuf,
     pub lmtp_endpoint: LmtpEndpoint,
-    /// Dovecot auth-client socket 路径（提交认证的后端，§3.5）。
-    ///
-    /// 只存路径不存客户端：`assemble` 保持「纯决策」，socket 连接由监听层在运行时建立，
-    /// 因此 Dovecot 暂时不可用只会让 AUTH 回 454，不会拦住整个服务启动。
-    pub auth_socket: PathBuf,
     /// 已校验的中继端点；`None` 表示尚未配置中继（直投）。
     pub relay_endpoint: Option<RelayEndpoint>,
     /// **部署**是否允许私网目标（非公网档才允许）。决定拨号时的地址策略。
@@ -184,7 +177,6 @@ pub fn assemble(paths: Paths, ports: &[u16]) -> Result<RuntimeConfig, DaemonErro
         queue_config,
         queue_root,
         lmtp_endpoint: LmtpEndpoint::from_env(),
-        auth_socket: DovecotAuthClient::from_env().socket_path().to_path_buf(),
         relay_endpoint,
         allow_private_network,
     })
@@ -419,9 +411,6 @@ mod tests {
 
     #[test]
     fn ports_map_to_the_right_tls_mode_and_starttls_advertisement() {
-        // 清掉可能影响结果的覆盖项，避免测试随开发机环境漂移。
-        std::env::remove_var("MAILSTACK_DOVECOT_AUTH_SOCKET");
-
         let (_dir, paths) = root();
         let config = assemble(paths, &[25, 465, 587]).expect("装配");
 
@@ -459,11 +448,6 @@ mod tests {
                 // 25 是 MX 收信口，不是提交口：在那里开放认证只是多一个口令攻击面。
                 offer_auth: false
             }
-        );
-        assert_eq!(
-            config.auth_socket,
-            std::path::PathBuf::from(mailstack_smtpd::DEFAULT_AUTH_SOCKET),
-            "未设 MAILSTACK_DOVECOT_AUTH_SOCKET 时取 Dovecot 默认 socket"
         );
     }
 

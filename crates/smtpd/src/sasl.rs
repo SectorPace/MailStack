@@ -1,12 +1,13 @@
-//! 提交端口的 SASL 认证（RFC 4954）与 Dovecot auth socket 客户端（规格书 §3.5）。
+//! 提交端口的 SASL 认证（RFC 4954）：本机口令库 + 可选的 Dovecot auth socket。
 //!
-//! ## 为什么认证要问 Dovecot，而不是自己读一份口令表
+//! ## 口令真相源：`mailbox-passwords.json`（INV-37）
 //!
-//! 重写后**没有** Postfix，也就没有 `smtpd_sasl_type = dovecot` 这层转接；但口令的
-//! 真相源仍然只有一份 —— Dovecot 的 passdb。自己去读 `/etc/shadow` 或另建一份哈希
-//! 表，等于凭空多出第二份真相源，改密时必然漂移。所以这里实现的是 Dovecot 的
-//! **auth-client 协议**（v1.2）的一个最小客户端：把凭据转给 Dovecot，只拿回
-//! 「成功/失败」。
+//! 默认后端是 [`MailboxPasswordsAuthenticator`]：直接按 `users.*` 写入的 PBKDF2 记录
+//! 校验（[`mailstack_core::password::verify_password`]，常量时间）。它与
+//! IMAP/POP3/ManageSieve 用的是**同一份**口令库，改密不会在两处漂移。
+//!
+//! [`DovecotAuthClient`] 仍然保留：仍在使用 Dovecot passdb 的部署（或既有测试）可以
+//! 注入它。它实现的是 Dovecot **auth-client 协议**（v1.2）的最小客户端。
 //!
 //! ## 只发 PLAIN，且只在 TLS 之上
 //!
@@ -14,21 +15,15 @@
 //!
 //! 1. 会话层（[`crate::session`]）在明文连接上直接拒绝 `AUTH`（538），这一层
 //!    永远拿不到凭据；
-//! 2. 本模块**不解析**凭据内容，原样转发 base64 给 Dovecot，因此口令既不进入日志，
-//!    也不进入任何字符串拼接之外的中间结构。
-//!
-//! ## 为什么 base64 必须在这里校验（安全，而不是正确性）
-//!
-//! Dovecot 的协议行是**制表符分隔**的。若把对端给的应答原样拼进协议行，一个含
-//! TAB 的「应答」就会在 auth socket 上凭空多出一个字段 —— 这与 SMTP 命令注入同源，
-//! 只不过注入面从 SMTP 搬到了 auth socket。防线：只接受严格 base64 字符集
-//! （[`is_valid_base64`]），制表符与换行都不在其中。
+//! 2. 本机后端在校验后才接触明文口令，**绝不**把口令或应答写进日志；
+//! 3. Dovecot 后端不解析凭据，原样转发 base64（见 [`is_valid_base64`] 的注入防护）。
 //!
 //! ## 失败分类
 //!
-//! * 连不上/超时/协议错乱 → [`AuthOutcome::TemporaryFailure`]（对外 454）：
-//!   Dovecot 抖动不该被当成「口令错」，否则客户端会去改密码。
-//! * Dovecot 明确回 `FAIL` 且不带 `temp` → [`AuthOutcome::InvalidCredentials`]（535）。
+//! * 本机库损坏/读不出 → **fail closed**：记 `warn` 并回
+//!   [`AuthOutcome::InvalidCredentials`]，绝不因为存储故障放行（与 IMAP 侧一致）。
+//! * 未知用户 → 先付一次 PBKDF2（对 dummy 记录）再拒绝，避免用响应时间枚举账号。
+//! * Dovecot 连不上/超时/协议错乱 → [`AuthOutcome::TemporaryFailure`]（对外 454）。
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -37,8 +32,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+
+use mailstack_core::mailbox_passwords::MailboxPasswords;
+use mailstack_core::password::{password_record, verify_password, PasswordRecord};
 
 /// Dovecot auth-client 的默认 socket 路径。
 ///
@@ -130,6 +129,105 @@ impl std::fmt::Debug for AuthBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("AuthBackend")
     }
+}
+
+/// 直接按 `mailbox-passwords.json`（INV-37）校验提交端口的 PLAIN 认证。
+///
+/// 这是提交端口的**默认口令源**：与 IMAP/POP3/ManageSieve 共用同一份记录，改密不会
+/// 在两处漂移。[`DovecotAuthClient`] 仍保留给仍在使用 Dovecot passdb 的部署。
+pub struct MailboxPasswordsAuthenticator {
+    passwords: MailboxPasswords,
+    /// 未知用户也要付一次 PBKDF2 —— 否则响应时间会泄露「账号是否存在」。
+    dummy: Option<PasswordRecord>,
+}
+
+impl MailboxPasswordsAuthenticator {
+    pub fn new(passwords: MailboxPasswords) -> Self {
+        // 常量输入构造 PBKDF2 记录是纯函数；万一核心库坏了也只退化为「无 dummy」，
+        // 不让认证后端在启动时 panic。口令满足强度策略且不含账号名。
+        let dummy = password_record("mailstackauthdummy", "Zq7-Kx9-DummyCost").ok();
+        Self { passwords, dummy }
+    }
+
+    /// 生产构造：读 `<Paths::mailbox_passwords>`。
+    pub fn at(paths: &mailstack_core::Paths) -> Self {
+        Self::new(MailboxPasswords::at(paths))
+    }
+
+    pub fn from_path(path: impl Into<std::path::PathBuf>) -> Self {
+        Self::new(MailboxPasswords::new(path))
+    }
+
+    /// 未知用户/存储故障时也消耗一次 PBKDF2，抹平响应时间差异。
+    fn pay_dummy_cost(&self, password: &str) {
+        if let Some(dummy) = &self.dummy {
+            let _ = verify_password(dummy, password);
+        }
+    }
+}
+
+impl Authenticator for MailboxPasswordsAuthenticator {
+    fn authenticate(&self, request: AuthRequest) -> AuthFuture<'_> {
+        Box::pin(async move {
+            if !request.mechanism.eq_ignore_ascii_case("PLAIN") {
+                return AuthOutcome::TemporaryFailure("unsupported SASL mechanism".to_string());
+            }
+            let Some((user, password)) = decode_plain(&request.response) else {
+                // 会话层已保证是合法 base64；解不出 \0 分隔字段是客户端/实现问题。
+                return AuthOutcome::InvalidCredentials;
+            };
+            for candidate in mailstack_core::mailbox_passwords::candidate_keys(&user) {
+                match self.passwords.get(&candidate) {
+                    Ok(Some(record)) => {
+                        return if verify_password(&record, &password) {
+                            let confirmed = if record.username.is_empty() {
+                                user
+                            } else {
+                                record.username
+                            };
+                            AuthOutcome::Success { user: confirmed }
+                        } else {
+                            AuthOutcome::InvalidCredentials
+                        };
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        // fail closed：存储坏了不能放行；但要把原因留在日志里，
+                        // 否则排障会指向认证逻辑而不是口令库。
+                        tracing::warn!(
+                            %error,
+                            path = %self.passwords.path().display(),
+                            "邮箱口令库不可读，拒绝本次认证"
+                        );
+                        self.pay_dummy_cost(&password);
+                        return AuthOutcome::InvalidCredentials;
+                    }
+                }
+            }
+            self.pay_dummy_cost(&password);
+            AuthOutcome::InvalidCredentials
+        })
+    }
+}
+
+/// 解码 SASL PLAIN 应答：`[authzid] \0 authcid \0 password`。
+///
+/// 返回值里的口令只用于一次常量时间比较，绝不进入日志。
+fn decode_plain(response: &str) -> Option<(String, String)> {
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(response.as_bytes())
+        .ok()?;
+    let fields: Vec<&[u8]> = payload.split(|byte| *byte == 0).collect();
+    let (user, password) = match fields.as_slice() {
+        [_, user, password] => (*user, *password),
+        [user, password] => (*user, *password),
+        _ => return None,
+    };
+    let user = String::from_utf8_lossy(user).to_string();
+    if user.trim().is_empty() {
+        return None;
+    }
+    Some((user, String::from_utf8_lossy(password).to_string()))
 }
 
 /// 严格 base64 校验（RFC 4648 标准字母表 + `=` 填充）。
@@ -564,5 +662,115 @@ mod tests {
             })
             .await;
         assert!(matches!(outcome, AuthOutcome::TemporaryFailure(_)));
+    }
+
+    // ---- 本机口令库后端：Phase 5 提交端口 SASL 的默认真相源 ----
+
+    const STRONG: &str = "Correct-Horse-9-Battery";
+
+    fn plain_response(user: &str, password: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(format!("\0{user}\0{password}"))
+    }
+
+    fn password_request(user: &str, password: &str) -> AuthRequest {
+        AuthRequest {
+            mechanism: "PLAIN".to_string(),
+            response: plain_response(user, password),
+            secured: true,
+            peer: "203.0.113.7:54321".parse().unwrap(),
+        }
+    }
+
+    fn store_with(dir: &std::path::Path, records: &[PasswordRecord]) -> MailboxPasswords {
+        let passwords = MailboxPasswords::new(dir.join("mailbox-passwords.json"));
+        for record in records {
+            passwords.upsert(record).unwrap();
+        }
+        passwords
+    }
+
+    fn address_record(address: &str) -> PasswordRecord {
+        mailstack_core::password::mailbox_password_record(address, STRONG).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_full_address_authenticates_against_the_mailbox_password_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwords = store_with(dir.path(), &[address_record("alice@example.com")]);
+        let auth = MailboxPasswordsAuthenticator::new(passwords);
+        assert_eq!(
+            auth.authenticate(password_request("Alice@Example.com", STRONG))
+                .await,
+            AuthOutcome::Success {
+                user: "alice@example.com".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_account_name_matches_its_bare_record_but_not_an_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwords = store_with(dir.path(), &[password_record("alice", STRONG).unwrap()]);
+        let auth = MailboxPasswordsAuthenticator::new(passwords);
+        assert!(matches!(
+            auth.authenticate(password_request("alice", STRONG)).await,
+            AuthOutcome::Success { .. }
+        ));
+        assert_eq!(
+            auth.authenticate(password_request("bob@other.example", STRONG))
+                .await,
+            AuthOutcome::InvalidCredentials
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_or_unknown_user_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwords = store_with(dir.path(), &[address_record("alice@example.com")]);
+        let auth = MailboxPasswordsAuthenticator::new(passwords);
+        assert_eq!(
+            auth.authenticate(password_request(
+                "alice@example.com",
+                "Wrong-Horse-9-Battery"
+            ))
+            .await,
+            AuthOutcome::InvalidCredentials
+        );
+        assert_eq!(
+            auth.authenticate(password_request("nobody@example.com", STRONG))
+                .await,
+            AuthOutcome::InvalidCredentials
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_store_fails_closed_instead_of_passing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mailbox-passwords.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+        let auth = MailboxPasswordsAuthenticator::from_path(&path);
+        assert_eq!(
+            auth.authenticate(password_request("alice@example.com", STRONG))
+                .await,
+            AuthOutcome::InvalidCredentials
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_mechanism_or_malformed_response_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = MailboxPasswordsAuthenticator::new(store_with(dir.path(), &[]));
+        let mut request = password_request("alice@example.com", STRONG);
+        request.mechanism = "LOGIN".to_string();
+        assert!(matches!(
+            auth.authenticate(request).await,
+            AuthOutcome::TemporaryFailure(_)
+        ));
+        let mut request = password_request("alice@example.com", STRONG);
+        request.response = "not*base64".to_string();
+        assert_eq!(
+            auth.authenticate(request).await,
+            AuthOutcome::InvalidCredentials
+        );
     }
 }

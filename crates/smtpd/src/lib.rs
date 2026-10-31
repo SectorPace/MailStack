@@ -58,7 +58,7 @@ pub use ratelimit::{RateDecision, RateLimitConfig, RateLimiter};
 pub use reply::Reply;
 pub use sasl::{
     AuthBackend, AuthFuture, AuthOutcome, AuthRequest, Authenticator, DovecotAuthClient,
-    UnavailableAuthenticator, DEFAULT_AUTH_SOCKET,
+    MailboxPasswordsAuthenticator, UnavailableAuthenticator, DEFAULT_AUTH_SOCKET,
 };
 pub use session::{
     AcceptedMessage, Action, AnyRecipient, DirectoryRecipients, RecipientChecker, Session,

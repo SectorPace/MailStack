@@ -124,8 +124,10 @@ passwd 解析、TLS 配置校验等）；`crates/core` 有 10 个（口令库）
 
 ## 6. 尚未接线（诚实披露）
 
-1. **SMTP 提交端口的 SASL 仍走 Dovecot auth-client**（`DEPLOYMENT.md` §3.2）。
-   换成直连本套口令库属 Phase 5，需要改 `mailstackd` 的 AUTH 路径。
+1. ~~SMTP 提交端口的 SASL 仍走 Dovecot auth-client~~ **已切换**：`mailstackd`
+   的提交端口现在用 `mailstack_smtpd::MailboxPasswordsAuthenticator` 直连本套口令库
+   （`mailbox-passwords.json`），与 IMAP/POP3/ManageSieve 同源；`DovecotAuthClient`
+   保留但默认不装配。
 2. **LMTP / ManageSieve 监听器未装配**：`imappop3` 已实现，但 MailStack 的入站
    仍是 SMTP + 队列，接管要同时改投递路径。
 3. **`/metrics` HTTP 端点未接**：需要 `mailstack-web` 抓

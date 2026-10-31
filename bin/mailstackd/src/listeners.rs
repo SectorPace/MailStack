@@ -15,8 +15,8 @@
 use std::sync::Arc;
 
 use mailstack_smtpd::{
-    tls_acceptor, AuthBackend, BanList, Clock, DirectoryRecipients, DovecotAuthClient, MailServer,
-    MessageSink, RateLimiter, ServerConfig, SessionConfig, TlsMode,
+    tls_acceptor, AuthBackend, BanList, Clock, DirectoryRecipients, MailServer,
+    MailboxPasswordsAuthenticator, MessageSink, RateLimiter, ServerConfig, SessionConfig, TlsMode,
 };
 use mailstack_store::LocalRecipients;
 use tokio::net::TcpListener;
@@ -108,11 +108,11 @@ where
         rate_limit: config.rate_limit,
         ban: config.ban,
         // 只有通告 AUTH 的监听才需要后端（构造期会校验二者一致）。
-        // 客户端对象本身不建立连接：Dovecot 暂时不可用时 AUTH 回 454，
-        // 而不是让整个服务起不来。
-        auth: plan.offer_auth.then(|| {
-            AuthBackend::new(Arc::new(DovecotAuthClient::new(config.auth_socket.clone())))
-        }),
+        // 口令真相源与 IMAP/POP3/ManageSieve 相同（mailbox-passwords.json，INV-37）：
+        // 库按需读取，缺失/损坏时 AUTH 失败而不是拦住整个服务启动。
+        auth: plan
+            .offer_auth
+            .then(|| AuthBackend::new(Arc::new(MailboxPasswordsAuthenticator::at(&config.paths)))),
         // 收件人名录：复用既有的 managed-mailboxes.json + 别名表，不另立一份。
         // 查不了时 `RCPT` 保持现状（只判域），所以装配它不需要任何可用性前提。
         recipients: Some(Arc::new(DirectoryRecipients::new(LocalRecipients::new(
