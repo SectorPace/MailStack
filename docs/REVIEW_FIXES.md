@@ -934,7 +934,7 @@ $ cargo deny check
 advisories ok, bans ok, licenses ok, sources ok        # 退出码 0
 ```
 
-依赖升级后的全量回归：`QUALITY_GATE=PASS`（1146 passed / 0 failed）、
+依赖升级后的全量回归：`QUALITY_GATE=PASS`（1371 passed / 0 failed）、
 `INVARIANT_GATE_OK`（277）、`DELIVERABLES_OK`。
 
 ---
@@ -995,7 +995,7 @@ rustfmt: PASS
 clippy:  PASS（-D warnings）
 test:    PASS
 QUALITY_GATE=PASS
-TOTAL_PASSED=1146          # 比之前多 1 条：新增的契约测试
+TOTAL_PASSED=1371          # 比之前多 1 条：新增的契约测试
 INVARIANT_GATE_OK          checked=277 missing=0 not_a_test=0 no_assert=0
 DELIVERABLES_OK
 ```
@@ -1058,7 +1058,7 @@ RCPT 名录的三态判定、A-R 的 RFC 8601 引用 —— 我逐条复核过�
 W='wsl -d Ubuntu -e env HOME=/root CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0'
 R=/mnt/e/MailStack/mailstack-rust
 
-# 1) 全量测试（应为 1146 passed / 0 failed）
+# 1) 全量测试（应为 1371 passed / 0 failed）
 $W bash $R/deploy/wsl-cargo.sh test --workspace --all-targets
 
 # 2) 三道门禁

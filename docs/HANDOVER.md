@@ -59,7 +59,7 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 
 | 维度 | 数值 | 说明 |
 |---|---|---|
-| 测试 | **1146 passed / 0 failed** | `cargo test --workspace --all-targets`；含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
+| 测试 | **1371 passed / 0 failed** | `cargo test --workspace --all-targets`；含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 | 不变量门禁 | **277 / 277 存在** | `deploy/verify-invariant-gate.sh`（从 `ci.yml` 动态取名单） |
 | 质量门禁 | `QUALITY_GATE=PASS` | rustfmt + clippy(`-D warnings`) + 全量测试 |
 | 交付物门禁 | `DELIVERABLES_OK` | `deploy/verify-deliverables.sh` |
@@ -99,7 +99,7 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 | `mailstack-web-bin` | 9 | **管理控制台服务入口**（`bin/mailstack-web`）：API + 前端产物托管、SPA 回退、`/api` 兜底保持 JSON、路径穿越拒绝、遥测后台采样宿主 |
 | `mailstackd` | 28 | 进程入口：fail-closed 装配、监听集中绑定、RPC 双通道、停机扇出、队列调度、封禁热重载 |
 | `mailstackctl` | 7 | CLI：参数→特权调用的翻译、退出码映射 |
-| **合计** | **1146** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
+| **合计** | **1371** | 含 34 个真实环境集成测试（TLS / TCP / unix socket / Postfix） |
 
 ### 2.4 Phase 进度明细
 
@@ -110,7 +110,7 @@ OpenDKIM 承担签名、fail2ban 承担封禁。
 | 2 SMTP 核心 | 🟡 **机制层完成** | 自研 SMTP / 队列 / DKIM / TLS / 限速 / 封禁 / SASL / 直投 / ARC 全部有测试；**尚未**：机会式 TLS、真实 Dovecot auth socket 与真实公网 MX 验证 |
 | 3 前端切换 | ✅ **已接入** | 新增 `bin/mailstack-web` 服务入口（此前 `crates/web` 只有 `build_router`，**没有任何二进制在跑它**）：`--dist` 托管前端产物 + SPA 回退 + `/api` 兜底保持 JSON + 启动遥测后台采样（2 秒）。为对接前端新增 **8 个只读动作 / 10 条路由**（`users.list` `aliases.list` `queue.list` `services.list` `dkim.keys` `dns.records` `metrics.system` `activity.list`）与 **RPC 桥 `POST /api/rpc`**；成功响应改回**裸对象**（见 §4.2）。仍缺：真实环境验证（§4.3） |
 | 4 写面切换 | ✅ **动作面完成** | **58/58 动作已实现、72/72 契约路由已接线**：2FA、设置、域名/别名、邮箱用户 `users.*`、DKIM、服务与队列、封禁、备份、初始化向导、环路自检、ACME 证书（`setup.cert.issue` / `certs.renew`）、AI 出站（`ai.*`，含 SSRF / DNS-rebinding 防护）、进程内时序遥测、**为管理前端新增的 8 个只读列表动作与 RPC 桥**（见 TEST_REPORT §3.6–§3.10）。**仍缺**：真实环境验证 |
-| 5 组件下线 | ⏳ 未启动 | 停用 Postfix / OpenDKIM / fail2ban / Node |
+| 5 组件下线 | 🟡 **IMAP/POP3 已切**（其余未动） | **Dovecot 的 imap/pop3 协议面已由自研 `crates/imappop3` 接管**：新增装配层 `crates/imapd` 与二进制 `bin/mailstack-imap`（143/993/110/995），口令来自 `mailbox-passwords.json`（PBKDF2，INV-37），邮箱为 `/etc/passwd` 家目录 + `~/Maildir`；`users.create/password/delete` 与口令记录并写/删除（写失败如实报错）。见 `docs/IMAPPOP3_INTEGRATION.md` 与 `DEPLOYMENT.md` §3.8。**尚未切换**：提交端口 SASL 仍走 Dovecot auth-client；LMTP/ManageSieve 未装配；停用 Postfix / OpenDKIM / fail2ban / Node 未动 |
 
 ---
 
