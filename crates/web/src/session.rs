@@ -669,7 +669,7 @@ mod tests {
         assert_eq!(&a, expected);
     }
 
-    /// Cookie 名必须跟随 `Secure` 判定（本次修复的核心配对关系）：
+    /// Cookie 名必须跟随 `Secure` 判定（下发与作废的配对关系由此产生）：
     /// `__Host-` 前缀在浏览器侧强制要求 `Secure`，无 `Secure` 时用前缀名
     /// 等于让登录开箱即坏；反过来加 `Secure` 时不用前缀名则丢掉前缀保护。
     #[test]

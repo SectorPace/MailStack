@@ -349,7 +349,7 @@ fn revoke_sessions(state: &AppState, username: &str, mut value: serde_json::Valu
 /// **逐字一致** —— 属性不同的同名 Cookie 在浏览器里是两条独立记录，只清掉一条
 /// 的话另一条仍会被发回服务端（表现为「登出了但立刻又自动登录」）。
 ///
-/// ## 为什么这里必须拿到请求上下文（本次修复）
+/// ## 为什么这里必须拿到请求上下文
 ///
 /// 原先本函数在响应阶段用**另一套** `Secure` 判定（`secure_cookie_from_env`，
 /// 对端按 `None` 处理）：HTTPS 部署下下发路径判出「加 `Secure`」，作废路径却
@@ -1024,7 +1024,7 @@ mod tests {
             .to_string();
         // 默认部署（HTTP、无可信回环对端）判定为**不加** `Secure`；此时名字
         // **必须**不带 `__Host-` 前缀 —— 无 `Secure` 的 `__Host-` cookie 会被
-        // 所有浏览器拒收，登录开箱即坏（本次修复的核心）。名字与 `Secure`
+        // 所有浏览器拒收，登录开箱即坏。名字与 `Secure`
         // 的配对关系由 `the_cookie_name_follows_the_secure_decision` 与
         // `issued_and_cleared_session_cookies_are_always_paired` 钉住。
         assert!(
@@ -1352,7 +1352,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    // ── 本次修复的回归守卫 ──
+    // ── 回归守卫 ──
 
     /// 下发与作废的会话 Cookie 必须**逐字配对**：同名、同 `Secure`。属性不同的
     /// 同名 Cookie 在浏览器里是两条独立记录，作废清不掉下发的那一枚 —— 表现为

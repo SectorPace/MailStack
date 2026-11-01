@@ -1176,7 +1176,7 @@ mod tests {
         assert_eq!(session_cookie(&headers).as_deref(), Some("abc123"));
     }
 
-    /// Cookie 名是**条件性**的（本次修复）：会加 `Secure` 的部署下发
+    /// Cookie 名是**条件性**的：会加 `Secure` 的部署下发
     /// `__Host-mailstack_session`，默认 HTTP 部署下发无前缀的
     /// `mailstack_session`（无 `Secure` 的 `__Host-` cookie 会被浏览器拒收）。
     /// 解析侧必须两个名字都认 —— 只认其一，另一种部署的浏览器会被全体判成
