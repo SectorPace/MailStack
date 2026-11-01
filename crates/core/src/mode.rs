@@ -5,26 +5,44 @@
 
 use crate::paths::Paths;
 
-/// 读取 `ACCESS_MODE`。文件或键缺失时返回 `local`。
+/// 读取 `ACCESS_MODE`。
+///
+/// * 文件**不存在**（首次启动）或键缺失 → `local`（文档化的默认值）；
+/// * 文件存在但**读不出来**（权限 / I/O 错误）→ **fail-closed 到 `direct`**
+///   并 warn —— 读不出部署模式时按最严的公网档处理。原先任何错误一律回落
+///   `local`（最宽松档），一次权限故障就会把一台本该按公网档锁死的机器
+///   静默降级成本地档。
 ///
 /// `install.sh` 以 `printf 'ACCESS_MODE=%q\n'` 写入，故值可能带 shell 引号，
 /// 必须剥离。
 pub fn read_access_mode(paths: &Paths) -> String {
-    let Ok(text) = std::fs::read_to_string(&paths.install_args_conf) else {
-        return "local".to_string();
-    };
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("ACCESS_MODE=") {
-            let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
-            return if value.is_empty() {
-                "local".to_string()
-            } else {
-                value.to_string()
-            };
+    match std::fs::read_to_string(&paths.install_args_conf) {
+        Ok(text) => {
+            for line in text.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("ACCESS_MODE=") {
+                    let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
+                    return if value.is_empty() {
+                        "local".to_string()
+                    } else {
+                        value.to_string()
+                    };
+                }
+            }
+            "local".to_string()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "local".to_string(),
+        Err(e) => {
+            crate::warn::warn_with_error(
+                &format!(
+                    "read access mode {} (failing closed to direct)",
+                    paths.install_args_conf.display()
+                ),
+                &e,
+            );
+            "direct".to_string()
         }
     }
-    "local".to_string()
 }
 
 /// 是否面向公网（`caddy`/`direct`）或显式高安全档。
@@ -162,6 +180,23 @@ mod tests {
         let f = Fixture::new();
         f.write(&f.paths.install_args_conf, "ACCESS_MODE=\n");
         assert_eq!(read_access_mode(&f.paths), "local");
+    }
+
+    /// fail-closed 守卫：文件存在但**读不出来**（权限/I-O 错误）时，
+    /// 不得回落到最宽松的 `local`，而要按最严的公网档 `direct` 处理并告警。
+    ///
+    /// 用一个**目录**冒充配置文件触发读错误：`read_to_string` 对目录报
+    /// EISDIR，与运行身份无关 —— 以 root 跑测试时 chmod 000 挡不住 root。
+    #[test]
+    fn an_unreadable_install_args_conf_fails_closed_to_the_restrictive_mode() {
+        let f = Fixture::new();
+        fs::create_dir_all(&f.paths.install_args_conf).unwrap();
+
+        assert_eq!(read_access_mode(&f.paths), "direct");
+        assert!(
+            is_public_mode_with(&f.paths, None),
+            "读不出部署模式必须按公网档（更严）处理"
+        );
     }
 
     #[test]

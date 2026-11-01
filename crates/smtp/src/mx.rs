@@ -36,6 +36,14 @@ use crate::target::{resolve_pinned, AddressPolicy, PinnedTarget};
 /// 直投端口。RFC 5321 §5.1：投递给 MX 一律用 25 端口（提交口不用于 MTA 之间）。
 pub const DIRECT_DELIVERY_PORT: u16 = 25;
 
+/// 单个收件域参与尝试的 MX 台数上限。
+///
+/// 真实的域不会有 10 台 MX；而 MX 记录是对端可控的输入 —— 一个恶意域可以用
+/// 几十条 MX 记录把一次投递放大成几十次「解析 + 策略筛选 + 建连」，长时间占用
+/// 投递 worker。超出上限的候选被**截断**（不是错误）：上限只收窄尝试范围，
+/// 前 10 台全部不可用与第 11 台起全部不可用没有本质区别。
+pub const MAX_MX_CANDIDATES: usize = 10;
+
 /// 一条 MX 记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MxRecord {
@@ -180,11 +188,13 @@ pub async fn resolve_mx_targets(
 ) -> SmtpResult<Vec<PinnedTarget>> {
     let records = resolver.lookup_mx(domain).await?;
 
-    let candidates: Vec<String> = match classify_mx(domain, records) {
+    let mut candidates: Vec<String> = match classify_mx(domain, records) {
         MxTargets::Null(domain) => return Err(SmtpError::NullMx(domain)),
         MxTargets::Implicit(domain) => vec![domain],
         MxTargets::Hosts(hosts) => hosts.into_iter().map(|record| record.host).collect(),
     };
+    // 截断放在逐台解析**之前**：否则上限只省掉后面的建连，几十次 DNS 查询照样发生。
+    candidates.truncate(MAX_MX_CANDIDATES);
 
     let mut targets = Vec::with_capacity(candidates.len());
     let mut last_error: Option<SmtpError> = None;
@@ -398,6 +408,28 @@ mod tests {
             targets[0].dial_addr().ip(),
             "203.0.114.9".parse::<IpAddr>().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn mx_candidates_are_capped_at_ten() {
+        // MX 记录是对端可控的输入：恶意域可以用海量记录把一次投递放大成几十次
+        // 「解析 + 筛选 + 建连」。15 台候选必须被截断到 [`MAX_MX_CANDIDATES`]，
+        // 且保留的是按优先级排在前面的那些。
+        let records: Vec<MxRecord> = (1u16..=15)
+            .map(|i| record(i, &format!("203.0.113.{i}")))
+            .collect();
+        let resolver = StaticMxResolver::with(records);
+        let targets = resolve_mx_targets(
+            &resolver,
+            "example.com",
+            DIRECT_DELIVERY_PORT,
+            AddressPolicy::allow_private(),
+        )
+        .await
+        .expect("候选主机都是 IP 字面量，应全部可用");
+        assert_eq!(targets.len(), MAX_MX_CANDIDATES, "必须截断到上限");
+        assert_eq!(targets[0].hostname, "203.0.113.1");
+        assert_eq!(targets[9].hostname, "203.0.113.10");
     }
 
     #[tokio::test]

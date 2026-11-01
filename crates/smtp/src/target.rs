@@ -4,12 +4,13 @@
 //! 可以被调换成内网地址（DNS rebinding / TOCTOU）。IP 固定的做法是：
 //!
 //! 1. 先解析，得到地址列表与 `pinned`
-//! 2. 建立连接时**只连 `pinned`**（不使用域名）
+//! 2. 建立连接时**只连这些 IP**（按解析顺序逐个尝试，不使用域名）
 //! 3. TLS 握手时用**原域名**做 SNI 与证书校验
 //!
 //! 本模块把第 2 步做成**类型上不可绕过**：所有拨号 API 只接受 [`PinnedTarget`]，
-//! 而 [`PinnedTarget::pinned`] 是 `SocketAddr`。因此不存在「按域名重连」的代码路径
-//! —— 这比「记得别用域名」可靠，因为退化后代码照样能跑、测试照样绿，
+//! 其可拨地址只有 [`PinnedTarget::pinned`] 与 [`PinnedTarget::addresses`]
+//! （后者是完整列表，`pinned` 恒为其中的第一项）。因此不存在「按域名重连」的
+//! 代码路径 —— 这比「记得别用域名」可靠，因为退化后代码照样能跑、测试照样绿，
 //! 防护却是静默消失的。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -21,9 +22,12 @@ use crate::error::SmtpError;
 pub struct PinnedTarget {
     /// 原域名：**仅用于** TLS SNI 与证书校验，绝不用于拨号。
     pub hostname: String,
-    /// 解析得到的全部地址（已按私网策略筛选）。
+    /// 解析得到的全部地址（已按私网策略筛选，按解析顺序排列）。
+    ///
+    /// 拨号时**按此顺序逐个尝试**（见 `dial::PinnedDialer::connect`）：
+    /// 全部成员来自同一次解析、同一轮策略筛选，逐个尝试不脱离 IP 固定。
     pub addresses: Vec<IpAddr>,
-    /// 实际拨号目标：`addresses` 的第一项。
+    /// 首选拨号目标：`addresses` 的第一项（多地址尝试全部失败时的报错地址）。
     pub pinned: SocketAddr,
 }
 
@@ -46,7 +50,10 @@ pub fn is_private_network_address(ip: IpAddr) -> bool {
 }
 
 impl PinnedTarget {
-    /// 拨号字符串形式：`ip:port`。**故意不提供** `host:port` 形式。
+    /// 首选拨号地址：`ip:port`。**故意不提供** `host:port` 形式。
+    ///
+    /// 供展示与报错使用；真正的拨号方（`dial::PinnedDialer::connect`）会按
+    /// [`PinnedTarget::addresses`] 顺序逐个尝试，`pinned` 是其中的第一项。
     pub fn dial_addr(&self) -> SocketAddr {
         self.pinned
     }

@@ -150,6 +150,11 @@ pub trait HostResolver: Send + Sync {
 }
 
 /// 生产解析器。
+///
+/// `resolve` 是**同步阻塞**调用（getaddrinfo）：不得钉在 tokio worker 上。
+/// 出站路径（`models_list` / `request_custom`）统一经
+/// `tokio::task::spawn_blocking` 挪进 blocking 线程池；同步入口 `config_set`
+/// 则由 `Registry::dispatch` 对同步处理器的 spawn_blocking 兜底。
 #[derive(Debug, Default)]
 pub struct SystemResolver;
 
@@ -962,7 +967,16 @@ impl Ai {
                 "AI provider API base URL is not configured",
             ));
         }
-        validate_endpoint(&base_url, allow_private, self.resolver()).map_err(HandlerError::new)?;
+        // 端点校验内含同步 DNS 解析（getaddrinfo），必须离开异步 worker：
+        // 挪进 blocking 线程池。`HostResolver` 是 Send + Sync，Arc 可安全跨线程。
+        let resolver = Arc::clone(&self.env.resolver);
+        let base_url_for_check = base_url.clone();
+        tokio::task::spawn_blocking(move || {
+            validate_endpoint(&base_url_for_check, allow_private, resolver.as_ref())
+        })
+        .await
+        .map_err(|error| HandlerError::new(format!("AI endpoint validation task failed: {error}")))?
+        .map_err(HandlerError::new)?;
 
         let api_key = first_truthy([
             cfg_str(&cfg, "apiKey"),
@@ -1027,19 +1041,18 @@ impl Ai {
             ));
         }
 
+        // 4.18/4.19 同款纪律（见 `models_list`）：base_url 与 api_key **只认持久化
+        // 配置**，请求体里的同名字段一律忽略。若采信 body 的 baseUrl，存储的 apiKey
+        // 就会被发送到调用方指定的任意 URL（密钥外带）；采信 body 的 apiKey 则把
+        // 「用谁的凭据」交给了调用方。provider / model 不是机密，仍允许按请求覆写。
         let params = ChatParams {
             messages,
             provider: provider.clone(),
-            base_url: first_truthy([
-                Some(str_field(data, "baseUrl").trim().to_string()),
-                cfg_str(&cfg, "baseUrl"),
-                Some(preset.base_url.to_string()),
-            ]),
-            api_key: first_truthy([
-                Some(str_field(data, "apiKey").trim().to_string()),
-                cfg_str(&cfg, "apiKey"),
-                Some(preset.default_key.to_string()),
-            ]),
+            base_url: cfg_str(&cfg, "baseUrl")
+                .map(|url| url.trim().to_string())
+                .unwrap_or_else(|| preset.base_url.to_string()),
+            api_key: cfg_str(&cfg, "apiKey")
+                .unwrap_or_else(|| preset.default_key.to_string()),
             model: first_truthy([
                 Some(str_field(data, "model").trim().to_string()),
                 cfg_str(&cfg, "model"),
@@ -1060,6 +1073,13 @@ impl Ai {
                 "AI API key is not configured for {}",
                 preset.name
             )));
+        }
+        if params.base_url.is_empty() {
+            // 与 `models_list` 同一文案：custom 预设没有自带 base_url，
+            // 未配置时宁可报「没配置」也不得拿空串去拼请求。
+            return Err(HandlerError::new(
+                "AI provider API base URL is not configured",
+            ));
         }
 
         let started = Instant::now();
@@ -1147,19 +1167,16 @@ impl Ai {
             ));
         }
 
+        // 与 `chat` / `models_list` 同一纪律：base_url 与 api_key 只认持久化配置，
+        // 请求体里的同名字段一律忽略（否则自检也能把存储的密钥送到任意 URL）。
         let params = ChatParams {
             messages: vec![json!({ "role": "user", "content": "Hello, test connection." })],
             provider: provider.clone(),
-            base_url: first_truthy([
-                Some(str_field(data, "baseUrl").trim().to_string()),
-                cfg_str(&cfg, "baseUrl"),
-                Some(preset.base_url.to_string()),
-            ]),
-            api_key: first_truthy([
-                Some(str_field(data, "apiKey").trim().to_string()),
-                cfg_str(&cfg, "apiKey"),
-                Some(preset.default_key.to_string()),
-            ]),
+            base_url: cfg_str(&cfg, "baseUrl")
+                .map(|url| url.trim().to_string())
+                .unwrap_or_else(|| preset.base_url.to_string()),
+            api_key: cfg_str(&cfg, "apiKey")
+                .unwrap_or_else(|| preset.default_key.to_string()),
             model: first_truthy([
                 Some(str_field(data, "model").trim().to_string()),
                 cfg_str(&cfg, "model"),
@@ -1174,6 +1191,11 @@ impl Ai {
                 "AI API key is not configured for {}",
                 preset.name
             )));
+        }
+        if params.base_url.is_empty() {
+            return Err(HandlerError::new(
+                "AI provider API base URL is not configured",
+            ));
         }
 
         let started = Instant::now();
@@ -1232,8 +1254,17 @@ impl Ai {
     async fn request_custom(&self, params: &ChatParams) -> Result<(String, Value), HandlerError> {
         let preset = preset(&params.provider).unwrap_or_else(default_preset);
         let base = params.base_url.trim_end_matches('/').to_string();
-        validate_endpoint(&base, params.allow_private, self.resolver())
-            .map_err(HandlerError::new)?;
+        // 端点校验内含同步 DNS 解析（getaddrinfo），必须离开异步 worker（见
+        // `models_list` 的同款处理）。
+        let resolver = Arc::clone(&self.env.resolver);
+        let base_for_check = base.clone();
+        let allow_private = params.allow_private;
+        tokio::task::spawn_blocking(move || {
+            validate_endpoint(&base_for_check, allow_private, resolver.as_ref())
+        })
+        .await
+        .map_err(|error| HandlerError::new(format!("AI endpoint validation task failed: {error}")))?
+        .map_err(HandlerError::new)?;
 
         if preset.protocol == "anthropic" {
             let (system_prompt, user_msgs) = split_anthropic_messages(&params.messages);
@@ -1267,7 +1298,7 @@ impl Ai {
                 return Err(HandlerError::new(format!(
                     "Claude API request failed: HTTP {}: {}",
                     response.status,
-                    response.body_text()
+                    truncate_for_error(&response.body_text())
                 )));
             }
             let result: Value = serde_json::from_str(&response.body_text()).unwrap_or(Value::Null);
@@ -1302,7 +1333,7 @@ impl Ai {
                 return Err(HandlerError::new(format!(
                     "AI completion request failed: HTTP {}: {}",
                     response.status,
-                    response.body_text()
+                    truncate_for_error(&response.body_text())
                 )));
             }
             let result: Value = serde_json::from_str(&response.body_text()).unwrap_or(Value::Null);
@@ -1405,6 +1436,15 @@ fn mask_key(key: &str) -> String {
 /// 取字符串字段（缺失/非字符串 → 空串）。
 fn str_field<'a>(data: &'a Value, key: &str) -> &'a str {
     data.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// 错误文案里内嵌的上游响应体截到**前 500 字符**。
+///
+/// 上游响应体可达 2 MB（[`MAX_RESPONSE_BYTES`]），此前会原样进 `HandlerError`、
+/// 再一路进错误信封、日志与前端 —— 一次上游故障就能把一整个页面塞进管理台。
+/// 500 字符足够看清供应商的错误 JSON（与 `acme.rs` 的 `detail[-500:]` 同一纪律）。
+fn truncate_for_error(body: &str) -> String {
+    body.chars().take(500).collect()
 }
 
 fn cfg_str(cfg: &Value, key: &str) -> Option<String> {
@@ -2183,6 +2223,101 @@ mod tests {
         assert_eq!(body["max_tokens"], 1500);
         assert_eq!(body["temperature"], 0.2);
         assert_eq!(body["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn chat_and_test_ignore_base_url_and_api_key_from_the_request_body() {
+        // 4.19：base_url / api_key 只认持久化配置（与 `models_list` 同款）。请求体里
+        // 塞攻击者 URL 不得改变出站目标 —— 否则「发一次对话」就能把存储的密钥
+        // 原样送到攻击者指定的端点；塞攻击者 key 也不得替换存储的凭据。
+        let f = Fixture::new("chaigroup");
+        f.write_config(json!({
+            "provider": "custom",
+            "apiKey": "stored-key",
+            "baseUrl": "https://api.example.com/v1",
+            "model": "m",
+        }));
+        let resolver = Arc::new(FakeResolver::with("api.example.com", &["8.8.8.8"]));
+        let transport = FakeTransport::with(vec![
+            Ok(json_response(
+                200,
+                "OK",
+                json!({ "choices": [{ "message": { "content": "ok" } }] }),
+            )),
+            Ok(json_response(
+                200,
+                "OK",
+                json!({ "choices": [{ "message": { "content": "ok" } }] }),
+            )),
+        ]);
+        let ai = f.ai(resolver, Arc::clone(&transport), false);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let body = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "baseUrl": "https://attacker.example",
+            "apiKey": "attacker-controlled",
+        });
+        rt.block_on(ai.chat(&body)).unwrap();
+        rt.block_on(ai.test(&body)).unwrap();
+
+        for request in transport.requests() {
+            assert_eq!(request.url, "https://api.example.com/v1/chat/completions");
+            assert!(
+                request
+                    .headers
+                    .iter()
+                    .any(|(k, v)| k == "authorization" && v == "Bearer stored-key"),
+                "必须携带存储的凭据: {:?}",
+                request.headers
+            );
+            assert!(
+                !request
+                    .headers
+                    .iter()
+                    .any(|(_, v)| v.contains("attacker-controlled")),
+                "请求体指定的 key 不得被采信"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_error_bodies_are_truncated_in_error_messages() {
+        // 上游响应体可达 2 MB，错误文案必须截断，否则一次上游故障就能把
+        // 一整个页面塞进错误信封 / 日志 / 前端。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let f = Fixture::new("chatbigerr");
+        f.write_config(chat_config());
+        let long_body = "x".repeat(4000);
+        let transport =
+            FakeTransport::with(vec![Ok(json_response(500, "Err", json!(long_body)))]);
+        let ai = f.ai(
+            Arc::new(FakeResolver::with("api.openai.com", &["8.8.8.8"])),
+            transport,
+            false,
+        );
+
+        let err = rt
+            .block_on(ai.chat(&json!({ "messages": [{ "role": "user", "content": "hi" }] })))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("AI completion request failed: HTTP 500:"),
+            "{err}"
+        );
+        assert!(
+            err.chars().count() < 600,
+            "错误文案必须截断（{} chars）",
+            err.chars().count()
+        );
+        // 纯函数口径：按字符截断到 500（不按字节，避免切进多字节字符中间）。
+        assert_eq!(truncate_for_error(&"a".repeat(600)).chars().count(), 500);
     }
 
     #[test]

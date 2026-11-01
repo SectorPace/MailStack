@@ -341,16 +341,76 @@ fn token_bytes(token: &Token) -> Result<Vec<u8>, SearchError> {
     }
 }
 
+/// 该条件是否依赖邮件正文（而非只看 [`MessageMeta`] / 序号）。
+///
+/// 这是 [`needs_message`] 与 [`matches_meta`] 的共同事实来源：新增依赖正文的
+/// key 时必须同步更新这里，否则元数据预筛会拿空正文做出错误判定。
+fn is_content_key(key: &SearchKey) -> bool {
+    matches!(
+        key,
+        SearchKey::Header { .. }
+            | SearchKey::Body(_)
+            | SearchKey::Text(_)
+            | SearchKey::SentDate { .. }
+    )
+}
+
 /// 判断一个条件是否需要读取正文（调用方据此避免无谓的磁盘 I/O）。
 pub fn needs_message(key: &SearchKey) -> bool {
     match key {
         SearchKey::And(keys) => keys.iter().any(needs_message),
         SearchKey::Or(first, second) => needs_message(first) || needs_message(second),
         SearchKey::Not(key) => needs_message(key),
-        SearchKey::Header { .. }
-        | SearchKey::Body(_)
-        | SearchKey::Text(_)
-        | SearchKey::SentDate { .. } => true,
+        key => is_content_key(key),
+    }
+}
+
+/// 元数据阶段的条件求值：只看 `MessageMeta` 与序号就能判定的条件返回
+/// `Some(结果)`；依赖正文的条件返回 `None`（未定）。
+///
+/// 与 [`needs_message`] 的分工：`needs_message` 按**条件树**静态回答「会不会
+/// 用到正文」；本函数按**单封邮件**实际求值 —— `OR (正文条件) (Meta 条件)` 在
+/// Meta 条件已命中的邮件上无需读正文即可判定。SORT/THREAD/SEARCH 据此预筛：
+/// `Some(false)` 直接排除，只有 `None` 才进正文读取批次。
+///
+/// 逻辑与 [`matches`] 同构（Kleene 三值）：`And` 一侧为假即假、全真才真；
+/// `Or` 一侧为真即真、全假才假；`Not` 取反。未定即 `None`。
+pub fn matches_meta(key: &SearchKey, context: &SearchContext<'_>) -> Option<bool> {
+    match key {
+        key if is_content_key(key) => None,
+        SearchKey::And(keys) => {
+            let mut undetermined = false;
+            for key in keys {
+                match matches_meta(key, context) {
+                    Some(false) => return Some(false),
+                    None => undetermined = true,
+                    Some(true) => {}
+                }
+            }
+            (!undetermined).then_some(true)
+        }
+        SearchKey::Or(first, second) => {
+            match (matches_meta(first, context), matches_meta(second, context)) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            }
+        }
+        SearchKey::Not(inner) => matches_meta(inner, context).map(|decided| !decided),
+        // 其余 key 只读 meta / 序号，`message` 为空不影响结果。
+        _ => Some(matches(key, context)),
+    }
+}
+
+/// 是否包含 `MODSEQ` 条件。MODSEQ 属于 CONDSTORE 扩展（RFC 7162），会话层
+/// 据此在未 ENABLE CONDSTORE 时回 BAD —— 与 FETCH MODSEQ / CHANGEDSINCE、
+/// STORE UNCHANGEDSINCE 的门控保持一致。
+pub fn contains_modseq(key: &SearchKey) -> bool {
+    match key {
+        SearchKey::And(keys) => keys.iter().any(contains_modseq),
+        SearchKey::Or(first, second) => contains_modseq(first) || contains_modseq(second),
+        SearchKey::Not(key) => contains_modseq(key),
+        SearchKey::ModSeq(_) => true,
         _ => false,
     }
 }
@@ -680,5 +740,52 @@ Hello Bob,\r\nattachment inside\r\n";
             b"x".to_vec()
         )))));
         assert!(!needs_message(&SearchKey::Not(Box::new(SearchKey::All))));
+    }
+
+    #[test]
+    fn meta_stage_evaluates_without_the_message_bytes() {
+        let meta = meta(&[Flag::System(SystemFlag::Seen)], false, 500, 1_700_000_000);
+        let context = context(&meta, b"");
+        // 纯 Meta 条件：与完整求值一致，直接给出确定结果。
+        assert_eq!(
+            matches_meta(
+                &SearchKey::System {
+                    flag: SystemFlag::Seen,
+                    present: true
+                },
+                &context
+            ),
+            Some(true)
+        );
+        assert_eq!(matches_meta(&SearchKey::Larger(100), &context), Some(true));
+        assert_eq!(
+            matches_meta(&SearchKey::Larger(1000), &context),
+            Some(false)
+        );
+        // 正文条件：未定，需要读文件。
+        assert_eq!(
+            matches_meta(&SearchKey::Body(b"x".to_vec()), &context),
+            None
+        );
+        // OR：Meta 侧命中则无需正文；Meta 侧未命中才落到未定。
+        let key = SearchKey::Or(
+            Box::new(SearchKey::Body(b"x".to_vec())),
+            Box::new(SearchKey::Larger(100)),
+        );
+        assert_eq!(matches_meta(&key, &context), Some(true));
+        let key = SearchKey::Or(
+            Box::new(SearchKey::Body(b"x".to_vec())),
+            Box::new(SearchKey::Smaller(100)),
+        );
+        assert_eq!(matches_meta(&key, &context), None);
+        // AND：一侧排除即可短路，无需读正文。
+        let key = SearchKey::And(vec![
+            SearchKey::Body(b"x".to_vec()),
+            SearchKey::Larger(1000),
+        ]);
+        assert_eq!(matches_meta(&key, &context), Some(false));
+        // NOT 穿透：正文条件仍未定。
+        let key = SearchKey::Not(Box::new(SearchKey::Body(b"x".to_vec())));
+        assert_eq!(matches_meta(&key, &context), None);
     }
 }

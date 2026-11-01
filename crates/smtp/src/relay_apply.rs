@@ -19,6 +19,8 @@
 //! 这里抽象出 [`RelayConfigStore`]，两种载体各自实现；测试用内存实现，
 //! 从而在没有 Postfix 的机器上也能验证回滚与回读语义。
 
+use std::sync::{LazyLock, Mutex};
+
 use serde_json::{json, Value};
 
 use crate::error::SmtpError;
@@ -39,6 +41,21 @@ pub const SASL_PASSWORD_PATH: &str = "/etc/postfix/sasl_passwd";
 
 /// 回读校验失败的文案（对外契约，规格书 §5.9.5 原文）。
 pub const ERR_RELAYHOST_VERIFY_FAILED: &str = "Postfix relayhost verification failed";
+
+/// 进程级落地互斥（与 INV-32「并发丢更新」同一考量）。
+///
+/// `apply_relay` 的「快照 → 写入 → 回读 →（失败）回滚」是一组必须**整体原子**的
+/// 操作：两次并发 apply 时，A 的快照可能落在 B 已写到一半的状态上，A 回滚时会把
+/// B 的新配置当成「旧值」写回去 —— 两次本应各自完整的落地互相踩踏，最终配置
+/// 既不是 A 的也不是 B 的。这条路径是低频管理操作（设置向导），整把串行锁没有
+/// 任何吞吐代价。
+///
+/// 刻意用 `std::sync::Mutex` 而不是 `tokio::sync::Mutex`：`apply_relay` 是同步
+/// 函数，而生产调用点（`priv::readers::setup_relay_apply`）在 async 上下文里
+/// **直接**调它 —— `tokio::sync::Mutex::blocking_lock` 在运行时线程上会 panic。
+/// 函数体内没有任何 `.await`，锁的持有期就是这个同步段，用 std 的锁在任何调用
+/// 环境下都安全。
+static APPLY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// 落地计划：由已校验的端点推导。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +114,11 @@ pub fn plan_relay_apply(endpoint: &RelayEndpoint) -> RelayPlan {
     }
 
     let credentials = if has_credentials {
+        // 格式契约：`<relayhost> <user>:<password>`，读侧在**第一个**冒号处切分
+        // （`relay_store::parse_sasl_passwd`，等价于 `splitn(2, ':')`）——
+        // 口令里再出现冒号是安全的，两侧往返一致。空白会破坏这个空白分隔的
+        // 载体（读回时被静默截断），已由 `validate_relay` 在入口硬拒；
+        // 用户名里应避免冒号（读回时冒号之后的部分会被当成口令）。
         Some(format!(
             "{relayhost} {}:{}\n",
             endpoint.username, endpoint.password
@@ -204,6 +226,13 @@ pub fn apply_relay(
     endpoint: &RelayEndpoint,
     test: &RelayTestResult,
 ) -> Result<RelayApplyResult, RelayApplyFailure> {
+    // 全程串行：锁必须覆盖「测试判定 → 快照 → 写入 → 回读 → 回滚」整段。
+    // 中毒只可能来自本函数内某次 panic；锁里没有会被破坏的共享不变量
+    // （载荷就是 `()`），恢复锁继续走比让此后所有 apply 永久失败更合理。
+    let _apply_guard = APPLY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     // ── 1) 测试不通过则不落任何配置 ──
     if !test.connected {
         return Err(RelayApplyFailure {
@@ -277,6 +306,38 @@ pub fn apply_relay(
     })
 }
 
+/// `apply_relay` 可能写入的全部键 —— 清除（direct 模式）的逆向范围以这份列表为准。
+///
+/// 与 [`plan_relay_apply`] 保持同源：`plan` 依端点动态增减 `wrappermode`，
+/// 清除时无从知道「上次 apply 用的是哪种端点」，因此对全集逐键移除 ——
+/// `remove_key` 对从未设置的键是幂等空操作。
+const APPLY_WRITTEN_KEYS: &[&str] = &[
+    KEY_RELAYHOST,
+    KEY_SASL_AUTH_ENABLE,
+    KEY_SASL_PASSWORD_MAPS,
+    KEY_SASL_SECURITY_OPTIONS,
+    KEY_TLS_SECURITY_LEVEL,
+    KEY_TLS_WRAPPERMODE,
+];
+
+/// 清除中继配置，回到「未配置中继（直投）」状态 —— [`apply_relay`] 的逆向。
+///
+/// * 键用 `remove_key` 回到**未设置**，而不是写空串 —— 理由与回滚相同：
+///   对部分键写空串会抹掉 Postfix 的默认安全项（见 `rollback` 的注释）。
+/// * 凭证文件一并删除；`reload` 让 Postfix 载体立即生效（原生载体是空操作）。
+/// * 与 [`apply_relay`] 共用同一把进程级互斥：clear 与 apply 并发时不得交错。
+/// * 幂等：重复调用、或清除一个从未配置过的载体，都是成功。
+pub fn clear_relay(store: &mut dyn RelayConfigStore) -> Result<(), SmtpError> {
+    let _apply_guard = APPLY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for key in APPLY_WRITTEN_KEYS {
+        store.remove_key(key)?;
+    }
+    store.remove_credentials()?;
+    store.reload()
+}
+
 fn take_snapshot(
     store: &mut dyn RelayConfigStore,
     plan: &RelayPlan,
@@ -292,8 +353,12 @@ fn take_snapshot(
 
 fn write_all(store: &mut dyn RelayConfigStore, plan: &RelayPlan) -> Result<(), SmtpError> {
     // 凭证先落盘（0600），再写配置键 —— 顺序与原文一致。
-    if let Some(content) = &plan.credentials {
-        store.write_credentials(content)?;
+    // 无凭证的计划必须**移除**已存凭证：`load_relay` 按 host:port 匹配重挂
+    // 凭证，留着旧凭证会让「不带凭证的 apply」实际仍拿旧账号去认证 ——
+    // 已吊销的凭证会以莫名 AUTH 失败的形式出现，明文密钥也一直留在盘上。
+    match &plan.credentials {
+        Some(content) => store.write_credentials(content)?,
+        None => store.remove_credentials()?,
     }
     for (key, value) in &plan.keys {
         store.write_key(key, value)?;
@@ -857,5 +922,49 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("refusing"));
+    }
+
+    // ───────────────── 清除（direct 模式）：apply 的逆向 ─────────────────
+
+    #[test]
+    fn clear_relay_removes_every_key_apply_writes_and_is_idempotent() {
+        // 先落一份完整 apply（含 465 的 wrappermode），再清除。
+        let mut store = InMemoryRelayStore::new();
+        apply_relay(
+            &mut store,
+            &endpoint(465, "SSL/TLS", "apikey", "secret"),
+            &passed_test(),
+        )
+        .unwrap();
+        assert_eq!(store.keys.len(), 6, "apply 应已写入 6 个键（含 wrappermode）");
+        assert!(store.credentials.is_some());
+
+        let reloads_before = store.reloads;
+        clear_relay(&mut store).unwrap();
+        assert!(
+            store.keys.is_empty(),
+            "全部键必须被清除，实际: {:?}",
+            store.keys
+        );
+        assert!(
+            store.credentials.is_none(),
+            "凭证文件必须随 clear 一并删除"
+        );
+        assert!(
+            store.reloads > reloads_before,
+            "清除后应重载（Postfix 载体靠它生效）"
+        );
+
+        // 幂等：对已清空的载体再 clear 一次仍是成功。
+        clear_relay(&mut store).unwrap();
+        assert!(store.keys.is_empty());
+    }
+
+    #[test]
+    fn clear_relay_on_an_unconfigured_store_is_a_successful_no_op() {
+        let mut store = InMemoryRelayStore::new();
+        clear_relay(&mut store).unwrap();
+        assert!(store.keys.is_empty());
+        assert!(store.credentials.is_none());
     }
 }

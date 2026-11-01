@@ -679,9 +679,20 @@ impl Readers {
 
     /// 队列的只读摘要（积压、损坏条目、出站结论）。复用持久化状态，
     /// 因此即便 `mailstackd` 不在跑，管理台看到的也是**磁盘上的真相**。
+    ///
+    /// 状态文件读失败时 backlog/corrupt 会渲染成 0 —— 那与「队列真空」是
+    /// 两件事（INV-2），所以降级项必须显式出现在 `unavailable` 里。
     fn queue_summary(&self) -> Value {
         let store = self.queue();
-        let entries = store.load_all().unwrap_or_default();
+        let mut unavailable: Vec<&'static str> = Vec::new();
+        let entries = match store.load_all() {
+            Ok(entries) => entries,
+            Err(error) => {
+                mailstack_core::warn::warn_with_detail("read queue entries", &error.to_string());
+                unavailable.push("backlog");
+                Vec::new()
+            }
+        };
         let health_state = store.load_health().unwrap_or_default();
         let relay = read_relay_host(&self.paths);
         let health = mailstack_queue::outbound_health_from(
@@ -692,7 +703,14 @@ impl Readers {
 
         let corrupt = std::fs::read_dir(store.corrupt_dir())
             .map(|read| read.flatten().count())
-            .unwrap_or(0);
+            .unwrap_or_else(|error| {
+                mailstack_core::warn::warn_with_detail(
+                    "read queue corrupt dir",
+                    &error.to_string(),
+                );
+                unavailable.push("corrupt");
+                0
+            });
 
         json!({
             "backlog": entries.len(),
@@ -706,6 +724,8 @@ impl Readers {
                 "lastSuccessAt": health_state.last_success_at,
                 "lastFailure": health_state.last_failure,
             },
+            // 空数组 = 全部读到。降级项（backlog / corrupt）会在这里列出来。
+            "unavailable": unavailable,
         })
     }
 
@@ -896,16 +916,32 @@ impl Readers {
         ));
 
         // 3) 域名表：空表会让库层 fail-closed 拒收全部收件人（INV-17）。
-        let domains = self.tables().domains();
-        checks.push(check(
-            "domain_table",
-            !domains.is_empty(),
-            if domains.is_empty() {
-                "domain table is empty: every recipient will be refused (INV-17)".to_string()
-            } else {
-                format!("{} domain(s)", domains.len())
-            },
-        ));
+        //    「读不到」与「真空」必须分开说（INV-2）：把读失败渲染成
+        //    「空表：所有收件人将被拒收」会让运维去查域名配置，而真正的问题
+        //    在权限或磁盘上。
+        let domains = mailstack_core::atomic::try_rows(&self.paths.domains);
+        checks.push(match domains {
+            Ok(rows) => {
+                let names: Vec<String> = rows
+                    .into_iter()
+                    .filter_map(|row| row.into_iter().next())
+                    .collect();
+                check(
+                    "domain_table",
+                    !names.is_empty(),
+                    if names.is_empty() {
+                        "domain table is empty: every recipient will be refused (INV-17)".to_string()
+                    } else {
+                        format!("{} domain(s)", names.len())
+                    },
+                )
+            }
+            Err(error) => check(
+                "domain_table",
+                false,
+                format!("domain table is unavailable: {error}"),
+            ),
+        });
 
         // 4) 中继配置：不存在是合法的「尚未配置」，存在就必须能解析。
         checks.push(self.relay_check());
@@ -1043,7 +1079,7 @@ impl Readers {
     /// 清单里的每一项都用**写入方实际使用的权限**作为上限（见
     /// [`mailstack_core::security`] 的说明），因此扫描器与写入方不会各说各话。
     pub fn security_scan(&self, _data: &Value) -> Result<Value, HandlerError> {
-        let report = mailstack_core::security::scan(&self.security_inventory());
+        let report = mailstack_core::security::scan(&self.security_inventory()?);
         let count = |severity| {
             report
                 .findings
@@ -1106,7 +1142,11 @@ impl Readers {
     }
 
     /// 需要体检的敏感路径清单。
-    fn security_inventory(&self) -> Vec<mailstack_core::security::SensitivePath> {
+    ///
+    /// DKIM 私钥按**纳管域**枚举，因此域名表读失败必须上抛（与
+    /// [`Self::managed_domains`] 的口径一致）：静默成空集合会让扫描器
+    /// 「恰好扫不到任何 DKIM 私钥」，把一次读故障伪装成一次干净的体检。
+    fn security_inventory(&self) -> Result<Vec<mailstack_core::security::SensitivePath>, HandlerError> {
         use mailstack_core::security::SensitivePath;
 
         let p = &self.paths;
@@ -1172,8 +1212,8 @@ impl Readers {
             "Postfix sasl_passwd：明文口令",
         ));
 
-        // DKIM 私钥：每个纳管域一把。
-        for domain in self.tables().domains() {
+        // DKIM 私钥：每个纳管域一把。域名表读失败上抛，不静默成「没有域」。
+        for domain in self.managed_domains()? {
             let dir = mailstack_auth::keys::dkim_key_dir(&self.paths, &domain);
             let Ok(read) = std::fs::read_dir(&dir) else {
                 continue;
@@ -1199,7 +1239,7 @@ impl Readers {
             }
         }
 
-        list
+        Ok(list)
     }
 
     /// `backup.list`：列出备份归档。
@@ -1388,6 +1428,10 @@ impl Readers {
             "preRestoreSnapshot": snapshot.0,
             "preRestoreSnapshotWarning": snapshot.1,
             "sha256": outcome.sha256,
+            // 受管服务的配置已经 reload，但 `mailstackd` 在启动期装配配置、
+            // 没有热重载 —— 不重启它就仍在按旧配置跑。这一事实必须出现在
+            // 响应里，而不是只写在代码注释里。
+            "restartRequired": true,
         }))
     }
 
@@ -1485,7 +1529,6 @@ impl Readers {
         if let Err(error) = store.write_metadata(&metadata) {
             // 归档在、元数据不在 —— 它仍然可恢复（靠 `describe` 的兜底），
             // 但要如实说明这次降级。
-            let _ = &error;
             mailstack_core::warn::warn_with_detail(
                 "pre-restore snapshot metadata",
                 &error.to_string(),
@@ -1535,10 +1578,14 @@ impl Readers {
         // `key` / `op` 是管理前端的字段名（它按 `{key, op}` 提交）；
         // 下面的 `id`/`name`/`service` 与 `verb`/`action` 是基线与控制台的字段名。
         let ident = crate::handlers::first_str(data, &["id", "name", "service", "key"])?;
-        let verb = crate::handlers::optional_str(data, "verb")
-            .or_else(|| crate::handlers::optional_str(data, "action"))
-            .or_else(|| crate::handlers::optional_str(data, "op"))
-            .unwrap_or("restart")
+        // 与 queue.action 同一纪律：缺字段显式报错，不猜默认动词 ——
+        // 「漏传参数」被悄悄当成 restart 是在替调用方做变更决定。
+        let verb = ["verb", "action", "op"]
+            .iter()
+            .find_map(|key| crate::handlers::optional_str(data, key))
+            .ok_or_else(|| {
+                HandlerError::new("missing required field (one of [\"verb\", \"action\", \"op\"])")
+            })?
             .trim()
             .to_ascii_lowercase();
         let unit = resolve_service_unit(ident)
@@ -1648,13 +1695,15 @@ impl Readers {
         // 第三个候选 `op` 是给管理前端的：它按 `{id, op}` 提交。
         //
         // 这一条**不是**可有可无的兼容装饰 —— 少了它，前端点「删除」时参数会被
-        // 静默忽略、落到下面的 `unwrap_or("retry")`，于是**队列里的邮件被重新投递
-        // 而不是被删除**。默认值让一个破坏性操作变成了另一种破坏性操作，且两边
-        // 都不报错，是这套参数解析里最危险的一处。
-        let verb = crate::handlers::optional_str(data, "verb")
-            .or_else(|| crate::handlers::optional_str(data, "action"))
-            .or_else(|| crate::handlers::optional_str(data, "op"))
-            .unwrap_or("retry")
+        // 静默忽略、落到某个默认动词上，于是**队列里的邮件被重新投递而不是被
+        // 删除**。缺字段是调用方的错误，必须显式失败：在重试/删除/冲刷之间
+        // 猜一个默认值，等于让「漏传参数」悄悄变成另一种破坏性操作。
+        let verb = ["verb", "action", "op"]
+            .iter()
+            .find_map(|key| crate::handlers::optional_str(data, key))
+            .ok_or_else(|| {
+                HandlerError::new("missing required field (one of [\"verb\", \"action\", \"op\"])")
+            })?
             .trim()
             .to_ascii_lowercase();
         // 前端把「立即投递」叫 `deliver`；本仓库对应的动作是「清零重试预算让它
@@ -1735,12 +1784,14 @@ impl Readers {
 
         let rotation = mailstack_auth::keys::rotate(&self.paths, &domain, Some(&selector))?;
 
+        // 重新走身份步骤意味着向导要重新收尾：wizardCompleted 随新配置归零。
         let config = mailstack_core::config::SetupConfig {
             domain,
             mail_host,
             server_ip,
             dkim_selector: rotation.selector.clone(),
             expected_spf: setup_expected_spf(data),
+            wizard_completed: false,
             updated_at: mailstack_core::now_iso8601_utc(),
         };
         mailstack_core::config::write_setup_config(&self.paths, &config)?;
@@ -1800,20 +1851,28 @@ impl Readers {
         let mut checks = serde_json::Map::new();
         // A：登记的 IP 必须逐字出现在 A 记录里。
         checks.insert("a".to_string(), json!(a.iter().any(|ip| ip == &server_ip)));
-        // MX：主机名出现在某条 MX 目标里（`dig +short` 的形态带优先级前缀，
-        // 故用子串匹配）。
+        // MX：期望主机与某条 MX 记录的**目标主机精确相等**（去优先级前缀、
+        // 去结尾点、忽略大小写）。子串匹配会把 `evilemail.example.com`、
+        // `mail.example.com.attacker.net` 一并判成匹配，不设防。
         checks.insert(
             "mx".to_string(),
-            json!(mx.iter().any(|item| item.contains(&mail_host))),
+            json!(mx_records_contain(&mx, &mail_host)),
         );
         // 恰好一条 SPF：两条 `v=spf1` 会让收信方按 RFC 7208 直接判 permerror。
         checks.insert("spfSingle".to_string(), json!(spf_records.len() == 1));
+        // 期望值缺省时不能恒报 false —— 那会把「SPF 实际正确」说成「期望校验
+        // 失败」。与 `dns.records` 同一口径：没有显式期望值时按惯例值
+        // `v=spf1 mx -all` 比较。
+        let expected_spf = expected
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("v=spf1 mx -all");
         checks.insert(
             "spfExpected".to_string(),
-            json!(expected
-                .as_deref()
-                .map(|want| spf_records.iter().any(|record| record.as_str() == want))
-                .unwrap_or(false)),
+            json!(spf_records
+                .iter()
+                .any(|record| record.trim() == expected_spf)),
         );
         checks.insert(
             "dkim".to_string(),
@@ -1843,9 +1902,10 @@ impl Readers {
                     self.dns.lookup_txt(&ses_from).await?,
                 )
             };
-            let mx_ok = ses_mx
-                .iter()
-                .any(|item| item.contains(&format!("feedback-smtp.{ses_region}.amazonses.com")));
+            // SES 的 MX 判据与上面同口径：精确匹配 SES Mail From 区的
+            // feedback-smtp 主机，不做子串匹配。
+            let ses_mx_host = format!("feedback-smtp.{ses_region}.amazonses.com");
+            let mx_ok = mx_records_contain(&ses_mx, &ses_mx_host);
             let spf_ok = {
                 let records: Vec<&String> = ses_spf
                     .iter()
@@ -1903,7 +1963,13 @@ impl Readers {
     /// 「测试不过一行配置都不写」「写完回读校验」「失败回滚」这三条顺序由
     /// [`mailstack_smtp::apply_relay`] 保证 —— 不在这里重写一遍，否则就有了第二个
     /// 真相源。
+    ///
+    /// `direct: true` 是**撤销**语义：把已配置的中继清掉、回到直投。不走「测试」
+    /// —— 清除不需要连通任何远端；也不要求此前真的配置过中继（幂等）。
     pub async fn setup_relay_apply(&self, data: &Value) -> Result<Value, HandlerError> {
+        if flag(data, "direct") {
+            return self.clear_relay_direct();
+        }
         let request = relay_request(data)?;
         let private = self.relay_private_network_enabled();
         let endpoint = mailstack_smtp::validate_relay(&request, private)?;
@@ -1926,6 +1992,32 @@ impl Readers {
             Ok(applied) => Ok(applied.to_json(&result)),
             Err(failure) => Ok(failure.to_json()),
         }
+    }
+
+    /// `setup.relay.apply` + `direct: true`：清除中继，回到直投。
+    ///
+    /// 与 [`mailstack_smtp::apply_relay`] 走**同一个**配置载体（`NativeRelayStore`
+    /// → `relay.json`），清除用它的逆向 [`mailstack_smtp::clear_relay`]：apply 写过
+    /// 的键（relayhost、SASL、TLS 安全级、wrappermode）全部回到未设置，凭证一并
+    /// 删除。基线的 `postconf -e "relayhost ="` 在本栈没有对应物 —— 本栈的 apply
+    /// 从不写 postconf（见 [`Readers::setup_relay_apply`] 的载体差异说明），真正的
+    /// 逆向必须作用在 apply 真正落盘的那份载体上。
+    ///
+    /// 通道与普通 apply 相同（RW、非破坏性）：同一动作的两种载荷语义不改变它的
+    /// 归类，撤销中继与配置中继的风险等级一致。
+    fn clear_relay_direct(&self) -> Result<Value, HandlerError> {
+        let mut store = NativeRelayStore::production(&self.paths);
+        mailstack_smtp::clear_relay(&mut store).map_err(HandlerError::from)?;
+
+        // 响应与成功的 apply 同形（`applied` / `relayhost` / `wrappermode`），
+        // 另带 `mode: "direct"` 让界面能区分「配置了中继」与「回到直投」。
+        // `relayhost` 如实为空：清除后没有任何中继。
+        Ok(json!({
+            "applied": true,
+            "mode": "direct",
+            "relayhost": "",
+            "wrappermode": false,
+        }))
     }
 
     /// `setup.mail.test`：向**本机提交端点**投一封测试信。
@@ -2321,12 +2413,13 @@ impl Readers {
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("mail.{domain}"));
 
-            // MX：观测值里出现目标主机即算匹配（`lookup_mx_records` 的形态带优先级前缀）。
+            // MX：观测记录的**目标主机**与期望主机精确相等（见
+            // [`mx_records_contain`]）；解析失败按「未匹配」处理，不让整条列表失败。
             let mx_ok = self
                 .dns
                 .lookup_mx_records(&domain)
                 .await
-                .map(|records| records.iter().any(|r| r.contains(&host)))
+                .map(|records| mx_records_contain(&records, &host))
                 .unwrap_or(false);
             items.push(json!({
                 "type": "MX", "name": domain, "value": host,
@@ -2534,6 +2627,27 @@ fn setup_address(data: &Value, keys: &[&str]) -> Result<String, HandlerError> {
     Ok(address)
 }
 
+/// MX 期望主机与观测记录是否**精确**相等。
+///
+/// 此前用子串判定（`record.contains(host)`）：`mail.example.com` 会被
+/// `evilemail.example.com`（子串）与 `mail.example.com.attacker.net`
+/// （前缀 + 尾巴）双双命中 —— 子串匹配放在 DNS 安全判据上等于不设防。
+/// `dig +short` 的 MX 形态是 `优先级 目标主机.`，这里拆出目标主机
+/// （最后一段），去掉结尾的点、忽略大小写后做精确比较。
+fn mx_records_contain(records: &[String], host: &str) -> bool {
+    let want = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if want.is_empty() {
+        return false;
+    }
+    records.iter().any(|record| {
+        record
+            .split_whitespace()
+            .last()
+            .map(|target| target.trim_end_matches('.').to_ascii_lowercase() == want)
+            .unwrap_or(false)
+    })
+}
+
 /// DKIM TXT 记录里是否带一个「看起来是真的」的 RSA 公钥。
 ///
 /// 判据与基线 `network.py:168` 的正则 `p=[A-Za-z0-9+/]{100,}={0,2}` 等价：
@@ -2566,6 +2680,15 @@ const DNS_TTL: u64 = 3600;
 
 /// `activity.list` 最多返回的条目数（最新在前）。
 const ACTIVITY_MAX_ITEMS: usize = 50;
+
+/// `activity.list` 每次读取的日志尾部字节数。
+///
+/// 审计日志只增不减，此前每次调用都把**整个文件**读进内存再取最后 50 条 ——
+/// 一台跑了几年、日志几百 MB 的机器上，这会把一个前端轮询动作变成 IO 放大器。
+/// 256 KiB 与 `mailstack_core::audit` 的尾部窗口同量级；日志在追加，尾部
+/// 字节里解析出的记录必然是最新的。极端情况下（单条记录超大）50 条装不满
+/// 256 KiB 的窗口会回更少的条目 —— 对「活动流」这是可接受的截断。
+const ACTIVITY_TAIL_BYTES: u64 = 262_144;
 
 /// DKIM TXT 记录的 owner 名：`<selector>._domainkey.<domain>`。
 fn dkim_record_name(selector: &str, domain: &str) -> String {
@@ -2676,7 +2799,8 @@ fn activity_kind(action: &str) -> &'static str {
     }
 }
 
-/// 读审计日志（JSON lines）并折成前端活动项，最新在前，最多 [`ACTIVITY_MAX_ITEMS`] 条。
+/// 读审计日志（JSON lines）的**尾部**并折成前端活动项，最新在前，最多
+/// [`ACTIVITY_MAX_ITEMS`] 条。
 ///
 /// 无法解析的行（被截断的半行、格式回滚的旧记录）**跳过**而不是让整个列表失败 ——
 /// 审计日志随时可能正被追加，半行是正常中间态。日志不存在回空数组：还没写过审计
@@ -2685,19 +2809,13 @@ fn activity_kind(action: &str) -> &'static str {
 /// 日志是追加写的，故倒排即「最新在前」。**不**按 `time` 字符串重排：不同条目的
 /// 时区偏移可能不同，字典序排序会得出错误顺序。
 fn read_activity(log_path: &Path) -> Result<Vec<Value>, HandlerError> {
-    let text = match std::fs::read_to_string(log_path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        // 与「不存在」不同，读不动（权限 / IO）是真故障：不静默成空列表。
-        Err(e) => {
-            return Err(HandlerError::new(format!(
-                "read audit log {}: {e}",
-                log_path.display()
-            )))
-        }
+    let Some((tail, truncated)) = read_log_tail(log_path, ACTIVITY_TAIL_BYTES)? else {
+        return Ok(Vec::new());
     };
-    let mut items: Vec<Value> = text
+    // 窗口是从日志中间切开的，第一行几乎必然是残行 —— 跳过它再解析。
+    let mut items: Vec<Value> = tail
         .lines()
+        .skip(if truncated { 1 } else { 0 })
         .filter_map(|line| serde_json::from_str::<mailstack_core::audit::AuditRecord>(line).ok())
         .map(|record| {
             let kind = activity_kind(&record.action);
@@ -2712,6 +2830,51 @@ fn read_activity(log_path: &Path) -> Result<Vec<Value>, HandlerError> {
     items.reverse();
     items.truncate(ACTIVITY_MAX_ITEMS);
     Ok(items)
+}
+
+/// 读日志文件的最后 `max_bytes` 字节。
+///
+/// 返回 `(文本, 窗口是否从行中间切开)`；文件不存在返回 `Ok(None)` ——
+/// 审计日志还没写过是合法状态。文件大于窗口时 `seek` 到 `len - max_bytes`
+/// 再读，**绝不**把整个文件读进内存：`activity.list` 是前端轮询的动作，
+/// 全量读等于把每次轮询变成一次 IO 放大。
+fn read_log_tail(
+    log_path: &Path,
+    max_bytes: u64,
+) -> Result<Option<(String, bool)>, HandlerError> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = match std::fs::File::open(log_path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(HandlerError::new(format!(
+                "read audit log {}: {e}",
+                log_path.display()
+            )))
+        }
+    };
+    let read_error = |e: std::io::Error| {
+        HandlerError::new(format!("read audit log {}: {e}", log_path.display()))
+    };
+    let len = file
+        .metadata()
+        .map_err(|e| read_error(e))?
+        .len();
+    if len <= max_bytes {
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(read_error)?;
+        return Ok(Some((text, false)));
+    }
+    file.seek(SeekFrom::Start(len - max_bytes))
+        .map_err(read_error)?;
+    let mut bytes = Vec::with_capacity(max_bytes as usize);
+    file.take(max_bytes).read_to_end(&mut bytes).map_err(read_error)?;
+    // 日志可能含非 UTF-8 的尾巴；有损解码与展示面的口径一致。
+    Ok(Some((
+        String::from_utf8_lossy(&bytes).into_owned(),
+        true,
+    )))
 }
 
 /// `YYYY-MM-DD HH:MM:SS`（UTC）。
@@ -2935,19 +3098,21 @@ fn clamp_lines(data: &Value) -> usize {
 ///
 /// `MESSAGE` 可能是字符串，也可能是字节数组（非 UTF-8 的日志会有后者）。
 /// 两种情况都要能读出来 —— 一条二进制日志不该让整个列表解析失败。
+/// 字节数组按 UTF-8 **有损**解码（与基线 `errors='replace'` 同口径）；
+/// `b as char` 的 Latin-1 展开会把每个非 ASCII 字节变成两个乱码字。
 fn journal_entry_to_json(raw: &Value) -> Value {
     let message = raw
         .get("MESSAGE")
         .map(|m| match m {
             Value::String(s) => s.clone(),
-            Value::Array(bytes) => bytes
-                .iter()
-                .filter_map(Value::as_u64)
-                .map(|b| b as u8)
-                .collect::<Vec<u8>>()
-                .into_iter()
-                .map(|b| b as char)
-                .collect(),
+            Value::Array(bytes) => {
+                let raw_bytes: Vec<u8> = bytes
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .map(|b| b as u8)
+                    .collect();
+                String::from_utf8_lossy(&raw_bytes).into_owned()
+            }
             other => other.to_string(),
         })
         .unwrap_or_default();
@@ -3458,6 +3623,7 @@ mod tests {
                     server_ip: "203.0.113.10".into(),
                     dkim_selector: "mail".into(),
                     expected_spf: None,
+                    wizard_completed: false,
                     updated_at: mailstack_core::now_iso8601_utc(),
                 },
             )
@@ -3591,6 +3757,44 @@ mod tests {
     }
 
     #[test]
+    fn queue_summary_marks_unreadable_state_instead_of_reporting_zero() {
+        // 状态读不到时 backlog/corrupt 仍是 0 —— 但必须同时在 `unavailable`
+        // 里显式列出，否则「读不到」被渲染成「队列真空」（INV-2）。
+        let f = Fixture::new("queueunreadable");
+        let store = mailstack_queue::QueueStore::from_paths(&f.paths);
+        // 隔离目录的位置被一个文件占住 → read_dir 必然失败。
+        fs::create_dir_all(store.corrupt_dir().parent().unwrap()).unwrap();
+        fs::write(store.corrupt_dir(), b"not a directory").unwrap();
+
+        let out = f.readers(always_ok_runner()).snapshot(&json!({})).unwrap();
+        let unavailable = out["queue"]["unavailable"].as_array().unwrap();
+        assert!(
+            unavailable.iter().any(|item| item == "corrupt"),
+            "实际: {out}"
+        );
+    }
+
+    #[test]
+    fn security_scan_propagates_an_unreadable_domain_table() {
+        // DKIM 私钥按纳管域枚举：域名表读失败必须报错 —— 静默成空表会让
+        // 体检「恰好扫不到任何 DKIM 私钥」，把读故障伪装成一次干净的体检。
+        let f = Fixture::new("scanunreadable");
+        fs::create_dir_all(f.paths.domains.parent().unwrap()).unwrap();
+        // 位置上是一个目录 → read_to_string 必然失败。
+        fs::create_dir_all(&f.paths.domains).unwrap();
+
+        let err = f
+            .readers(always_ok_runner())
+            .security_scan(&json!({}))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("managed domain table is unreadable"),
+            "实际: {err}"
+        );
+    }
+
+    #[test]
     fn metrics_realtime_reads_proc_and_lists_every_managed_service() {
         let f = Fixture::new("metrics");
         let out = f
@@ -3702,6 +3906,18 @@ mod tests {
             "字节数组形态的 MESSAGE 也要能读"
         );
         assert_eq!(entries[1]["level"], "info");
+    }
+
+    #[test]
+    fn journal_binary_messages_are_decoded_as_utf8_lossy_not_latin1() {
+        // `b as char` 的 Latin-1 展开会把每个非 ASCII 字节变成一个乱码字，
+        // 且多字节 UTF-8 序列全部损坏；有损解码与展示面的口径一致。
+        let raw = json!({
+            "MESSAGE": [72, 0xE9, 0xFF, 108, 111],
+            "__REALTIME_TIMESTAMP": "1767225600000000",
+        });
+        let out = journal_entry_to_json(&raw);
+        assert_eq!(out["message"], "H\u{FFFD}\u{FFFD}lo");
     }
 
     #[test]
@@ -3941,6 +4157,7 @@ mod tests {
         let paths: Vec<String> = f
             .readers(always_ok_runner())
             .security_inventory()
+            .unwrap()
             .into_iter()
             .map(|e| e.path.display().to_string())
             .collect();
@@ -4135,6 +4352,26 @@ mod tests {
         assert!(readers
             .services_action(&json!({ "verb": "restart" }))
             .is_err());
+    }
+
+    #[test]
+    fn services_action_without_a_verb_is_an_error_not_a_default_restart() {
+        // 与 queue.action 同一纪律：缺 verb 不能默认成 restart（变更性动作）。
+        let f = Fixture::new("svcnoverb");
+        let runner = FakeRunner::returning(0, "");
+        let readers = f.readers_with_env(runner.clone(), systemd_env());
+
+        let err = readers
+            .services_action(&json!({ "id": "dovecot" }))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("missing required field"),
+            "实际: {err}"
+        );
+        assert!(
+            runner.calls().is_empty(),
+            "缺动词不得执行任何 systemctl 命令"
+        );
     }
 
     #[test]
@@ -4343,6 +4580,29 @@ mod tests {
             .load_all()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn queue_action_without_a_verb_is_an_error_not_a_default_retry() {
+        // 缺 verb 不能默认成 `retry`（变更性动作）：漏传参数必须显式失败，
+        // 否则「前端漏传 op」会被悄悄执行成一次重新投递。
+        let f = Fixture::new("qnoverb");
+        let id = enqueue(&f, 0, NOW);
+        let readers = f.readers(always_ok_runner());
+
+        let err = readers.queue_action(&json!({ "id": id })).unwrap_err();
+        assert!(
+            err.to_string().contains("missing required field"),
+            "实际: {err}"
+        );
+        assert_eq!(
+            mailstack_queue::QueueStore::from_paths(&f.paths)
+                .load_all()
+                .unwrap()
+                .len(),
+            1,
+            "缺动词不得触发任何队列变更"
+        );
     }
 
     #[test]
@@ -4730,6 +4990,8 @@ mod tests {
 
         assert_eq!(out["restored"], true);
         assert!(out["filesCount"].as_u64().unwrap() > 0);
+        // `mailstackd` 没有热重载：恢复完成后必须告诉调用方「要重启才能生效」。
+        assert_eq!(out["restartRequired"], true);
         assert_eq!(
             fs::read_to_string(f.restore_root.join("etc/mailstack/settings.json")).unwrap(),
             "{}"
@@ -5168,6 +5430,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mx_records_contain_requires_an_exact_host_match() {
+        // 子串匹配会把 `evilemail.example.com`（含期望串）与
+        // `mail.example.com.attacker.net`（期望串作前缀）一并判成命中 ——
+        // DNS 安全判据必须按**目标主机**精确相等。
+        let records = vec![
+            "10 evilemail.example.com.".to_string(),
+            "20 mail.example.com.attacker.net.".to_string(),
+        ];
+        assert!(
+            !mx_records_contain(&records, "mail.example.com"),
+            "子串 / 后缀伪装不得命中"
+        );
+        // 正常命中：去结尾点、忽略大小写、`dig +short` 的优先级前缀要能拆掉。
+        assert!(mx_records_contain(
+            &["10 mail.example.com.".to_string()],
+            "mail.example.com"
+        ));
+        assert!(mx_records_contain(
+            &["10 MAIL.EXAMPLE.COM".to_string()],
+            "mail.example.com."
+        ));
+        // 空期望主机不命中任何东西。
+        assert!(!mx_records_contain(&records, "  "));
+    }
+
+    #[tokio::test]
+    async fn spf_expected_falls_back_to_the_conventional_value_when_absent() {
+        // 请求不带 expectedSpf 时不能恒报 false：SPF 实际正确（恰好一条
+        // `v=spf1 mx -all`）应如实报告为通过 —— 与 dns.records 的缺省口径一致。
+        let f = Fixture::new("spfdefault");
+        let mut payload = identity_payload();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("expectedSpf");
+        let readers =
+            readers_with_networks(&f, Arc::new(published_dns()), ScriptedRelayProbe::passing());
+
+        let out = readers.setup_dns_verify(&payload).await.unwrap();
+        assert_eq!(out["checks"]["spfExpected"], true, "整份结果: {out}");
+        assert_eq!(out["checks"]["mx"], true);
+    }
+
     #[tokio::test]
     async fn setup_relay_test_reports_a_failed_probe_as_a_conclusion_with_stages() {
         // 对端不通是**结论**，不是「服务器出错」：返回 200 + connected:false +
@@ -5350,6 +5656,77 @@ mod tests {
             fs::read_to_string(&f.paths.relay_config).unwrap(),
             r#"{"relayhost":"[old.example.com]:25"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn setup_relay_apply_with_direct_clears_a_previously_configured_relay() {
+        use mailstack_smtp::RelayConfigStore;
+
+        // `direct: true` 是撤销语义：apply 写过的键与凭证必须全部回到未设置。
+        let f = Fixture::new("setupapplydirect");
+        // 先落一份「与生产 apply 同形」的配置（直接经同一载体写入）。
+        let mut store = NativeRelayStore::production(&f.paths);
+        store
+            .write_key(mailstack_smtp::relay_apply::KEY_RELAYHOST, "[smtp.sendgrid.net]:587")
+            .unwrap();
+        store
+            .write_key(mailstack_smtp::relay_apply::KEY_SASL_AUTH_ENABLE, "yes")
+            .unwrap();
+        store
+            .write_key(mailstack_smtp::relay_apply::KEY_TLS_SECURITY_LEVEL, "encrypt")
+            .unwrap();
+        store
+            .write_credentials("[smtp.sendgrid.net]:587 apikey:SG.secret\n")
+            .unwrap();
+
+        let readers = f.readers(always_ok_runner());
+        let out = readers
+            .setup_relay_apply(&json!({ "direct": true }))
+            .await
+            .unwrap();
+        // 响应与成功的 apply 同形，且 mode 标明回到直投。
+        assert_eq!(out["applied"], true);
+        assert_eq!(out["mode"], "direct");
+        assert_eq!(out["relayhost"], "");
+
+        // 落在守护进程真正会读的那份文件上：中继相关的键与凭证都不在了。
+        let doc: Value =
+            serde_json::from_str(&fs::read_to_string(&f.paths.relay_config).unwrap()).unwrap();
+        for key in [
+            "relayhost",
+            "smtp_sasl_auth_enable",
+            "smtp_sasl_password_maps",
+            "smtp_sasl_security_options",
+            "smtp_tls_security_level",
+            "smtp_tls_wrappermode",
+            "saslPasswd",
+        ] {
+            assert!(
+                doc.get(key).is_none(),
+                "{key} 必须被清除，实际: {doc}"
+            );
+        }
+
+        // 幂等：再 clear 一次仍是成功。
+        let again = readers
+            .setup_relay_apply(&json!({ "direct": true }))
+            .await
+            .unwrap();
+        assert_eq!(again["applied"], true);
+        assert_eq!(again["mode"], "direct");
+    }
+
+    #[tokio::test]
+    async fn setup_relay_apply_with_direct_on_a_fresh_install_is_a_successful_no_op() {
+        // 从未配置过中继时，direct 清除也必须成功（幂等语义），不得报错。
+        let f = Fixture::new("setupapplydirectfresh");
+        let readers = f.readers(always_ok_runner());
+        let out = readers
+            .setup_relay_apply(&json!({ "direct": true }))
+            .await
+            .unwrap();
+        assert_eq!(out["applied"], true);
+        assert_eq!(out["mode"], "direct");
     }
 
     #[test]
@@ -6220,5 +6597,33 @@ mod tests {
             .activity_list(&json!({}))
             .unwrap();
         assert!(out.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn activity_list_reads_only_the_tail_of_a_large_log() {
+        // 审计日志只增不减：读取必须限制在尾部窗口（[`ACTIVITY_TAIL_BYTES`]），
+        // 否则一个前端轮询动作会随日志增长变成 IO 放大器。先垫 ~400KB 的
+        // 填充行（模拟一台跑了几年的日志），窗口之外的内容不得影响结果。
+        let f = Fixture::new("activitytail");
+        let log = &f.paths.audit_log;
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let mut padding = String::new();
+        for _ in 0..1200 {
+            padding.push_str(&format!("{{\"padding\":\"{}\"}}\n", "x".repeat(300)));
+        }
+        fs::write(log, &padding).unwrap();
+        mailstack_core::audit::audit(log, "users.add", true, "", "alice").unwrap();
+        mailstack_core::audit::audit(log, "domains.add", true, "", "example.com").unwrap();
+
+        let out = f
+            .readers(always_ok_runner())
+            .activity_list(&json!({}))
+            .unwrap();
+        let items = out.as_array().unwrap();
+        assert_eq!(items.len(), 2, "尾部窗口必须覆盖到最新记录: {items:?}");
+        assert_eq!(items[0]["title"], "domains.add", "最新在前");
+        assert_eq!(items[0]["sub"], "example.com");
+        assert_eq!(items[1]["title"], "users.add");
+        assert!(items[0]["time"].as_str().unwrap().ends_with("+00:00"));
     }
 }

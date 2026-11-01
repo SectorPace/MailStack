@@ -122,16 +122,27 @@ pub fn atomic_as(path: &Path, data: &[u8], mode: u32, group: Option<&str>) -> Co
         use std::io::Write;
         // `.mode(..)` 是 `OpenOptionsExt`（Unix）的方法。生产目标是 Linux，
         // 与 `backup.rs` 里 `open_no_follow` 的做法一致；Windows 上没有「创建时
-        // 指定权限」这回事，故只在 Unix 上挂载。
+        // 指定权限」这回事，整个 builder 链按平台分两支 —— `.mode(..)` 挂在
+        // Unix 分支上，否则非 Unix 目标根本编译不过。
         #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .open(&tmp)
-            .map_err(|e| CoreError::io(&tmp, e))?;
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(&tmp)
+                .map_err(|e| CoreError::io(&tmp, e))?
+        };
+        #[cfg(not(unix))]
+        let mut f = {
+            let _ = mode;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| CoreError::io(&tmp, e))?
+        };
         f.write_all(data).map_err(|e| CoreError::io(&tmp, e))?;
         f.flush().map_err(|e| CoreError::io(&tmp, e))?;
         f.sync_all().map_err(|e| CoreError::io(&tmp, e))?;
@@ -244,7 +255,7 @@ fn chown_group_best_effort(path: &Path, group: &str) {
         crate::warn::warn(&format!("resolve group {group}"));
         return;
     };
-    if let Err(e) = std::os::unix::fs::chown(path, Some(u32::MAX), Some(gid)) {
+    if let Err(e) = std::os::unix::fs::chown(path, None, Some(gid)) {
         crate::warn::warn(&format!("chown {} to group {group}: {e}", path.display()));
     }
 }
@@ -328,8 +339,12 @@ pub fn file_restore(path: &Path, snapshot: &FileSnapshot, mode: Option<u32>) -> 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| CoreError::io(parent, e))?;
     }
-    fs::write(path, &snapshot.content).map_err(|e| CoreError::io(path, e))?;
+    // 回滚复制不能退回 `fs::write` —— 那是 `0666 & ~umask` 落盘且会**跟随**预置在
+    // 原路径上的符号链接。走本模块自己的原子写：`O_EXCL` 唯一临时文件 + 创建即
+    // `mode` + rename，与正常写入路径共用同一套不变量（INV-33）。
     let effective = mode.or(snapshot.mode).unwrap_or(0o640);
+    atomic_as(path, &snapshot.content, effective, None)?;
+    // belt-and-braces：rename 之后权限必然已是 effective，再设一次不做失败传播。
     set_mode(path, effective)
 }
 

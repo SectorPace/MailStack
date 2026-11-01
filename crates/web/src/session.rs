@@ -1,7 +1,9 @@
 //! 会话与 CSRF（规格书 §5.3；INV-6、INV-7）。
 //!
 //! * 会话为**服务端内存表**，非 JWT
-//! * 会话 ID 只在 HttpOnly Cookie `mailstack_session`
+//! * 会话 ID 只在 HttpOnly Cookie（名字**条件性**：加 `Secure` 的部署为
+//!   `__Host-mailstack_session`，默认 HTTP 部署为 `mailstack_session`，见
+//!   [`session_cookie_context`]）
 //! * CSRF token 仅存于前端内存变量，经 `x-csrf-token` 头回传
 //! * 8 小时滑动过期 + 7 天绝对上限；`MAX_SESSIONS` 上限
 //!
@@ -14,15 +16,34 @@ use std::sync::Mutex;
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 
-/// Cookie 名（对外契约，不得改动）。
+/// 会加 `Secure` 的部署（HTTPS / 公网模式 / 显式 `MAILSTACK_COOKIE_SECURE=1`）
+/// 下的会话 Cookie 名。
 ///
 /// **`__Host-` 前缀**：浏览器强制它的三条规则（必须 `Secure`、必须 `Path=/`、
 /// **不得**有 `Domain`）正好把「同站子域写入同名 cookie 覆盖会话」这条攻击路径
-/// 彻底关掉 —— 攻击者控制的 `evil.example.com` 无法给 `example.com` 写 cookie，
-/// 而不带前缀的 `mailstack_session` 是可以的。代价是改名会让**所有人重新登录**
-/// （浏览器会把新名字当成从未见过的 cookie），这在一次安全修复里是可接受的：
-/// 强制重登恰好也是我们想顺手做掉的事。
-pub const SESSION_COOKIE: &str = "__Host-mailstack_session";
+/// 彻底关掉 —— 攻击者控制的 `evil.example.com` 无法给 `example.com` 写 cookie。
+pub const SESSION_COOKIE_SECURE_NAME: &str = "__Host-mailstack_session";
+
+/// 默认 HTTP 部署（**不加** `Secure`）下的会话 Cookie 名。
+///
+/// **不得**带 `__Host-` 前缀：前缀的「必须 `Secure`」是浏览器硬规则，无
+/// `Secure` 的 `__Host-` cookie 会被**所有浏览器拒收** —— 而本进程默认部署是
+/// HTTP（`DEFAULT_BIND = 127.0.0.1:8443`，TLS 属部署层），此时强行用前缀名
+/// 等于让登录开箱即坏（「密码输对了却提示未登录」）。
+pub const SESSION_COOKIE_PLAIN_NAME: &str = "mailstack_session";
+
+/// 全部条件性名字。Cookie 的**下发/作废**从 [`session_cookie_context`] 按
+/// `Secure` 判定取其一；**解析**侧（`crate::session_cookie`）则两个都认 ——
+/// 只认其一，另一种部署的浏览器会被全体判成未认证。
+pub const SESSION_COOKIE_NAMES: &[&str] =
+    &[SESSION_COOKIE_SECURE_NAME, SESSION_COOKIE_PLAIN_NAME];
+
+/// 兼容别名：保留既有导出名（HTTPS 部署下的名字）。
+///
+/// 代价是改名会让**所有人重新登录**（浏览器会把新名字当成从未见过的 cookie），
+/// 这在一次安全修复里是可接受的：强制重登恰好也是我们想顺手做掉的事。
+/// 部署模式切换（HTTP ↔ HTTPS）同样会换名重登，见 [`session_cookie_context`]。
+pub const SESSION_COOKIE: &str = SESSION_COOKIE_SECURE_NAME;
 
 /// 显式覆盖会话 Cookie `Secure` 标志的环境变量。
 ///
@@ -79,6 +100,31 @@ pub fn session_cookie_secure(
     forwarded_proto(headers).as_deref() == Some("https")
 }
 
+/// 一次会话 Cookie 的上下文：`(名字, 是否 Secure)` —— **唯一**判定入口。
+///
+/// 登录下发（`routes::build_session_cookie`）与登出 / 吊销作废
+/// （`routes::clear_session_cookie`）都必须从这里取值。名字必须跟随
+/// `Secure` 的判定：`__Host-` 前缀在浏览器侧强制要求 `Secure`，无 `Secure`
+/// 时用前缀名等于让登录开箱即坏；反过来加 `Secure` 时不用前缀名则丢掉
+/// 前缀保护。两条路径分开判定的历史教训：作废路径拿不到请求上下文，用了
+/// 另一套 `Secure` 判定 —— HTTPS 部署下作废 Cookie 缺 `Secure`，浏览器拒绝
+/// 删除 `__Host-` cookie，表现为「登出了但立刻又自动登录」。从同一入口取
+/// （名字，`Secure`）对之后，下发与作废**必然**配对。
+pub fn session_cookie_context(
+    env_flag: Option<&str>,
+    public_mode: bool,
+    peer: Option<&std::net::SocketAddr>,
+    headers: &axum::http::HeaderMap,
+) -> (&'static str, bool) {
+    let secure = session_cookie_secure(env_flag, public_mode, peer, headers);
+    let name = if secure {
+        SESSION_COOKIE_SECURE_NAME
+    } else {
+        SESSION_COOKIE_PLAIN_NAME
+    };
+    (name, secure)
+}
+
 /// 是否是可信代理的回环来源。
 fn is_trusted_proxy(peer: Option<&std::net::SocketAddr>) -> bool {
     // 拿不到传输层对端（测试里的 in-process 调用）：**不**认定可信。
@@ -106,6 +152,10 @@ pub fn forwarded_proto(headers: &axum::http::HeaderMap) -> Option<String> {
 pub const SESSION_TTL_SECONDS: i64 = 28_800;
 
 /// 绝对上限：7 天，自建立起算，不因活动而延长。
+///
+/// 同时也是会话 Cookie 的 `Max-Age`（见 `routes::build_session_cookie`）：
+/// 活跃会话的续期在**服务端**滑动，cookie 寿命若短于绝对上限（旧值 8 小时）
+/// 会把活跃用户也提前强制登出 —— 两者必须对齐。
 pub const SESSION_ABSOLUTE_MAX_SECONDS: i64 = 7 * 24 * 3600;
 
 /// 会话数上限。
@@ -617,5 +667,39 @@ mod tests {
         // 已知向量：确认算法是 sha256 前缀而不是别的哈希。
         let expected = &hex::encode(Sha256::digest(b"session-a"))[..16];
         assert_eq!(&a, expected);
+    }
+
+    /// Cookie 名必须跟随 `Secure` 判定（本次修复的核心配对关系）：
+    /// `__Host-` 前缀在浏览器侧强制要求 `Secure`，无 `Secure` 时用前缀名
+    /// 等于让登录开箱即坏；反过来加 `Secure` 时不用前缀名则丢掉前缀保护。
+    #[test]
+    fn the_cookie_name_follows_the_secure_decision() {
+        // 默认 HTTP 部署（无可信对端、无显式配置）：不加 Secure ⇒ 无前缀名。
+        let (name, secure) =
+            session_cookie_context(None, false, None, &axum::http::HeaderMap::new());
+        assert_eq!(name, SESSION_COOKIE_PLAIN_NAME);
+        assert!(!secure);
+
+        // 可信回环对端 + X-Forwarded-Proto: https ⇒ `__Host-` 名 + Secure。
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-proto",
+            axum::http::HeaderValue::from_static("https"),
+        );
+        let peer: std::net::SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let (name, secure) = session_cookie_context(None, false, Some(&peer), &headers);
+        assert_eq!(name, SESSION_COOKIE_SECURE_NAME);
+        assert!(secure);
+
+        // 公网模式（部署前提就是 TLS 终结）⇒ 同上。
+        let (name, secure) =
+            session_cookie_context(None, true, None, &axum::http::HeaderMap::new());
+        assert_eq!(name, SESSION_COOKIE_SECURE_NAME);
+        assert!(secure);
+
+        assert_ne!(
+            SESSION_COOKIE_SECURE_NAME, SESSION_COOKIE_PLAIN_NAME,
+            "两个条件性名字不得撞名，否则前缀保护形同虚设"
+        );
     }
 }

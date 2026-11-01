@@ -78,6 +78,15 @@ fi
 CARGO_ARGS=(build --release --locked)
 [ "$OFFLINE" -eq 1 ] && CARGO_ARGS+=(--offline)
 
+# 构建前先清空 dist：上一轮留下的旧产物若不清，会连同本轮产物一起被收进
+# SHA256SUMS，发布包里混入陈旧文件而校验和「看起来」仍然有效。
+# 只删本脚本自己的输出目录，且删除前双重守卫：变量必须非空，且不得是 / 或仓库根。
+: "${DIST_DIR:?DIST_DIR 未设置}"
+case "$DIST_DIR" in
+  /|"$REPO_ROOT"|"$REPO_ROOT"/) die "DIST_DIR 指向危险位置（$DIST_DIR），拒绝 rm -rf" ;;
+esac
+rm -rf -- "$DIST_DIR"
+
 step "3/6 构建（${CARGO_ARGS[*]}）"
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1704067200}"   # 可复现构建锚点
 export MAILSTACK_BUILT_AT="$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
@@ -165,7 +174,16 @@ for name, version, license in rows:
     print(f"{name} {version} {license}")
 '
   } > "$DIST_DIR/dependency-inventory.txt"
-  entries=$(grep -cv '^#' "$DIST_DIR/dependency-inventory.txt" 2>/dev/null || echo 0)
+  # `grep -c` 在「零命中」时会**既打印 0 又以退出码 1 结束**，原先的 `|| echo 0`
+  # 于是又追加一行 0 —— entries 变成 "0\n0"，`[ ... -gt 0 ]` 报
+  # "integer expression expected"，把一个合法的空清单误判成脚本故障。
+  # 现在命令替换只取输出（`|| true` 保住 set -e 下赋值语句的退出码），
+  # 空输出回落为 0，再按数字校验兜底。
+  entries=$(grep -cv '^#' "$DIST_DIR/dependency-inventory.txt" 2>/dev/null || true)
+  entries=${entries:-0}
+  case "$entries" in
+    ''|*[!0-9]*) die "依赖清单条数不是数字：$entries" ;;
+  esac
   echo "cargo-sbom 不可用，已退化为 dependency-inventory.txt（$entries 条外部依赖）"
   echo "（正式发布前请安装 cargo-sbom 以产出 SPDX/CycloneDX）"
   [ "$entries" -gt 0 ] || die "依赖清单为空：退化路径失效，SBOM 不可用"

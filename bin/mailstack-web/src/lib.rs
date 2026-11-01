@@ -69,6 +69,16 @@ pub fn build_app(state: AppState, dist: Option<PathBuf>) -> Router {
 
 /// 启动服务，直到进程被终止。
 pub async fn run(paths: Paths, config: WebConfig) -> Result<(), WebError> {
+    // **先**绑定，再创建状态与采样任务。绑定不需要任何状态，可以安全前置：
+    // bind 失败是这里唯一可能提前返回的路径，此时 `sampling` 尚不存在，
+    // 也就不存在「早退路径漏掉 abort、留下一条一直读 /proc 的后台任务」的问题。
+    let listener = tokio::net::TcpListener::bind(config.bind)
+        .await
+        .map_err(|source| WebError::Bind {
+            addr: config.bind,
+            source,
+        })?;
+
     let state = AppState::new(paths);
 
     // 采样任务的生命周期与进程一致：`run` 返回（出错或退出）时就该收掉它，
@@ -76,12 +86,6 @@ pub async fn run(paths: Paths, config: WebConfig) -> Result<(), WebError> {
     let sampling = state.inner.telemetry.start_sampling(config.sample_interval);
 
     let app = build_app(state, config.dist.clone());
-    let listener = tokio::net::TcpListener::bind(config.bind)
-        .await
-        .map_err(|source| WebError::Bind {
-            addr: config.bind,
-            source,
-        })?;
 
     tracing::info!(
         bind = %config.bind,

@@ -180,6 +180,12 @@ pub const ROUTES: &[RouteSpec] = &[
     r("GET", "/api/setup/status", Some("setup.status"), Required),
     r(
         "POST",
+        "/api/setup/wizard/complete",
+        Some("setup.wizard.complete"),
+        Required,
+    ),
+    r(
+        "POST",
         "/api/setup/identity",
         Some("setup.identity.apply"),
         Required,
@@ -467,9 +473,11 @@ mod tests {
         // （GET /api/queue、/api/services、/api/dkim/keys、/api/dns/records、
         // /api/metrics/system、/api/activity）。
         // 十条都是**新增**，没有改动或删除任何既有条目。
+        // 72 → 73：新增 `POST /api/setup/wizard/complete`（向导收尾，
+        // 置位 setup.json 的 wizardCompleted；RW 动作，幂等）。
         assert_eq!(
             ROUTES.len(),
-            72,
+            73,
             "路由数量变化需同步更新契约与 fixtures（实际 {}）",
             ROUTES.len()
         );

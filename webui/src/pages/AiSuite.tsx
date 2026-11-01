@@ -63,8 +63,13 @@ export default function AiSuite() {
       // 后端给的是字符串数组，mock 给的是 {id,label,context}，统一成 AiModel。
       setModels((r.data?.models ?? []).map((m) => (typeof m === "string" ? { id: m, label: m } : m)));
     });
-    rpc<AiConfig>("ai.config.get").then((r) => r.ok && setCfg(r.data));
-    rpc<AiTest>("ai.test", {}).then((r) => r.ok && setTest(r.data));
+    // {ok:true} 无载荷时保持 cfg=null（走「未配置」分支），不把 undefined 塞进 state。
+    rpc<AiConfig>("ai.config.get").then((r) => {
+      if (r.ok && r.data) setCfg(r.data);
+    });
+    // 原先挂载即发 `ai.test`（{}` 载荷）：那是**真实的 provider 连通调用**，打开页面
+    // 就产生一次外部请求与计费/延迟，属于副作用越权。连通测试只能由用户点
+    // 「测试连通」按钮触发（testConn）。
   }, []);
 
   useEffect(() => {
@@ -82,6 +87,37 @@ export default function AiSuite() {
     };
   }
 
+  /**
+   * 保存 AI 配置（唯一的写路径）。
+   *
+   * 后端 ai.config.set 是**整体覆写**而不是逐字段合并：provider 缺省落 bigmodel、
+   * baseUrl 缺省落预设 endpoint、model 缺省落预设模型（crates/priv/src/ai.rs
+   * config_set）。逐字段分开写（旧实现 {model} / {provider} / {baseUrl} / {apiKey}
+   * 各发各的）会把没提交的字段悄悄重置成预设 —— 改个模型就丢掉自定义 baseUrl。
+   * 因此每次写入都把增量合并进 state 后**整包**提交 {provider, model, baseUrl,
+   * apiKey}；apiKey 留空时后端沿用已存密钥（first_truthy 跳过空串），不会清凭据。
+   * 写入失败一律 toast 后端错误，绝不静默。
+   */
+  async function saveAiConfig(partial: Partial<AiConfig>) {
+    if (!cfg) return;
+    const next = { ...cfg, ...partial };
+    setCfg(next);
+    const r = await rpc<AiConfig>("ai.config.set", {
+      provider: next.provider,
+      model: next.model,
+      baseUrl: next.baseUrl ?? next.endpoint,
+      apiKey: next.apiKey,
+    });
+    if (r.ok) {
+      // 响应是保存后的公开配置（provider/model/baseUrl/maskedKey…，无明文 key）：
+      // 回填以服务器落盘值为准（如 baseUrl 去尾斜杠），apiKey 不在响应里、不会被清。
+      if (r.data) setCfg((c) => ({ ...(c ?? next), ...r.data }));
+      toast(t("saved"));
+    } else {
+      toast(r.error, "err");
+    }
+  }
+
   async function send() {
     const q = input.trim();
     if (!q || busy) return;
@@ -93,8 +129,14 @@ export default function AiSuite() {
       message: q,
     });
     setBusy(false);
-    if (r.ok) setMsgs((m) => [...m, { role: "assistant", text: r.data.reply ?? "" }]);
-    else setMsgs((m) => [...m, { role: "assistant", text: `error: ${r.error}` }]);
+    if (r.ok) {
+      const reply = r.data?.reply ?? "";
+      // 后端可能回 {ok:true} 但无 reply：塞空串会渲染一个「空气泡」，改为明确占位。
+      setMsgs((m) => [
+        ...m,
+        { role: "assistant", text: reply || (zh ? "（模型未返回内容，请检查 AI 配置后重试）" : "(The model returned no content — check the AI config and retry)") },
+      ]);
+    } else setMsgs((m) => [...m, { role: "assistant", text: `error: ${r.error}` }]);
   }
 
   async function testConn() {
@@ -104,7 +146,7 @@ export default function AiSuite() {
     setTesting(false);
     if (r.ok) {
       setTest(r.data);
-      toast("AI ✓ " + (r.data.latencyMs ?? 0) + "ms");
+      toast("AI ✓ " + (r.data?.latencyMs ?? 0) + "ms");
     } else toast(r.error, "err");
   }
 
@@ -113,7 +155,8 @@ export default function AiSuite() {
     const r = await rpc<{ summary?: string; items?: DiagItem[]; reply?: string }>("ai.diagnose", {});
     setBusy(false);
     if (r.ok) {
-      const d = r.data;
+      // {ok:true} 无载荷时 r.data 可能为 undefined，兜底空对象走「无摘要」分支。
+      const d: { summary?: string; items?: DiagItem[]; reply?: string } = r.data ?? {};
       // mock 回 {summary, items}；真后端 ai.diagnose 回的是 chat 结果（只有 reply）。
       const summary = d.summary ?? d.reply ?? "";
       const items = d.items ?? [];
@@ -133,10 +176,7 @@ export default function AiSuite() {
             {cfg && (
               <GlassSelect
                 value={cfg.model ?? ""}
-                onChange={(v) => {
-                  setCfg({ ...cfg, model: v });
-                  rpc("ai.config.set", { model: v });
-                }}
+                onChange={(v) => void saveAiConfig({ model: v })}
                 options={models.map((m) => ({ value: m.id, label: m.context ? `${m.label} · ${m.context}` : m.label }))}
                 ariaLabel={t("ai_models")}
                 width={210}
@@ -257,10 +297,7 @@ export default function AiSuite() {
                 <span className="mb-1.5 block text-[12px] font-medium text-[var(--text-2)]">{zh ? "服务商" : "Provider"}</span>
                 <GlassSelect
                   value={cfg.provider ?? ""}
-                  onChange={(v) => {
-                    setCfg({ ...cfg, provider: v });
-                    rpc("ai.config.set", { provider: v });
-                  }}
+                  onChange={(v) => void saveAiConfig({ provider: v })}
                   options={providerOptions}
                   ariaLabel="provider"
                 />
@@ -271,7 +308,7 @@ export default function AiSuite() {
                   className="input"
                   value={cfg.baseUrl ?? cfg.endpoint ?? ""}
                   onChange={(e) => setCfg({ ...cfg, baseUrl: e.target.value })}
-                  onBlur={() => rpc("ai.config.set", { baseUrl: cfg.baseUrl ?? cfg.endpoint })}
+                  onBlur={() => void saveAiConfig({})}
                 />
               </label>
               <label className="mb-2.5 block">
@@ -281,7 +318,7 @@ export default function AiSuite() {
                   type="password"
                   value={cfg.apiKey ?? ""}
                   onChange={(e) => setCfg({ ...cfg, apiKey: e.target.value })}
-                  onBlur={() => rpc("ai.config.set", { apiKey: cfg.apiKey })}
+                  onBlur={() => void saveAiConfig({})}
                   placeholder={cfg.maskedKey || "sk-…"}
                 />
               </label>
@@ -289,10 +326,7 @@ export default function AiSuite() {
                 <span className="mb-1.5 block text-[12px] font-medium text-[var(--text-2)]">{t("ai_models")}</span>
                 <GlassSelect
                   value={cfg.model ?? ""}
-                  onChange={(v) => {
-                    setCfg({ ...cfg, model: v });
-                    rpc("ai.config.set", { model: v });
-                  }}
+                  onChange={(v) => void saveAiConfig({ model: v })}
                   options={models.map((m) => ({ value: m.id, label: m.label }))}
                   ariaLabel={t("ai_models")}
                 />
@@ -301,13 +335,7 @@ export default function AiSuite() {
                 <button className="btn glass--control" disabled={testing} onClick={testConn}>
                   {testing ? "…" : zh ? "测试连通" : "Test connection"}
                 </button>
-                <button
-                  className="btn btn-accent"
-                  onClick={async () => {
-                    const r = await rpc("ai.config.set", aiPayload());
-                    toast(r.ok ? t("saved") : r.error, r.ok ? "ok" : "err");
-                  }}
-                >
+                <button className="btn btn-accent" onClick={() => void saveAiConfig({})}>
                   {zh ? "保存配置" : "Save"}
                 </button>
               </div>

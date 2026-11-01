@@ -14,6 +14,8 @@
 //! 返回 `mark_seen`，由会话层落盘并补发一条 untagged FETCH（RFC 建议服务器主动
 //! 通知标志变化）。把副作用留在模块外，是为了让 FETCH 渲染保持纯函数、可穷举测试。
 
+use std::borrow::Cow;
+
 use crate::date;
 use crate::error::{MailError, Result};
 use crate::maildir::{FlagSet, MessageMeta};
@@ -89,7 +91,7 @@ pub enum FetchItem {
     Rfc822,
     Rfc822Header,
     Rfc822Text,
-    /// RFC 3516：解码后的部件内容（不改变 `\Seen`）。
+    /// RFC 3516：解码后的部件内容。`peek` 为 `false` 时与 BODY 一样置 `\Seen`。
     Binary(BodySpec),
     /// RFC 3516：解码后的部件字节数。空路径表示整封。
     BinarySize(Vec<u32>),
@@ -219,7 +221,7 @@ pub fn parse_items(raw: &str) -> Result<Vec<FetchItem>> {
                     return Err(MailError::invalid("BODY.PEEK requires a section"));
                 }
             }
-            "BINARY" => {
+            "BINARY" | "BINARY.PEEK" => {
                 if cursor.peek() != Some(b'[') {
                     return Err(MailError::invalid("BINARY requires a section"));
                 }
@@ -229,9 +231,10 @@ pub fn parse_items(raw: &str) -> Result<Vec<FetchItem>> {
                         "BINARY supports only body part sections",
                     ));
                 }
+                // RFC 3516：BINARY 与 BODY 一样会置 \Seen；BINARY.PEEK 才不动。
                 items.push(FetchItem::Binary(BodySpec {
                     section,
-                    peek: true,
+                    peek: upper == "BINARY.PEEK",
                     partial,
                 }));
             }
@@ -566,6 +569,10 @@ pub fn render(
             FetchItem::Binary(spec) => {
                 let message =
                     message.ok_or_else(|| MailError::storage("message body is unavailable"))?;
+                if !spec.peek {
+                    // 与 BODY（非 PEEK）一致：非 PEEK 的 BINARY 也要置 \Seen。
+                    mark_seen = true;
+                }
                 push_separator(&mut out);
                 push_binary(&mut out, message, spec);
             }
@@ -667,42 +674,48 @@ fn push_owned_literal(out: &mut Vec<u8>, label: &str, data: &[u8]) {
 }
 
 /// 提取 section。不存在返回 `None`（渲染成 NIL）。
-pub fn extract_section(message: &[u8], section: &Section) -> Option<Vec<u8>> {
+///
+/// 返回 [`Cow`]：整封（Full）、正文段（Text）与部件正文可以直接借用原消息
+/// 字节 —— 百 MiB 级邮件 FETCH BODY[] 时省掉一整份中间拷贝（拼进响应缓冲
+/// 的那一次拷贝是字面量语法本身要求的，省不掉）；头部块由 `raw_block` 重新
+/// 组装，保持 `Owned`。Cow 只借用 `message`（Owned 分支不携带 `section`
+/// 的任何借用数据），生命周期因此只挂在 message 上。
+pub fn extract_section<'a>(message: &'a [u8], section: &Section) -> Option<Cow<'a, [u8]>> {
     let (_, body) = mime::split_headers_body(message);
     let headers = mime::parse_headers(message);
     match section {
-        Section::Full => Some(message.to_vec()),
-        Section::Header => Some(headers.raw_block(None)),
-        Section::Text => Some(body.to_vec()),
-        Section::HeaderFields { names, not } => {
-            Some(headers.raw_block(Some((names.as_slice(), *not))))
-        }
+        Section::Full => Some(Cow::Borrowed(message)),
+        Section::Header => Some(Cow::Owned(headers.raw_block(None))),
+        Section::Text => Some(Cow::Borrowed(body)),
+        Section::HeaderFields { names, not } => Some(Cow::Owned(
+            headers.raw_block(Some((names.as_slice(), *not))),
+        )),
         Section::Part(path) => {
             let part = resolve_part(message, path)?;
             let (_, part_body) = mime::split_headers_body(part);
-            Some(part_body.to_vec())
+            Some(Cow::Borrowed(part_body))
         }
         Section::Mime(path) => {
             if path.is_empty() {
-                return Some(headers.raw_block(None));
+                return Some(Cow::Owned(headers.raw_block(None)));
             }
             let part = resolve_part(message, path)?;
-            Some(mime::parse_headers(part).raw_block(None))
+            Some(Cow::Owned(mime::parse_headers(part).raw_block(None)))
         }
         Section::HeaderPart(path) => {
             if path.is_empty() {
-                return Some(headers.raw_block(None));
+                return Some(Cow::Owned(headers.raw_block(None)));
             }
             let part = resolve_part(message, path)?;
-            Some(mime::parse_headers(part).raw_block(None))
+            Some(Cow::Owned(mime::parse_headers(part).raw_block(None)))
         }
         Section::TextPart(path) => {
             if path.is_empty() {
-                return Some(body.to_vec());
+                return Some(Cow::Borrowed(body));
             }
             let part = resolve_part(message, path)?;
             let (_, part_body) = mime::split_headers_body(part);
-            Some(part_body.to_vec())
+            Some(Cow::Borrowed(part_body))
         }
     }
 }
@@ -909,14 +922,48 @@ Content-Type: text/html\r\n\r\n\
 <b>two</b>\r\n\
 --b--\r\n";
         assert_eq!(
-            extract_section(message, &Section::Part(vec![2])).unwrap(),
-            b"<b>two</b>".to_vec()
+            extract_section(message, &Section::Part(vec![2]))
+                .unwrap()
+                .as_ref(),
+            b"<b>two</b>"
         );
         assert!(extract_section(message, &Section::Part(vec![3])).is_none());
         assert_eq!(
-            extract_section(message, &Section::Mime(vec![1])).unwrap(),
-            b"Content-Type: text/plain\r\n\r\n".to_vec()
+            extract_section(message, &Section::Mime(vec![1]))
+                .unwrap()
+                .as_ref(),
+            b"Content-Type: text/plain\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn full_text_and_part_sections_borrow_the_message_without_copying() {
+        // 整封与正文段直接借用消息字节（MEMORY 缺陷修复：FETCH BODY[] 不得
+        // 再复制一份百 MiB 级消息）；重新组装的头部块保持 Owned。
+        let message: &[u8] = b"Subject: hello\r\n\r\nbody here\r\n";
+        assert!(matches!(
+            extract_section(message, &Section::Full),
+            Some(Cow::Borrowed(_))
+        ));
+        assert!(matches!(
+            extract_section(message, &Section::Text),
+            Some(Cow::Borrowed(_))
+        ));
+        assert!(matches!(
+            extract_section(message, &Section::TextPart(vec![1])),
+            Some(Cow::Borrowed(_))
+        ));
+        let multipart = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n\
+--b\r\n\r\none\r\n\
+--b--\r\n";
+        assert!(matches!(
+            extract_section(multipart, &Section::Part(vec![1])),
+            Some(Cow::Borrowed(_))
+        ));
+        assert!(matches!(
+            extract_section(message, &Section::Header),
+            Some(Cow::Owned(_))
+        ));
     }
 
     #[test]
@@ -958,6 +1005,23 @@ Content-Type: text/html\r\n\r\n\
 
     #[test]
     fn binary_items_parse_and_decode_transfer_encoding() {
+        // BINARY（非 PEEK）与 BINARY.PEEK 是两个不同的 item，peek 标志必须分开。
+        assert_eq!(
+            parse_items("BINARY[1]").unwrap(),
+            vec![FetchItem::Binary(BodySpec {
+                section: Section::Part(vec![1]),
+                peek: false,
+                partial: None,
+            })]
+        );
+        assert_eq!(
+            parse_items("BINARY.PEEK[1]").unwrap(),
+            vec![FetchItem::Binary(BodySpec {
+                section: Section::Part(vec![1]),
+                peek: true,
+                partial: None,
+            })]
+        );
         let items = parse_items("(BINARY[] BINARY[1] BINARY.SIZE[1])").unwrap();
         assert!(matches!(&items[0], FetchItem::Binary(_)));
         assert!(matches!(&items[1], FetchItem::Binary(_)));
@@ -966,14 +1030,20 @@ Content-Type: text/html\r\n\r\n\
 
         // HEADER/TEXT 之类的 section 不允许用于 BINARY。
         assert!(parse_items("(BINARY[HEADER])").is_err());
+        assert!(parse_items("BINARY.PEEK").is_err());
 
         let message =
             b"Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=";
-        let items = parse_items("(BINARY[])").unwrap();
+        let items = parse_items("(BINARY.PEEK[])").unwrap();
         let (bytes, seen) = render(&items, &meta(), Some(message), false).unwrap();
-        assert!(!seen, "BINARY 不应改变 \\Seen");
+        assert!(!seen, "BINARY.PEEK 不应改变 \\Seen");
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.starts_with("BINARY[] {5}\r\nhello"), "{text:?}");
+
+        // 不带 .PEEK 的 BINARY 与 BODY 一样置 \Seen。
+        let items = parse_items("(BINARY[])").unwrap();
+        let (_, seen) = render(&items, &meta(), Some(message), false).unwrap();
+        assert!(seen);
 
         let items = parse_items("(BINARY.SIZE[])").unwrap();
         let (bytes, _) = render(&items, &meta(), Some(message), false).unwrap();

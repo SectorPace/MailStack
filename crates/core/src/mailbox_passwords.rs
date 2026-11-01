@@ -25,9 +25,18 @@
 //! * 缺失文件 = 合法的空库（尚未创建任何邮箱）；
 //! * **损坏/版本不符/非空但读不出来 = 错误**，绝不当作空库 —— 否则一次截断
 //!   就会让所有邮箱「找不到口令」，排障方向会被误导到认证逻辑。
+//!
+//! ## 读缓存（mtime + len 键）
+//!
+//! IMAP/POP3 每次认证都会 [`MailboxPasswords::get`]，原先每次都整读 + JSON
+//! 解析整个口令库。现在按 `path + mtime + len` 缓存解析结果（见 [`DbCache`]）：
+//! 两个指纹都对得上才复用；写路径成功后立即失效缓存，所以缓存描述的内容
+//! 永远不超前于磁盘。损坏语义不变：解析失败时缓存一并失效并如实报错。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -74,15 +83,40 @@ struct FileFormat {
     records: BTreeMap<String, PasswordRecord>,
 }
 
+/// 读缓存的条目：解析结果 + 它对应的文件指纹（`mtime + len`）。
+///
+/// ## 为什么是 `mtime + len` 双指纹
+///
+/// `mtime` 在部分文件系统上粒度很粗（秒级），单看它会漏掉「同一秒内的改写」；
+/// `len` 在粗粒度文件系统上通常仍随内容变化（JSON 增删一条记录几乎必然改变
+/// 长度）。两个都对得上才复用。这是不引入额外依赖前提下的折中：真正的
+/// 一致性底线由「写路径成功后立即失效缓存」保证 —— 经由本类型的写永远
+/// 反映在缓存里，外部改写靠指纹检测，指纹相同的同长度外部改写是已知的
+/// 残余风险窗口（秒级粒度 + 同长度，实际运维里可忽略）。
+#[derive(Debug)]
+struct DbCache {
+    path: PathBuf,
+    mtime: SystemTime,
+    len: u64,
+    parsed: Arc<BTreeMap<String, PasswordRecord>>,
+}
+
 /// 邮箱口令记录库（一个 JSON 文件）。
+///
+/// `Clone` 共享同一份读缓存（`Arc<Mutex<..>>`）：缓存键含 `path + mtime + len`，
+/// 指向同一文件的克隆共享缓存既正确又省一次解析。
 #[derive(Debug, Clone)]
 pub struct MailboxPasswords {
     path: PathBuf,
+    cache: Arc<Mutex<Option<DbCache>>>,
 }
 
 impl MailboxPasswords {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            cache: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// 生产路径：`<Paths::mailbox_passwords>`。
@@ -130,14 +164,75 @@ impl MailboxPasswords {
     }
 
     /// 查一个用户的口令记录。
+    ///
+    /// 认证热路径：每次 IMAP/POP3 登录都会走到这里。带缓存（见
+    /// [`load_cached`]）；损坏/版本不符等语义与 [`load`] 完全一致。
     pub fn get(&self, user: &str) -> CoreResult<Option<PasswordRecord>> {
-        Ok(self.load()?.remove(&key(user)))
+        Ok(self.load_cached()?.get(&key(user)).cloned())
+    }
+
+    /// 带缓存的整库读取，返回共享的解析结果。
+    ///
+    /// 先 `stat` 文件：`mtime + len` 都与缓存条目一致才复用（只 clone 一个
+    /// `Arc`），否则重读。失效规则：
+    ///
+    /// * 文件消失（stat NotFound）⇒ 缓存失效，按空库返回（与 `load` 一致）；
+    /// * 解析失败 ⇒ 缓存失效并如实报错 —— **绝不**拿旧缓存掩盖一次损坏；
+    /// * 写路径（[`upsert`] / [`remove`]）成功后主动失效，缓存内容永远
+    ///   不超前于磁盘。
+    fn load_cached(&self) -> CoreResult<Arc<BTreeMap<String, PasswordRecord>>> {
+        let meta = match std::fs::metadata(&self.path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                *self.lock_cache() = None;
+                return Ok(Arc::new(BTreeMap::new()));
+            }
+            Err(error) => return Err(CoreError::io(&self.path, error)),
+        };
+        let mtime = meta
+            .modified()
+            .map_err(|error| CoreError::io(&self.path, error))?;
+        let len = meta.len();
+
+        {
+            let guard = self.lock_cache();
+            if let Some(cached) = guard.as_ref() {
+                if cached.path == self.path && cached.mtime == mtime && cached.len == len {
+                    return Ok(Arc::clone(&cached.parsed));
+                }
+            }
+        }
+        match self.load() {
+            Ok(records) => {
+                let parsed = Arc::new(records);
+                *self.lock_cache() = Some(DbCache {
+                    path: self.path.clone(),
+                    mtime,
+                    len,
+                    parsed: Arc::clone(&parsed),
+                });
+                Ok(parsed)
+            }
+            Err(error) => {
+                *self.lock_cache() = None;
+                Err(error)
+            }
+        }
+    }
+
+    fn lock_cache(&self) -> std::sync::MutexGuard<'_, Option<DbCache>> {
+        match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     /// 写入（新增或覆盖）一条记录。
     ///
     /// 整个读改写都在 [`atomic::locked`] 的跨进程文件锁里完成，因此并发调用
     /// 不会互相丢记录；落盘走临时文件 + rename（[`atomic::atomic_as`]）。
+    /// 成功后失效读缓存（写穿透语义：下一次 `get` 必然看到新记录）；失败时
+    /// 不动缓存 —— 原子写失败磁盘内容未变，旧缓存依然如实。
     pub fn upsert(&self, record: &PasswordRecord) -> CoreResult<()> {
         let user_key = key(&record.username);
         if user_key.is_empty() {
@@ -147,20 +242,27 @@ impl MailboxPasswords {
             let mut records = self.load()?;
             records.insert(user_key.clone(), record.clone());
             self.write_all(&records)
-        })
+        })?;
+        *self.lock_cache() = None;
+        Ok(())
     }
 
     /// 删除一条记录；返回「是否真的删掉了」。
     pub fn remove(&self, user: &str) -> CoreResult<bool> {
         let user_key = key(user);
-        atomic::locked(&self.path, || {
+        let removed = atomic::locked(&self.path, || {
             let mut records = self.load()?;
             let removed = records.remove(&user_key).is_some();
             if removed {
                 self.write_all(&records)?;
             }
             Ok(removed)
-        })
+        })?;
+        if removed {
+            // 只有内容真的变了才失效缓存（未删除 = 磁盘未变 = 缓存仍如实）。
+            *self.lock_cache() = None;
+        }
+        Ok(removed)
     }
 
     fn write_all(&self, records: &BTreeMap<String, PasswordRecord>) -> CoreResult<()> {
@@ -321,5 +423,79 @@ mod tests {
 
         let all = store.load().unwrap();
         assert_eq!(all.len(), 8, "8 个线程各写一条，一条都不能丢：{all:?}");
+    }
+
+    /// 写穿透：`upsert` / `remove` 成功后缓存必须失效，下一次 `get` 立即看到
+    /// 磁盘现状 —— 包括「负结果先被缓存、之后才写入」的顺序。
+    #[test]
+    fn upsert_and_remove_are_visible_to_the_next_get() {
+        let (_dir, store) = fixture();
+        store.upsert(&record("alice", "Correct-Horse-9")).unwrap();
+        assert!(store.get("alice").unwrap().is_some(), "预热缓存");
+        assert!(store.get("nobody").unwrap().is_none(), "预热负结果");
+
+        store.upsert(&record("nobody", "Battery-Staple-7")).unwrap();
+        assert!(
+            store.get("nobody").unwrap().is_some(),
+            "写入后下一次 get 必须看到新记录（缓存不得掩盖写路径）"
+        );
+
+        store.remove("nobody").unwrap();
+        assert!(store.get("nobody").unwrap().is_none(), "删除后必须看不到");
+    }
+
+    /// 外部改写文件（内容与长度都不同 —— 长度是比 mtime 更可靠的失效信号，
+    /// 粗粒度 mtime 文件系统上同秒改写只有 len 靠得住）后，get 必须看到新数据。
+    #[test]
+    fn get_picks_up_external_modifications() {
+        let (_dir, store) = fixture();
+        store.upsert(&record("alice", "Correct-Horse-9")).unwrap();
+        assert!(store.get("alice").unwrap().is_some(), "预热缓存");
+
+        // 绕过本类型直接改文件：新增一条 bob（输出长度必然不同）。
+        let mut all = store.load().unwrap();
+        all.insert("bob".to_string(), record("bob", "Battery-Staple-7"));
+        let file = FileFormat {
+            version: FORMAT_VERSION,
+            records: all,
+        };
+        let mut text = serde_json::to_string_pretty(&file).unwrap();
+        text.push('\n');
+        std::fs::write(store.path(), text).unwrap();
+
+        assert!(
+            store.get("bob").unwrap().is_some(),
+            "外部新增的记录必须可见：缓存不得掩盖磁盘现状"
+        );
+        assert!(store.get("alice").unwrap().is_some(), "原有记录不受影响");
+    }
+
+    /// 反例守卫：缓存变热之后文件被外部损坏，get 仍必须报错 —— 绝不拿旧缓存
+    /// 掩盖一次真实损坏（fail-closed 语义与冷缓存完全一致）。
+    #[test]
+    fn a_corrupt_file_is_still_an_error_after_the_cache_is_warm() {
+        let (_dir, store) = fixture();
+        store.upsert(&record("alice", "Correct-Horse-9")).unwrap();
+        assert!(store.get("alice").unwrap().is_some(), "预热缓存");
+
+        // 外部损坏：内容更长，len 指纹必然失配 → 重读 → 报错。
+        std::fs::write(
+            store.path(),
+            "{\"version\":1,\"records\":{},\"trailing garbage\"",
+        )
+        .unwrap();
+        assert!(store.get("alice").is_err(), "缓存不得掩盖一次真实损坏");
+    }
+
+    /// 文件被外部删除：get 按空库处理（与 `load` 的 NotFound 语义一致），
+    /// 缓存不得复活已消失的记录。
+    #[test]
+    fn a_deleted_file_reads_as_empty_again() {
+        let (_dir, store) = fixture();
+        store.upsert(&record("alice", "Correct-Horse-9")).unwrap();
+        assert!(store.get("alice").unwrap().is_some(), "预热缓存");
+
+        std::fs::remove_file(store.path()).unwrap();
+        assert!(store.get("alice").unwrap().is_none());
     }
 }

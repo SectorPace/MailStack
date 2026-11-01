@@ -257,8 +257,14 @@ pub async fn run_relay_test(
         rec.push(RelayStage::Tls, json!({ "code": tls_response.code }));
 
         // STARTTLS 之后必须重新 EHLO（能力集已变化）。
-        if let Err(e) = session.ehlo("mailstack").await {
-            return Err(rec.fail(e));
+        // 判据与第一处 EHLO 一致：**非 2xx 完成同样是硬失败** —— 原实现只看 Err，
+        // 对端在升级后回一条 5xx 会被当作「EHLO 成功、无新能力」继续跑完测试。
+        match session.ehlo("mailstack").await {
+            Ok(ehlo) if !ehlo.is_positive_completion() => {
+                return Err(rec.fail(SmtpError::Rejected(ehlo.banner())))
+            }
+            Ok(_) => {}
+            Err(e) => return Err(rec.fail(e)),
         }
     }
 
@@ -319,8 +325,14 @@ pub async fn run_direct_probe(
         json!({ "code": banner.code, "banner": banner.banner() }),
     );
 
-    if let Err(e) = session.ehlo("mailstack").await {
-        return Err(rec.fail(e));
+    // EHLO 的判据与 run_relay_test 相同：非 2xx 完成也是硬失败 —— 本机 MTA 对
+    // EHLO 回 5xx 意味着它根本没准备好收信，探测必须如实报告失败。
+    match session.ehlo("mailstack").await {
+        Ok(ehlo) if !ehlo.is_positive_completion() => {
+            return Err(rec.fail(SmtpError::Rejected(ehlo.banner())))
+        }
+        Ok(_) => {}
+        Err(e) => return Err(rec.fail(e)),
     }
     let _ = session.quit().await;
 

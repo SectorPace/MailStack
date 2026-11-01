@@ -152,12 +152,19 @@ pub struct SealContext<'a> {
 }
 
 /// 取 RFC 5322 `From` 的域（供 `dkim=` / `dmarc=` 的 `header.from=` 使用）。
+///
+/// 与信封侧共用同一套清洗（`dmarc::sanitize_domain_part`）：域半段可能带 `>`
+/// 尾巴或大写，直接进 `Authentication-Results` / 对齐比较会静默失配。
+/// mail-auth 解析 `From` 时已做过一次小写折叠与括号剥离，这里是**纵深防御**
+/// （两条口径必须同源，而不是各自信任上游的某个实现细节）。
+/// 清洗后为空（如 `user@`）或没有 `@` 时退回 `fallback`。
 fn header_from(message: &AuthenticatedMessage<'_>, fallback: &str) -> String {
     message
         .from
         .first()
         .and_then(|address| address.rsplit_once('@'))
-        .map(|(_, domain)| domain.to_string())
+        .map(|(_, domain)| crate::dmarc::sanitize_domain_part(domain))
+        .filter(|domain| !domain.is_empty())
         .unwrap_or_else(|| fallback.to_string())
 }
 
@@ -206,17 +213,19 @@ pub async fn seal_with(
     let dkim_outputs = resolver
         .verify_dkim(Parameters::new(&parsed).with_txt_cache(cache))
         .await;
-    let mail_from_domain = context
-        .mail_from
-        .rsplit_once('@')
-        .map_or("", |(_, domain)| domain);
+    // 信封域与 dmarc::evaluate 共用同一套清洗（crate::dmarc::sanitized_domain）：
+    // 上游传来的 MAIL FROM 可能是 `<User@Example.COM>` 这类形态，裸
+    // `rsplit_once('@')` 会切出 `Example.COM>` —— DMARC 对齐比较是逐字的，
+    // 于是**静默**失败。两条路径只有一个清洗来源，才不会各走样一份。
+    // 无 `@`（null sender 等）时为空串，与「无信封发件人身份」的 DMARC 语义一致。
+    let mail_from_domain = crate::dmarc::sanitized_domain(context.mail_from);
     let dmarc_output = resolver
         .verify_dmarc(
             Parameters::new(DmarcParameters {
                 message: &parsed,
                 dkim_output: &dkim_outputs,
                 dkim2_output: None,
-                rfc5321_mail_from_domain: mail_from_domain,
+                rfc5321_mail_from_domain: mail_from_domain.as_str(),
                 spf_output: &spf_output,
             })
             .with_txt_cache(cache),
@@ -326,6 +335,33 @@ mod tests {
         assert_eq!(ArcStatus::Pass.keyword(), "pass");
         assert_eq!(ArcStatus::Fail(String::new()).keyword(), "fail");
         assert_eq!(ArcStatus::None.keyword(), "none");
+    }
+
+    /// `header_from` 与信封侧必须共用同一套域清洗（`dmarc::sanitize_domain_part`）：
+    /// 大写折叠、去 `>` 尾巴，且没有可用域时退回 fallback 而不是产出空域 ——
+    /// 空域进 `Authentication-Results` / 对齐比较会静默失配。
+    #[test]
+    fn header_from_domain_is_sanitised_and_falls_back_when_absent() {
+        // 解析结果借用了报文字节，所以在这个辅助函数内完成「解析 → 取域」，
+        // 只把 owned 的结果带出去。
+        fn header_domain_for(from_line: &str, fallback: &str) -> String {
+            let raw = format!("From: {from_line}\r\nTo: bob@example.net\r\n\r\nbody\r\n");
+            let message =
+                AuthenticatedMessage::parse(raw.as_bytes()).expect("报文应可解析");
+            header_from(&message, fallback)
+        }
+
+        // 大写折叠为小写域。
+        assert_eq!(header_domain_for("Alice@Example.COM", "fallback.test"), "example.com");
+
+        // 角括号形式同样取域（mail-auth 解析时已剥离，清洗不得破坏）。
+        assert_eq!(
+            header_domain_for("<Alice@Example.COM>", "fallback.test"),
+            "example.com"
+        );
+
+        // 没有 @（解析不出地址或域为空）：退回 fallback。
+        assert_eq!(header_domain_for("no-at-sign", "fallback.test"), "fallback.test");
     }
 
     // ─────────────────────────── 封印（RFC 8617 §5） ───────────────────────────

@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -14,7 +15,7 @@ use axum::Json;
 
 use crate::error::{api_not_found, ApiError};
 use crate::ratelimit::{ERR_INVALID_CREDENTIALS, ERR_TOTP_REQUIRED};
-use crate::session::{forwarded_proto, session_cookie_secure};
+use crate::session::forwarded_proto;
 use crate::{AppState, AuthenticatedUser};
 
 /// 为一个特权动作生成处理器函数。
@@ -31,9 +32,10 @@ macro_rules! action_handlers {
             pub async fn $name(
                 State(state): State<AppState>,
                 path_params: Option<Path<HashMap<String, String>>>,
-                body: Option<Json<serde_json::Value>>,
+                headers: axum::http::HeaderMap,
+                body: Result<Json<serde_json::Value>, JsonRejection>,
             ) -> Response {
-                run_action(&state, $action, path_params, body).await
+                run_action(&state, $action, path_params, &headers, body).await
             }
         )*
     };
@@ -56,6 +58,7 @@ action_handlers! {
     totp_begin              => "admin.totp.begin",
     system_doctor           => "system.doctor",
     setup_status            => "setup.status",
+    setup_wizard_complete   => "setup.wizard.complete",
     ai_config_get           => "ai.config.get",
     queue_action            => "queue.action",
     services_action         => "services.action",
@@ -101,13 +104,14 @@ async fn run_action(
     state: &AppState,
     action: &'static str,
     path_params: Option<Path<HashMap<String, String>>>,
-    body: Option<Json<serde_json::Value>>,
+    headers: &axum::http::HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
     // 载荷：请求体 + 路径参数（如 :id / :name），语义与原实现一致。
-    let mut data = body.map(|Json(v)| v).unwrap_or(serde_json::Value::Null);
-    if data.is_null() {
-        data = serde_json::json!({});
-    }
+    let mut data = match json_payload(body, headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     if let Some(obj) = data.as_object_mut() {
         if let Some(Path(params)) = path_params {
             for (k, v) in params {
@@ -151,9 +155,15 @@ async fn run_action(
 /// —— 恰好与目的相反。以落盘配置为准才是真相源。
 pub async fn admin_set(
     State(state): State<AppState>,
-    body: Option<Json<serde_json::Value>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let payload = json_body(body);
+    let payload = match json_payload(body, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let peer_addr = peer.map(|ConnectInfo(addr)| addr);
 
     if let Err(e) = state.inner.client.call("admin.set", &payload).await {
         // 失败**不吊销**：凭据没变，踢下线只会白白让用户重登，
@@ -165,7 +175,12 @@ pub async fn admin_set(
         return e500_missing_admin_config();
     };
     let mut response = revoke_sessions(&state, &username, serde_json::json!({ "ok": true }));
-    if let Some(error) = finish_after_revocation(&mut response, &state) {
+    if let Some(error) = finish_after_revocation(
+        &mut response,
+        &state,
+        peer_addr.as_ref(),
+        forwarded_proto(&headers).as_deref(),
+    ) {
         return error;
     }
     response
@@ -185,16 +200,27 @@ pub async fn admin_set(
 /// 注释：`wasEnabled` 为真时才清会话，否则每次 begin 都会把会话作废掉）。
 pub async fn totp_enable(
     State(state): State<AppState>,
-    body: Option<Json<serde_json::Value>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let payload = json_body(body);
+    let payload = match json_payload(body, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let peer_addr = peer.map(|ConnectInfo(addr)| addr);
     match state.inner.client.call("admin.totp.enable", &payload).await {
         Ok(value) => {
             let Some(username) = admin_username(&state) else {
                 return e500_missing_admin_config();
             };
             let mut response = revoke_sessions(&state, &username, value);
-            if let Some(error) = finish_after_revocation(&mut response, &state) {
+            if let Some(error) = finish_after_revocation(
+                &mut response,
+                &state,
+                peer_addr.as_ref(),
+                forwarded_proto(&headers).as_deref(),
+            ) {
                 return error;
             }
             response
@@ -210,9 +236,15 @@ pub async fn totp_enable(
 /// 能发起这个请求的会话正是劫持来的。
 pub async fn totp_disable(
     State(state): State<AppState>,
-    body: Option<Json<serde_json::Value>>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let payload = json_body(body);
+    let payload = match json_payload(body, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let peer_addr = peer.map(|ConnectInfo(addr)| addr);
     match state
         .inner
         .client
@@ -224,7 +256,12 @@ pub async fn totp_disable(
                 return e500_missing_admin_config();
             };
             let mut response = revoke_sessions(&state, &username, value);
-            if let Some(error) = finish_after_revocation(&mut response, &state) {
+            if let Some(error) = finish_after_revocation(
+                &mut response,
+                &state,
+                peer_addr.as_ref(),
+                forwarded_proto(&headers).as_deref(),
+            ) {
                 return error;
             }
             response
@@ -233,12 +270,56 @@ pub async fn totp_disable(
     }
 }
 
-/// 请求体归一化：缺体与 `null` 都变成空对象。
-fn json_body(body: Option<Json<serde_json::Value>>) -> serde_json::Value {
-    match body.map(|Json(v)| v) {
-        Some(v) if !v.is_null() => v,
-        _ => serde_json::json!({}),
+/// 请求体 → 载荷：`null` 归一化为空对象；提取失败按 [`request_has_body`]
+/// 区分处理。`Err(response)` 表示必须直接以该响应回复（400 错误外壳）。
+///
+/// 旧实现是 `Option<Json<Value>>`：axum 0.7 对 `Option<T>` 的实现把**所有**
+/// 提取失败（畸形 JSON、错误 Content-Type、超限）都塌缩成 `None` —— 动作
+/// 拿着 `{}` 跑完并回 200，客户端却以为提交的数据生效了。现在除「无主体的
+/// 请求」外一律显式拒绝。
+fn json_payload(
+    body: Result<Json<serde_json::Value>, JsonRejection>,
+    headers: &axum::http::HeaderMap,
+) -> Result<serde_json::Value, Response> {
+    match body {
+        Ok(Json(value)) => Ok(if value.is_null() {
+            serde_json::json!({})
+        } else {
+            value
+        }),
+        Err(rejection) => {
+            // 无主体的请求（典型：`DELETE /api/domains/:id`，载荷全在路径参数
+            // 里）本就无 JSON 可言：维持既有「空载荷继续」语义，否则所有无主体
+            // 的删除/列表请求会全体 400。带主体但 Content-Type 不是 JSON、或
+            // JSON 解析失败的，一律 400 错误外壳。
+            if matches!(
+                &rejection,
+                JsonRejection::MissingJsonContentType(_)
+            ) && !request_has_body(headers)
+            {
+                return Ok(serde_json::json!({}));
+            }
+            Err(ApiError::new(
+                crate::ratelimit::ERR_REQUEST_FAILED,
+                rejection.body_text(),
+            )
+            .into_response())
+        }
     }
+}
+
+/// 请求是否声明携带主体：`Content-Length > 0`，或分块传输。
+///
+/// 两者皆无时视为「没带请求体」—— 与缺失请求体同义。
+fn request_has_body(headers: &axum::http::HeaderMap) -> bool {
+    if let Some(length) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return length > 0;
+    }
+    headers.contains_key(header::TRANSFER_ENCODING)
 }
 
 /// 读落盘配置里的管理员用户名。
@@ -264,23 +345,27 @@ fn revoke_sessions(state: &AppState, username: &str, mut value: serde_json::Valu
 
 /// 下发一个「立即作废」的会话 Cookie。
 ///
-/// `Max-Age=0` 让浏览器马上丢弃；`__Host-` 前缀与 `Secure` 必须与登录时
-/// 下发的那一枚**逐字一致** —— 属性不同的同名 Cookie 在浏览器里是两条独立
-/// 记录，只清掉一条的话另一条仍会被发回服务端（表现为「登出了但立刻又自动
-/// 登录」）。
+/// `Max-Age=0` 让浏览器马上丢弃；Cookie 名与 `Secure` 必须与登录时下发的那一枚
+/// **逐字一致** —— 属性不同的同名 Cookie 在浏览器里是两条独立记录，只清掉一条
+/// 的话另一条仍会被发回服务端（表现为「登出了但立刻又自动登录」）。
 ///
-/// ## 为什么这里的 `Secure` 走保守判定
+/// ## 为什么这里必须拿到请求上下文（本次修复）
 ///
-/// 本函数在**响应**阶段，没有请求头也没有对端地址可用（处理器已消费掉）。
-/// 沿用 [`cookie_secure`] 的同一套判定：读显式配置项，读不到就不加 ——
-/// 与登录路径的默认行为一致，因此「下发」与「作废」必然配对。
-fn clear_session_cookie(response: &mut Response, state: &AppState) -> Result<(), String> {
-    let mut cookie = format!(
-        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-        crate::SESSION_COOKIE,
-        "",
-    );
-    if secure_cookie_from_env(state) {
+/// 原先本函数在响应阶段用**另一套** `Secure` 判定（`secure_cookie_from_env`，
+/// 对端按 `None` 处理）：HTTPS 部署下下发路径判出「加 `Secure`」，作废路径却
+/// 判出「不加」—— 浏览器拒绝用无 `Secure` 的 cookie 删除 `__Host-` cookie。
+/// 现在由调用方把**下发路径用的同一份**对端地址与 `X-Forwarded-Proto` 传进来，
+/// 两边都从 [`crate::session::session_cookie_context`] 取（名字，`Secure`）对，
+/// 配对由此成为结构保证。
+pub(crate) fn clear_session_cookie(
+    response: &mut Response,
+    state: &AppState,
+    peer: Option<&SocketAddr>,
+    forwarded_proto: Option<&str>,
+) -> Result<(), String> {
+    let (name, secure) = cookie_context(state, peer, forwarded_proto);
+    let mut cookie = format!("{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    if secure {
         cookie.push_str("; Secure");
     }
     // 5.5：原先是 `if let Ok(value) = ..` —— 装不下就**什么也不做**，
@@ -298,25 +383,41 @@ fn clear_session_cookie(response: &mut Response, state: &AppState) -> Result<(),
 ///
 /// 5.5：这三处原先都写 `clear_session_cookie(..); response` —— 返回值被丢弃，
 /// 作废失败会被静默吞掉。集中成一处，避免三份拷贝各自漂移。
-fn finish_after_revocation(response: &mut Response, state: &AppState) -> Option<Response> {
-    match clear_session_cookie(response, state) {
+fn finish_after_revocation(
+    response: &mut Response,
+    state: &AppState,
+    peer: Option<&SocketAddr>,
+    forwarded_proto: Option<&str>,
+) -> Option<Response> {
+    match clear_session_cookie(response, state, peer, forwarded_proto) {
         Ok(()) => None,
         Err(message) => Some(ApiError::internal(message).into_response()),
     }
 }
 
-/// 只看显式配置项的 `Secure` 判定（响应阶段没有请求信息可用）。
+/// 本次下发/作废共用的 Cookie 上下文：`(名字, 是否 Secure)`。
 ///
-/// **刻意不**在这里推断「当前是不是 https」：作废 Cookie 若与下发时算出的
-/// 属性不一致，浏览器就清不掉那一枚 —— 那比多加一次 `Secure` 更糟。
-/// 配置项是运维能同时对齐两处的唯一手段。
-fn secure_cookie_from_env(state: &AppState) -> bool {
+/// 名字与 `Secure` **必须**由同一个判定产生：`__Host-` 前缀在浏览器侧强制要求
+/// `Secure`，反过来无 `Secure` 时不得用带前缀的名字（浏览器直接拒收，登录
+/// 开箱即坏）。下发（[`build_session_cookie`]）与作废（[`clear_session_cookie`]）
+/// 都从这里取值，二者才必然配对。
+fn cookie_context(
+    state: &AppState,
+    peer: Option<&SocketAddr>,
+    forwarded_proto: Option<&str>,
+) -> (&'static str, bool) {
+    let mut headers = axum::http::HeaderMap::new();
+    if let Some(proto) = forwarded_proto {
+        if let Ok(value) = HeaderValue::from_str(proto) {
+            headers.insert("x-forwarded-proto", value);
+        }
+    }
     let env_flag = std::env::var(crate::session::SESSION_COOKIE_SECURE_ENV).ok();
-    session_cookie_secure(
+    crate::session::session_cookie_context(
         env_flag.as_deref(),
         state.inner.public_mode,
-        None,
-        &axum::http::HeaderMap::new(),
+        peer,
+        &headers,
     )
 }
 
@@ -351,12 +452,24 @@ fn e500_missing_admin_config() -> Response {
 /// 按 `body.ok` / `body.data` 拆包（见 [`crate::error::rpc_ok_json`]）。
 pub async fn rpc_bridge(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("");
     if !crate::contract::is_exposed_action(action) {
         // 不区分「动作不存在」与「动作未暴露」—— 否则内部动作名会成为可探测信息。
         return crate::error::rpc_err_json(StatusCode::BAD_REQUEST, "unknown action");
+    }
+
+    // AI 动作经桥触达时必须过**同一道**独立限流：桥是前端的兜底传输层，全部
+    // `ai.*` 动作都能从这里走 —— 只限流 `/api/ai/` 路径的话，改走桥就用一句
+    // `{"action":"ai.chat"}` 绕开了出站付费调用的配额。429 的状态码、错误外壳
+    // 与 `Retry-After` 语义与 `/api/ai/*` 的中间件完全一致（同一构造函数）。
+    if action.starts_with("ai.") {
+        let peer_addr = peer.map(|ConnectInfo(addr)| addr);
+        if let Some(response) = crate::ai_limited_response(&state, peer_addr.as_ref()) {
+            return response;
+        }
     }
 
     let data = body.get("data").cloned().unwrap_or(serde_json::Value::Null);
@@ -430,7 +543,7 @@ fn normalize_ip(ip: IpAddr) -> String {
 ///
 /// `Secure` 一旦加错方向，登录就**开箱即坏**（浏览器不再回传 cookie）。
 /// 而「外部是不是 HTTPS」只有本进程能判定，且必须区分「可信来源」与
-/// 「任何人可伪造的头」—— 详见 [`session_cookie_secure`]。
+/// 「任何人可伪造的头」—— 详见 [`crate::session::session_cookie_secure`]。
 pub async fn login(
     State(state): State<AppState>,
     peer: Option<ConnectInfo<SocketAddr>>,
@@ -498,8 +611,10 @@ pub async fn login(
         Err(error) => {
             // 阻塞任务本身崩了/被取消。这是**基础设施故障**，不是凭证失败 ——
             // 因此不记失败次数（否则与 5.4 同样会把管理员锁死）。
-            return ApiError::internal(format!("password verification task failed: {error}"))
-                .into_response();
+            // JoinError 原文只进日志不进响应：它可能携带任务 panic 的任意内部
+            // 内容，回显给客户端等于把内部细节泄出去。
+            tracing::error!("password verification task failed: {error}");
+            return ApiError::internal("internal error").into_response();
         }
     };
     let username_ok = config.username == username;
@@ -594,41 +709,28 @@ pub async fn login(
 
 /// 组装会话 Cookie 的 `Set-Cookie` 值。
 ///
-/// `__Host-` 前缀是常量（见 [`crate::SESSION_COOKIE`]）；`Secure` 由
-/// [`session_cookie_secure`] 逐请求判定，理由见那里的注释（默认不加，
-/// 以免把「只提供 HTTP」的默认部署弄成登不进去）。
+/// Cookie 名与 `Secure` 都从 [`cookie_context`] 取（同一判定，和作废路径必然
+/// 配对）：会加 `Secure` 的部署用 `__Host-mailstack_session`（保留前缀保护），
+/// 默认 HTTP 部署用无前缀的 `mailstack_session`（无 `Secure` 的 `__Host-`
+/// cookie 会被浏览器拒收）。
 fn build_session_cookie(
     sid: &str,
     state: &AppState,
     peer: Option<&SocketAddr>,
     forwarded_proto: Option<&str>,
 ) -> String {
+    let (name, secure) = cookie_context(state, peer, forwarded_proto);
     let mut cookie = format!(
-        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-        crate::SESSION_COOKIE,
-        sid,
-        crate::session::SESSION_TTL_SECONDS
+        "{name}={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        // Max-Age 与服务端**绝对上限**对齐，而不是 8 小时滑动 TTL：活跃会话
+        // 的续期在服务端（滑动），cookie 若只活 8 小时会把活跃用户也强制登出
+        // —— 与服务端「滑动 8h、绝对 7d」的语义脱节。7 天后两者同时到期。
+        crate::session::SESSION_ABSOLUTE_MAX_SECONDS
     );
-    if cookie_secure(state, peer, forwarded_proto) {
+    if secure {
         cookie.push_str("; Secure");
     }
     cookie
-}
-
-/// 本次下发是否应带 `Secure`。
-fn cookie_secure(
-    state: &AppState,
-    peer: Option<&SocketAddr>,
-    forwarded_proto: Option<&str>,
-) -> bool {
-    let mut headers = axum::http::HeaderMap::new();
-    if let Some(proto) = forwarded_proto {
-        if let Ok(value) = HeaderValue::from_str(proto) {
-            headers.insert("x-forwarded-proto", value);
-        }
-    }
-    let env_flag = std::env::var(crate::session::SESSION_COOKIE_SECURE_ENV).ok();
-    session_cookie_secure(env_flag.as_deref(), state.inner.public_mode, peer, &headers)
 }
 
 /// `GET /api/auth/sessions`。
@@ -688,8 +790,19 @@ pub async fn metrics_telemetry(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let range = params.get("range").map(String::as_str);
-    Json(state.inner.telemetry.telemetry(range)).into_response()
+    let range = params.get("range").cloned();
+    let collector = std::sync::Arc::clone(&state.inner.telemetry);
+    // 采样会持锁做 /proc 遍历并跑 `df` / `postqueue` 子进程（毫秒到秒级的
+    // 阻塞操作）—— 必须搬进阻塞线程池：直接跑在 async worker 上会把整个
+    // worker 池占住（与登录的 PBKDF2 同一纪律，见 `login` 的注释）。
+    match tokio::task::spawn_blocking(move || collector.telemetry(range.as_deref())).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => {
+            // 采样任务崩了属基础设施故障：JoinError 原文只进日志，不回客户端。
+            tracing::error!("telemetry sampling task failed: {error}");
+            ApiError::internal("internal error").into_response()
+        }
+    }
 }
 
 /// `/api/*` 兜底：**必须**返回 JSON（规格书 §5.1）。
@@ -909,22 +1022,33 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        // 默认部署（HTTP、无可信回环对端）判定为**不加** `Secure`；此时名字
+        // **必须**不带 `__Host-` 前缀 —— 无 `Secure` 的 `__Host-` cookie 会被
+        // 所有浏览器拒收，登录开箱即坏（本次修复的核心）。名字与 `Secure`
+        // 的配对关系由 `the_cookie_name_follows_the_secure_decision` 与
+        // `issued_and_cleared_session_cookies_are_always_paired` 钉住。
         assert!(
-            cookie.starts_with(&format!("{}=", crate::SESSION_COOKIE)),
+            cookie.starts_with(&format!(
+                "{}=",
+                crate::session::SESSION_COOKIE_PLAIN_NAME
+            )),
             "cookie: {cookie}"
         );
-        // `__Host-` 前缀是浏览器强制「必须 Secure + 必须 Path=/ + 不得有 Domain」
-        // 的那条线，缺了它同站子域就能写同名 cookie 覆盖会话。
         assert!(
-            crate::SESSION_COOKIE.starts_with("__Host-"),
-            "会话 Cookie 必须带 `__Host-` 前缀，否则同站子域可覆盖它"
+            !cookie.contains("Secure"),
+            "HTTP 默认部署不得带 Secure：{cookie}"
         );
         assert!(cookie.contains("HttpOnly"), "会话 Cookie 必须是 HttpOnly");
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Path=/"));
-        // 注意：默认部署只提供 HTTP，所以**不能**无条件断言 `Secure` ——
-        // 加了它浏览器就不回传 cookie，登录会直接坏掉。`Secure` 由
-        // `session_cookie_secure()` 判定，其行为由该函数的专属测试覆盖。
+        // Cookie 寿命与服务端 7 天绝对上限对齐（滑动续期在服务端）。
+        assert!(
+            cookie.contains(&format!(
+                "Max-Age={}",
+                crate::session::SESSION_ABSOLUTE_MAX_SECONDS
+            )),
+            "cookie 寿命必须对齐服务端绝对上限：{cookie}"
+        );
 
         let body = body_json(response).await;
         assert_eq!(body["ok"], true);
@@ -1183,7 +1307,10 @@ mod tests {
                 .unwrap()
                 .to_string();
             assert!(
-                cookie.starts_with(&format!("{}=", crate::SESSION_COOKIE)),
+                cookie.starts_with(&format!(
+                    "{}=",
+                    crate::session::SESSION_COOKIE_PLAIN_NAME
+                )),
                 "第 {round} 轮：cookie 不可用"
             );
 
@@ -1223,5 +1350,252 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── 本次修复的回归守卫 ──
+
+    /// 下发与作废的会话 Cookie 必须**逐字配对**：同名、同 `Secure`。属性不同的
+    /// 同名 Cookie 在浏览器里是两条独立记录，作废清不掉下发的那一枚 —— 表现为
+    /// 「登出了但立刻又自动登录」。历史上作废路径用另一套 `Secure` 判定（拿不到
+    /// 请求上下文），HTTPS 部署下作废 Cookie 会缺 `Secure`，浏览器因此拒绝删除
+    /// `__Host-` cookie。名字跟随 `Secure` 判定后，两条路径必须从同一判定取值。
+    #[test]
+    fn issued_and_cleared_session_cookies_are_always_paired() {
+        let (root, state) = test_state("cookiepair");
+
+        // ── 默认 HTTP 部署（无可信对端）：无前缀名 + 无 Secure ──
+        let issued = build_session_cookie("sid-http", &state, None, None);
+        let mut response = Response::builder().body(Body::empty()).unwrap();
+        clear_session_cookie(&mut response, &state, None, None).unwrap();
+        let cleared = response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        for cookie in [&issued, &cleared] {
+            assert!(
+                cookie.starts_with(&format!(
+                    "{}=",
+                    crate::session::SESSION_COOKIE_PLAIN_NAME
+                )),
+                "HTTP 默认部署必须用无前缀名：{cookie}"
+            );
+            assert!(
+                !cookie.contains("Secure"),
+                "HTTP 默认部署不得带 Secure：{cookie}"
+            );
+        }
+        assert!(cleared.contains("Max-Age=0"), "作废必须立即过期：{cleared}");
+
+        // ── 可信回环对端 + X-Forwarded-Proto: https：`__Host-` 名 + Secure ──
+        let peer: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let issued = build_session_cookie("sid-tls", &state, Some(&peer), Some("https"));
+        let mut response = Response::builder().body(Body::empty()).unwrap();
+        clear_session_cookie(&mut response, &state, Some(&peer), Some("https")).unwrap();
+        let cleared = response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        for cookie in [&issued, &cleared] {
+            assert!(
+                cookie.starts_with(&format!("{}=", crate::SESSION_COOKIE)),
+                "HTTPS 部署必须用 `__Host-` 名：{cookie}"
+            );
+            assert!(cookie.contains("Secure"), "HTTPS 部署必须带 Secure：{cookie}");
+        }
+        assert!(cleared.contains("Max-Age=0"), "作废必须立即过期：{cleared}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 畸形 JSON 不得再被 `Option<Json>` 吞成「空载荷继续执行」—— 那会让动作
+    /// 拿着 `{}` 跑完并回 200，客户端却以为提交的数据生效了。现在是 400 错误外壳。
+    #[tokio::test]
+    async fn a_malformed_json_body_is_rejected_with_the_error_envelope() {
+        let (root, state) = test_state("badjson");
+        let (sid, csrf) = state.inner.sessions.create_session("admin");
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/queue/action")
+                    .header(header::COOKIE, format!("{}={sid}", crate::SESSION_COOKIE))
+                    .header("x-csrf-token", csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{\"queue_id\": "))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["ok"], false);
+        assert!(
+            body["error"]["code"].is_string() && body["error"]["message"].is_string(),
+            "必须是既有错误外壳形状：{body}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 带主体但 Content-Type 不是 JSON 的请求同样必须显式拒绝 —— 旧实现会把
+    /// 载荷静默丢成 `{}` 继续执行。
+    #[tokio::test]
+    async fn a_json_body_with_the_wrong_content_type_is_rejected() {
+        let (root, state) = test_state("wrongct");
+        let (sid, csrf) = state.inner.sessions.create_session("admin");
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/queue/action")
+                    .header(header::COOKIE, format!("{}={sid}", crate::SESSION_COOKIE))
+                    .header("x-csrf-token", csrf)
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    // oneshot 的手工请求不会像 hyper 那样自动补 Content-Length；
+                    // 缺了它 `request_has_body` 会把带主体请求误判成无主体，
+                    // 走「无主体豁免」而不是本用例要验证的 400 拒绝路径。
+                    .header(header::CONTENT_LENGTH, "19")
+                    .body(Body::from("{\"queue_id\": \"abc\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["ok"], false);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 无主体的请求（典型：不带 Content-Type 的 GET/DELETE）本就无 JSON 可言，
+    /// 必须维持既有「空载荷 + 路径参数」语义 —— 不得被新的拒绝路径误伤成 400。
+    #[tokio::test]
+    async fn a_bodyless_request_still_reaches_the_action_with_an_empty_payload() {
+        // 公网模式保证助手不可达（INV-26：不得 fallback 到 sudo）⇒ 确定的 503。
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "mailstack-routes-bodyless-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = Paths::rooted(&root);
+        std::fs::create_dir_all(&paths.etc).unwrap();
+        std::fs::write(&paths.install_args_conf, "ACCESS_MODE=direct\n").unwrap();
+        let state = AppState::new(paths);
+
+        let (sid, _csrf) = state.inner.sessions.create_session("admin");
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/queue")
+                    .header(header::COOKIE, format!("{}={sid}", crate::SESSION_COOKIE))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // 公网模式 + 助手不可达 ⇒ 503；这说明载荷校验已放行 ——
+        // 400 才是回归（无主体被误判为非法载荷）。
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "无主体的 GET 必须维持「空载荷继续」语义，实际 {}",
+            response.status()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// AI 动作经 RPC 桥触达时必须过**同一道**独立限流：桥是前端的兜底传输层，
+    /// 全部 `ai.*` 动作都能从这里走 —— 只限流 `/api/ai/` 路径等于没限。
+    #[tokio::test]
+    async fn ai_actions_via_the_rpc_bridge_hit_the_same_rate_limit() {
+        // 公网模式保证助手不可达（非 AI 请求 ⇒ 503 而非真实副作用）。
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "mailstack-routes-rpcai-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = Paths::rooted(&root);
+        std::fs::create_dir_all(&paths.etc).unwrap();
+        std::fs::write(&paths.install_args_conf, "ACCESS_MODE=direct\n").unwrap();
+        let state = AppState::new(paths);
+
+        let (sid, csrf) = state.inner.sessions.create_session("admin");
+        let app = build_router(state.clone());
+
+        // 非 AI 动作不受 AI 桶牵连（公网模式下助手不可达 ⇒ 503，绝不是 429）。
+        let non_ai = post_rpc(
+            app.clone(),
+            &sid,
+            &csrf,
+            serde_json::json!({ "action": "queue.list" }),
+        )
+        .await;
+        assert_ne!(
+            non_ai.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "非 AI 动作不得被 AI 桶限流"
+        );
+
+        // 打满本来源（oneshot 无对端 ⇒ client_key = "local"，与桥内判定同键）。
+        for _ in 0..crate::contract::AI_RATE_LIMIT_PER_MINUTE {
+            assert!(state.inner.ai_limiter.check("local").is_allowed());
+        }
+
+        let limited = post_rpc(
+            app,
+            &sid,
+            &csrf,
+            serde_json::json!({ "action": "ai.chat", "data": {} }),
+        )
+        .await;
+        assert_eq!(
+            limited.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "ai.* 经桥必须与 /api/ai/* 路由共用同一配额"
+        );
+        assert!(
+            limited.headers().get("retry-after").is_some(),
+            "429 必须带 Retry-After（与中间件同语义）"
+        );
+        let body = body_json(limited).await;
+        assert_eq!(body["error"]["code"], "RATE_LIMITED");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    async fn post_rpc(
+        app: axum::Router,
+        sid: &str,
+        csrf: &str,
+        body: serde_json::Value,
+    ) -> Response {
+        app.oneshot(
+            HttpRequest::builder()
+                .method(axum::http::Method::POST)
+                .uri("/api/rpc")
+                .header(header::COOKIE, format!("{}={sid}", crate::SESSION_COOKIE))
+                .header("x-csrf-token", csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
     }
 }

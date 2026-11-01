@@ -718,22 +718,29 @@ pub fn consume_recovery(paths: &Paths, code: &str) -> CoreResult<bool> {
 
 /// 消费一个动态码：命中且**尚未被消费过**的 step 才算通过，并就地记账。
 ///
-/// 整个「读块 → 判是否已用 → 记账 → 写回」都在 [`update_admin_config`] 的
-/// `locked()` 临界区内（INV-32）：若锁外读、锁外判，两个并发请求会各自看到
-/// 「这一步还没用过」并双双放行 —— 那等于没有重放保护。
+/// 整个「解密 secret → 判命中哪一步 → 判是否已用 → 记账 → 写回」都在
+/// [`update_admin_config`] 的 `locked()` 临界区内（INV-32）：若锁外读、锁外判，
+/// 两个并发请求会各自看到「这一步还没用过」并双双放行 —— 那等于没有重放保护。
+///
+/// ## 为什么 secret 必须在锁内解
+///
+/// secret 与记账同属 `admin.json` 里的**同一个** `totp` 块。若在锁外用旧块解出的
+/// secret 命中 step、再进锁记账，「disable → 立刻 re-enable（换新 secret）」就能
+/// 在这个窗口里把旧 secret 的 step 记到新块上 —— 新块的重放账被污染，旧码反而
+/// 可能再被放行。让「解 secret」与「记账」读同一份锁内快照，这个窗口就不存在。
 ///
 /// 记账的写入是一次真实的 `admin.json` 覆写，因此**只在形状像动态码时才进临界区**：
 /// 恢复码与畸形输入根本不可能命中任何一步，让它们也去改一次配置文件毫无意义。
-fn consume_totp_step(paths: &Paths, secret: &[u8], code: &str, unix_time: u64) -> CoreResult<bool> {
+fn consume_totp_step(
+    paths: &Paths,
+    key: &[u8; TOTP_KEY_BYTES],
+    code: &str,
+    unix_time: u64,
+) -> CoreResult<bool> {
     // 形状先判：非 6 位数字既不可能是动态码，也不值得一次写盘。
     if !code_shape_ok(code) {
         return Ok(false);
     }
-    // secret / 时间都不随配置变，所以「命中哪一步」可以锁外算；真正需要串行化的
-    // 是「这一步是否已被消费过」的判定与记账，那部分在锁内。
-    let Some(step) = matching_step(secret, code, unix_time) else {
-        return Ok(false);
-    };
 
     update_admin_config(&paths.admin_config, |current| {
         let Some(block) = totp_block(current) else {
@@ -742,6 +749,11 @@ fn consume_totp_step(paths: &Paths, secret: &[u8], code: &str, unix_time: u64) -
         if state(current) != TotpState::Enabled {
             return Ok((current.clone(), false));
         }
+        // secret 与记账来自同一份锁内快照（见上方函数文档）。
+        let secret = open(key, &envelope_from_block(block)?)?;
+        let Some(step) = matching_step(&secret, code, unix_time) else {
+            return Ok((current.clone(), false));
+        };
         if step_already_used(block, step) {
             // **刻意与「码不对」返回同一个结论、同一段文案**：若这里给一个
             // 「该码已被使用」的错误，攻击者就能用它区分「我猜的码曾经有效过」
@@ -765,16 +777,18 @@ pub fn verify(paths: &Paths, code: &str, unix_time: u64) -> CoreResult<VerifyRes
     let Some(config) = crate::config::read_admin_config(paths) else {
         return Ok(VerifyResult::rejected());
     };
-    let Some(block) = totp_block(&config) else {
+    // 下面只是锁外的**快速预判**，省掉明显不可能命中的临界区；真正的判定与
+    // 记账在 `consume_totp_step` 的锁内用同一份配置快照完成 —— secret 绝不能
+    // 在锁外解（见 `consume_totp_step` 的文档）。
+    if totp_block(&config).is_none() {
         return Ok(VerifyResult::rejected());
-    };
+    }
     if state(&config) != TotpState::Enabled {
         return Ok(VerifyResult::rejected());
     }
 
     let key = load_master_key(paths)?;
-    let secret = open(&key, &envelope_from_block(block)?)?;
-    if consume_totp_step(paths, &secret, code, unix_time)? {
+    if consume_totp_step(paths, &key, code, unix_time)? {
         return Ok(VerifyResult {
             valid: true,
             method: Some(VerifyMethod::Totp),
@@ -1452,6 +1466,66 @@ mod tests {
         // 再拨回 10 分钟仍然不行（哪怕此时 `step` 已经小于记账里的任何值）。
         let much_earlier = base - 20 * TOTP_PERIOD_SECS;
         assert!(!verify(&f.paths, &code, much_earlier).unwrap().valid);
+    }
+
+    /// 回归锚：secret 与记账必须来自**同一份锁内快照**。
+    ///
+    /// 老实现在锁外用旧块解出的 secret 命中 step、再进锁记账 —— 一次
+    /// 「disable → 立刻 re-enable（换新 secret）」就能把旧 secret 的 step
+    /// 记到新块上，污染新块的重放账。secret 改为锁内解密后，判定用的是
+    /// **当前**块的 secret：旧码不再命中，也不留下任何记账。
+    ///
+    /// 固定 secret 与固定时刻，断言完全确定（不依赖随机 secret 的巧合）。
+    #[test]
+    fn a_code_of_a_stale_secret_is_never_booked_into_the_new_block() {
+        const T: u64 = 1_700_000_000; // 固定时刻：step 与码都是确定的
+        let f = Fixture::new("stalesecret");
+        let key = load_or_create_master_key(&f.paths).unwrap();
+        let old_secret = [0x11u8; TOTP_SECRET_BYTES];
+        let new_secret = [0x22u8; TOTP_SECRET_BYTES];
+        let stale_code = code_at(&old_secret, T);
+
+        let enabled_block = |secret: &[u8; TOTP_SECRET_BYTES]| {
+            let envelope = seal(&key, secret).unwrap();
+            json!({
+                "version": ENVELOPE_VERSION,
+                "enabled": true,
+                "enc": envelope.enc,
+                "nonce": envelope.nonce,
+                "tag": envelope.tag,
+                "recovery": [],
+            })
+        };
+        let write_block = |block: Value| {
+            let mut value = f.admin_json();
+            value["totp"] = block;
+            fs::write(
+                &f.paths.admin_config,
+                serde_json::to_string_pretty(&value).unwrap(),
+            )
+            .unwrap();
+        };
+
+        // 旧 secret 启用 → 消费当前 step（记账进入旧块）。
+        write_block(enabled_block(&old_secret));
+        assert!(verify(&f.paths, &stale_code, T).unwrap().valid);
+
+        // disable → re-enable：换新 secret，记账随块作废（新块为空）。
+        // disable 本身要交第二个因子，但 stale_code 的 step 已被消费，
+        // 用相邻步的码（对旧 secret 仍然有效）来关。
+        let disable_code = code_at(&old_secret, T + TOTP_PERIOD_SECS);
+        disable(&f.paths, &disable_code, T + TOTP_PERIOD_SECS).unwrap();
+        write_block(enabled_block(&new_secret));
+        assert!(used_steps(&f.admin_json()["totp"]).is_empty());
+
+        // 旧 secret 的码再提交：按**当前**块解出的新 secret 判定 → 不命中，
+        // 且不得把旧 step 记进新块。
+        assert!(!verify(&f.paths, &stale_code, T).unwrap().valid);
+        assert!(
+            used_steps(&f.admin_json()["totp"]).is_empty(),
+            "旧 secret 的 step 不得被记进新块：{:?}",
+            f.admin_json()["totp"]["usedSteps"]
+        );
     }
 
     #[test]

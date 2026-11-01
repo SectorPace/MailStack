@@ -36,8 +36,9 @@ pub const LOCKOUT_SECONDS: i64 = 900;
 pub const MAX_KEY_LEN: usize = 256;
 /// 三张表各自允许的最大条目数。
 ///
-/// 上界配合淘汰：只要条目数超限就在每次判定前清扫已过窗口的项，因此攻击者
-/// 无法靠「窗口内高基数」把内存顶起来。
+/// 上界配合淘汰：插入路径上发现表顶到上界时才清扫已过窗口的项（仍超则按
+/// 最旧窗口淘汰）—— 被拒绝的请求不插入，也就不做全表清扫，避免把每次判定
+/// 都变成 O(n)。
 pub const MAX_TRACKED_KEYS: usize = 4096;
 
 /// 桶类型。
@@ -123,10 +124,6 @@ impl LoginLimiter {
             state.failures.remove(account_key.as_ref());
         }
 
-        // 淘汰必须在下面查表**之前**做完。原实现把 `entry().or_insert_with(..)`
-        // 放在判决前，于是「被限流的请求」也留下新键 —— 限流器本身成了内存增长来源。
-        state.evict_expired(now);
-
         // 先只读判决：不存在的桶不新建。这样「判决」不会产生副作用。
         let global_verdict = match state.global.as_mut() {
             Some(counter) => counter.peek(now, GLOBAL_LIMIT_PER_MINUTE),
@@ -151,6 +148,7 @@ impl LoginLimiter {
         }
 
         // 全部放行：这时才累加，并**顺带**为首次出现的键建立计数器。
+        // 「被限流的请求不留下新键」由结构保证 —— 插入只发生在放行路径。
         let global = state.global.get_or_insert_with(|| Counter::new(now));
         global.count += 1;
         state
@@ -163,6 +161,17 @@ impl LoginLimiter {
             .entry(account_key.into_owned())
             .or_insert_with(|| Counter::new(now))
             .count += 1;
+
+        // 淘汰只在**插入路径**、且确有表顶到上界时才跑：原先每次判定都全表
+        // 清扫（三张表各一遍 O(n)），表在 4096 键规模下等于把每次登录限流判定
+        // 都变成 O(n)。窗口过期的条目在命中时由 `Counter::peek` 就地重置，
+        // 内存上界由这里兜住。见 [`LimiterState::evict_expired`]。
+        if state.by_ip.len() > MAX_TRACKED_KEYS
+            || state.by_account.len() > MAX_TRACKED_KEYS
+            || state.failures.len() > MAX_TRACKED_KEYS
+        {
+            state.evict_expired(now);
+        }
         LimitVerdict::Allow
     }
 
@@ -173,7 +182,6 @@ impl LoginLimiter {
 
     pub fn record_failure_at(&self, account: &str, now: OffsetDateTime) {
         let mut state = self.lock();
-        state.evict_expired(now);
         // 键与 `check_at` 用同一个规范化函数，否则两者会记到不同桶上。
         let key = sanitized(account);
         let entry = state.failures.entry(key.into_owned()).or_insert((0, None));
@@ -181,11 +189,20 @@ impl LoginLimiter {
         if entry.0 >= FAILURE_LOCKOUT_THRESHOLD {
             entry.1 = Some(now + Duration::seconds(LOCKOUT_SECONDS));
         }
+        // 淘汰同样只在插入路径、表顶到上界时才跑（与 `check_at` 同一纪律）。
+        if state.failures.len() > MAX_TRACKED_KEYS {
+            state.evict_expired(now);
+        }
     }
 
     /// 记录一次成功：清除失败计数与锁定。
+    ///
+    /// 键与 [`Self::record_failure_at`] / [`Self::is_locked_at`] 必须走**同一个**
+    /// 规范化函数 —— 原先这里直接删原始键，超长键记在 sanitized 键上却永远
+    /// 清不掉（`is_locked` 同样用原始键查，锁定状态对长键整体失灵）。
     pub fn record_success(&self, account: &str) {
-        self.lock().failures.remove(account);
+        let key = sanitized(account);
+        self.lock().failures.remove(key.as_ref());
     }
 
     /// 该账号当前是否处于锁定期。
@@ -195,7 +212,8 @@ impl LoginLimiter {
 
     pub fn is_locked_at(&self, account: &str, now: OffsetDateTime) -> bool {
         let state = self.lock();
-        matches!(state.failures.get(account), Some((_, Some(until))) if *until > now)
+        let key = sanitized(account);
+        matches!(state.failures.get(key.as_ref()), Some((_, Some(until))) if *until > now)
     }
 
     /// 清除全部状态（仅供测试）。
@@ -341,36 +359,41 @@ impl AiRateLimiter {
             .by_ip
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let window = Duration::minutes(1);
-        map.retain(|_, counter| now - counter.window_start < window);
-
         let limit = crate::contract::AI_RATE_LIMIT_PER_MINUTE;
         let key = sanitized(ip);
 
-        // 判决**不新建**条目：只有真的放行时才建。
+        // 判定**不新建**条目：只有真的放行时才建。
+        // 命中路径不做全表清扫 —— 窗口过期的条目由 `Counter::peek` 就地重置，
+        // 原先每次判定都 `retain` 一遍全表（O(n)），表在 4096 键规模下等于把
+        // 每次 AI 调用都变成 O(n)。
         if let Some(counter) = map.get_mut(key.as_ref()) {
             if let LimitVerdict::Limited { retry_after_secs } = counter.peek(now, limit) {
                 return LimitVerdict::Limited { retry_after_secs };
             }
+            counter.count += 1;
+            return LimitVerdict::Allow;
         }
 
-        // 累加之后才收缩上界 —— 先收缩再插入会留下 `MAX + 1` 条，
-        // 而「限流器自己有上界」正是这里要保证的性质。
-        map.entry(key.into_owned())
-            .or_insert_with(|| Counter::new(now))
-            .count += 1;
-
-        // 同窗口内的高基数来源：按最旧窗口淘汰，保证「最热」优先留下。
-        while map.len() > MAX_TRACKED_KEYS {
-            let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, c)| c.window_start)
-                .map(|(k, _)| k.clone())
-            else {
-                break;
-            };
-            map.remove(&oldest);
+        // 新键走插入路径：仅当表真的顶到上界时才做一次淘汰 —— 先清扫已过
+        // 窗口的条目；仍满则按最旧窗口 drop 一条（一次 O(n) 扫描取最小值，
+        // 不排序）。保证「最热」的键优先留下，且插入后条目数不超上界。
+        if map.len() >= MAX_TRACKED_KEYS {
+            let window = Duration::minutes(1);
+            map.retain(|_, counter| now - counter.window_start < window);
+            if map.len() >= MAX_TRACKED_KEYS {
+                if let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, c)| c.window_start)
+                    .map(|(k, _)| k.clone())
+                {
+                    map.remove(&oldest);
+                }
+            }
         }
+
+        let mut counter = Counter::new(now);
+        counter.count = 1;
+        map.insert(key.into_owned(), counter);
 
         LimitVerdict::Allow
     }
@@ -652,6 +675,37 @@ mod tests {
         }
         assert!(limiter.is_locked_at("admin", t0));
         assert!(!limiter.is_locked_at("other", t0), "锁定不得影响其它账号");
+    }
+
+    /// 键规范化必须在 `record_failure_at` / `record_success` / `is_locked_at`
+    /// 三处一致：超长键（超 [`MAX_KEY_LEN`]）此前失败记在 sanitized 键上、
+    /// 成功清的是**原始**键、查锁又用**原始**键 —— 锁定状态对长键整体失灵
+    /// （既锁不上也清不掉，且与 `check_at` 的锁定判定互相矛盾）。
+    #[test]
+    fn lockout_uses_the_sanitized_key_everywhere() {
+        let limiter = LoginLimiter::new();
+        let t0 = OffsetDateTime::now_utc();
+        let long_account = format!("admin-{}", "x".repeat(MAX_KEY_LEN + 64));
+
+        for _ in 0..FAILURE_LOCKOUT_THRESHOLD {
+            limiter.record_failure_at(&long_account, t0);
+        }
+        assert!(
+            limiter.is_locked_at(&long_account, t0),
+            "长账号键必须能上锁"
+        );
+
+        limiter.record_success(&long_account);
+        assert!(
+            !limiter.is_locked_at(&long_account, t0),
+            "成功登录必须能清掉长账号键的锁定"
+        );
+
+        // 清掉之后再次失败仍能重新计数上锁（计数确实归零，不是删错键）。
+        for _ in 0..FAILURE_LOCKOUT_THRESHOLD {
+            limiter.record_failure_at(&long_account, t0);
+        }
+        assert!(limiter.is_locked_at(&long_account, t0));
     }
 
     #[test]

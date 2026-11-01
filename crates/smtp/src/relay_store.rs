@@ -209,6 +209,16 @@ pub use mailstack_core::exec::hash_db_path;
 ///
 /// 每行格式 `<relayhost> <user>:<password>`；跳过空行与 `#` 注释；
 /// 不符合格式的行被忽略（不报错——迁移不应因一行脏数据而中断）。
+///
+/// ## 两点格式边界（与 `relay_apply::plan_relay_apply` 的写侧拼装互为镜像）
+///
+/// * `user:password` 在**第一个**冒号处切分（`split_once`，等价于
+///   `splitn(2, ':')`）：口令里允许再有冒号，写侧也是这个语义，两侧往返一致。
+///   反向注意：**用户名**里的冒号无法往返（读回时其后部分会被当成口令），
+///   配置时应避免。
+/// * 凭证中的空格/Tab 无法在此格式中表示（字段按空白切分，含空白的凭证读回时
+///   被静默截断）。新配置已由 `validate_relay` 在入口硬拒空白；本函数只负责
+///   如实读旧文件，不做修正。
 pub fn parse_sasl_passwd(content: &str) -> Vec<SaslEntry> {
     content
         .lines()

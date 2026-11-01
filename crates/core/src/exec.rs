@@ -125,15 +125,31 @@ impl CommandRunner for SystemCommandRunner {
             .spawn()
             .map_err(|e| CoreError::invalid(format!("cannot run {resolved}: {e}")))?;
 
-        // 写完后必须 drop 句柄以关闭管道，否则子进程会一直等 EOF。
-        if let Some(mut pipe) = child.stdin.take() {
-            pipe.write_all(stdin.as_bytes()).map_err(|e| {
-                CoreError::invalid(format!("cannot write stdin to {resolved}: {e}"))
-            })?;
-        }
+        // 死锁修复：原先在主线程上**先写完整个 stdin** 再读输出。子进程若把自己的
+        // stdout 管道填满（通常 64 KB）就会阻塞在 write 上，而主线程还堵在
+        // `write_all(stdin)` 上等它腾出管道空间 —— 两边互相等待，谁也动不了。
+        // 把 stdin 写入挪到独立线程与 `wait_with_output()` 并发：读输出的一方
+        // 不再被写输入的一方挡住。句柄在线程结束时 drop，管道随之关闭，
+        // 子进程自然看到 EOF。
+        let writer = child.stdin.take().map(|mut pipe| {
+            let payload = stdin.as_bytes().to_vec();
+            // 写入失败（含子进程提前退出导致的 EPIPE）由 join 结果带回；
+            // 无论成败，`pipe` 在线程结束时 drop，管道关闭即给出 EOF。
+            std::thread::spawn(move || pipe.write_all(&payload).map_err(|e| e.to_string()))
+        });
+
         let output = child
             .wait_with_output()
             .map_err(|e| CoreError::invalid(format!("cannot wait for {resolved}: {e}")))?;
+
+        // 子进程已退出，stdin 管道要么写完要么 EPIPE —— 写入线程此刻必然已结束，
+        // join 不会悬挂。写入失败仍要如实报错（chpasswd 收到半截口令不该被当成
+        // 「设置成功」），且此时子进程已被回收，不会留下孤儿。
+        if let Some(Err(detail)) = writer.and_then(|handle| handle.join().ok()) {
+            return Err(CoreError::invalid(format!(
+                "cannot write stdin to {resolved}: {detail}"
+            )));
+        }
 
         Ok(CommandOutput {
             status: output.status.code().unwrap_or(-1),
@@ -167,9 +183,13 @@ impl CommandRunner for SystemCommandRunner {
                 Ok(Some(_)) => break,
                 Ok(None) => {}
                 Err(e) => {
+                    // try_wait 出错同样要 kill 并回收，否则与超时路径一样会留下
+                    // 孤儿/僵尸进程。
+                    let _ = child.kill();
+                    let _ = child.wait();
                     return Err(CoreError::invalid(format!(
                         "cannot wait for {resolved}: {e}"
-                    )))
+                    )));
                 }
             }
             if Instant::now() >= deadline {
@@ -538,9 +558,22 @@ pub fn service_ctl(
 ///
 /// 注意这里是「逐个尝试、命中即真」，与 [`service_ctl`] 的首命中不同 ——
 /// 探测要尽量给出一致的结论，而执行必须只走一条路。
+///
+/// 探测**全部带超时**（与 [`service_ctl`] 用同一个 `SERVICE_COMMAND_TIMEOUT`）：
+/// `status` 子命令可能卡在挂死的 init 脚本上，没超时的探测会把调用方一起拖住。
+///
+/// 「running」判定刻意收窄：基线用 `contains("running")`，而 `postfix is not
+/// running` 这类失败输出同样包含它 —— 一台服务挂了的主机会被报成「在运行」。
+/// 现在的规则：命令成功即在运行；失败时只有输出明示 `active (running)` 且**不含**
+/// `inactive` / `not running` / `failed` 才算在运行。pgrep 兜底按退出码判定，
+/// 不受文本误匹配影响。
 pub fn is_service_active(env: &dyn ServiceEnv, runner: &dyn CommandRunner, unit: &str) -> bool {
     if env.program_available("systemctl") && env.path_exists(Path::new("/run/systemd/system")) {
-        if let Ok(out) = runner.run("systemctl", &["is-active", "--quiet", unit]) {
+        if let Ok(out) = runner.run_with_timeout(
+            "systemctl",
+            &["is-active", "--quiet", unit],
+            SERVICE_COMMAND_TIMEOUT,
+        ) {
             if out.success() {
                 return true;
             }
@@ -548,16 +581,27 @@ pub fn is_service_active(env: &dyn ServiceEnv, runner: &dyn CommandRunner, unit:
     }
 
     if env.program_available("service") {
-        if let Ok(out) = runner.run("service", &[unit, "status"]) {
+        if let Ok(out) =
+            runner.run_with_timeout("service", &[unit, "status"], SERVICE_COMMAND_TIMEOUT)
+        {
+            if out.success() {
+                return true;
+            }
             let combined = format!("{}{}", out.stdout, out.stderr).to_lowercase();
-            if out.success() || combined.contains("running") {
+            let says_running = combined.contains("active (running)");
+            let says_stopped = combined.contains("inactive")
+                || combined.contains("not running")
+                || combined.contains("failed");
+            if says_running && !says_stopped {
                 return true;
             }
         }
     }
 
     if env.program_available("rc-service") {
-        if let Ok(out) = runner.run("rc-service", &[unit, "status"]) {
+        if let Ok(out) =
+            runner.run_with_timeout("rc-service", &[unit, "status"], SERVICE_COMMAND_TIMEOUT)
+        {
             if out.success() {
                 return true;
             }
@@ -570,7 +614,11 @@ pub fn is_service_active(env: &dyn ServiceEnv, runner: &dyn CommandRunner, unit:
         {
             return true;
         }
-        if let Ok(out) = runner.run("fail2ban-client", &["ping"]) {
+        if let Ok(out) = runner.run_with_timeout(
+            "fail2ban-client",
+            &["ping"],
+            SERVICE_COMMAND_TIMEOUT,
+        ) {
             if out.success() && out.stdout.to_lowercase().contains("pong") {
                 return true;
             }
@@ -578,7 +626,7 @@ pub fn is_service_active(env: &dyn ServiceEnv, runner: &dyn CommandRunner, unit:
     }
 
     let pattern = format!(".*{}.*", regex::escape(unit));
-    match runner.run("pgrep", &["-f", &pattern]) {
+    match runner.run_with_timeout("pgrep", &["-f", &pattern], SERVICE_COMMAND_TIMEOUT) {
         Ok(out) => out.success(),
         Err(_) => false,
     }
@@ -1120,9 +1168,46 @@ mod tests {
 
     #[test]
     fn is_service_active_accepts_a_running_string_from_service_status() {
-        let runner = StatusRunner::new(&[("service", 3, "postfix is running")]);
+        // systemd 风格的「active (running)」是唯一被认作在运行的失败输出。
+        let runner = StatusRunner::new(&[("service", 3, "postfix is active (running)")]);
         let env = FakeEnv::with(&["service"], &[]);
         assert!(is_service_active(&env, &runner, "postfix"));
+    }
+
+    /// 反例守卫：`contains("running")` 曾把 `is not running` 也当成在运行。
+    #[test]
+    fn is_service_active_rejects_a_not_running_string_from_service_status() {
+        let runner = StatusRunner::new(&[("service", 3, "postfix is not running")]);
+        let env = FakeEnv::with(&["service"], &[]);
+        assert!(
+            !is_service_active(&env, &runner, "postfix"),
+            "「is not running」绝不能被当成在运行"
+        );
+    }
+
+    #[test]
+    fn is_service_active_rejects_inactive_and_failed_status_strings() {
+        for body in ["postfix is inactive (dead)", "postfix failed to start"] {
+            let runner = StatusRunner::new(&[("service", 3, body)]);
+            let env = FakeEnv::with(&["service"], &[]);
+            assert!(
+                !is_service_active(&env, &runner, "postfix"),
+                "{body} 必须被判定为未运行"
+            );
+        }
+    }
+
+    #[test]
+    fn is_service_active_probes_run_with_a_bounded_timeout() {
+        let runner = RecordingRunner::new();
+        let env = FakeEnv::with(&["systemctl"], &["/run/systemd/system"]);
+        assert!(is_service_active(&env, &runner, "postfix"));
+        let timeouts = runner.timeouts.lock().unwrap();
+        assert!(!timeouts.is_empty(), "探测必须实际发起命令");
+        assert!(
+            timeouts.iter().all(|(_, t)| *t == SERVICE_COMMAND_TIMEOUT),
+            "每个探测都必须带超时：{timeouts:?}"
+        );
     }
 
     #[test]
@@ -1180,6 +1265,17 @@ mod tests {
                 stdout: stdout.to_string(),
                 stderr: String::new(),
             })
+        }
+
+        // is_service_active 的探测现在全部走超时通道；替身必须同样应答，
+        // 否则默认实现会「响亮失败」而让整条探测链测不到。
+        fn run_with_timeout(
+            &self,
+            program: &str,
+            args: &[&str],
+            _timeout: std::time::Duration,
+        ) -> CoreResult<CommandOutput> {
+            self.run(program, args)
         }
     }
 

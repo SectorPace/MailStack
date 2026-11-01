@@ -28,6 +28,12 @@ export function DonutChart({
         <g transform={`rotate(-90 ${size / 2} ${size / 2})`}>
           {segments.map((seg, i) => {
             const len = (seg.value / total) * C;
+            // 零值/极小段（len<=gap）：linecap=round 会把它们画成脱线的「幽灵圆点」，
+            // 视觉上像多出一个状态 —— 直接跳过（offset 仍按 len 前进，占位不变）。
+            if (len <= gap) {
+              offset += len;
+              return null;
+            }
             const dash = Math.max(0, len - gap);
             const el = (
               <circle

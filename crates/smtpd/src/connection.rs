@@ -330,6 +330,18 @@ where
                 }
             }
             Action::EnterData(reply) => {
+                // 全局收信并发预算：每条连接在 DATA 阶段可缓冲至多
+                // `max_message_size`（默认 25 MiB），而连接数上限（512）并不约束
+                // **字节** —— 512 × 25 MiB × 数份拷贝可以把进程推向 OOM。
+                // 用进程级计数把「同时收正文」封顶，给出确定的总内存上界；
+                // 到顶的新 DATA 按 451 临时拒绝（不开 354、事务状态不动），
+                // 客户端稍后重试即可。
+                let Some(_data_slot) = DataSlot::acquire() else {
+                    let backpressure =
+                        Reply::with_enhanced(451, "4.3.2", texts::DATA_BACKPRESSURE);
+                    write_reply(&mut stream, &backpressure).await?;
+                    continue;
+                };
                 write_reply(&mut stream, &reply).await?;
                 match collect_data(&mut stream, &mut buffer, session, &limits).await? {
                     DataOutcome::Closed => return Ok(ServeOutcome::Closed),
@@ -339,7 +351,10 @@ where
                         return Ok(ServeOutcome::Closed);
                     }
                     // 552 已经在收集过程中发过了（那时才知道超限），这里不再重复。
-                    DataOutcome::Discarded => {}
+                    // 但事务必须在此终结（RFC 5321 §4.1.1.4：DATA 的最终应答结束
+                    // 事务）—— 否则信封残留：下一条 MAIL 撞 503「嵌套 MAIL」，
+                    // 重复 DATA 会把新正文投给上一位收件人。
+                    DataOutcome::Discarded => session.discard_data(),
                     DataOutcome::Received(data) => {
                         let (reply, accepted) = session.finish_data(data);
                         match accepted {
@@ -365,6 +380,34 @@ enum DataOutcome {
     Rejected(Reply),
     /// 对端提前关闭。
     Closed,
+}
+
+/// 同时处于「收正文」阶段的连接数上限（进程级）。见 `drive` 的 EnterData 分支：
+/// 它把并发 DATA 的总缓冲字节封在 `48 × max_message_size` 这个确定上界内。
+const MAX_CONCURRENT_DATA_COLLECTIONS: usize = 48;
+static ACTIVE_DATA_COLLECTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 收正文并发的占位。Drop 时归还计数，任何早退路径（断开、裸 LF、超限）
+/// 都不会泄漏。
+struct DataSlot;
+
+impl DataSlot {
+    fn acquire() -> Option<Self> {
+        let prev = ACTIVE_DATA_COLLECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if prev >= MAX_CONCURRENT_DATA_COLLECTIONS {
+            ACTIVE_DATA_COLLECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        } else {
+            Some(DataSlot)
+        }
+    }
+}
+
+impl Drop for DataSlot {
+    fn drop(&mut self) {
+        ACTIVE_DATA_COLLECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// 收一封正文，直到结束标记。

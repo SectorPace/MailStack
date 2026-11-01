@@ -1,9 +1,11 @@
-// SF Symbols 风格细线描边图标（stroke ≈ 1.5）
+// SF Symbols 风格细线描边图标。
+// 光学规格全库统一：strokeWidth 1.8、round 线帽/拐点、默认 16px（调用方按需传
+// 12/13/14/15/20 等尺寸 —— viewBox 24 恒定，缩放即等比光学尺寸）。
 import type { ReactNode, SVGProps } from "react";
 
 type P = SVGProps<SVGSVGElement> & { size?: number };
 
-function Svg({ size = 17, children, ...rest }: P & { children: ReactNode }) {
+function Svg({ size = 16, children, ...rest }: P & { children: ReactNode }) {
   return (
     <svg
       width={size}
@@ -11,7 +13,7 @@ function Svg({ size = 17, children, ...rest }: P & { children: ReactNode }) {
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
-      strokeWidth={1.5}
+      strokeWidth={1.8}
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"
@@ -322,6 +324,15 @@ export const IconMenu = (p: P) => (
     <path d="M4 7h16" />
     <path d="M4 12h16" />
     <path d="M4 17h16" />
+  </Svg>
+);
+
+/** 行尾「⋯」更多操作入口（实心圆点，非描边） */
+export const IconMore = (p: P) => (
+  <Svg {...p} fill="currentColor" stroke="none">
+    <circle cx="5" cy="12" r="1.7" />
+    <circle cx="12" cy="12" r="1.7" />
+    <circle cx="19" cy="12" r="1.7" />
   </Svg>
 );
 

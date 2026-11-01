@@ -27,7 +27,9 @@
 //! 失败被标记为 [`DeliveryFailure::with_local_fault`]，因此**不会**污染「出站健康」——
 //! 否则运维会看到「出站 25 被封，请配置中继」，然后去查一个完全无关的方向。
 
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 use mailstack_auth::keys::load_private_key_der;
 use mailstack_auth::policy::{signing_policy, SigningPolicyOutcome};
@@ -61,7 +63,10 @@ pub trait MessageSigner: Send + Sync {
 
 /// 生产签名器：策略来自 `setup.json`，私钥来自 `/etc/opendkim/keys/<domain>/`。
 ///
-/// 每次都重新解析策略与私钥，因此**密钥轮换后下一次投递就生效**，不需要重启。
+/// 私钥经 [`cached_private_key`] 按 mtime 缓存：每封邮件只做一次 `stat`，
+/// 文件没变就直接复用上次解析出的 DER —— 每消息重读密钥文件 + PEM 解析
+/// 是纯浪费。轮换语义不变：**文件一变（mtime 变化），下一封邮件就用新钥匙**，
+/// 不需要重启。
 pub struct DkimSigner {
     paths: Paths,
     headers: Vec<String>,
@@ -111,7 +116,7 @@ impl MessageSigner for DkimSigner {
             return SigningOutcome::NotApplicable;
         }
 
-        let key = match load_private_key_der(&policy.private_key) {
+        let key = match cached_private_key(&policy.private_key) {
             Ok(key) => key,
             Err(error) => return SigningOutcome::Failed(error.to_string()),
         };
@@ -133,6 +138,57 @@ impl MessageSigner for DkimSigner {
             Err(error) => SigningOutcome::Failed(error.to_string()),
         }
     }
+}
+
+/// 已解析私钥的缓存条目：路径 + 读取时的 mtime + 文件长度 + 解析结果。
+struct KeyCache {
+    path: PathBuf,
+    mtime: Option<SystemTime>,
+    len: Option<u64>,
+    parsed: Arc<Vec<u8>>,
+}
+
+/// 进程级私钥缓存（[`KeyCache`]）。
+///
+/// 签名是每封外发邮件一次的热路径，而密钥文件几乎从不变化：每封邮件重读
+/// 文件 + PEM→DER 解析是纯浪费。缓存的失效判据是 **mtime + len 双指纹** ——
+/// 每次签名先 `stat`（便宜、恒定开销），两者都没变才复用，任一变了就重读。
+/// 这样密钥轮换（`dkim.rotate` 原子落盘新文件）自然失效缓存，轮换后下一封
+/// 邮件即生效；len 兜住「同 mtime 粒度内换了内容」的窗口（PEM 长度几乎
+/// 必然不同），把陈旧密钥的暴露面压到理论极限。
+static KEY_CACHE: OnceLock<Mutex<Option<KeyCache>>> = OnceLock::new();
+
+/// 读取（或命中缓存）指定路径的 PKCS#1 DER 私钥。
+///
+/// 读失败**不得**被缓存：密钥暂时不可读（权限修复中、轮换进行中）时，
+/// 下一封邮件必须重试读取，而不是把一次失败钉死到进程退出。
+fn cached_private_key(path: &Path) -> mailstack_auth::AuthResult<Arc<Vec<u8>>> {
+    // stat 拿不到（文件缺失/不可读）记为 None：None 与 None 相等，
+    // 但随之而来的读取也会失败，因此不会把「不存在」缓存成命中。
+    let fingerprint = std::fs::metadata(path).ok().map(|meta| {
+        (
+            meta.modified().ok(),
+            meta.len(),
+        )
+    });
+
+    let cache = KEY_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = guard.as_ref() {
+        if let Some((mtime, len)) = &fingerprint {
+            if cached.path == path && cached.mtime == *mtime && cached.len == Some(*len) {
+                return Ok(Arc::clone(&cached.parsed));
+            }
+        }
+    }
+    let parsed = Arc::new(load_private_key_der(path)?);
+    *guard = Some(KeyCache {
+        path: path.to_path_buf(),
+        mtime: fingerprint.as_ref().and_then(|(mtime, _)| *mtime),
+        len: fingerprint.as_ref().map(|(_, len)| *len),
+        parsed: Arc::clone(&parsed),
+    });
+    Ok(parsed)
 }
 
 /// 给任意远端传输套上 DKIM 签名。
@@ -312,6 +368,8 @@ mod tests {
             server_ip: "203.0.113.10".to_string(),
             dkim_selector: "mailstack".to_string(),
             expected_spf: None,
+            // 仅补齐新字段以通过编译；本 crate 的断言与向导完成标志无关。
+            wizard_completed: false,
             updated_at: "2026-10-01T00:00:00Z".to_string(),
         }
     }
@@ -382,6 +440,39 @@ mod tests {
                 )
             }
             other => panic!("损坏的私钥必须判为失败，实际 {other:?}"),
+        }
+    }
+
+    /// 轮换语义（缓存的边界条件）：密钥文件一变，**下一封邮件**就用新内容。
+    /// 缓存只按 mtime 失效 —— 变了立即重读，绝不把旧钥匙钉死到进程退出；
+    /// 读取失败也不被缓存（见 [`cached_private_key`]）。
+    #[test]
+    fn a_changed_key_file_is_picked_up_by_the_next_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        write_setup_config(&paths, &config()).unwrap();
+        mailstack_auth::keys::rotate(&paths, "example.org", None).expect("生成 DKIM 密钥");
+        let signer = DkimSigner::new(paths.clone());
+        let key_path = mailstack_auth::keys::private_key_path(&paths, "example.org", "mailstack");
+
+        assert!(
+            matches!(signer.sign(MESSAGE), SigningOutcome::Signed(_)),
+            "首次签名应成功（同时填充缓存）"
+        );
+
+        // mtime 粒度依文件系统而定：留出间隔，保证变化一定体现在 mtime 上。
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        std::fs::write(
+            &key_path,
+            b"-----BEGIN RSA PRIVATE KEY-----\nnot base64 at all\n",
+        )
+        .unwrap();
+
+        match signer.sign(MESSAGE) {
+            SigningOutcome::Failed(reason) => {
+                assert!(reason.contains("mailstack.private"), "{reason}")
+            }
+            other => panic!("密钥文件变化后必须被重新读取，实际 {other:?}"),
         }
     }
 }

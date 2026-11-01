@@ -48,6 +48,8 @@ pub const DKIM_KEY_BITS: usize = 2048;
 pub const DKIM_KEY_GROUP: &str = "opendkim";
 /// 私钥权限：属主可写、属组只读，其他人无权限。
 pub const DKIM_KEY_MODE: u32 = 0o640;
+/// 域名总长上限（RFC 1035 §2.3.4：表示上 255 八位组，域名本体 ≤253）。
+pub const MAX_DOMAIN_LENGTH: usize = 253;
 
 /// `dkim.rotate` 的返回体，逐字对齐基线：
 /// `{status:'ok', domain, selector, record}`（`certs.py:199`）。
@@ -83,9 +85,15 @@ pub struct DkimKeyMaterial {
 }
 
 /// 校验并规范化域名；失败文案与 `certs.py:184` 逐字一致。
+///
+/// [`DOMAIN_RE`] 只约束**单段**长度（每段 ≤63、TLD ≤63），对**总长**没有上界 ——
+/// 几十个长标签拼起来的域名能穿过正则。总长 ≤253 必须在这里显式守住：域名会成为
+/// 文件系统路径的一段（`<etc>/opendkim/keys/<domain>/`），超长域名要么让内核以
+/// 难排查的 `ENAMETOOLONG` 失败，要么在有人「截断再拼路径」时让两个域共享同一个
+/// 密钥目录。
 pub fn validate_domain(domain: &str) -> AuthResult<String> {
     let domain = domain.trim().to_ascii_lowercase();
-    if !DOMAIN_RE.is_match(&domain) {
+    if !DOMAIN_RE.is_match(&domain) || domain.len() > MAX_DOMAIN_LENGTH {
         return Err(AuthError::invalid("invalid domain format"));
     }
     Ok(domain)
@@ -226,12 +234,19 @@ const TXT_CHUNK_LIMIT: usize = 255;
 ///
 /// **不变量**：把引号与空白全部去掉后拼接，必须逐字等于 `value`。
 /// 这是对 `network.py:115` 记录的那次公钥截断事故的回归守卫。
+///
+/// 分块只落在**字符边界**上：此前是 `debug_assert!(value.is_ascii())` +
+/// 裸 `split_at`，release 下非 ASCII 输入会在非边界处 panic。
+/// DKIM 密钥实际总是 base64（ASCII），但本函数是公开 API，必须不 panic ——
+/// 任意 UTF-8 输入现在都会被边界安全地分块，拼接往返不变量依旧逐字成立。
 pub fn zone_txt_fragment(owner: &str, value: &str, comment: &str) -> String {
-    debug_assert!(value.is_ascii(), "TXT 值必须是 ASCII，否则分块会撕裂字符");
     let mut chunks: Vec<&str> = Vec::new();
     let mut rest = value;
     while !rest.is_empty() {
-        let take = rest.len().min(TXT_CHUNK_LIMIT);
+        let mut take = rest.len().min(TXT_CHUNK_LIMIT);
+        while take < rest.len() && !rest.is_char_boundary(take) {
+            take -= 1;
+        }
         let (head, tail) = rest.split_at(take);
         chunks.push(head);
         rest = tail;
@@ -526,6 +541,28 @@ mod tests {
                 .to_string(),
             "invalid DKIM selector"
         );
+    }
+
+    #[test]
+    fn domain_total_length_is_capped_at_253_before_path_use() {
+        // DOMAIN_RE 只限单段长度：4 个 63 字符标签 + `.com` = 259 字符能穿过正则，
+        // 却会变成密钥目录路径的一段（<etc>/opendkim/keys/<domain>/）。入口必须拒。
+        let a63 = "a".repeat(63);
+        let too_long = format!("{a63}.{a63}.{a63}.{a63}.com");
+        assert_eq!(too_long.len(), 259);
+        assert!(
+            DOMAIN_RE.is_match(&too_long),
+            "正则放行超长域名 —— 这正是本守卫要补的洞"
+        );
+        assert_eq!(
+            validate_domain(&too_long).unwrap_err().to_string(),
+            "invalid domain format"
+        );
+
+        // 恰好 253 的合法域名放行（63+63+63+61 四段加三个点）。
+        let at_limit = format!("{a63}.{a63}.{a63}.{}", "a".repeat(61));
+        assert_eq!(at_limit.len(), 253);
+        assert_eq!(validate_domain(&at_limit).unwrap(), at_limit);
     }
 
     #[test]

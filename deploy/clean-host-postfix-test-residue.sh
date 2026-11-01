@@ -18,8 +18,14 @@ done
 
 echo
 echo "=== 备份到 $BACKUP ==="
-cp -a "$MAIN" "$BACKUP"
-echo "  done"
+# 备份只在**不存在**时创建：重复运行时若无条件覆盖，第一次运行捕获的
+# 「清理前原始状态」会被第二次运行（已清理过的状态）覆盖，回滚点就此丢失。
+if [ -e "$BACKUP" ]; then
+  echo "  已存在，保留首次运行时的原始状态（不覆盖）"
+else
+  cp -a "$MAIN" "$BACKUP"
+  echo "  done"
+fi
 
 echo
 echo "=== 移除测试写入的键（仅当其值等于测试所写内容时才移除，避免误删运维配置）==="

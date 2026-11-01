@@ -97,14 +97,16 @@ impl Registry {
 
         let p = paths.clone();
         registry.register("setup.status", move |_data| {
-            let setup = mailstack_core::config::read_setup_config(&p);
-            let admin = mailstack_core::config::admin_public(&p);
-            Ok(json!({
-                "identityConfigured": setup.is_some(),
-                "identity": setup,
-                "passwordConfigured": admin.password_configured,
-                "twoFactorEnabled": admin.two_factor_enabled,
-            }))
+            setup_status_json(&p)
+        });
+
+        // 向导收尾：置位 `setup.json` 的 `wizardCompleted` 并回同一份状态形状。
+        // 幂等（重复调用是成功的空操作）；身份未配置时由 core 侧拒绝 ——
+        // 「完成的向导」必须长在真实身份之上。
+        let p = paths.clone();
+        registry.register("setup.wizard.complete", move |_data| {
+            mailstack_core::config::mark_setup_wizard_complete(&p)?;
+            setup_status_json(&p)
         });
 
         let p = paths.clone();
@@ -341,9 +343,24 @@ impl Registry {
     ///
     /// 注意：**白名单与通道判定不在这里**——那由 [`crate::dispatch::ActionGate`]
     /// 在调用本方法之前完成。本方法只负责「已放行的动作如何执行」。
+    ///
+    /// 同步处理器**绝不内联执行**：`backup.create/restore`、`certs.renew`
+    /// （acme.sh 子进程可达 300s）、`users.*`（fork/exec）、`metrics.system`
+    /// （内部 sleep）都会把调用方所在的 tokio worker 钉死。这里统一挪进
+    /// blocking 线程池 —— `Handler` 是 `Send + Sync + 'static`，clone Arc 并
+    /// clone 载荷后整体 move 进闭包即可。
     pub async fn dispatch(&self, action: &str, data: &Value) -> Result<Value, HandlerError> {
         match self.handlers.get(action) {
-            Some(Entry::Sync(handler)) => handler(data),
+            Some(Entry::Sync(handler)) => {
+                let handler = Arc::clone(handler);
+                let payload = data.clone();
+                match tokio::task::spawn_blocking(move || handler(&payload)).await {
+                    Ok(result) => result,
+                    Err(error) => Err(HandlerError::new(format!(
+                        "privileged handler task for {action} failed: {error}"
+                    ))),
+                }
+            }
             Some(Entry::Async(handler)) => handler(data).await,
             None => Err(HandlerError::new(format!(
                 "NOT_IMPLEMENTED: action {action} is registered in the allowlist but has no Rust implementation yet"
@@ -415,6 +432,27 @@ impl From<mailstack_smtp::SmtpError> for HandlerError {
     fn from(e: mailstack_smtp::SmtpError) -> Self {
         HandlerError::new(e.to_string())
     }
+}
+
+/// `setup.status` 的响应体；`setup.wizard.complete` 回**同一份**形状。
+///
+/// `completed` 是向导是否真正走完（`setup.json` 的 `wizardCompleted`，旧文件
+/// 回落 `false`）—— 与 `identityConfigured`（第一步完成即为真）刻意区分：
+/// 界面靠它判断「向导弃了一半」还是「已经收尾」。
+fn setup_status_json(paths: &Paths) -> Result<Value, HandlerError> {
+    let setup = mailstack_core::config::read_setup_config(paths);
+    let completed = setup
+        .as_ref()
+        .map(|config| config.wizard_completed)
+        .unwrap_or(false);
+    let admin = mailstack_core::config::admin_public(paths);
+    Ok(json!({
+        "identityConfigured": setup.is_some(),
+        "identity": setup,
+        "passwordConfigured": admin.password_configured,
+        "twoFactorEnabled": admin.two_factor_enabled,
+        "completed": completed,
+    }))
 }
 
 /// 取一个**可选**字符串字段；存在但不是字符串时同样视为缺失。
@@ -674,6 +712,7 @@ mod tests {
             server_ip: "203.0.113.10".into(),
             dkim_selector: "mail".into(),
             expected_spf: None,
+            wizard_completed: false,
             updated_at: mailstack_core::now_iso8601_utc(),
         };
         mailstack_core::config::write_setup_config(&f.paths, &config).unwrap();
@@ -684,6 +723,79 @@ mod tests {
             .unwrap();
         assert_eq!(out["identityConfigured"], true);
         assert_eq!(out["identity"]["domain"], "example.com");
+        assert_eq!(
+            out["completed"], false,
+            "向导未收尾时 completed 必须是 false（identityConfigured 仍为真）"
+        );
+    }
+
+    #[test]
+    fn setup_wizard_complete_marks_the_flag_and_reports_the_status_shape() {
+        let f = Fixture::new("wizardcomplete");
+        mailstack_core::config::write_setup_config(
+            &f.paths,
+            &mailstack_core::config::SetupConfig {
+                domain: "example.com".into(),
+                mail_host: "mail.example.com".into(),
+                server_ip: "203.0.113.10".into(),
+                dkim_selector: "mail".into(),
+                expected_spf: None,
+                wizard_completed: false,
+                updated_at: mailstack_core::now_iso8601_utc(),
+            },
+        )
+        .unwrap();
+        let registry = f.registry();
+
+        // 完成前：identityConfigured 为真、completed 为假 —— 界面据此知道向导弃了一半。
+        let before = registry
+            .dispatch_blocking("setup.status", &json!({}))
+            .unwrap();
+        assert_eq!(before["identityConfigured"], true);
+        assert_eq!(before["completed"], false);
+
+        let out = registry
+            .dispatch_blocking("setup.wizard.complete", &json!({}))
+            .unwrap();
+        assert_eq!(out["completed"], true);
+        assert_eq!(out["identityConfigured"], true);
+        assert_eq!(
+            out["identity"]["domain"], "example.com",
+            "响应必须是完整的 status 形状"
+        );
+        assert_eq!(out["passwordConfigured"], false);
+
+        // 磁盘上真的置位了。
+        assert!(
+            mailstack_core::config::read_setup_config(&f.paths)
+                .unwrap()
+                .wizard_completed
+        );
+
+        // 幂等：重复完成仍是成功，completed 保持真。
+        let again = registry
+            .dispatch_blocking("setup.wizard.complete", &json!({}))
+            .unwrap();
+        assert_eq!(again["completed"], true);
+    }
+
+    #[test]
+    fn setup_wizard_complete_is_refused_without_an_identity() {
+        let f = Fixture::new("wizardnoid");
+        let registry = f.registry();
+        let err = registry
+            .dispatch_blocking("setup.wizard.complete", &json!({}))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not configured"),
+            "身份未配置必须拒绝：{err}"
+        );
+        // 状态里 completed 维持 false（没有 identity 也就没有 completed 可言）。
+        let status = registry
+            .dispatch_blocking("setup.status", &json!({}))
+            .unwrap();
+        assert_eq!(status["identityConfigured"], false);
+        assert_eq!(status["completed"], false);
     }
 
     // ── 2FA 动作（§5.5） ──
@@ -950,6 +1062,7 @@ mod tests {
             "aliases.add",
             "aliases.delete",
             "dkim.rotate",
+            "setup.wizard.complete",
         ] {
             assert!(registry.is_implemented(action), "{action} 必须已接线");
         }

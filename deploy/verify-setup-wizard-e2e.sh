@@ -78,6 +78,10 @@ else
 fi
 
 say "1. 生成夹具（fail-closed 启动所需）"
+# ROOT 可被环境变量覆盖；rm -rf 之前守住：空值与 / 一律拒绝执行。
+case "$ROOT" in
+  ""|"/") echo "  **ROOT 非法（'$ROOT'），拒绝 rm -rf**" >&2; exit 1 ;;
+esac
 rm -rf "$ROOT"
 mkdir -p "$ROOT/etc/mailstack" "$ROOT/etc/postfix" "$ROOT/var/lib/mailstack/queue" "$ROOT/etc/mailstack/tls/$DOMAIN"
 printf '%s OK\n' "$DOMAIN" > "$ROOT/etc/postfix/mailstack_domains"

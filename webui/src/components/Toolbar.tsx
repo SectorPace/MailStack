@@ -19,8 +19,9 @@ import {
   IconSun,
   IconUser,
 } from "./icons";
-import { GlassSelect } from "./ui";
+import { GlassSelect, toast } from "./ui";
 import { BrandLogo } from "./BrandLogo";
+import { formatTime } from "../lib/format";
 
 const CRUMB: Record<RouteKey, { en: string; zhKey: DictKey }> = {
   dashboard: { en: "DASHBOARD", zhKey: "nav_dashboard" },
@@ -53,8 +54,9 @@ function actText(a: ActivityItem, t: (k: DictKey) => string): string {
 
 function actTime(a: ActivityItem): string {
   const raw = a.time ?? "";
-  // 后端是 ISO8601（2026-09-29T14:22:10+00:00），mock 是 "14:22"；两种都取到分钟。
-  return raw.length > 10 ? raw.slice(11, 16) : raw;
+  // 后端是 ISO8601（2026-09-29T14:22:10+00:00，UTC）——slice 会把 UTC 当本地时间展示；
+  // mock 是 "14:22" 短串，原样返回。ISO 交给共享助手转本地时区。
+  return raw.length > 10 ? formatTime(raw) : raw;
 }
 
 export function Toolbar({
@@ -68,6 +70,7 @@ export function Toolbar({
   mode,
   onMenu,
   showMenu,
+  menuOpen,
 }: {
   route: RouteKey;
   nav: (r: RouteKey) => void;
@@ -79,6 +82,8 @@ export function Toolbar({
   mode: "live" | "mock";
   onMenu?: () => void;
   showMenu?: boolean;
+  /** 抽屉开合态（State 在 App.tsx）：仅用于汉堡的 aria-expanded。 */
+  menuOpen?: boolean;
 }) {
   const { t, prefs, resolvedTheme, setTheme, setLang } = useSettings();
 
@@ -87,7 +92,8 @@ export function Toolbar({
   const [readKeys, setReadKeys] = useState<Set<string>>(() => {
     try {
       const raw = localStorage.getItem(NOTIF_READ_KEY);
-      return new Set(raw ? (JSON.parse(raw) as string[]) : []);
+      // 上限 200 条（drop-oldest）：读集合无上限会随会话无限增长，localStorage 越写越大。
+      return new Set(raw ? (JSON.parse(raw) as string[]).slice(-200) : []);
     } catch {
       return new Set();
     }
@@ -98,28 +104,39 @@ export function Toolbar({
   const notifKey = (a: ActivityItem) => `${a.title ?? ""}|${a.time ?? ""}|${a.sub ?? ""}`;
   const unreadCount = activity.filter((a) => !readKeys.has(notifKey(a))).length;
 
-  /** 「全部已读」：把当前活动流标记为已读（本地持久化），红点随之熄灭。原先该按钮没有 onClick。 */
+  /**
+   * 「全部已读」：把当前活动流标记为已读（本地持久化），红点随之熄灭。
+   * Set 保持插入序（旧→新），只保留最近 ~200 条，防止无界增长。
+   */
   function markAllRead() {
     const next = new Set(readKeys);
     activity.forEach((a) => next.add(notifKey(a)));
-    setReadKeys(next);
+    const capped = [...next].slice(-200);
+    setReadKeys(new Set(capped));
     try {
-      localStorage.setItem(NOTIF_READ_KEY, JSON.stringify([...next]));
+      localStorage.setItem(NOTIF_READ_KEY, JSON.stringify(capped));
     } catch {
       /* 存储不可用时仅本会话生效 */
     }
   }
 
+  // 通知与管理员名原先整个会话只拉一次：红点/动态会一直停留在打开页面那一刻。
+  // 与下方系统状态徽标一致，用 60s 轻轮询（比 focus 监听更省事，两处行为统一）。
   useEffect(() => {
     let live = true;
-    rpc<ActivityItem[]>("activity.list").then((r) => {
-      if (live && r.ok) setActivity(r.data ?? []);
-    });
-    rpc<{ username?: string }>("admin.get").then((r) => {
-      if (live && r.ok) setAdminName((r.data as { username?: string } | undefined)?.username ?? null);
-    });
+    const load = () => {
+      rpc<ActivityItem[]>("activity.list").then((r) => {
+        if (live && r.ok) setActivity(r.data ?? []);
+      });
+      rpc<{ username?: string }>("admin.get").then((r) => {
+        if (live && r.ok) setAdminName((r.data as { username?: string } | undefined)?.username ?? null);
+      });
+    };
+    load();
+    const timer = setInterval(load, 60_000);
     return () => {
       live = false;
+      clearInterval(timer);
     };
   }, []);
 
@@ -166,12 +183,15 @@ export function Toolbar({
 
   return (
     <div
-      className={`glass--toolbar sticky top-0 z-30 flex h-[54px] shrink-0 items-center gap-2 px-3 ${scrolled ? "is-scrolled" : ""}`}
-      style={{ borderRadius: "var(--r-panel)" }}
+      // 全宽贴顶（非浮动胶囊）：高度走 --toolbar-height（48px），底部 0.5px 发丝线
+      // 与滚动强化在 index.css 的 .app-toolbar / .app-toolbar.is-scrolled。
+      className={`glass--toolbar app-toolbar sticky top-0 z-30 flex h-[var(--toolbar-height)] shrink-0 items-center gap-2 px-3 ${scrolled ? "is-scrolled" : ""}`}
       role="toolbar"
       aria-label="toolbar"
     >
-      {/* 0. 汉堡菜单（<1024 抽屉模式） */}
+      {/* 0. 汉堡菜单（<1024 抽屉模式）。开合态 menuOpen 由 App 传入（aria-expanded），
+          aria-controls 指向 Sidebar 抽屉 aside 的 id="app-drawer"。
+          尺寸：.icon-btn = var(--control-h)（iOS 度量档 44px）→ 触控目标已达标。 */}
       {showMenu && (
         <motion.button
           whileTap={{ scale: 0.9 }}
@@ -179,6 +199,8 @@ export function Toolbar({
           className="icon-btn glass--control mr-0.5 shrink-0"
           onClick={onMenu}
           aria-label="Menu"
+          aria-expanded={menuOpen}
+          aria-controls="app-drawer"
         >
           <IconMenu size={17} />
         </motion.button>
@@ -255,7 +277,8 @@ export function Toolbar({
             </motion.button>
           </RDropdown.Trigger>
           <RDropdown.Portal>
-            <RDropdown.Content align="end" sideOffset={8} className="glass--clear radix-pop edge-lens" style={{ width: 300 }}>
+            {/* data-chrome：折射/边缘透镜仅作用于 chrome 浮层（index.css glass budget） */}
+            <RDropdown.Content align="end" sideOffset={8} className="glass--clear radix-pop edge-lens" data-chrome={true} style={{ width: 300 }}>
               <div className="flex items-center justify-between px-2.5 py-1.5 text-[12px] font-semibold text-[var(--text-2)]">
                 {t("notifications")}
                 <button className="text-[11.5px] font-normal text-[var(--accent)]" onClick={markAllRead} disabled={unreadCount === 0}>
@@ -323,14 +346,16 @@ export function Toolbar({
         {/* 9. 管理员菜单 */}
         <RDropdown.Root>
           <RDropdown.Trigger asChild>
-            <button className="glass--control flex h-[34px] items-center gap-2 rounded-full py-0 pl-1 pr-2.5" aria-label={t("admin")}>
+            {/* <sm：图标-only 头像钮（名字与箭头折叠，P1 移动溢出修复的一部分） */}
+            <button className="glass--control flex h-[var(--control-h)] items-center gap-2 rounded-full py-0 pl-1 pr-1.5 sm:pr-2.5" aria-label={t("admin")}>
               <Avatar />
               <span className="hidden text-[13px] font-medium text-[var(--text-1)] sm:inline">{adminName ?? "—"}</span>
-              <IconChevronDown size={12} className="text-[var(--text-3)]" />
+              <IconChevronDown size={12} className="hidden text-[var(--text-3)] sm:block" />
             </button>
           </RDropdown.Trigger>
           <RDropdown.Portal>
-            <RDropdown.Content align="end" sideOffset={8} className="glass--clear radix-pop edge-lens" style={{ minWidth: 200 }}>
+            {/* data-chrome：折射/边缘透镜仅作用于 chrome 浮层 */}
+            <RDropdown.Content align="end" sideOffset={8} className="glass--clear radix-pop edge-lens" data-chrome={true} style={{ minWidth: 200 }}>
               <div className="flex items-center gap-2.5 px-2.5 py-2">
                 <Avatar size={34} />
                 <div>
@@ -340,15 +365,16 @@ export function Toolbar({
                 </div>
               </div>
               <div className="radix-sep" />
+              {/* Golden Gate 菜单：无逐项图标（无可用快捷键，故不造键位提示） */}
               <RDropdown.Item className="radix-item" onSelect={() => nav("settings")}>
-                <IconUser size={14} /> {t("admin_profile")}
+                {t("admin_profile")}
               </RDropdown.Item>
               <RDropdown.Item className="radix-item" onSelect={() => nav("settings")}>
-                <BrandLogo size={14} radius={4} /> MailStack {t("settings_title")}
+                MailStack {t("settings_title")}
               </RDropdown.Item>
               <div className="radix-sep" />
               <RDropdown.Item className="radix-item" style={{ color: "rgb(var(--err-rgb))" }} onSelect={() => void toastLogout()}>
-                <IconMoon size={14} /> {t("logout")}
+                {t("logout")}
               </RDropdown.Item>
             </RDropdown.Content>
           </RDropdown.Portal>
@@ -363,9 +389,15 @@ export function Toolbar({
  *
  * 原实现只 dispatchEvent 做本地跳转：HttpOnly 会话 Cookie（Max-Age 8h）仍然有效，
  * 「退出」并不等于会话失效 —— 拿同一浏览器再进来（或点开 SPA 的登录页刷新）仍是已登录态。
+ * rpc 失败时解析成 {ok:false}（不 reject），必须显式检视：登出失败说明会话可能仍
+ * 在服务端存活，此时不能清 CSRF / 派发 logout 事件，否则用户以为已退出。
  */
 async function toastLogout() {
-  await rpc("auth.logout", {});
+  const r = await rpc("auth.logout", {});
+  if (!r.ok) {
+    toast(r.error, "err");
+    return;
+  }
   resetCsrf();
   window.dispatchEvent(new CustomEvent("mailstack:logout"));
 }

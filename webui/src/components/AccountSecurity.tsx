@@ -50,8 +50,10 @@ export default function AccountSecurity() {
       toast(zh ? "密码不一致" : "Passwords do not match", "err");
       return;
     }
-    if (pass1 && pass1.length < 8) {
-      toast(zh ? "密码至少 8 位" : "Password must be at least 8 characters", "err");
+    // 与后端/向导同规（Setup.tsx：≥12 位、含字母与数字）：原先前端只查 8 位，
+    // 满足 8 位但弱于后端规则的口令会在这里通过、到后端才被拒。
+    if (pass1 && (pass1.length < 12 || !/[a-zA-Z]/.test(pass1) || !/[0-9]/.test(pass1))) {
+      toast(zh ? "密码至少 12 位，且需包含字母与数字" : "Password must be 12+ characters with letters and digits", "err");
       return;
     }
     setSavingAcct(true);

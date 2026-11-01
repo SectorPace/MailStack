@@ -173,11 +173,16 @@ pub fn read_last_audit_hash(log_path: &Path) -> Option<String> {
 
 /// [`read_last_audit_hash`] 的**如实报错**版本（6.10）。
 ///
-/// 语义严格区分三件事，这正是原实现混为一谈的地方：
+/// 语义严格区分四件事，这正是原实现混为一谈的地方：
 ///
 /// * 文件**不存在** → `Ok(None)`：这是一条新链，用创世值合法。
 /// * 文件存在但**为空** → `Ok(None)`：同上。
-/// * 文件存在、非空，却**读不出可用的尾 hash** → `Err`：
+/// * 文件存在、非空，尾部是 **legacy（无 hash 字段）记录** → `Ok(None)`：
+///   B3 之前的日志从未写过 hash，[`audit_verify`] 把它判为合法状态
+///   （"no anchor (pre-B3 log)"）；追加端必须接受同一口径 —— 首条链上记录
+///   从创世值起步，正好接上这条 legacy 尾巴。若这里报错，`audit()` 会在
+///   一份完全合法的 legacy 日志上永久拒绝写入，与校验端自相矛盾。
+/// * 文件存在、非空，尾部却**连一条可解析的 JSON 记录都没有** → `Err`：
 ///   truncate、权限错误、尾部只剩半行、尾行 JSON 损坏 —— 都不能当成「新链」，
 ///   否则审计链会在没有任何告警的情况下被分叉。
 pub fn read_last_audit_hash_strict(log_path: &Path) -> CoreResult<Option<String>> {
@@ -218,17 +223,27 @@ pub fn read_last_audit_hash_strict(log_path: &Path) -> CoreResult<Option<String>
     };
 
     let text = String::from_utf8_lossy(&text);
+    let mut saw_any_record = false;
     for line in text.lines().rev() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        if !value.is_object() {
+            continue;
+        }
+        saw_any_record = true;
         if let Some(h) = value.get("hash").and_then(|v| v.as_str()) {
             return Ok(Some(h.to_string()));
         }
+        // 无 hash 的 JSON 对象 = legacy 记录：继续向前找链上记录；
+        // 整个窗口都没有链上记录时按 legacy 尾部处理（见函数文档）。
     }
-    // 非空文件里一条可用记录都没有 —— 绝不当成新链。
+    if saw_any_record {
+        return Ok(None);
+    }
+    // 非空文件里一条可解析记录都没有 —— 绝不当成新链。
     Err(CoreError::invalid(format!(
-        "{}: audit log is non-empty but no record with a `hash` field was found near the tail",
+        "{}: audit log is non-empty but no parseable record was found near the tail",
         log_path.display()
     )))
 }
@@ -334,6 +349,10 @@ pub struct AuditVerdict {
 /// * 每条记录的 `prev_hash` 必须等于前一条的 hash，且自身 hash 必须重算一致
 /// * `.head` 存在且非空时必须等于最后一条链上记录的 hash（截尾检测）
 /// * 空锚是 logrotate 后的状态，不参与比对；锚缺失则跳过检查（B3 前日志从未写过）
+///
+/// 日志按行**流式**读取：审计日志会无界增长，`read_to_string` 把整个文件
+/// 一次性搬进内存只为一个逐行校验。逐行语义与整串读取完全一致
+/// （包括「任意一行非 UTF-8 即整个校验失败」）。
 pub fn audit_verify(log_path: &Path) -> AuditVerdict {
     let head_path = audit_head_path(log_path);
     let mut errors: Vec<String> = Vec::new();
@@ -342,9 +361,12 @@ pub fn audit_verify(log_path: &Path) -> AuditVerdict {
     let mut prev_hash = AUDIT_GENESIS.to_string();
     let mut last_hash: Option<String> = None;
 
-    let text = match std::fs::read_to_string(log_path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let file = match std::fs::File::open(log_path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // 不存在的日志视为空链：与原 `read_to_string` 的 NotFound 分支一致。
+            return finish_verify(&head_path, errors, entries, last_hash);
+        }
         Err(e) => {
             return AuditVerdict {
                 ok: false,
@@ -355,51 +377,78 @@ pub fn audit_verify(log_path: &Path) -> AuditVerdict {
         }
     };
 
-    for (idx, raw) in text.lines().enumerate() {
-        let lineno = idx + 1;
-        if raw.trim().is_empty() {
-            continue;
-        }
-        let value: serde_json::Value = match serde_json::from_str(raw) {
-            Ok(v) => v,
-            Err(_) => {
-                errors.push(format!("line {lineno}: record is not valid JSON"));
+    {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(file);
+        for (idx, line) in reader.lines().enumerate() {
+            let lineno = idx + 1;
+            let raw = match line {
+                Ok(raw) => raw,
+                Err(e) => {
+                    // 原 `read_to_string` 对非 UTF-8 日志整体报错；流式读到坏行
+                    // 时给出同一个失败判定。
+                    return AuditVerdict {
+                        ok: false,
+                        entries: 0,
+                        anchor: false,
+                        error: format!("read audit log failed: {e}"),
+                    };
+                }
+            };
+            if raw.trim().is_empty() {
                 continue;
             }
-        };
-        if !value.is_object() {
-            errors.push(format!("line {lineno}: record is not a JSON object"));
-            continue;
-        }
-        let hash = value.get("hash").and_then(|v| v.as_str());
-        let prev = value.get("prev_hash").and_then(|v| v.as_str());
-        let (Some(hash), Some(prev)) = (hash, prev) else {
-            if chain_started {
+            let value: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => {
+                    errors.push(format!("line {lineno}: record is not valid JSON"));
+                    continue;
+                }
+            };
+            if !value.is_object() {
+                errors.push(format!("line {lineno}: record is not a JSON object"));
+                continue;
+            }
+            let hash = value.get("hash").and_then(|v| v.as_str());
+            let prev = value.get("prev_hash").and_then(|v| v.as_str());
+            let (Some(hash), Some(prev)) = (hash, prev) else {
+                if chain_started {
+                    errors.push(format!(
+                        "line {lineno}: unhashed record after chained record"
+                    ));
+                }
+                continue;
+            };
+
+            chain_started = true;
+            if prev != prev_hash {
                 errors.push(format!(
-                    "line {lineno}: unhashed record after chained record"
+                    "line {lineno}: prev_hash mismatch (chain broken, reordered or spliced)"
                 ));
             }
-            continue;
-        };
-
-        chain_started = true;
-        if prev != prev_hash {
-            errors.push(format!(
-                "line {lineno}: prev_hash mismatch (chain broken, reordered or spliced)"
-            ));
+            match record_hash_from_value(&value) {
+                Some(recomputed) if recomputed == hash => {}
+                _ => errors.push(format!(
+                    "line {lineno}: record hash mismatch (record tampered)"
+                )),
+            }
+            prev_hash = hash.to_string();
+            last_hash = Some(hash.to_string());
+            entries += 1;
         }
-        match record_hash_from_value(&value) {
-            Some(recomputed) if recomputed == hash => {}
-            _ => errors.push(format!(
-                "line {lineno}: record hash mismatch (record tampered)"
-            )),
-        }
-        prev_hash = hash.to_string();
-        last_hash = Some(hash.to_string());
-        entries += 1;
     }
 
-    let anchor_value = match std::fs::read_to_string(&head_path) {
+    finish_verify(&head_path, errors, entries, last_hash)
+}
+
+/// `.head` 锚比对 + 组装最终结论（[`audit_verify`] 的收尾段）。
+fn finish_verify(
+    head_path: &Path,
+    mut errors: Vec<String>,
+    entries: usize,
+    last_hash: Option<String>,
+) -> AuditVerdict {
+    let anchor_value = match std::fs::read_to_string(head_path) {
         Ok(t) => Some(t.trim().to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
@@ -748,6 +797,57 @@ mod tests {
         fs::write(&empty, b"").unwrap();
         let second = audit(&empty, "b", true, "", "").expect("空日志应视作新链");
         assert_eq!(second.prev_hash, AUDIT_GENESIS);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// legacy（无 hash）尾部必须被**追加端与校验端一致地**接受。
+    ///
+    /// `audit_verify` 把「整份无 hash 记录 + 无锚」判为合法状态
+    /// （"no anchor (pre-B3 log)"）；若 `read_last_audit_hash_strict` 在同一份
+    /// 日志上报错，`audit()` 就会在一份完全合法的 legacy 日志上永久拒绝写入。
+    /// 对齐后的口径：legacy 尾部 → `Ok(None)` → 首条链上记录从创世值起步，
+    /// 正好接上这条尾巴，`audit_verify` 也认。
+    #[test]
+    fn a_legacy_hashless_tail_is_accepted_and_the_chain_continues_from_genesis() {
+        let dir = temp_dir("legacy-append");
+        let log = dir.join("audit.log");
+        // B3 之前的记录：无 hash/prev_hash 字段，无锚。
+        fs::write(
+            &log,
+            "{\"time\":\"2020-01-01T00:00:00\",\"action\":\"old\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_last_audit_hash_strict(&log).unwrap(),
+            None,
+            "legacy 尾部应返回「无链上记录」，而不是错误"
+        );
+
+        let record = audit(&log, "domains.list", true, "", "").unwrap();
+        assert_eq!(
+            record.prev_hash, AUDIT_GENESIS,
+            "legacy 之上首条链上记录必须从创世值起步"
+        );
+
+        let verdict = audit_verify(&log);
+        assert!(verdict.ok, "追加后的日志必须通过校验: {}", verdict.error);
+        assert_eq!(verdict.entries, 1, "legacy 记录不计入 entries");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 对照组：非空但**连一条可解析记录都没有**的尾部仍然是错误 ——
+    /// 「legacy」只豁免像样的 JSON 记录，不豁免二进制垃圾。
+    #[test]
+    fn a_tail_of_unparseable_garbage_is_still_an_error() {
+        let dir = temp_dir("garbage-tail");
+        let log = dir.join("audit.log");
+        fs::write(&log, "hello world\nnot json\n").unwrap();
+        let error = read_last_audit_hash_strict(&log).expect_err("垃圾尾部必须报错");
+        assert!(
+            error.to_string().contains("no parseable record"),
+            "{error}"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }

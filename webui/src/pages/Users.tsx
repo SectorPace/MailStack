@@ -1,45 +1,56 @@
 // 邮箱用户 —— 列表 + 添加 / 删除 / 启停 / 重置密码（users.*）
-import { useEffect, useContext, useState } from "react";
+import { useContext, useState } from "react";
 import * as RDropdown from "@radix-ui/react-dropdown-menu";
 import { useSettings } from "../store/settings";
 import { rpc } from "../api/client";
+import { useApiList } from "../hooks/useApiList";
 import { RefreshContext } from "../App";
-import { PageHeader, DataPanel, StatusBadge, ConfirmDialog, toast } from "../components/ui";
+import { PageHeader, DataPanel, StatusBadge, ConfirmDialog, LoadError, toast } from "../components/ui";
 import { DataTable, type Column } from "../components/DataTable";
 import { InputDialog } from "../components/InputDialog";
 import { IconPlus, IconGear } from "../components/icons";
 
+// 后端 users.list 恒回 quotaUsed: 0 / quotaTotal: 0（配额未实现）；字段保留
+// 是为了不改后端载荷与列表类型，界面层不再把它当测量值展示。
 type UserRow = { address: string; name: string; active: boolean; quotaUsed: number; quotaTotal: number; createdAt: string };
 
+/** 配额合法域（GB，与输入框标注一致）：正整数、上限 1e6（≈1PB，防手滑多打零）。 */
+const QUOTA_MIN = 1;
+const QUOTA_MAX = 1_000_000;
+
 export default function Users() {
-  const { t } = useSettings();
+  const { t, prefs } = useSettings();
+  const zh = prefs.lang === "zh";
   const refreshN = useContext(RefreshContext);
-  const [rows, setRows] = useState<UserRow[]>([]);
+  // useApiList：undefined 载荷兜底 []、失败显示重试横幅、seq 守卫防旧响应覆写。
+  const { rows, setRows, error, reload } = useApiList<UserRow>("users.list", [refreshN]);
   const [addOpen, setAddOpen] = useState(false);
   const [values, setValues] = useState({ address: "", name: "", quota: "10", password: "" });
   const [del, setDel] = useState<string | null>(null);
   const [pwdFor, setPwdFor] = useState<UserRow | null>(null);
   const [pwdValue, setPwdValue] = useState("");
 
-  useEffect(() => {
-    rpc<UserRow[]>("users.list").then((r) => r.ok && setRows(r.data));
-  }, [refreshN]);
-
   async function add() {
     // 后端 users.add 强制要求口令（且有强度校验：不得包含用户名或完整邮箱），
     // 缺口令必然失败，因此这里一并提交 password。
+    // 配额原先 `Number(x) || 10`：空串/非数字悄悄变 10、负数照单提交。改为显式
+    // 校验（正整数、1..1e6），不合法时提示并不提交，不再静默改写用户输入。
+    const quota = Number(values.quota.trim());
+    if (!Number.isInteger(quota) || quota < QUOTA_MIN || quota > QUOTA_MAX) {
+      toast(zh ? `配额必须是 ${QUOTA_MIN}–${QUOTA_MAX} 之间的整数（GB）` : `Quota must be an integer between ${QUOTA_MIN} and ${QUOTA_MAX} (GB)`, "err");
+      return;
+    }
     const r = await rpc("users.add", {
       address: values.address.trim(),
       name: values.name.trim(),
       password: values.password,
-      quota: Number(values.quota) || 10,
+      quota,
     });
     if (r.ok) {
       toast(`${values.address.trim()} ✓`);
       setAddOpen(false);
       setValues({ address: "", name: "", quota: "10", password: "" });
-      const list = await rpc<UserRow[]>("users.list");
-      if (list.ok) setRows(list.data);
+      reload();
     } else toast(r.error, "err");
   }
 
@@ -86,18 +97,11 @@ export default function Users() {
     {
       key: "quota",
       header: t("quota"),
-      sortValue: (r) => r.quotaUsed / Math.max(1, r.quotaTotal),
       width: 190,
-      render: (r) => (
-        <div className="flex items-center gap-2">
-          <div className="bar w-24">
-            <i style={{ width: `${Math.min(100, (r.quotaUsed / Math.max(1, r.quotaTotal)) * 100)}%` }} className={r.quotaUsed / r.quotaTotal > 0.85 ? "warn" : ""} />
-          </div>
-          <span className="tnum text-[11.5px] text-[var(--text-2)]">
-            {r.quotaUsed} / {r.quotaTotal} GB
-          </span>
-        </div>
-      ),
+      // 后端 users.list 恒回 quotaUsed: 0 / quotaTotal: 0（readers.rs users_list，
+      // 配额尚未实现）—— 按「0 / 0 GB + 空条」渲染是在展示不存在的测量值。
+      // 诚实标注未实现；后端落地配额后再恢复用量条。
+      render: () => <span className="text-[11.5px] text-[var(--text-3)]">{t("quota_not_impl")}</span>,
     },
     { key: "createdAt", header: t("created_at"), sortValue: (r) => r.createdAt, render: (r) => <span className="tnum text-[var(--text-2)]">{r.createdAt}</span>, width: 158 },
     {
@@ -128,6 +132,7 @@ export default function Users() {
         }
       />
       <DataPanel>
+        {error && <div className="px-3 pt-3"><LoadError message={error} onRetry={reload} /></div>}
         <DataTable columns={cols} rows={rows} rowKey={(r) => r.address} pageSize={10} filterKeys={(r) => `${r.address} ${r.name}`} filterPlaceholder={t("users_title")} />
       </DataPanel>
 
@@ -136,9 +141,11 @@ export default function Users() {
         title={t("users_title")}
         fields={[
           { key: "address", label: t("users_title"), placeholder: "user@example.com" },
-          { key: "name", label: t("admin_profile"), placeholder: "Name" },
-          { key: "password", label: "Password", placeholder: "••••••••", type: "password" },
-          { key: "quota", label: `${t("quota")} (GB)`, placeholder: "10" },
+          { key: "name", label: t("field_name"), placeholder: "Name" },
+          { key: "password", label: t("field_password"), placeholder: "••••••••", type: "password" },
+          // 后端 users.add 不读 quota、users.list 恒回 0/0 —— 输入框禁用并说明，
+          // 而不是让用户填一个会被静默忽略的数字。
+          { key: "quota", label: `${t("quota")} (GB)`, placeholder: "10", disabled: true, hint: t("quota_not_impl") },
         ]}
         values={values}
         onChange={(k, v) => setValues((x) => ({ ...x, [k]: v }))}

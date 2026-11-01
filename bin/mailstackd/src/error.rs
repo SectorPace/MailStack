@@ -37,6 +37,12 @@ pub enum DaemonError {
     #[error("relayhost 无法解析：{0:?}")]
     RelayHost(String),
 
+    /// 裸 IPv6 字面量（如 `::1`）无法与 `host:port` 区分，按旧的 rsplit 规则会被
+    /// 静默拆成 host=`::`、port=1。拒绝并给出可照做的写法，而不是让它变成一个
+    /// 错误的中继端点。
+    #[error("relayhost 是裸 IPv6 地址 {0:?}：IPv6 字面量必须用方括号包住并附端口，例如 [::1]:25")]
+    RelayHostBareIpv6(String),
+
     #[error(
         "端口 {0} 上的中继未启用加密：请设置 smtp_tls_wrappermode=yes、改用 465，\
          或把 smtp_tls_security_level 设为 encrypt/secure/dane/verify"

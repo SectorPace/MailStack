@@ -38,6 +38,17 @@ pub const DEFAULT_RW_SOCKET: &str = "/run/mailstack/helper.sock";
 pub const HELPER_TIMEOUT_MS_DEFAULT: u64 = 120_000;
 /// 单个 RPC 请求帧读取超时，避免占满 worker 的连接停留在半帧状态。
 const RPC_REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// 单个 RPC 请求的服务端执行上限。
+///
+/// 客户端默认 120s 就会超时返回，但服务端此前没有兜底 —— 一个挂死的
+/// 处理器（acme.sh、备份还原、磁盘 IO）会永远占着一条分派路径。900s 是
+/// **慷慨**的上限：比最长的合法动作（acme.sh 300s + 安装 120s）还宽得多，
+/// 这条线只该命中「处理器永远不会返回」的故障，而不是正常长动作。
+///
+/// 注意 `spawn_blocking` 里的处理器**不可取消**：超时后应答立即回给客户端、
+/// 分派结果被丢弃，但阻塞线程会在后台自然跑完 —— 这是 tokio 的语义限制，
+/// 仍远好于此前「客户端早已超时、服务端还在无限等」的状态。
+const RPC_REQUEST_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// RO 服务配置。
 #[derive(Debug, Clone)]
@@ -116,9 +127,17 @@ impl RoServer {
             }
         }
 
-        match self.registry.dispatch(&action, &data).await {
-            Ok(value) => RpcResponse::ok(value),
-            Err(e) => RpcResponse::err(e.to_string()),
+        // 服务端执行兜底：处理器挂死时客户端至少能在 900s 内拿到确定的失败
+        // 应答，而不是各端各自挂死。spawn_blocking 的处理器不可取消，超时后
+        // 阻塞线程会在后台跑完 —— 见 [`RPC_REQUEST_EXEC_TIMEOUT`] 的说明。
+        let dispatch = self.registry.dispatch(&action, &data);
+        match tokio::time::timeout(RPC_REQUEST_EXEC_TIMEOUT, dispatch).await {
+            Ok(Ok(value)) => RpcResponse::ok(value),
+            Ok(Err(e)) => RpcResponse::err(e.to_string()),
+            Err(_) => RpcResponse::err(format!(
+                "PRIVILEGED_OPERATION_TIMEOUT: {action} exceeded the {}s server-side execution limit",
+                RPC_REQUEST_EXEC_TIMEOUT.as_secs()
+            )),
         }
     }
 
@@ -212,6 +231,13 @@ impl RoServer {
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    // 满载必须**可见**：静默 drop 会让运维把「新连接连不上」
+                    // 误判成网络故障。许可按**连接**持有（keep-alive 的长连接会
+                    // 一直占着），所以这里打的是 warn 而不是 debug —— 改成按
+                    // 请求持有许可是更大的重构，留作后续工作。
+                    mailstack_core::warn::warn(
+                        "privileged helper is at its concurrent connection limit; dropping new connection",
+                    );
                     drop(stream);
                     continue;
                 }
@@ -237,6 +263,25 @@ pub fn bind_unix_socket(
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        // 特权 socket 的父目录**不能停在 umask 给出的 0755**（root 常见 umask 022）：
+        // 那样任何本地用户都能列举目录、看到 socket 的存在。收紧到 0750 ——
+        // 刻意**不是** 0700：RO 面（0660 root:mailstack-admin）要靠属组用户穿越
+        // 目录去连接 socket，0700 会把整个只读面掐断；0750 + 尽力把属组对齐
+        // socket 属组，既挡住其他用户又保住这条通路。
+        // 根目录与空路径不动（相对路径测试场景下 parent 可能为空）。
+        if !parent.as_os_str().is_empty() && parent != Path::new("/") {
+            let mut permissions = std::fs::metadata(parent)?.permissions();
+            permissions.set_mode(0o750);
+            std::fs::set_permissions(parent, permissions)?;
+            #[cfg(unix)]
+            if let Some(group) = group {
+                if let Some(gid) = mailstack_core::atomic::gid_by_name(group) {
+                    // 尽力而为：属组对不上时 socket 自身的 0660 + group chown
+                    // 仍然会在下面被判为致命错误。
+                    let _ = std::os::unix::fs::chown(parent, None, Some(gid));
+                }
+            }
+        }
     }
     // 陈旧 socket 必须先移除，否则 bind 报 EADDRINUSE。
     if path.exists() {
@@ -244,6 +289,8 @@ pub fn bind_unix_socket(
     }
 
     let listener = UnixListener::bind(path)?;
+    // socket 文件自身的权限位在下面的 `permission_result` 里显式设置
+    // （RO 0660 / RW 0600），不依赖 umask。
     let permission_result = (|| {
         if let Some(group) = group {
             let gid = mailstack_core::atomic::gid_by_name(group).ok_or_else(|| {
@@ -376,6 +423,10 @@ mod tests {
 
         let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o660, "RO socket 必须为 0660");
+        // 父目录不能停在 umask 的 0755：特权 socket 的存在性不该对所有人可见。
+        let parent = socket.parent().unwrap();
+        let parent_mode = std::fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(parent_mode, 0o750, "socket 父目录必须收紧到 0750");
         std::fs::remove_dir_all(&root).ok();
     }
 

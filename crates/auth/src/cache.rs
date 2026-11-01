@@ -48,6 +48,25 @@ pub const MAX_ENTRIES: usize = 4096;
 /// `HashMap<Box<str>, (Txt, Option<Instant>)>` 会触发 `clippy::type_complexity`。
 type CacheEntry = (Txt, Option<Instant>);
 
+/// DMARC 原始记录旁表的值类型：原始记录文本。
+///
+/// 旁表存在的原因：mail-auth 0.13 解析 `Dmarc` 时直接丢弃 `pct=` 标签
+/// （RFC 7489 §6.6.4 的抽样参数），解析后的结构永远取不回它；而
+/// [`crate::dmarc::evaluate`] 的 pct 抽样只能从原始文本解析（见
+/// [`TxtCache::add_dmarc`] 的说明）。
+type DmarcRaw = Box<str>;
+
+/// 主表（解析后的 TXT）与 DMARC 原始文本旁表共用一把锁、同步增删。
+///
+/// 镜像不变量：旁表里的每一条都必须有主表里同键的解析孪生；反之不然
+/// （非 DMARC 记录没有旁表条目）。所有对主表的生命周期操作（写入 / 覆盖 /
+/// 删除 / 过期清理 / 容量淘汰）都必须同步维护旁表 —— 见各方法内的说明。
+#[derive(Default)]
+struct Inner {
+    entries: HashMap<Box<str>, CacheEntry>,
+    dmarc_raw: HashMap<Box<str>, DmarcRaw>,
+}
+
 /// 内存 TXT 缓存。键在写入时按 mail-auth 的 `ToFqdn` 规则规范化
 /// （小写 + 末尾点），否则查询必然落空。
 ///
@@ -68,7 +87,7 @@ type CacheEntry = (Txt, Option<Instant>);
 /// 所以用 `None`（不过期）显式表达「注入」，`Some(t)` 表达「有 TTL」。
 #[derive(Default)]
 pub struct TxtCache {
-    entries: Mutex<HashMap<Box<str>, CacheEntry>>,
+    inner: Mutex<Inner>,
 }
 
 impl TxtCache {
@@ -80,29 +99,46 @@ impl TxtCache {
         name.to_fqdn().into_owned().into_boxed_str()
     }
 
-    fn store(&self, name: &str, value: Txt) {
-        let mut guard = match self.entries.lock() {
+    /// 拿锁。毒化的锁照常取内值：某个持锁线程 panic 过不代表整张表作废，
+    /// 与本文件原有的处理方式一致。
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, Inner> {
+        match self.inner.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
-        };
+        }
+    }
+
+    /// 写入一条解析记录；`raw` 是配套的原始文本（仅 DMARC 记录有）。
+    ///
+    /// 原始文本与解析结构必须在**同一个临界区**内成对写入：拆成两次加锁的话，
+    /// 两次之间并发的带 TTL 写入（`insert`）可能插进来清掉/换掉同一键的记录，
+    /// 旁表就会留下一条与主表配错对的原始文本。
+    fn store(&self, name: &str, value: Txt, raw: Option<&str>) {
+        let mut guard = self.lock_inner();
         let key = Self::key(name);
         Self::enforce_capacity(&mut guard, Some(key.as_ref()));
         // `None` = 注入条目，永不过期（理由见类型文档）。
-        guard.insert(key, (value, None));
+        guard.entries.insert(key.clone(), (value, None));
+        match raw {
+            Some(raw) => {
+                guard.dmarc_raw.insert(key, raw.into());
+            }
+            // 该键现在存放的不是带原始文本的 DMARC 记录：旁表不得残留旧值。
+            None => {
+                guard.dmarc_raw.remove(key.as_ref());
+            }
+        }
     }
 
     /// 只在键不存在时写入。
     fn store_if_absent(&self, name: &str, value: Txt) {
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = self.lock_inner();
         let key = Self::key(name);
-        if guard.contains_key(key.as_ref()) {
+        if guard.entries.contains_key(key.as_ref()) {
             return;
         }
         Self::enforce_capacity(&mut guard, Some(key.as_ref()));
-        guard.insert(key, (value, None));
+        guard.entries.insert(key, (value, None));
     }
 
     /// 丢掉过期的条目；仍超上界时按「过期时间最近」淘汰 —— 留最久不过期的。
@@ -111,9 +147,9 @@ impl TxtCache {
     /// 就不会动它们，因此离线注入的稳定性不受容量压力影响。
     ///
     /// `keep` 是调用方即将写入、必须留住的键（`retain` 不看值，得单独传下来）。
-    fn enforce_capacity(guard: &mut HashMap<Box<str>, CacheEntry>, keep: Option<&str>) {
+    fn enforce_capacity(guard: &mut Inner, keep: Option<&str>) {
         let now = Instant::now();
-        guard.retain(|key, (_, until)| {
+        guard.entries.retain(|key, (_, until)| {
             if Some(key.as_ref()) == keep {
                 return true;
             }
@@ -123,8 +159,13 @@ impl TxtCache {
                 Some(expiry) => *expiry > now,
             }
         });
+        // 镜像同步：惰性过期只动了主表，主表里已消失的键旁表不得残留
+        // （下面的容量淘汰分支自己成对删除，不经这里）。
+        guard
+            .dmarc_raw
+            .retain(|key, _| guard.entries.contains_key(key.as_ref()));
         // 上界为 0 时留不出空间给 `keep`，此时直接不淘汰（退化但不会 panic）。
-        while guard.len() > MAX_ENTRIES.saturating_sub(1) {
+        while guard.entries.len() > MAX_ENTRIES.saturating_sub(1) {
             // 淘汰顺序：**先丢最接近过期的带 TTL 条目**。
             //
             // 关键在 `Option` 的序是 `None < Some(_)`，所以朴素的
@@ -133,14 +174,17 @@ impl TxtCache {
             // 先只在「带 TTL 且未过期」的条目里挑最接近过期的；实在没有可丢的
             // （表里全是注入条目）才退回到任意淘汰。
             let victim = guard
+                .entries
                 .iter()
                 .filter(|(key, (_, until))| Some(key.as_ref()) != keep && until.is_some())
                 .min_by_key(|(_, (_, until))| *until)
-                .or_else(|| guard.iter().find(|(key, _)| Some(key.as_ref()) != keep))
+                .or_else(|| guard.entries.iter().find(|(key, _)| Some(key.as_ref()) != keep))
                 .map(|(k, _)| k.clone());
             match victim {
                 Some(victim) => {
-                    guard.remove(&victim);
+                    guard.entries.remove(&victim);
+                    // 主表淘汰谁，旁表的孪生就跟着走 —— 旁表不允许比主表活得久。
+                    guard.dmarc_raw.remove(victim.as_ref());
                 }
                 None => break,
             }
@@ -150,21 +194,29 @@ impl TxtCache {
     /// 放入一条 DKIM 公钥记录（`v=DKIM1; ... p=...`）。
     pub fn add_domain_key(&self, name: &str, record: &[u8]) -> AuthResult<()> {
         let parsed = DomainKey::parse(record).map_err(|error| AuthError::Dns(error.to_string()))?;
-        self.store(name, parsed.into());
+        self.store(name, parsed.into(), None);
         Ok(())
     }
 
     /// 放入一条 SPF 记录。
     pub fn add_spf(&self, name: &str, record: &[u8]) -> AuthResult<()> {
         let parsed = Spf::parse(record).map_err(|error| AuthError::Dns(error.to_string()))?;
-        self.store(name, parsed.into());
+        self.store(name, parsed.into(), None);
         Ok(())
     }
 
     /// 放入一条 DMARC 记录。
+    ///
+    /// 与其他 `add_*` 不同，这里还要把**原始文本**一并存进旁表：mail-auth 0.13
+    /// 解析 `Dmarc` 时直接丢弃 `pct=` 标签（RFC 7489 §6.6.4 的抽样参数），解析
+    /// 后的结构永远取不回它，而 [`crate::dmarc::evaluate`] 的 pct 抽样只能从
+    /// 原始文本解析 —— 旁表是它唯一的来源。
     pub fn add_dmarc(&self, name: &str, record: &[u8]) -> AuthResult<()> {
         let parsed = Dmarc::parse(record).map_err(|error| AuthError::Dns(error.to_string()))?;
-        self.store(name, parsed.into());
+        // TXT 记录允许多段字符串拼接，原始字节可能不是 UTF-8；pct 解析只关心
+        // ASCII 标签，有损转换不影响语义。
+        let raw = String::from_utf8_lossy(record).into_owned();
+        self.store(name, parsed.into(), Some(&raw));
         Ok(())
     }
 
@@ -215,6 +267,43 @@ impl TxtCache {
             )),
         );
     }
+
+    /// 取某域可用的**原始** DMARC 记录文本（`pct=` 只能从这里取回）。
+    ///
+    /// 查找顺序与 mail-auth 的 DMARC 树走查一致（RFC 9989 §4.10）：从本域的
+    /// `_dmarc.<域>` 起逐级向上，返回找到的第一条 —— 本域记录优先，其次各级
+    /// 祖先。键规范化与主表相同（小写 + 末尾点），所以大小写与末尾点写法无关。
+    ///
+    /// ## `None` 的语义必须读对
+    ///
+    /// 只有经 [`TxtCache::add_dmarc`] 注入的记录才有原始文本 —— mail-auth 联网
+    /// 解析时把原始字节消费在解析器内部，[`ResolverCache::insert`] 回调里只有
+    /// 解析后的结构（`pct` 已被丢弃）。因此 **`None` 不等于「无 DMARC 记录」**，
+    /// 只等于「拿不到原始文本」：调用方必须把它当「未公布 `pct`」处理
+    /// （全量执行已公布策略，fail-closed），绝不能当成「该域无策略」。
+    pub fn raw_dmarc_record(&self, domain: &str) -> Option<String> {
+        let labels: Vec<&str> = domain
+            .trim_matches('.')
+            .split('.')
+            .filter(|label| !label.is_empty())
+            .collect();
+        if labels.len() < 2 {
+            // 单标签域不可能是 DMARC 的适用对象（树走查也从这里起步）。
+            return None;
+        }
+        let guard = self.lock_inner();
+        for start in 0..labels.len() - 1 {
+            let key = Self::key(&format!("_dmarc.{}", labels[start..].join(".")));
+            if let Some(raw) = guard.dmarc_raw.get(key.as_ref()) {
+                // 镜像不变量要求旁表条目必有主表孪生；这里多看一眼主表，
+                // 防御未来演化不小心破坏镜像时把 pct 配到不存在的记录上。
+                if guard.entries.contains_key(key.as_ref()) {
+                    return Some(raw.to_string());
+                }
+            }
+        }
+        None
+    }
 }
 
 impl ResolverCache<Box<str>, Txt> for TxtCache {
@@ -223,23 +312,22 @@ impl ResolverCache<Box<str>, Txt> for TxtCache {
         Box<str>: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = self.lock_inner();
         let key = name.borrow();
         // 过期即视为「没查到」—— 交给上层走一次真实 DNS，而不是拿旧答案当现状。
         // 这里**顺带**删除：否则过期条目会一直留在表里。
-        let expired = match guard.get(key) {
+        let expired = match guard.entries.get(key) {
             None => return None,
             Some((_, Some(expiry))) => *expiry <= Instant::now(),
             Some(_) => false,
         };
         if expired {
-            guard.remove(key);
+            guard.entries.remove(key);
+            // 主表过期被清，旁表孪生跟着清（旁表不允许比主表活得久）。
+            guard.dmarc_raw.remove(key);
             return None;
         }
-        guard.get(key).map(|(value, _)| value.clone())
+        guard.entries.get(key).map(|(value, _)| value.clone())
     }
 
     fn remove<Q>(&self, name: &Q) -> Option<Txt>
@@ -247,11 +335,12 @@ impl ResolverCache<Box<str>, Txt> for TxtCache {
         Box<str>: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.remove(name.borrow()).map(|(value, _)| value)
+        let mut guard = self.lock_inner();
+        let removed = guard.entries.remove(name.borrow()).map(|(value, _)| value);
+        if removed.is_some() {
+            guard.dmarc_raw.remove(name.borrow());
+        }
+        removed
     }
 
     /// 写入一条**带 TTL** 的查询结果（mail-auth 在每次 TXT 查询后调用，
@@ -260,13 +349,15 @@ impl ResolverCache<Box<str>, Txt> for TxtCache {
     /// 原实现把 `valid_until` 命名成 `_valid_until` 并丢弃，`get` 也不查过期，
     /// 于是 TTL 完全失效。现在按它兑现，并把上界压到 [`MAX_TTL`]。
     fn insert(&self, key: Box<str>, value: Txt, valid_until: Instant) {
-        let mut guard = match self.entries.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = self.lock_inner();
         Self::enforce_capacity(&mut guard, Some(key.as_ref()));
         let expiry = Some(std::cmp::min(valid_until, Instant::now() + MAX_TTL));
-        guard.insert(key, (value, expiry));
+        // 联网解析路径拿到的只有解析后的结构（原始字节留在了 mail-auth 内部）。
+        // 同一键写入**任何**新鲜 TTL 条目都使旧的注入原始文本失效 —— 它描述的
+        // 可能已不是 DNS 当前的状态（非 DMARC 条目同样会顶掉同名键）。
+        // 宁可丢掉（pct 按未公布处理，全量执行已公布策略）也不能拿旧文本配新结构。
+        guard.entries.insert(key.clone(), (value, expiry));
+        guard.dmarc_raw.remove(key.as_ref());
     }
 }
 
@@ -447,8 +538,9 @@ mod tests {
             )),
             Instant::now() + Duration::from_secs(315_360_000),
         );
-        let guard = cache.entries.lock().unwrap();
+        let guard = cache.inner.lock().unwrap();
         let (_, until) = guard
+            .entries
             .get("mailstack._domainkey.example.com.")
             .expect("条目应存在");
         let expiry = until.expect("走 insert 的条目必须带过期时间");
@@ -484,15 +576,116 @@ mod tests {
             );
         }
 
-        let guard = cache.entries.lock().unwrap();
+        let guard = cache.inner.lock().unwrap();
         assert!(
-            guard.len() <= MAX_ENTRIES,
+            guard.entries.len() <= MAX_ENTRIES,
             "缓存必须有界（实际 {} 条）",
-            guard.len()
+            guard.entries.len()
         );
         assert!(
-            guard.contains_key("pinned._domainkey.example.com."),
+            guard
+                .entries
+                .contains_key("pinned._domainkey.example.com."),
             "注入条目被带 TTL 的条目挤掉了：淘汰顺序反了"
         );
+    }
+
+    /// pct= 接线的地基：`add_dmarc` 必须把**原始文本**留在旁表里，且键规范化
+    /// 与主表一致（`raw_dmarc_record` 按树走查方向从本域向上找）。
+    #[test]
+    fn raw_dmarc_text_is_retained_and_reachable_up_the_tree() {
+        let cache = TxtCache::new();
+        cache
+            .add_dmarc(
+                "_dmarc.example.com",
+                b"v=DMARC1; p=reject; pct=10",
+            )
+            .expect("装载 DMARC 记录");
+
+        assert_eq!(
+            cache.raw_dmarc_record("example.com").as_deref(),
+            Some("v=DMARC1; p=reject; pct=10"),
+            "原始文本必须原样保留：pct= 只能从这里取回"
+        );
+        // 大小写与末尾点不得影响命中（与主表同一套键规范化）。
+        assert!(cache.raw_dmarc_record("EXAMPLE.com.").is_some());
+        // 树走查方向：从子域向上也能找到（本域记录优先，其次祖先）。
+        assert!(cache.raw_dmarc_record("sub.example.com").is_some());
+        // 只有 DMARC 记录有原始文本旁表：放一条别的类型的记录也不产生原始文本。
+        cache
+            .add_spf("other.test", b"v=spf1 -all")
+            .expect("装载 SPF 记录");
+        assert!(cache.raw_dmarc_record("other.test").is_none());
+        // 单标签域不适用 DMARC，直接无原始文本。
+        assert!(cache.raw_dmarc_record("localhost").is_none());
+    }
+
+    /// 反例守卫：生产路径的带 TTL 写入（mail-auth 联网解析后的回调）只有
+    /// 解析后的结构 —— 同一键残留的注入原始文本必须被清掉，绝不能拿旧文本
+    /// 去配新结构（pct 张冠李戴比没有 pct 更糟）。
+    #[test]
+    fn a_fresh_ttl_insert_supersedes_the_injected_raw_text() {
+        let cache = TxtCache::new();
+        cache
+            .add_dmarc("_dmarc.example.com", b"v=DMARC1; p=reject; pct=10")
+            .expect("装载 DMARC 记录");
+
+        let fresh: Txt = Dmarc::parse(b"v=DMARC1; p=quarantine")
+            .expect("解析新记录")
+            .into();
+        cache.insert(
+            "_dmarc.example.com.".into(),
+            fresh,
+            Instant::now() + Duration::from_secs(60),
+        );
+
+        assert!(
+            cache.raw_dmarc_record("example.com").is_none(),
+            "新结构配旧原始文本是 pct 张冠李戴：宁可按未公布 pct 处理（fail-closed）"
+        );
+    }
+
+    /// 反例守卫：主表条目被删除 / 被容量淘汰时，旁表孪生必须跟着走。
+    #[test]
+    fn the_raw_twin_never_outlives_its_parsed_entry() {
+        let cache = TxtCache::new();
+        cache
+            .add_dmarc("_dmarc.example.com", b"v=DMARC1; p=reject")
+            .expect("装载 DMARC 记录");
+
+        // 显式删除。
+        assert!(cache.remove::<str>("_dmarc.example.com.").is_some());
+        assert!(cache.raw_dmarc_record("example.com").is_none());
+
+        // 容量压力：注入条目在其解析孪生幸存时同样幸存（镜像淘汰顺序），
+        // 孪生被淘汰时旁表不得残留。
+        let cache = TxtCache::new();
+        cache
+            .add_dmarc("_dmarc.pinned.example.com", b"v=DMARC1; p=reject; pct=10")
+            .expect("装载 DMARC 记录");
+        for i in 0..(MAX_ENTRIES + 64) {
+            cache.insert(
+                format!("sel{i}._domainkey.example.com.").into(),
+                Txt::Error(mail_auth::Error::Dns(
+                    mail_auth::DnsError::InvalidRecordType,
+                )),
+                Instant::now() + Duration::from_secs(1),
+            );
+        }
+        let parsed_twin_survived = {
+            let guard = cache.inner.lock().unwrap();
+            guard.entries.contains_key("_dmarc.pinned.example.com.")
+        };
+        if parsed_twin_survived {
+            assert!(
+                cache.raw_dmarc_record("pinned.example.com").is_some(),
+                "解析孪生幸存时旁表必须同样幸存"
+            );
+        } else {
+            assert!(
+                cache.raw_dmarc_record("pinned.example.com").is_none(),
+                "解析孪生被淘汰后旁表不得残留"
+            );
+        }
     }
 }

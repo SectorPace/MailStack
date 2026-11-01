@@ -15,7 +15,9 @@
 //! * **正文不是合法 UTF-8** ⇒ 554 拒绝。队列把报文建模为 `String`（见
 //!   [`mailstack_queue::QueueEntry`]），若在此处做有损转换，等于**静默篡改**了
 //!   报文字节 —— 被破坏的报文还会让下游的 DKIM 校验失败。宁可明确拒绝。
-//!   这是当前实现的已知边界，而非可以忽略的细节。
+//!   这是当前实现的已知边界，而非可以忽略的细节 —— 因此 EHLO **不通告
+//!   8BITMIME**（见 `session.rs::ehlo_reply`）：通告一个兑现不了的能力，
+//!   等于邀请对端发我们注定要退的信。
 //!
 //! ## 为什么用 `EntryKind::Outbound`
 //!
@@ -111,7 +113,7 @@ impl QueueSink {
         let data = format!("{header}{text}");
 
         let now_unix = self.clock.now_millis() / 1000;
-        let entry = QueueEntry::new(
+        let mut entry = QueueEntry::new(
             EntryKind::Outbound,
             message.mail_from,
             message.recipients,
@@ -119,8 +121,10 @@ impl QueueSink {
             now_unix,
         )
         .map_err(|_| Reply::with_enhanced(451, "4.3.0", texts::QUEUE_WRITE_FAILED))?;
+        // 入站报文是全新邮件：必须走 O_EXCL 语义的 enqueue_new ——
+        // 同毫秒撞 id 时重生成而不是静默覆盖（那会丢掉先到的邮件）。
         self.store
-            .enqueue(&entry)
+            .enqueue_new(&mut entry)
             .map_err(|_| Reply::with_enhanced(451, "4.3.0", texts::QUEUE_WRITE_FAILED))?;
 
         Ok(())

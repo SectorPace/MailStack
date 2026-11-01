@@ -69,10 +69,14 @@ fn decode_saslname(value: &str) -> Result<String> {
             if index + 2 >= bytes.len() {
                 return Err(MailError::invalid("invalid SCRAM username escape"));
             }
-            let escaped = &value[index + 1..index + 3];
-            match escaped.to_ascii_uppercase().as_str() {
-                "2C" => out.push(b','),
-                "3D" => out.push(b'='),
+            // =2C/=3D 都是 ASCII，按字节校验即可；不能对 &str 切片 ——
+            // 多字节字符落在转义序列中间时 `&value[index + 1..index + 3]`
+            // 会因不在 char boundary 上而 panic。
+            let mut hex = [bytes[index + 1], bytes[index + 2]];
+            hex.make_ascii_uppercase();
+            match &hex {
+                b"2C" => out.push(b','),
+                b"3D" => out.push(b'='),
                 _ => return Err(MailError::invalid("invalid SCRAM username escape")),
             }
             index += 3;
@@ -130,6 +134,12 @@ pub fn verify_client_final(
         match key {
             "c" => channel_binding = Some(value.to_string()),
             "r" => nonce = Some(value.to_string()),
+            // RFC 5802 §5.1：m= 是强制扩展协商，不支持就必须失败，不能静默忽略。
+            "m" => {
+                return Err(MailError::invalid(
+                    "SCRAM mandatory extension is not supported",
+                ))
+            }
             _ => {}
         }
     }
@@ -198,6 +208,32 @@ mod tests {
         assert_eq!(client.gs2_header, "n,,");
         assert!(parse_client_first("p=tls-unique,,n=a,r=b").is_err());
         assert!(parse_client_first("n,,n=a=ZZ,r=b").is_err());
+    }
+
+    #[test]
+    fn saslname_escape_over_a_multibyte_char_is_rejected_without_panicking() {
+        // '=' 后面跟着多字节 UTF-8 字符：转义序列必须按字节校验。
+        // 旧的 &str 切片写法会在 char boundary 上 panic。
+        assert!(parse_client_first("n,,n=a=\u{4E2D}b,r=x").is_err());
+        assert!(parse_client_first("n,,n==\u{4E2D},r=x").is_err());
+    }
+
+    #[test]
+    fn client_final_rejects_the_mandatory_extension_attribute() {
+        let mut record =
+            mailstack_core::password::password_record("alice", "Tr0ubadour9x").unwrap();
+        record.username = "alice@example.com".to_string();
+        let credentials = scram_credentials_from_record(&record).unwrap();
+        let client = parse_client_first("n,,n=alice@example.com,r=clientnonce").unwrap();
+        // m= 出现在 client-final：RFC 5802 要求服务端失败，而不是忽略。
+        let wrong = verify_client_final(
+            &client,
+            "s=AA==,i=1",
+            "servernonce",
+            "c=biws,m=,r=clientnonceservernonce,p=AAAA",
+            &credentials,
+        );
+        assert!(wrong.is_err());
     }
 
     #[test]

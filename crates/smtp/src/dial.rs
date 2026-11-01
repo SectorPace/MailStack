@@ -9,6 +9,7 @@
 //! 而它的拨号字段是 `SocketAddr`。**不存在**接受 `host:port` 字符串的连接函数。
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rustls::ClientConfig;
@@ -46,6 +47,17 @@ impl TlsMode {
         }
     }
 }
+
+/// TLS 握手超时。
+///
+/// ## 为什么握手必须独立限时
+///
+/// TCP 建连有 [`PinnedDialer::connect`] 的 `connect_timeout`，但握手**没有**：
+/// `start_tls` 的 `connector.connect` 原先裸 `await`。对端（直投模式下是任意
+/// 收件域的 MX）可以完成三次握手后让 TLS 握手永远不结束 —— 连接与 worker 一起
+/// 挂住。STARTTLS（[`PinnedDialer::start_tls`] 被两处复用）与隐式 TLS 三条路径
+/// 都汇聚到这一处，在这里限时即可全覆盖。
+pub const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 拨号器：持有 TLS 配置与超时。
 #[derive(Clone)]
@@ -100,24 +112,42 @@ impl PinnedDialer {
         }
     }
 
-    /// 拨号：**只连 `target.pinned`**。
+    /// 拨号：按 `target.addresses` 的顺序逐个尝试（第一个就是 `pinned`）。
     ///
-    /// 注意入参是 [`PinnedTarget`] 而非 `&str`：调用方无法传入域名，
-    /// 因此「按域名重连」这一退化路径在类型层面就不存在。
+    /// 全部地址都来自**同一次**解析、过了**同一轮**地址策略筛选 —— 逐个尝试没有
+    /// 脱离 IP 固定（INV-14）：任何时刻都不存在「按域名重连」。原实现只连第一个
+    /// 地址，其余 A/AAAA 记录被丢弃；解析出多个地址的域（多线机房很常见）会因
+    /// 第一台瞬时不可用而整次投递失败。全部失败时上报**最后一个**错误。
+    ///
+    /// 总时长仍以 `connect_timeout` 为上界：所有尝试共享一个截止时间，而不是
+    /// 每个地址各领一份 —— 否则一个多地址的坏目标能把投递任务挂上 N 倍超时。
     pub async fn connect(&self, target: &PinnedTarget) -> Result<TcpStream, SmtpError> {
-        let addr = target.dial_addr();
-        match tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => {
-                // 关闭 Nagle：SMTP 是请求-响应式小包交互，延迟比吞吐重要。
-                let _ = stream.set_nodelay(true);
-                Ok(stream)
+        let deadline = tokio::time::Instant::now() + self.connect_timeout;
+        let port = target.pinned.port();
+        let mut last_error: Option<SmtpError> = None;
+
+        for ip in &target.addresses {
+            let addr = SocketAddr::new(*ip, port);
+            match tokio::time::timeout_at(deadline, TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
+                    // 关闭 Nagle：SMTP 是请求-响应式小包交互，延迟比吞吐重要。
+                    let _ = stream.set_nodelay(true);
+                    return Ok(stream);
+                }
+                Ok(Err(e)) => last_error = Some(SmtpError::Connect { addr, source: e }),
+                Err(_) => {
+                    last_error = Some(SmtpError::ConnectTimeout {
+                        addr,
+                        secs: self.connect_timeout.as_secs(),
+                    })
+                }
             }
-            Ok(Err(e)) => Err(SmtpError::Connect { addr, source: e }),
-            Err(_) => Err(SmtpError::ConnectTimeout {
-                addr,
-                secs: self.connect_timeout.as_secs(),
-            }),
         }
+
+        // 两个构造函数都保证 `addresses` 非空；这个兜底只是为了不引入 `unwrap`。
+        Err(last_error.unwrap_or_else(|| {
+            SmtpError::InvalidEndpoint(format!("no address to dial for {}", target.hostname))
+        }))
     }
 
     /// 在已建立的 TCP 连接上做 TLS 握手。
@@ -134,10 +164,22 @@ impl PinnedDialer {
         })?;
 
         let connector = TlsConnector::from(Arc::clone(&self.tls_config));
-        connector
-            .connect(server_name, stream)
-            .await
-            .map_err(|e| SmtpError::Tls(format!("TLS handshake with {}: {e}", target.hostname)))
+        // 握手限时：对端可以「TCP 收下、握手挂起」，没有这条超时连接就会永久占用。
+        // 与 TCP 建连的 `connect_timeout` 同一立场 —— 慢与坏是同一种失败。
+        match tokio::time::timeout(
+            TLS_HANDSHAKE_TIMEOUT,
+            connector.connect(server_name, stream),
+        )
+        .await
+        {
+            Ok(result) => result
+                .map_err(|e| SmtpError::Tls(format!("TLS handshake with {}: {e}", target.hostname))),
+            Err(_) => Err(SmtpError::Tls(format!(
+                "TLS handshake with {} timed out after {}s",
+                target.hostname,
+                TLS_HANDSHAKE_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     /// 一步完成「拨号 →（隐式 TLS 时）握手」。

@@ -40,6 +40,22 @@ function maskKey(k: string): string {
   return k.length < 16 ? "••••••••" : k.slice(0, 12) + "•••…" + k.slice(-8);
 }
 
+/**
+ * 口令弱串检测：3 个及以上「相等或连续（升降）」的码点。
+ * 与后端 has_weak_run（crates/core/src/password.rs）同一算法、同一判定：
+ * aaa / 111 / abc / 123 / cba / 963 都命中，两个字符重复（aa / ab）不命中。
+ */
+function hasWeakRun(password: string): boolean {
+  const cps = Array.from(password).map((c) => c.codePointAt(0) ?? 0);
+  for (let i = 0; i + 2 < cps.length; i++) {
+    const a = cps[i];
+    const b = cps[i + 1];
+    const c = cps[i + 2];
+    if ((a === b && b === c) || (b === a + 1 && c === b + 1) || (b + 1 === a && c + 1 === b)) return true;
+  }
+  return false;
+}
+
 export default function Setup({ onDone }: { onDone: () => void }) {
   const { t, prefs } = useSettings();
   const zh = prefs.lang === "zh";
@@ -83,13 +99,15 @@ export default function Setup({ onDone }: { onDone: () => void }) {
   // 后端 validate_setup_identity 要求 mailHost 必须是 domain 的子域，否则
   // setup.identity.apply / setup.dns.verify 都会直接拒；在前端先挡住，
   // 省得用户填完一整页才看到一句 "mail host must be a subdomain of the domain"。
-  const s1ok = domain.length > 3 && mailHost.length > 3 && serverIp.length > 6 && mailHost.endsWith(`.${domain}`);
+  // 两侧都 trim + 小写化：原先大小写敏感且不trim，"Mail.Example.COM" 会被误拒。
+  const dNorm = domain.trim().toLowerCase();
+  const hNorm = mailHost.trim().toLowerCase();
+  const s1ok = dNorm.length > 3 && hNorm.length > 3 && serverIp.trim().length > 6 && hNorm.endsWith(`.${dNorm}`);
 
-  // 后端 users.add 的口令校验是「不得包含用户名或完整邮箱」
-  // （validate_mailbox_password 的 context 参数就是这两项）。
-  // 这一条**必须**在前端挡住：账号名固定为 "admin"，而 admin 是极常见的口令用词，
-  // 用户很容易填出 admin123456 —— 它满足长度与字母数字要求，却会被后端拒，
-  // 而错误消息只有等到点按钮之后才出现。用户会以为是自己格式写错了。
+  // 后端 validate_mailbox_password（crates/core/src/password.rs）的完整规则：
+  // 12–256 位、字母+数字、无控制字符、**无 3 个及以上相等或连续（升降）码点**
+  // （aaa / 123 / cba 都是弱串）、不含身份 token。这里在前端按同一算法预检，
+  // 与第 5 步的提示文案保持一致 —— 否则用户会以为自己格式写错了。
   const ADMIN_ACCOUNT = "admin";
   const adminEmailForPass = `admin@${domain}`.toLowerCase();
   const passHasContext =
@@ -99,6 +117,7 @@ export default function Setup({ onDone }: { onDone: () => void }) {
     adminPass.length >= 12 &&
     /[a-zA-Z]/.test(adminPass) &&
     /[0-9]/.test(adminPass) &&
+    !hasWeakRun(adminPass) &&
     passHasContext;
 
   // 后端 setup.dns.verify 的 spfExpected 判据是「TXT 逐字等于期望值」，
@@ -141,11 +160,20 @@ export default function Setup({ onDone }: { onDone: () => void }) {
     setBusy(true);
     try {
       if (step === 0) {
-        const r = await rpc<{ dkimPublicKey?: string; identity?: { dkimSelector?: string } }>("setup.identity.apply", { domain, mailHost, serverIp });
+        // expectedSpf = 第 2 步展示并逐字验证的那条 SPF（v=spf1 mx ip4:<ip> -all）。
+        // 后端把它持久化进 setup.json，dns.records / security 的 SPF 判据都以它
+        // 为准 —— 不传的话后端回落 "v=spf1 mx -all"，带 ip4: 的验证恒失败。
+        const r = await rpc<{ dkimPublicKey?: string; identity?: { dkimSelector?: string } }>("setup.identity.apply", {
+          domain,
+          mailHost,
+          serverIp,
+          expectedSpf: spf,
+        });
         if (!r.ok) throw new Error(r.error);
         // selector 与公钥都取服务器刚落盘的那份：写死 selector 或示例公钥，
         // 第 2 步的 DKIM 判据（v=DKIM1 + p= 至少 100 字节）就永远过不了。
-        if (r.data.dkimPublicKey) {
+        // {ok:true} 无载荷时 r.data 为 undefined → 原先直接读 r.data.dkimPublicKey 会崩。
+        if (r.data?.dkimPublicKey) {
           setDkim({ selector: r.data.identity?.dkimSelector ?? "mail", publicKey: r.data.dkimPublicKey });
         }
         // setup.identity.apply 只写 setup.json，不写 Postfix 虚拟域名表；而
@@ -171,7 +199,7 @@ export default function Setup({ onDone }: { onDone: () => void }) {
           },
         );
         if (!r.ok) throw new Error(r.error);
-        if (r.data.applied === false) {
+        if (r.data?.applied === false) {
           throw new Error(r.data.error?.message ?? r.data.test?.error?.message ?? (zh ? "中继测试未通过，配置未写入" : "relay test failed, nothing written"));
         }
       }
@@ -183,11 +211,25 @@ export default function Setup({ onDone }: { onDone: () => void }) {
     }
   }
 
+  const [finishing, setFinishing] = useState(false);
+
+  /**
+   * 收尾：调用 setup.wizard.complete（POST /api/setup/wizard/complete）把
+   * wizardCompleted 落进 setup.json。幂等；响应与 setup.status 同形，显式检视
+   * `completed === true` 才算成功 —— 不写这一步的话，下次启动 App 仍会因
+   * completed:false 重新弹出向导（后端不认「我点过按钮」）。失败 toast 后留在
+   * 向导里，绝不假装完成。
+   */
   async function finish() {
-    try {
-      localStorage.setItem("mailstack.setupDone", "1");
-    } catch { /* ignore */ }
-    onDone();
+    if (finishing) return;
+    setFinishing(true);
+    const r = await rpc<{ completed?: boolean }>("setup.wizard.complete");
+    setFinishing(false);
+    if (r.ok && r.data?.completed === true) {
+      onDone();
+      return;
+    }
+    toast(r.ok ? (zh ? "服务器未确认向导完成，请重试" : "The server did not confirm wizard completion — retry") : r.error, "err");
   }
 
   const stepsZh = STEPS_ZH;
@@ -281,13 +323,13 @@ export default function Setup({ onDone }: { onDone: () => void }) {
                           ...(relayId === "ses" ? { selectedRelay: relayId } : {}),
                         });
                         setVerifying(false);
-                        if (r.ok && r.data.verified) {
+                        if (r.ok && r.data?.verified) {
                           setDnsVerified(true);
                           toast(zh ? "DNS 验证通过" : "DNS verified");
                         } else if (r.ok) {
                           // 后端 checks 是逐条判据，把没过的条目摊开给用户看，
                           // 否则只给一句「未通过」等于让人自己猜是哪一条。
-                          const failed = Object.entries(r.data.checks ?? {}).filter(([, v]) => !v).map(([k]) => k);
+                          const failed = Object.entries(r.data?.checks ?? {}).filter(([, v]) => !v).map(([k]) => k);
                           toast(zh ? `DNS 未通过${failed.length ? "：" + failed.join(" / ") : ""}` : `DNS unverified${failed.length ? ": " + failed.join(" / ") : ""}`, "err");
                         } else toast(r.error, "err");
                       }}
@@ -386,12 +428,12 @@ export default function Setup({ onDone }: { onDone: () => void }) {
                           },
                         );
                         setTesting(false);
-                        if (r.ok && (r.data.connected ?? r.data.success)) {
+                        if (r.ok && (r.data?.connected ?? r.data?.success)) {
                           setRelayTested(true);
-                          toast(`${zh ? "中继鉴权成功" : "Relay authenticated"}${r.data.latencyMs != null ? ` · ${r.data.latencyMs}ms` : ""}`);
+                          toast(`${zh ? "中继鉴权成功" : "Relay authenticated"}${r.data?.latencyMs != null ? ` · ${r.data.latencyMs}ms` : ""}`);
                         } else if (r.ok) {
                           // stage 是后端给出的「卡在哪一步」，比一句 failed 有用得多。
-                          toast(r.data.error?.message ?? r.data.stage ?? (zh ? "中继测试失败" : "Relay test failed"), "err");
+                          toast(r.data?.error?.message ?? r.data?.stage ?? (zh ? "中继测试失败" : "Relay test failed"), "err");
                         } else toast(r.error, "err");
                       }}
                     >
@@ -429,10 +471,12 @@ export default function Setup({ onDone }: { onDone: () => void }) {
                 </div>
                 {relayId !== "direct" && (
                   <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-                    <Field label={zh ? "中继 SMTP 服务器" : "Relay host"} value={relayHost} onChange={setRelayHost} />
-                    <Field label={zh ? "中继端口（587 / 465）" : "Relay port"} value={String(relayPort)} onChange={(v) => setRelayPort(Number(v) || 587)} />
-                    <Field label={zh ? "SMTP 授权用户名" : "SMTP username"} value={relayUser} onChange={setRelayUser} />
-                    <Field label={zh ? "SMTP 授权密码" : "SMTP password"} type="password" value={relayPass} onChange={setRelayPass} />
+                    {/* 任一凭据被改动即失效上一次的 ✓：否则换了 host/密码后按钮仍显示
+                        「中继鉴权成功」，下一步会带着未经验证的凭据放行。 */}
+                    <Field label={zh ? "中继 SMTP 服务器" : "Relay host"} value={relayHost} onChange={(v) => { setRelayHost(v); setRelayTested(false); }} />
+                    <Field label={zh ? "中继端口（587 / 465）" : "Relay port"} value={String(relayPort)} onChange={(v) => { setRelayPort(Number(v) || 587); setRelayTested(false); }} />
+                    <Field label={zh ? "SMTP 授权用户名" : "SMTP username"} value={relayUser} onChange={(v) => { setRelayUser(v); setRelayTested(false); }} />
+                    <Field label={zh ? "SMTP 授权密码" : "SMTP password"} type="password" value={relayPass} onChange={(v) => { setRelayPass(v); setRelayTested(false); }} />
                   </div>
                 )}
               </>
@@ -468,16 +512,27 @@ export default function Setup({ onDone }: { onDone: () => void }) {
                         }>("setup.cert.issue", { domain: mailHost, email: `postmaster@${domain}` });
                         setIssuing(false);
                         if (r.ok) {
-                          const c = r.data.cert;
-                          setCertInfo({
-                            domain: c?.domain ?? mailHost,
-                            issuer: c?.issuer ?? "",
-                            notAfter: c?.notAfter ?? "",
-                            daysLeft: c?.daysUntilExpiry ?? null,
-                            keyMode: c?.keyMode ?? null,
-                          });
-                          setCertIssued(true);
-                          toast(zh ? "证书签发成功" : "Certificate issued");
+                          const d = r.data;
+                          const c = d?.cert;
+                          // 软失败检视：后端对「acme.sh 缺失 / 80 端口不通」等会回 200 +
+                          // 失败 status 或 cert.error。原先只看 r.ok 就 toast「证书签发成功」
+                          // 并解锁下一步 —— 虚假 UI。status 缺失且无证书也视为失败（fail-closed）。
+                          const okIssue = d?.status != null ? d.status === "ok" : !!d?.cert && !d.cert.error;
+                          if (!okIssue) {
+                            setCertIssued(false);
+                            const msg = c?.error ?? (d?.status != null ? `status: ${d.status}` : zh ? "服务器未返回证书" : "no certificate in response");
+                            toast(zh ? `证书签发失败：${msg}` : `Certificate issuance failed: ${msg}`, "err");
+                          } else {
+                            setCertInfo({
+                              domain: c?.domain ?? mailHost,
+                              issuer: c?.issuer ?? "",
+                              notAfter: c?.notAfter ?? "",
+                              daysLeft: c?.daysUntilExpiry ?? null,
+                              keyMode: c?.keyMode ?? null,
+                            });
+                            setCertIssued(true);
+                            toast(zh ? "证书签发成功" : "Certificate issued");
+                          }
                         } else toast(r.error, "err");
                       }}
                     >
@@ -540,6 +595,10 @@ export default function Setup({ onDone }: { onDone: () => void }) {
                           address: adminEmail,
                           username: ADMIN_ACCOUNT,
                           password: adminPass,
+                          // 后端 users.add 收 name/displayName 落 displayName
+                          // （managed-mailboxes.json），向导的「管理员姓名」因此接线，
+                          // 不再是只改本地变量的死字段。
+                          name: adminName.trim(),
                         });
                         // 「已存在」不是失败：重复点击或上一轮已建过，邮箱已可用，
                         // 直接继续发信。其余任何错误都真实展示并中止。
@@ -561,11 +620,11 @@ export default function Setup({ onDone }: { onDone: () => void }) {
                         );
                         setPhase("");
                         setSending(false);
-                        if (r.ok && r.data.queued) {
+                        if (r.ok && r.data?.queued) {
                           setTestSent(true);
-                          toast(`${zh ? "测试邮件已入队" : "Test mail queued"}${r.data.code != null ? ` · ${r.data.code}` : ""}`);
+                          toast(`${zh ? "测试邮件已入队" : "Test mail queued"}${r.data?.code != null ? ` · ${r.data.code}` : ""}`);
                         } else {
-                          const msg = r.ok ? `code ${r.data.code ?? "?"}` : r.error;
+                          const msg = r.ok ? `code ${r.data?.code ?? "?"}` : r.error;
                           // 「受管邮箱未命中」是一个可自助修复的失败：它说明上一步
                           // 建号其实没真正生效（口令被拒 / 域名未受管 / 账号被删），
                           // 必须让用户一眼看出「邮箱还没建好」，而不是笼统的发信失败。
@@ -666,8 +725,8 @@ export default function Setup({ onDone }: { onDone: () => void }) {
                   ))}
                 </div>
                 <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
-                  <button className="btn btn-accent h-11 px-7 text-[14px] font-bold" onClick={finish}>
-                    {zh ? "进入系统控制台" : "Launch MailStack Console"}
+                  <button className="btn btn-accent h-11 px-7 text-[14px] font-bold" disabled={finishing} onClick={() => void finish()}>
+                    {finishing ? "…" : zh ? "进入系统控制台" : "Launch MailStack Console"}
                     <IconChevronRight size={15} />
                   </button>
                   <button className="btn glass--control h-11" onClick={() => setStep(0)}>
@@ -718,7 +777,7 @@ export default function Setup({ onDone }: { onDone: () => void }) {
         <IconUser size={11} /> {zh ? "需要管理员权限" : "Administrator privileges required"} · RW channel
       </div>
       <div className="mb-2 mt-3 flex items-center justify-center gap-1.5 text-[11px] text-[var(--text-3)]">
-        <IconChevronDown size={11} /> {t("settings_title")} · setup.status / setup.identity.apply / domains.add / setup.dns.verify / setup.relay.apply / setup.cert.issue / users.add / setup.mail.test
+        <IconChevronDown size={11} /> {t("settings_title")} · setup.status / setup.identity.apply / domains.add / setup.dns.verify / setup.relay.apply / setup.cert.issue / users.add / setup.mail.test / setup.wizard.complete
       </div>
     </div>
   );

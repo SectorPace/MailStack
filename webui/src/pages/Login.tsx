@@ -29,12 +29,25 @@ async function doLogin(username: string, password: string, totp?: string): Promi
     if (username.trim().length === 0 || password.length === 0) throw { message: "invalid" } as LoginError;
     return;
   }
-  const res = await fetch("/api/auth/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "same-origin",
-    body: JSON.stringify({ username, password, ...(totp ? { code: totp } : {}) }),
-  });
+  // 登录请求 8s 超时（client.ts probe() 的 6s 同款）：后端悬挂时不能永远转圈，
+  // 超时走既有错误路径给用户明确提示。
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  let res: Response;
+  try {
+    res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ username, password, ...(totp ? { code: totp } : {}) }),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    if (e instanceof Error && e.name === "AbortError") throw { code: "TIMEOUT" } as LoginError;
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   if (res.ok) {
     const j = (await res.json().catch(() => ({}))) as { csrf?: string };
     captureCsrf(j.csrf);
@@ -91,6 +104,8 @@ export default function Login({ onOk }: { onOk: () => void }) {
         setTotpStage(true);
         setTotp("");
         setErr(zh ? "需要两步验证：请输入身份验证器的 6 位验证码或恢复码" : "2FA required: enter the 6-digit code or a recovery code");
+      } else if (le.code === "TIMEOUT") {
+        setErr(zh ? "登录请求超时，请检查网络后重试" : "Login request timed out. Check your connection and retry.");
       } else {
         setErr(zh ? (totpStage ? "验证码不正确或已失效，请重试" : "登录失败：请检查用户名与密码") : le.message || "Login failed");
       }

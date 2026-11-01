@@ -28,16 +28,30 @@ impl QueueOutboundSink {
 
 impl OutboundSink for QueueOutboundSink {
     fn submit(&self, from: &str, to: &str, data: &[u8]) -> Result<()> {
-        let entry = mailstack_queue::QueueEntry::new(
+        // 队列条目只承载文本（`data: String`，JSON 持久化），而 LMTP 广播
+        // 8BITMIME：非 UTF-8 的报文经 `from_utf8_lossy` 会把每个坏字节替换成
+        // U+FFFD，转发出去的就是被改写的信。宁可跳过这次转发并告警，也绝不
+        // 投递损坏的报文；本地投递不受影响。
+        let Ok(text) = std::str::from_utf8(data) else {
+            tracing::warn!(
+                from = %from,
+                to = %to,
+                "Sieve redirect skipped: message is not valid UTF-8 and would be corrupted"
+            );
+            return Ok(());
+        };
+        let mut entry = mailstack_queue::QueueEntry::new(
             mailstack_queue::EntryKind::Outbound,
             from,
             vec![to.to_string()],
-            String::from_utf8_lossy(data).to_string(),
+            text.to_string(),
             mailstack_queue::now_unix(),
         )
         .map_err(|error| MailError::storage(format!("outbound enqueue failed: {error}")))?;
+        // 新条目必须走「只新增不覆盖」的入队：撞 id 时后写的一方覆盖先写的，
+        // 收件人视角就是丢信（`enqueue` 的覆盖语义只属于重试回写）。
         self.store
-            .enqueue(&entry)
+            .enqueue_new(&mut entry)
             .map_err(|error| MailError::storage(format!("outbound enqueue failed: {error}")))
     }
 }

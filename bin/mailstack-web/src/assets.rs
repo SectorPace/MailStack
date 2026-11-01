@@ -19,6 +19,13 @@ use axum::response::{IntoResponse, Response};
 /// 托管前端的入口页面。
 const INDEX: &str = "index.html";
 
+/// 单个静态文件的大小上限。
+///
+/// 产物由构建机生成（JS/CSS/图片/字体），正常不会超过几 MiB。把「任意大小」的
+/// 文件原样读进内存，等于允许一个普通 GET 占住一块与文件等大的堆。超限不读，
+/// 直接拒绝；真实路径与大小只进日志，不进响应体。
+const MAX_ASSET_BYTES: u64 = 16 * 1024 * 1024;
+
 /// 为 `path` 生成响应。
 ///
 /// `dist` 为 `None` 表示本次部署没有配置前端产物目录 —— 这时**只**提供 API，
@@ -102,6 +109,21 @@ fn is_safe_relative(relative: &str) -> bool {
 /// 回 SPA 入口。入口缺失时说明「产物没部署」，而不是回一个空白成功。
 async fn index_response(root: &Path) -> Response {
     let index = root.join(INDEX);
+    // 大小上限先于读取：入口页与其它静态文件一样不做无上限的内存缓冲。
+    if let Ok(metadata) = tokio::fs::metadata(&index).await {
+        if metadata.len() > MAX_ASSET_BYTES {
+            mailstack_core::warn::warn_with_detail(
+                "serve frontend index",
+                &format!(
+                    "{} is {} bytes, above the {} MiB cap",
+                    index.display(),
+                    metadata.len(),
+                    MAX_ASSET_BYTES / (1024 * 1024)
+                ),
+            );
+            return not_deployed("frontend bundle is not usable on this host");
+        }
+    }
     match tokio::fs::read(&index).await {
         Ok(bytes) => (
             StatusCode::OK,
@@ -117,14 +139,41 @@ async fn index_response(root: &Path) -> Response {
             bytes,
         )
             .into_response(),
-        Err(error) => not_deployed(&format!(
-            "frontend bundle not found at {} ({error})",
-            index.display()
-        )),
+        Err(error) => {
+            // 响应体只给固定文案：内部路径与 OS 错误串属于日志，不属于给外部的响应。
+            mailstack_core::warn::warn_with_detail(
+                "serve frontend index",
+                &format!("cannot read {}: {error}", index.display()),
+            );
+            not_deployed("frontend bundle is not available on this host")
+        }
     }
 }
 
 async fn file_response(file: &Path) -> Response {
+    // 先看大小、再读内容：超限的文件不进入内存。
+    if let Ok(metadata) = tokio::fs::metadata(file).await {
+        if metadata.len() > MAX_ASSET_BYTES {
+            mailstack_core::warn::warn_with_detail(
+                "serve frontend asset",
+                &format!(
+                    "{} is {} bytes, above the {} MiB static-asset cap",
+                    file.display(),
+                    metadata.len(),
+                    MAX_ASSET_BYTES / (1024 * 1024)
+                ),
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/plain; charset=utf-8"),
+                )],
+                "frontend asset is too large to serve\n",
+            )
+                .into_response();
+        }
+    }
     match tokio::fs::read(file).await {
         Ok(bytes) => {
             // 用真实文件名（而不是 URL）推内容类型 —— 见 `serve` 里的说明。
@@ -144,7 +193,14 @@ async fn file_response(file: &Path) -> Response {
             )
                 .into_response()
         }
-        Err(error) => not_deployed(&format!("cannot read {} ({error})", file.display())),
+        Err(error) => {
+            // 响应体只给固定文案：内部路径与 OS 错误串属于日志，不属于给外部的响应。
+            mailstack_core::warn::warn_with_detail(
+                "serve frontend asset",
+                &format!("cannot read {}: {error}", file.display()),
+            );
+            not_deployed("frontend asset is not available on this host")
+        }
     }
 }
 

@@ -4,8 +4,12 @@ import { SettingsProvider, useSettings } from "./store/settings";
 import { useRoute, type RouteKey } from "./router";
 import { useViewport } from "./hooks/useViewport";
 import { initApi, getMode, onModeChange, rpc, captureCsrf, type Mode } from "./api/client";
+import { cssUrl } from "./lib/format";
+import { DICT, type DictKey } from "./i18n";
 import { Sidebar } from "./components/Sidebar";
 import { Toolbar, type TimeRange } from "./components/Toolbar";
+import { TabBar } from "./components/TabBar";
+import { useIsMobile } from "./hooks/useIsMobile";
 import { CommandPalette } from "./components/CommandPalette";
 import { ToastHost } from "./components/ui";
 import { IconUser, IconSearch, IconGear, IconChevronDown } from "./components/icons";
@@ -81,6 +85,11 @@ function useRefreshSignal() {
   return [n, useCallback(() => setN((v) => v + 1), [])] as const;
 }
 
+/** hash 的首段路径（与 router.ts parse() 同口径），用于识别显式再入 #/setup。 */
+function parseHash(): string {
+  return location.hash.replace(/^#\/?/, "").split("?")[0];
+}
+
 export default function App() {
   return (
     <SettingsProvider>
@@ -90,7 +99,7 @@ export default function App() {
 }
 
 function Shell() {
-  const { prefs, customBg } = useSettings();
+  const { prefs, customBg, t } = useSettings();
   const [route, nav] = useRoute();
   const [scrolled, setScrolled] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -104,6 +113,8 @@ function Shell() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const vp = useViewport();
   const variant: "fixed" | "rail" | "drawer" = vp.isDrawer ? "drawer" : vp.isRail ? "rail" : "fixed";
+  // 移动断点（<768，与 CSS iOS 度量档同口径）：决定底部标签栏与内容底部避让
+  const isMobile = useIsMobile();
 
   const forceLogin = useMemo(() => new URLSearchParams(location.search).get("login") === "1", []);
 
@@ -144,11 +155,23 @@ function Shell() {
   useEffect(() => {
     if (!authed || !booted) return;
     let live = true;
-    // 后端 setup.status 返回 identityConfigured（是否已写身份），没有 completed；
-    // mock 仍回 completed，故两者都兼容，避免真后端下向导永远弹出。
+    // 后端（priv/handlers.rs setup_status_json）返回 completed（setup.json 的
+    // wizardCompleted；旧配置文件回落 false），与 identityConfigured（第一步完成
+    // 即为真）刻意区分 —— 向导弃了一半时 identityConfigured=true 而 completed=false，
+    // 向导必须重新弹出。以 completed 为准；后端没带该字段（旧契约）才回落
+    // identityConfigured（防御式兼容，绝不把「未收尾」当成「已完成」）。
     rpc<{ completed?: boolean; identityConfigured?: boolean }>("setup.status").then((r) => {
       if (!live) return;
-      setSetupDone(r.ok ? !!(r.data.identityConfigured ?? r.data.completed) : true);
+      // {ok:true} 无载荷时 r.data 为 undefined：缺数据按「未配置」处理（保持原
+      // 语义：fail 向向导，不向控制台）。
+      const d = r.ok ? (r.data ?? {}) : null;
+      const done =
+        d == null
+          ? true
+          : typeof d.completed === "boolean"
+            ? d.completed
+            : !(d.identityConfigured ?? false);
+      setSetupDone(done);
     });
     return () => {
       live = false;
@@ -172,6 +195,39 @@ function Shell() {
       window.removeEventListener("mailstack:unauthorized", fn);
       window.removeEventListener("mailstack:logout", fn);
     };
+  }, []);
+
+  // 显式再入向导：hash 路由 #/setup 强制渲染向导（即使 completed === true）。
+  // ROUTES（router.ts）刻意不含 "setup"——它不是导航页，parse() 会把未知 hash
+  // 回落 dashboard；这里在 Shell 单独解析。用途：向导收尾后又想重跑（改域名、
+  // 重发 DNS 校验）时，直接打开 #/setup 即可；向导的「进入控制台」按钮会重新
+  // 调 setup.wizard.complete 固化完成态并清掉该 hash。
+  const [forceSetup, setForceSetup] = useState(() => parseHash() === "setup");
+  useEffect(() => {
+    const fn = () => setForceSetup(parseHash() === "setup");
+    window.addEventListener("hashchange", fn);
+    return () => window.removeEventListener("hashchange", fn);
+  }, []);
+
+  // document.title 随路由：<页面名> · MailStack。页面名用现有导航词典；
+  // 键缺失时用常量兜底（RouteKey 与 nav_* 一一对应，缺失只可能是未来加路由忘配词典）。
+  useEffect(() => {
+    const key = `nav_${route}` as DictKey;
+    const name = Object.prototype.hasOwnProperty.call(DICT, key) ? t(key) : "MailStack";
+    document.title = `${name} · MailStack`;
+  }, [route, t]);
+
+  // 路由切换显式回顶：page-scroll 是滚动容器，motion.div 只做入场动画，
+  // 不复位的话从长列表页切到短设置页会停在中部/底部。
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [route]);
+
+  // 向导收尾回调：固化 completed 后清掉 #/setup，否则 forceSetup 会把刚进
+  // 控制台的用户再拉回向导。
+  const handleSetupDone = useCallback(() => {
+    setSetupDone(true);
+    if (parseHash() === "setup") location.hash = "#/dashboard";
   }, []);
 
   // ⌘K 命令面板
@@ -200,12 +256,17 @@ function Shell() {
         </filter>
       </svg>
       <div className="relative flex h-full">
-      {/* 背景活动光场 —— 晨光山湖照片 + 主题罩层 + 漂移柔光（玻璃折射的真实内容） */}
-      <div className="lightfield" aria-hidden>
-        <div className="lf-photo" style={customBg ? { backgroundImage: `url(${customBg})` } : undefined} />
-        <div className="lf-veil" />
-        <div className="blob b1" />
-      </div>
+      {/* 背景活动光场 —— 晨光山湖照片 + 主题罩层 + 漂移柔光（玻璃折射的真实内容）。
+          仅未登录 / 向导态渲染：登录后的控制台是数据表面，全屏照片会从玻璃后面
+          一直顶到内容层（也更耗合成层）；控制台背景回落 --canvas。 */}
+      {(!authed || setupDone === false) && (
+        <div className="lightfield" aria-hidden>
+          {/* customBg 来自 localStorage，可被外部改写：url() 必须带引号并转义（lib/format.cssUrl） */}
+          <div className="lf-photo" style={customBg ? { backgroundImage: `url(${cssUrl(customBg)})` } : undefined} />
+          <div className="lf-veil" />
+          <div className="blob b1" />
+        </div>
+      )}
 
       {!booted ? (
         <div className="relative z-10 flex h-full w-full items-center justify-center">
@@ -219,10 +280,10 @@ function Shell() {
             <Login onOk={() => setAuthed(true)} />
           </Suspense>
         </div>
-      ) : setupDone === false ? (
+      ) : setupDone === false || forceSetup ? (
         <div className="relative z-10 h-full w-full overflow-y-auto">
           <Suspense fallback={<PageSkeleton />}>
-            <Setup onDone={() => setSetupDone(true)} />
+            <Setup onDone={handleSetupDone} />
           </Suspense>
         </div>
       ) : (
@@ -238,7 +299,13 @@ function Shell() {
 
       <main
         className="relative z-10 flex min-w-0 flex-1 flex-col"
-        style={{ padding: variant === "drawer" ? 10 : "10px 10px 10px 0" }}
+        style={{
+          padding: variant === "drawer" ? 10 : "10px 10px 10px 0",
+          // 移动端内容底部避让 TabBar（fixed，不占布局）：scroll 区止步于标签栏上方
+          paddingBottom: isMobile
+            ? "calc(var(--tabbar-height) + env(safe-area-inset-bottom))"
+            : undefined,
+        }}
       >
         <Toolbar
           route={route}
@@ -251,6 +318,7 @@ function Shell() {
           mode={mode}
           showMenu={variant === "drawer"}
           onMenu={() => setMenuOpen((o) => !o)}
+          menuOpen={menuOpen}
         />
         <div
           ref={scrollRef}
@@ -272,6 +340,10 @@ function Shell() {
           </RefreshContext.Provider>
         </div>
       </main>
+
+      {/* 移动底部标签栏（<768）：主导航 5 定页；其余路由走汉堡抽屉。
+          抽屉遮罩 z-40 > TabBar z-30，打开抽屉时标签栏被盖住（符合预期）。 */}
+      {isMobile && <TabBar route={route} nav={nav} />}
 
       </>
       )}

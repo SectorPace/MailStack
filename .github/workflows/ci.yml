@@ -70,17 +70,21 @@ jobs:
       # deny.toml** —— 也就是说它必然失败、失败又被永久吞掉，供应链门禁实质失效。
       # 现在 deny.toml 已入库（白名单来自本机 449 个 crate 的许可证实测归纳），
       # 并且不再允许失败。
+      # 动作按 commit SHA 钉扎：该 SHA 即 v2 tag 的当前解析结果（2.1.1，2026-07-13，
+      # 经 GitHub API 实测取回），tag 可被上游重新指向，SHA 不能。
       - name: cargo-deny（漏洞 / 许可白名单 / 来源白名单 / 通配依赖）
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2 (2.1.1, 2026-07-13)
         with:
           command: check
 
       # 6.1：原先 `cargo install ... || true` + `cargo audit || true` —— 装不上也过、
-      # 有漏洞也过。现在两步都必须是真成功。
+      # 有漏洞也过。现在两步都必须是真成功，且显式钉住 cargo-audit 版本：
+      # 未钉版本时每次 CI 都可能拉到带新行为/新告警规则的新版，审计结果不可复现
+      #（0.22.2 为 2026-11-01 时点 crates.io 上的最新非 yanked 版本）。
       - name: cargo-audit（RUSTSEC 漏洞库）
         run: |
           set -euo pipefail
-          cargo install cargo-audit --locked
+          cargo install cargo-audit --locked --version 0.22.2
           cargo audit
 
   # ── 不变量门禁：确认安全关键断言未被删除或弱化 ──
@@ -91,6 +95,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+
+      # 与 quality / supply-chain 相同的工具链钉扎（从那两个 job 原样复制）。
+      # 原先本 job 依赖 runner 预装的 rust：ubuntu-24.04 镜像里的 rustc 版本随
+      # GitHub 镜像更新漂移，`cargo test` 的结果不可复现，与其它 job 也不同基线。
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-10-16
+        with:
+          toolchain: 1.98.1
+
       - name: 关键不变量测试必须存在
         run: |
           # 6.8：清单与判定逻辑都只有一份 —— deploy/required-invariants.txt +

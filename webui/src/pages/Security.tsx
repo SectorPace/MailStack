@@ -6,13 +6,14 @@
 // bannedIpScope:"manual" }。它**没有** score / lastScan / failedLogins24h，
 // 封禁条目也没有 fails/until —— 这些一律显示占位符或按真实数据推导，绝不编造。
 // 下面的类型与读取同时兼容 mock 的旧形状。
-import { useEffect, useState, useContext } from "react";
+import { useCallback, useEffect, useState, useContext } from "react";
 import { useSettings } from "../store/settings";
 import { rpc } from "../api/client";
 import { RefreshContext } from "../App";
-import { PageHeader, Card, DataPanel, StatusBadge, toast } from "../components/ui";
+import { PageHeader, Card, DataPanel, StatusBadge, LoadError, toast } from "../components/ui";
 import { DataTable, type Column } from "../components/DataTable";
 import { IconShield, IconCheck, IconX, IconWarn } from "../components/icons";
+import { formatDayTime } from "../lib/format";
 
 type Finding = {
   id?: string;
@@ -76,16 +77,28 @@ export default function Security() {
   const { t } = useSettings();
   const refreshN = useContext(RefreshContext);
   const [scan, setScan] = useState<Scan | null>(null);
+  const [scanErr, setScanErr] = useState<string | null>(null);
   // SPF / DMARC / DKIM 只能从 dns.records 的**实查结果**得到（security.scan 的 findings
   // 是文件系统审计项）；fail2ban 状态来自 services.list。两者都缺失时显示 —。
   const [dns, setDns] = useState<DnsRecord[] | null>(null);
   const [services, setServices] = useState<ServiceRow[] | null>(null);
 
-  useEffect(() => {
-    rpc<Scan>("security.scan").then((r) => r.ok && setScan(r.data));
+  const load = useCallback(() => {
+    // security.scan 失败原先静默：页面永远停在骨架屏，与「加载中」无法区分。
+    rpc<Scan>("security.scan").then((r) => {
+      if (r.ok && r.data) {
+        setScan(r.data);
+        setScanErr(null);
+      } else if (!r.ok) setScanErr(r.error);
+      // r.ok 但无载荷：保持 null → 继续骨架屏，不把 undefined 塞进 state。
+    });
     rpc<DnsRecord[]>("dns.records").then((r) => r.ok && setDns(Array.isArray(r.data) ? r.data : null));
     rpc<ServiceRow[]>("services.list").then((r) => r.ok && setServices(Array.isArray(r.data) ? r.data : null));
-  }, [refreshN]);
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load, refreshN]);
 
   async function unban(ip: string) {
     const r = await rpc("security.unban", { ip });
@@ -95,7 +108,18 @@ export default function Security() {
     } else toast(r.error, "err");
   }
 
-  if (!scan) return <div className="p-4"><div className="skeleton h-64" /></div>;
+  if (!scan)
+    return (
+      <div className="p-4">
+        {scanErr ? (
+          <Card>
+            <LoadError message={scanErr} onRetry={load} />
+          </Card>
+        ) : (
+          <div className="skeleton h-64" />
+        )}
+      </div>
+    );
 
   const findings = scan.findings ?? [];
   const bans = scan.bans ?? scan.bannedIps ?? [];
@@ -119,7 +143,7 @@ export default function Security() {
       <PageHeader
         title={t("security_title")}
         sub={t("security_sub")}
-        right={<span className="badge badge-neutral">{t("last_scan")} · {lastScan ? lastScan.slice(5, 16) : "—"}</span>}
+        right={<span className="badge badge-neutral">{t("last_scan")} · {lastScan ? formatDayTime(lastScan) : "—"}</span>}
       />
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-[300px_minmax(0,1fr)]">
@@ -129,7 +153,7 @@ export default function Security() {
             <ScoreRing score={score} />
             <div className="mt-3 text-[13px] font-semibold text-[var(--text-1)]">{t("threat_scan")}</div>
             <div className="text-[11.5px] text-[var(--text-3)]">
-              {scan.failedLogins24h != null ? `${scan.failedLogins24h} ${t("failed_logins")} · 24h` : `${findings.length} findings`}
+              {scan.failedLogins24h != null ? `${scan.failedLogins24h} ${t("failed_logins")} · 24h` : t("findings_count", { n: findings.length })}
             </div>
           </Card>
           <Card>

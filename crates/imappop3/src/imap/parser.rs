@@ -308,8 +308,13 @@ fn parse_quoted(bytes: &[u8], start: usize) -> Result<(String, usize)> {
         let byte = bytes[index];
         index += 1;
         if escaped {
-            out.push(byte);
             escaped = false;
+            // RFC 3501 禁止 quoted string 里出现 CR/LF，转义字节也不例外：
+            // 否则 `"a\<CR>b"` 会从下面的检查绕过去。
+            if byte == b'\r' || byte == b'\n' {
+                return Err(MailError::protocol("CR/LF inside a quoted string"));
+            }
+            out.push(byte);
             continue;
         }
         match byte {
@@ -481,6 +486,8 @@ mod tests {
             b"A1 LOGIN {99999999999999999999}\r\n",
             b"A1 LOGIN {4\r\n",
             b"A1 NOOP\x07\r\n",
+            // 转义过的 CR 也算 quoted string 里的 CR/LF。
+            b"A1 LOGIN \"a\\\rb\"\r\n",
         ] {
             assert!(
                 parse(input).await.is_err(),

@@ -133,14 +133,40 @@ pub async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-/// 从 Cookie 头里取出 `mailstack_session` 的值。
+/// `/api/*` 响应禁止任何缓存（`Cache-Control: no-store`）。
+///
+/// 会话与登录响应把 **CSRF token** 放在响应体里（`GET /api/auth/session`、
+/// `POST /api/auth/login`）；这类带凭据的响应一旦被中间层（浏览器磁盘缓存、
+/// 公司代理）缓存，下一个读到缓存副本的人就拿到了一枚可直接冒用会话的
+/// token。管理面的读数（队列、指标、会话列表）同样不该被缓存。
+/// 路径判定让本层可以安全挂在同时托管静态产物的宿主上 —— `build_router`
+/// 的 `/api` 兜底 404 也经它覆盖。
+async fn no_store_api(request: Request, next: Next) -> Response {
+    // 路径判定要在把 request 交给 next 之前取好 —— Request 会被移动。
+    let is_api = request.uri().path().starts_with("/api/");
+    let mut response = next.run(request).await;
+    if is_api {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
+}
+
+/// 从 Cookie 头里取出会话 ID。
+///
+/// 会话 Cookie 的名字是**条件性**的（加 `Secure` 的部署带 `__Host-` 前缀、
+/// 默认 HTTP 部署不带，见 [`crate::session::session_cookie_context`]），解析侧
+/// 必须两个名字都认 —— 只认其一，另一种部署的浏览器会被全体判成未认证。
 pub fn session_cookie(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in raw.split(';') {
         let part = part.trim();
-        if let Some(value) = part.strip_prefix(&format!("{SESSION_COOKIE}=")) {
-            if !value.is_empty() {
-                return Some(value.to_string());
+        for name in crate::session::SESSION_COOKIE_NAMES {
+            if let Some(value) = part.strip_prefix(&format!("{name}=")) {
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
             }
         }
     }
@@ -248,14 +274,30 @@ async fn ai_rate_limit(
         return next.run(request).await;
     }
     let peer_addr = peer.map(|axum::extract::ConnectInfo(addr)| addr);
+    match ai_limited_response(&state, peer_addr.as_ref()) {
+        Some(response) => response,
+        None => next.run(request).await,
+    }
+}
+
+/// AI 独立限流的统一入口：本来源已耗尽配额时返回 **`Some(429 响应)`**。
+///
+/// [`ai_rate_limit`]（`/api/ai/*` 路由）与 `/api/rpc` 桥（`ai.*` 动作）共用
+/// 这一个构造，保证两边 429 的状态码、错误外壳与 `Retry-After` 语义完全一致。
+/// 桥是前端的兜底传输层，全部 `ai.*` 动作都能经它触达 —— 只限流 `/api/ai/`
+/// 路径的话，改走桥就用一句 `{"action":"ai.chat"}` 绕开了出站付费调用的配额。
+pub fn ai_limited_response(
+    state: &AppState,
+    peer: Option<&std::net::SocketAddr>,
+) -> Option<Response> {
     match state
         .inner
         .ai_limiter
-        .check(&crate::routes::client_key(peer_addr.as_ref()))
+        .check(&crate::routes::client_key(peer))
     {
-        crate::ratelimit::LimitVerdict::Allow => next.run(request).await,
+        crate::ratelimit::LimitVerdict::Allow => None,
         crate::ratelimit::LimitVerdict::Limited { retry_after_secs } => {
-            ApiError::rate_limited(retry_after_secs).into_response()
+            Some(ApiError::rate_limited(retry_after_secs).into_response())
         }
     }
 }
@@ -273,13 +315,29 @@ pub async fn auth_session(axum::Extension(user): axum::Extension<AuthenticatedUs
 /// `POST /api/auth/logout`。
 pub async fn auth_logout(
     State(state): State<AppState>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
     axum::Extension(user): axum::Extension<AuthenticatedUser>,
 ) -> Response {
     state.inner.sessions.remove(&user.session_id);
-    Json(serde_json::json!({ "ok": true })).into_response()
+    let mut response = Json(serde_json::json!({ "ok": true })).into_response();
+    // 5.5：只删服务端会话而不作废浏览器那枚 cookie，「登出了但立刻又自动
+    // 登录」照样成立。这里与各吊销路径用同一个作废助手 —— Cookie 名与
+    // `Secure` 必须和登录时逐字配对（见 `session_cookie_context`）。
+    let peer_addr = peer.map(|axum::extract::ConnectInfo(addr)| addr);
+    match crate::routes::clear_session_cookie(
+        &mut response,
+        &state,
+        peer_addr.as_ref(),
+        crate::session::forwarded_proto(&headers).as_deref(),
+    ) {
+        Ok(()) => response,
+        Err(message) => ApiError::internal(message).into_response(),
+    }
 }
 
-/// 组装**只含 `/api` 面**的路由：不含兜底、不含安全响应头。
+/// 组装**只含 `/api` 面**的路由：不含兜底；安全响应头由调用方统一加，
+/// 但 `Cache-Control: no-store`（CSRF token 会出现在响应体里）已内建于本层。
 ///
 /// 认证层挂在**业务路由**上，而 `/api/health` 与 `/api/auth/login` 显式挂在认证层之前。
 ///
@@ -369,6 +427,10 @@ pub fn build_api_router(state: AppState) -> Router {
         .route("/api/doctor", get(crate::routes::system_doctor))
         .route("/api/system/doctor", get(crate::routes::system_doctor))
         .route("/api/setup/status", get(crate::routes::setup_status))
+        .route(
+            "/api/setup/wizard/complete",
+            post(crate::routes::setup_wizard_complete),
+        )
         // AI 子系统：`GET /api/ai/config` 是只读公开配置；其余 9 条写/出站路由中，
         // `/api/ai/dns-chat`、`/api/ai/diagnose-dns`、`/api/ai/parse-dns-raw` 与
         // 各自的「非 dns」路由映射到**同一个动作**（契约如此，不新增动作）。
@@ -442,9 +504,14 @@ pub fn build_api_router(state: AppState) -> Router {
         // 两道防线缺一不可：
         // 1. `DefaultBodyLimit` 限制**实际读取量**（覆盖分块传输、无 Content-Length 的情形）；
         // 2. `reject_oversized_bodies` 在进处理器**之前**按 Content-Length 直接回 413
-        //    —— 因为 `DefaultBodyLimit` 的 413 会被 `Option<Json<Value>>` 吞掉（见下）。
+        //    —— 分块超限走不到这条快速路径，但提取器会拒绝（回 400 错误外壳），
+        //    内存上界仍由 `DefaultBodyLimit` 兜住。
         .layer(axum::extract::DefaultBodyLimit::max(API_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn(reject_oversized_bodies))
+        // `/api/*` 一律 no-store：CSRF token 在会话/登录响应体里，绝不可被缓存。
+        // 这里挂在 API 面上，宿主无论怎么组合都拿得到；`build_router` 还会再
+        // 挂一次以覆盖 `/api` 兜底 404（同一判定，重复插入无害）。
+        .layer(middleware::from_fn(no_store_api))
 }
 
 /// INV-12 / 5.1 的「快速拒绝」半边：在进任何提取器之前按 `Content-Length` 判定。
@@ -465,8 +532,11 @@ pub fn build_api_router(state: AppState) -> Router {
 /// 实测表现为处理器拿着空对象去调助手，最终回 500（与上限毫无关系的一句错误）。
 /// 在提取器之前判定，才能让「超限」这件事如实反映成 413。
 ///
-/// 这条同时也堵住了 `Option<Json>` 更广的一类静默失败：畸形 JSON 会被当成 `{}`。
-/// 彻底修掉需要把所有处理器改成非 `Option` 的 `Json`，属于契约层改动，另行登记。
+/// 处理器侧的另一类静默失败（`Option<Json>` 把畸形 JSON / 错误 Content-Type
+/// 也塌缩成「没带请求体」）现已彻底修掉：处理器改用
+/// `Result<Json, JsonRejection>`，畸形/类型错误的请求体现在是显式 400 错误
+/// 外壳（见 `routes::json_payload`）。本中间件仍保留 —— 它是 Content-Length
+/// 可判定时 413 的快速路径，并且先于提取器执行。
 async fn reject_oversized_bodies(request: Request, next: Next) -> Response {
     if let Some(length) = request
         .headers()
@@ -488,6 +558,7 @@ async fn reject_oversized_bodies(request: Request, next: Next) -> Response {
 pub fn build_router(state: AppState) -> Router {
     build_api_router(state)
         .fallback(crate::routes::api_fallback)
+        .layer(middleware::from_fn(no_store_api))
         .layer(middleware::from_fn(security_headers))
 }
 
@@ -599,9 +670,9 @@ mod tests {
 
     /// 无 `Content-Length`（分块）时内存仍必须被 `DefaultBodyLimit` 兜住。
     ///
-    /// 这一路**不会**得到 413：`Option<Json<Value>>` 把限流拒绝吞成 `None`
-    /// （见 `reject_oversized_bodies` 的注释）。此处只钉住「拒绝发生」这个事实，
-    /// 不假装状态码是对的 —— 真正的修法是让处理器不再用 `Option<Json>`。
+    /// 这一路**不会**得到 413 的快速路径（那需要 `Content-Length` 可判定）：
+    /// 限流错误在 `Json` 提取时暴露，处理器回 400 错误外壳。此处钉住
+    /// 「拒绝发生」这个事实 —— 真正的内存上界由 `DefaultBodyLimit` 保证。
     #[tokio::test]
     async fn a_chunked_oversized_body_is_still_refused() {
         let (root, state) = test_state("bodylimitchunked");
@@ -895,6 +966,47 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// 会话端点把 **CSRF token** 放在响应体里 —— 这类带凭据的响应绝不可被
+    /// 缓存（浏览器磁盘缓存、公司代理都会成为 token 的二次分发点）。
+    /// `/api` 兜底 404 由同一层覆盖。
+    #[tokio::test]
+    async fn session_responses_carry_cache_control_no_store() {
+        let (root, state) = test_state("nostore");
+        let (sid, _csrf) = state.inner.sessions.create_session("admin");
+        let app = build_router(state);
+
+        let session = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/auth/session")
+                    .header(header::COOKIE, format!("{SESSION_COOKIE}={sid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.status(), StatusCode::OK);
+        assert_eq!(
+            session.headers()["cache-control"],
+            "no-store",
+            "会话响应（含 CSRF token）绝不可缓存"
+        );
+
+        let fallback = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fallback.status(), StatusCode::NOT_FOUND);
+        assert_eq!(fallback.headers()["cache-control"], "no-store");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[tokio::test]
     async fn two_factor_state_is_served_in_process_and_the_write_routes_are_wired() {
         let (root, state) = test_state("totproutes");
@@ -1064,24 +1176,25 @@ mod tests {
         assert_eq!(session_cookie(&headers).as_deref(), Some("abc123"));
     }
 
-    /// 回归守卫：`__Host-` 前缀是这次安全修复的一部分，解析侧必须认新名字。
-    ///
-    /// 若解析仍按旧名 `mailstack_session` 找 substring，`__Host-mailstack_session=…`
-    /// 里恰好也含 `mailstack_session=`，所以**这条断言单独看不出问题**；
-    /// 真正的风险是「下发新名、解析旧名」这种不一致。因此下面再钉一条
-    /// 「旧名（无前缀）不再被接受」—— 强制所有浏览器重新登录正是本次改动的
-    /// 明确意图（见 `SESSION_COOKIE` 的文档）。
+    /// Cookie 名是**条件性**的（本次修复）：会加 `Secure` 的部署下发
+    /// `__Host-mailstack_session`，默认 HTTP 部署下发无前缀的
+    /// `mailstack_session`（无 `Secure` 的 `__Host-` cookie 会被浏览器拒收）。
+    /// 解析侧必须两个名字都认 —— 只认其一，另一种部署的浏览器会被全体判成
+    /// 未认证。空值仍然无效。
     #[test]
-    fn session_cookie_parsing_requires_the_host_prefix() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::COOKIE,
-            HeaderValue::from_static("mailstack_session=abc123"),
-        );
-        assert!(
-            session_cookie(&headers).is_none(),
-            "不带 `__Host-` 前缀的旧 cookie 不得再被接受"
-        );
+    fn session_cookie_parsing_accepts_both_conditional_names() {
+        for name in crate::session::SESSION_COOKIE_NAMES {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::COOKIE,
+                HeaderValue::from_str(&format!("{name}=abc123")).unwrap(),
+            );
+            assert_eq!(
+                session_cookie(&headers).as_deref(),
+                Some("abc123"),
+                "{name} 必须被解析"
+            );
+        }
     }
 
     #[test]

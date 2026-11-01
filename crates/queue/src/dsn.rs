@@ -164,17 +164,22 @@ pub fn build_dsn(req: &DsnRequest<'_>) -> String {
 
 /// 由状态码推导 RFC 3463 的扩展状态码（`X.Y.Z`）。
 ///
-/// 只对 4xx/5xx 给出诚实映射；未知一律回落到 `5.0.0`（本函数只在退信时调用，
-/// 而退信意味着已判定为最终失败）。
+/// **本函数只服务于最终失败退信**（`Action: failed`），因此映射结果必须是
+/// 永久类（5.x.x）：退信意味着重试预算已经耗尽、不再重试 —— 这时给 4xx 的
+/// 最后一次应答安一个 `4.0.0`，就会产出「`Status: 4.0.0`（临时）+ `Action: failed`
+/// （永久）」的自相矛盾，下游按 Status 分类的系统会把这封退信当成「还会重试」。
+///
+/// 所以：5xx 保留诚实映射（诊断价值更高）；4xx 与未知一律回落 `5.0.0` ——
+/// 最后一次是临时失败这一事实保留在 `Diagnostic-Code` 的人类可读文本里，
+/// 不进机器可读的 `Status`。
 fn extended_status(code: Option<u16>) -> &'static str {
     match code {
-        Some(421) | Some(451) => "4.0.0",
-        Some(450) | Some(452) => "4.0.0",
         Some(550) => "5.1.1",
         Some(551) => "5.1.6",
         Some(552) => "5.2.2",
         Some(553) => "5.1.3",
         Some(554) => "5.0.0",
+        // 4xx（重试耗尽的临时失败）与未知码：最终状态是永久失败。
         _ => "5.0.0",
     }
 }
@@ -523,10 +528,28 @@ mod tests {
 
     #[test]
     fn extended_status_covers_the_common_codes() {
-        assert_eq!(extended_status(Some(450)), "4.0.0");
         assert_eq!(extended_status(Some(550)), "5.1.1");
         assert_eq!(extended_status(Some(552)), "5.2.2");
         assert_eq!(extended_status(None), "5.0.0", "未知状态码按最终失败处理");
+    }
+
+    /// 重试预算耗尽的退信往往带着**最后一次**临时失败（4xx）的状态码。
+    /// 机器可读的 `Status` 必须与 `Action: failed` 一致（永久类）；
+    /// 「最后一次是临时失败」这一事实保留在人类可读的诊断文本里。
+    #[test]
+    fn an_exhausted_transient_failure_gets_a_permanent_status_not_4xx() {
+        let original = original();
+        let message = dsn(&original, "452 4.2.2 over quota (last attempt)", Some(452));
+
+        assert!(
+            message.contains("Status: 5.0.0"),
+            "最终退信不得写 4.x.x 状态（与 Action: failed 自相矛盾）：\n{message}"
+        );
+        assert!(message.contains("Action: failed"));
+        assert!(
+            message.contains("452 4.2.2 over quota (last attempt)"),
+            "最后一次失败的原因必须仍可读：\n{message}"
+        );
     }
 
     #[test]

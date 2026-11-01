@@ -523,6 +523,8 @@ pub fn validate_archive(
 ///
 /// 少了第 1 步，一次「写到一半才发现第 3 个成员是符号链接」的恢复会留下
 /// 半个现场；少了 `O_NOFOLLOW`，校验与落地之间的时间差就足以让攻击者换掉目标。
+/// 落地阶段还带**真实回滚**：覆盖既有文件之前先把原件备份进 staging，
+/// 任一步失败就还原已覆盖的、删除新建的（尽力而为），然后才报错返回。
 pub fn extract_archive(
     archive: &Path,
     dest_root: &Path,
@@ -554,55 +556,159 @@ pub fn extract_archive(
         if let Some(parent) = staged.parent() {
             std::fs::create_dir_all(parent).map_err(|e| BackupError::io(parent, e))?;
         }
-        let mut out = std::fs::File::create(&staged).map_err(|e| BackupError::io(&staged, e))?;
+        // staging 里的成员是**未校验落地的机密**（admin.json / sasl_passwd / 私钥）。
+        // staging 目录本身已 0700，但成员文件仍要以 O_EXCL + 0600 创建：
+        // 首字节落盘之前权限就必须到位，最终权限由落地阶段套用（不变）。
+        let mut out = create_mode_file(&staged, 0o600)?;
         std::io::copy(&mut entry, &mut out).map_err(|e| BackupError::io(&staged, e))?;
         out.flush().map_err(|e| BackupError::io(&staged, e))?;
     }
 
+    // 落地阶段：把 staging 里的成员逐个复制到目标目录。
+    //
+    // 「任何一步失败都不留下半个现场」由**真实回滚**兑现：
+    // * 覆盖既有文件之前，先把原件备份进 staging（0600）；
+    // * 任一步失败，把已覆盖的文件从备份还原、删除新建的文件（尽力而为，
+    //   逐项记录失败），然后才把最初的错误返回给调用方。
     let mut restored = Vec::new();
-    for normalized in &inspected {
-        let source = staging.path().join(normalized);
-        if source.is_dir() {
-            continue;
-        }
-        let parts: Vec<&str> = normalized.split('/').collect();
-        let parent = make_safe_parent(&dest_root, &parts[..parts.len() - 1])?;
-        let target = parent.join(parts[parts.len() - 1]);
-        if std::fs::symlink_metadata(&target)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return Err(BackupError::invalid(format!(
-                "Restore target is a symbolic link: {}",
-                target.display()
-            )));
-        }
-        let existed = target.exists();
-        if existed {
-            let metadata =
-                std::fs::symlink_metadata(&target).map_err(|e| BackupError::io(&target, e))?;
-            if hard_link_count(&metadata) > 1 {
+    // (目标路径, staging 内的备份路径, 覆盖前的权限位)
+    let mut overwritten: Vec<(PathBuf, PathBuf, Option<u32>)> = Vec::new();
+    let mut created: Vec<PathBuf> = Vec::new();
+
+    let landing = (|| -> Result<(), BackupError> {
+        for normalized in &inspected {
+            let source = staging.path().join(normalized);
+            if source.is_dir() {
+                continue;
+            }
+            let parts: Vec<&str> = normalized.split('/').collect();
+            let parent = make_safe_parent(&dest_root, &parts[..parts.len() - 1])?;
+            let target = parent.join(parts[parts.len() - 1]);
+            if std::fs::symlink_metadata(&target)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
                 return Err(BackupError::invalid(format!(
-                    "Restore target has multiple hard links: {}",
+                    "Restore target is a symbolic link: {}",
                     target.display()
                 )));
             }
+            let existed = target.exists();
+            let mode_before = if existed { file_mode(&target) } else { None };
+            if existed {
+                let metadata =
+                    std::fs::symlink_metadata(&target).map_err(|e| BackupError::io(&target, e))?;
+                if hard_link_count(&metadata) > 1 {
+                    return Err(BackupError::invalid(format!(
+                        "Restore target has multiple hard links: {}",
+                        target.display()
+                    )));
+                }
+                // 覆盖之前先备份原件 —— 回滚的原料必须在第一次写入前就备好。
+                let backup = staging
+                    .path()
+                    .join(format!(".rollback-{}", unique_temp_tag()));
+                backup_original(&target, &backup)?;
+                overwritten.push((target.clone(), backup, mode_before));
+            } else {
+                created.push(target.clone());
+            }
+            let mode = restored_mode(parts[parts.len() - 1]);
+            land_one(
+                &source,
+                &target,
+                mode,
+                parts[parts.len() - 1],
+                existed,
+                &parent,
+            )?;
+            restored.push(target);
         }
-        let mode = restored_mode(parts[parts.len() - 1]);
-        let mut output = open_no_follow(&target, mode)?;
-        let mut input = std::fs::File::open(&source).map_err(|e| BackupError::io(&source, e))?;
-        std::io::copy(&mut input, &mut output).map_err(|e| BackupError::io(&target, e))?;
-        output.flush().map_err(|e| BackupError::io(&target, e))?;
-        output.sync_all().map_err(|e| BackupError::io(&target, e))?;
-        set_mode(&output, &target, mode)?;
-        if parts[parts.len() - 1] == ADMIN_FILE_NAME {
-            chown_admin_group(&output, &target);
-        } else if !existed {
-            chown_like_parent(&output, &parent);
-        }
-        restored.push(target);
+        Ok(())
+    })();
+
+    if let Err(error) = landing {
+        rollback_landing(&overwritten, &created);
+        return Err(error);
     }
     Ok(restored)
+}
+
+/// 覆盖目标之前的原件备份：逐字节复制进 staging（0600），不改变原件。
+fn backup_original(target: &Path, backup: &Path) -> Result<(), BackupError> {
+    let mut input = std::fs::File::open(target).map_err(|e| BackupError::io(target, e))?;
+    let mut output = create_mode_file(backup, 0o600)?;
+    std::io::copy(&mut input, &mut output).map_err(|e| BackupError::io(backup, e))?;
+    output.flush().map_err(|e| BackupError::io(backup, e))?;
+    output.sync_all().map_err(|e| BackupError::io(backup, e))?;
+    Ok(())
+}
+
+/// 落地单个成员：以 `O_NOFOLLOW` 打开目标、复制、套用最终权限与属主。
+fn land_one(
+    source: &Path,
+    target: &Path,
+    mode: u32,
+    file_name: &str,
+    existed: bool,
+    parent: &Path,
+) -> Result<(), BackupError> {
+    let mut output = open_no_follow(target, mode)?;
+    let copy = (|| -> Result<(), BackupError> {
+        let mut input = std::fs::File::open(source).map_err(|e| BackupError::io(source, e))?;
+        std::io::copy(&mut input, &mut output).map_err(|e| BackupError::io(target, e))?;
+        output.flush().map_err(|e| BackupError::io(target, e))?;
+        output.sync_all().map_err(|e| BackupError::io(target, e))?;
+        Ok(())
+    })();
+    copy?;
+    set_mode(&output, target, mode)?;
+    if file_name == ADMIN_FILE_NAME {
+        chown_admin_group(&output, target);
+    } else if !existed {
+        chown_like_parent(&output, parent);
+    }
+    Ok(())
+}
+
+/// 落地失败时的尽力回滚：已覆盖的文件从备份还原，新建的文件删除。
+///
+/// 回滚自身也可能失败 —— 逐项 warn，但不掩盖最初让落地失败的那个错误。
+fn rollback_landing(
+    overwritten: &[(PathBuf, PathBuf, Option<u32>)],
+    created: &[PathBuf],
+) {
+    for (target, backup, mode_before) in overwritten {
+        let result = (|| -> Result<(), BackupError> {
+            let mut output = open_no_follow(target, RESTORED_FILE_MODE)?;
+            let mut input =
+                std::fs::File::open(backup).map_err(|e| BackupError::io(backup, e))?;
+            std::io::copy(&mut input, &mut output).map_err(|e| BackupError::io(target, e))?;
+            output.flush().map_err(|e| BackupError::io(target, e))?;
+            output.sync_all().map_err(|e| BackupError::io(target, e))?;
+            if let Some(mode) = mode_before {
+                set_mode(&output, target, *mode)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            crate::warn::warn_with_detail(
+                "restore rollback",
+                &format!("{}: {error}", target.display()),
+            );
+        }
+        let _ = std::fs::remove_file(backup);
+    }
+    for target in created {
+        match std::fs::remove_file(target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => crate::warn::warn_with_detail(
+                "restore rollback",
+                &format!("remove {}: {e}", target.display()),
+            ),
+        }
+    }
 }
 
 /// 恢复时该用的权限位。
@@ -684,6 +790,12 @@ pub fn is_gzip_file(path: &Path) -> bool {
 /// 目录会被递归展开；**符号链接一律跳过**（归档里放链接是恢复期攻击的第一步，
 /// 自家生成的归档没必要带链接）。`allow_partial` 为真时，单个文件读不到只记账，
 /// 不中断整次备份。
+///
+/// 归档**不是**直接写 `target`：`File::create` 以进程 umask（通常 0644）落盘，
+/// 而 gzip 可能耗时数分钟 —— 那意味着整段窗口里凭证与私钥对全系统可读。
+/// 这里在同目录先建一个 `O_EXCL` + 0600 的唯一临时文件（权限在首字节落盘前
+/// 生效，也不会跟随预置的符号链接），gzip 完成后 `rename` 到 `target`，
+/// 保留「目标已存在则覆盖」的既有语义。
 pub fn create_archive(
     root: &Path,
     sources: &[PathBuf],
@@ -694,30 +806,45 @@ pub fn create_archive(
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| BackupError::io(parent, e))?;
     }
-    let file = std::fs::File::create(target).map_err(|e| BackupError::io(target, e))?;
-    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-    let mut builder = tar::Builder::new(encoder);
-    let mut partial = false;
+    let staged = unique_sibling_path(target);
+    let write = (|| -> Result<bool, BackupError> {
+        let file = create_mode_file(&staged, ARCHIVE_MODE)?;
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut partial = false;
 
-    for source in sources {
-        add_tree(
-            &mut builder,
-            root,
-            source,
-            excludes,
-            allow_partial,
-            &mut partial,
-        )?;
+        for source in sources {
+            add_tree(
+                &mut builder,
+                root,
+                source,
+                excludes,
+                allow_partial,
+                &mut partial,
+            )?;
+        }
+
+        let encoder = builder
+            .into_inner()
+            .map_err(|e| BackupError::Archive(e.to_string()))?;
+        encoder.finish().map_err(|e| BackupError::io(&staged, e))?;
+        Ok(partial)
+    })();
+
+    match write {
+        Ok(partial) => {
+            // gzip 句柄已随闭包结束而关闭，rename 是同目录内的原子替换。
+            std::fs::rename(&staged, target).map_err(|e| BackupError::io(target, e))?;
+            // belt-and-braces：临时文件创建时已是 0600，rename 后再收紧一次。
+            set_mode_path(target, ARCHIVE_MODE)?;
+            Ok(partial)
+        }
+        Err(error) => {
+            // 失败路径清理临时归档：不能把半份凭证留在备份目录里。
+            let _ = std::fs::remove_file(&staged);
+            Err(error)
+        }
     }
-
-    let encoder = builder
-        .into_inner()
-        .map_err(|e| BackupError::Archive(e.to_string()))?;
-    encoder.finish().map_err(|e| BackupError::io(target, e))?;
-    // 归档里有凭证与私钥，权限必须显式收紧 —— `File::create` 会用进程 umask
-    // （通常是 0644）落盘，等于把备份内容对整个系统可读。
-    set_mode_path(target, ARCHIVE_MODE)?;
-    Ok(partial)
 }
 
 fn add_tree(
@@ -980,9 +1107,12 @@ pub fn restore_archive(
                 "gpg is not installed; encrypted backups cannot be restored",
             ));
         }
+        // 唯一后缀（pid + 序号 + 纳秒，与 `atomic.rs` 的 temp_path 同一模式）：
+        // 原先只有 PID，同一进程里两个并发恢复会撞名 —— 各自把解密结果写进
+        // 同一个 `.tar`，互相覆盖出半写文件，再被对方拿去恢复。
         let staged = store
             .dir()
-            .join(format!(".mailstack-restore-{}.tar", std::process::id()));
+            .join(format!(".mailstack-restore-{}.tar", unique_temp_tag()));
         cipher.decrypt(names_archive, &staged, &passphrase)?;
         Some(staged)
     } else {
@@ -1036,7 +1166,8 @@ fn is_sha256_hex(value: &str) -> bool {
 }
 
 /// 加密归档（就地）。失败时**连明文一起删掉** —— 运维要求了加密，留下明文
-/// 就是一次静默降级。
+/// 就是一次静默降级。加密成功之后的任何一步（chmod / rename）失败同样如此：
+/// staged 密文与明文归档一并尽力清理，不让半份成品留在盘上。
 pub fn encrypt_in_place(
     archive: &Path,
     passphrase: &str,
@@ -1053,11 +1184,18 @@ pub fn encrypt_in_place(
         archive.file_name().unwrap_or_default().to_string_lossy()
     ));
     match cipher.encrypt(archive, &staged, passphrase) {
-        Ok(()) => {
+        Ok(()) => match (|| -> Result<(), BackupError> {
             set_mode_path(&staged, ARCHIVE_MODE)?;
-            std::fs::rename(&staged, archive).map_err(|e| BackupError::io(archive, e))?;
-            Ok(())
-        }
+            std::fs::rename(&staged, archive).map_err(|e| BackupError::io(archive, e))
+        })() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // 尽力清理：失败不能掩盖真正的错误。
+                let _ = std::fs::remove_file(&staged);
+                let _ = std::fs::remove_file(archive);
+                Err(error)
+            }
+        },
         Err(error) => {
             let _ = std::fs::remove_file(&staged);
             let _ = std::fs::remove_file(archive);
@@ -1067,6 +1205,63 @@ pub fn encrypt_in_place(
 }
 
 // ─────────────────────────── 平台细节 ───────────────────────────
+
+/// 进程内唯一的临时名标签：`<pid>.<序号>.<纳秒>`。
+///
+/// 与 `atomic.rs` 的 `temp_path` 同一模式：序号保证同进程快速连续调用不撞名，
+/// 纳秒保证跨进程/跨重启也不撞。
+fn unique_temp_tag() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}.{}.{}", std::process::id(), seq, nanos)
+}
+
+/// 目标同目录下的唯一临时路径（`<name>.tmp.<pid>.<seq>.<nanos>`）。
+///
+/// 固定同目录，`rename` 才是同文件系统内的原子操作；唯一后缀让
+/// 「预置同名临时文件/符号链接」与「两个写者交错」都不再可能。
+fn unique_sibling_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.tmp.{}", unique_temp_tag()))
+}
+
+/// 以 `O_CREAT|O_EXCL` 创建文件，`mode` 在**首字节落盘之前**就生效。
+///
+/// 生产目标是 Linux，与 [`open_no_follow`] 的做法一致；Windows 上没有
+/// 「创建时指定权限」，只保留普通创建（`create_new` 的排他性仍然有效）。
+fn create_mode_file(path: &Path, mode: u32) -> Result<std::fs::File, BackupError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    options.open(path).map_err(|e| BackupError::io(path, e))
+}
+
+/// 文件的权限位（仅 mode 部分）；读不到返回 `None`。
+#[cfg(unix)]
+fn file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o777)
+}
+
+#[cfg(not(unix))]
+fn file_mode(_path: &Path) -> Option<u32> {
+    None
+}
 
 /// 以 `O_NOFOLLOW` 打开目标：校验与落地之间的时间差里若有人把目标换成符号链接，
 /// 这次打开会直接失败，而不是顺着链接写出去。
@@ -1163,6 +1358,10 @@ fn chown_like_parent(file: &std::fs::File, parent: &Path) {
 }
 
 /// 解压用的临时目录，析构即清理。
+///
+/// 目录本身以 **0700** 创建：staging 里会短暂存放归档中的全部机密
+/// （admin.json / sasl_passwd / 私钥成员），权限必须在第一个文件落盘之前
+/// 就是 0700 —— `/tmp` 下的 0755 目录等于把这些内容借给全系统看。
 struct StagingDir {
     path: PathBuf,
 }
@@ -1178,7 +1377,20 @@ impl StagingDir {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        std::fs::create_dir_all(&base).map_err(|e| BackupError::io(&base, e))?;
+        #[cfg(unix)]
+        {
+            // `DirBuilder::mode` 让 create(2) 那一刻就是 0700（umask 只会更严）；
+            // 不能先 create 再 chmod —— 那个窗口里文件已经可以落进去了。
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&base)
+                .map_err(|e| BackupError::io(&base, e))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(&base).map_err(|e| BackupError::io(&base, e))?;
+        }
         Ok(Self { path: base })
     }
 
@@ -1748,6 +1960,82 @@ mod tests {
             std::fs::read_dir(&dest).unwrap().next().is_none(),
             "dryRun 不得写任何目标路径"
         );
+    }
+
+    /// 落地失败必须**真实回滚**：已覆盖的文件从 staging 备份还原为原件。
+    ///
+    /// 归档成员按传入顺序落地：settings.json 覆盖既有文件，下一个成员
+    /// （evil.json）的目标是符号链接 → 落地失败。失败的 restore 不得把
+    /// settings.json 留在「半恢复」状态。
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_landing_restores_overwritten_files_from_their_backups() {
+        let root = temp_root("rollback");
+        let store = BackupStore::new(root.join("backups"));
+        let target = build_backup(
+            &store,
+            "mailstack-backup-20261002-120000.tar.gz",
+            &[
+                // 先落地：dest 里已存在，会被覆盖 → 必须被回滚还原。
+                ("etc/mailstack/settings.json", b"new-settings"),
+                // 后落地：目标是符号链接 → 落地必然失败。
+                ("etc/mailstack/evil.json", b"never-lands"),
+            ],
+            false,
+            &NoCipher,
+        );
+
+        let dest = root.join("dest");
+        write(&dest.join("etc/mailstack/settings.json"), b"original-settings");
+        std::os::unix::fs::symlink(
+            dest.join("etc/mailstack/nowhere").as_path(),
+            dest.join("etc/mailstack/evil.json").as_path(),
+        )
+        .unwrap();
+
+        let error = restore_archive(
+            &store,
+            &target,
+            &dest,
+            &RestoreOptions::default(),
+            &BTreeSet::new(),
+            &NoCipher,
+        )
+        .expect_err("符号链接目标必须被拒");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+
+        // 已覆盖的 settings.json 必须被还原为原始内容。
+        assert_eq!(
+            std::fs::read_to_string(dest.join("etc/mailstack/settings.json")).unwrap(),
+            "original-settings",
+            "落地失败必须把已覆盖的文件回滚为原件"
+        );
+        // 符号链接没有被顺藤摸瓜地写穿。
+        assert!(
+            std::fs::symlink_metadata(dest.join("etc/mailstack/evil.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// 归档经由同目录的唯一临时文件 + rename 产出：成功不留 `.tmp.*` 残留，
+    /// 失败也不留半份归档（这里的成员全部可读，走成功路径）。
+    #[test]
+    fn create_archive_leaves_no_temporary_file_behind() {
+        let (staging, sources) = source_tree("notmp");
+        let store_dir = staging.parent().unwrap().join("backups");
+        let target = store_dir.join("mailstack-backup-20261002-120000.tar.gz");
+
+        create_archive(&staging, &sources, &target, &[], false).unwrap();
+
+        let leftovers: Vec<String> = std::fs::read_dir(&store_dir)
+            .unwrap()
+            .filter_map(|item| item.ok())
+            .map(|item| item.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "不得残留临时归档: {leftovers:?}");
     }
 
     #[test]

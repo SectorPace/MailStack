@@ -77,6 +77,10 @@ impl Pop3Server {
     }
 
     /// 用一份共享的指标注册表替换默认的每实例注册表。
+    ///
+    /// 与 [`crate::imap::server::ImapServer::with_metrics`] 不同：这里不设置
+    /// `self.context.metrics` —— `Pop3SessionContext` 没有 metrics 字段（POP3
+    /// 会话不产生命令级指标），因此传输层注册表就是全部。
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = metrics;
         self

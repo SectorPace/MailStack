@@ -16,6 +16,7 @@
 //! 每个收件人经 [`LmtpRouter`] 映射到独立 Maildir，写盘走 blocking 线程池。
 //! 一封信的分发是**逐收件人独立成功/失败**：一个邮箱磁盘满不影响其他收件人。
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,6 +81,9 @@ struct LmtpSession<'a, S> {
     helo: bool,
     mail_from: Option<String>,
     recipients: Vec<Recipient>,
+    /// 本事务已接受的收件人（路由器同款大小写归一化）：重复 RCPT 仍回 250
+    /// （对客户端重试保持宽容），但只入队一次，避免同一封投两份。
+    seen: HashSet<String>,
 }
 
 pub async fn serve_connection<S>(io: S, ctx: &LmtpContext, peer: SocketAddr) -> Result<LmtpExit<S>>
@@ -93,6 +97,7 @@ where
         helo: false,
         mail_from: None,
         recipients: Vec::new(),
+        seen: HashSet::new(),
     }
     .run()
     .await
@@ -250,7 +255,11 @@ where
         }
         match self.ctx.router.route(&address) {
             Some(store) => {
-                self.recipients.push(Recipient { address, store });
+                // 与 router 同款归一化：同址不同写法（大小写、空白）只投一次。
+                let key = address.trim().to_ascii_lowercase();
+                if self.seen.insert(key) {
+                    self.recipients.push(Recipient { address, store });
+                }
                 self.write_line("250 2.1.5 Ok").await?;
             }
             None => {
@@ -350,6 +359,10 @@ where
             .await;
             let line = match read {
                 Err(_) => {
+                    // 空闲超时发生在 DATA 中途：会话即将结束，但必须先回 421
+                    // 再关连接 —— 静默断开会让上游 MTA 把它当成连接层故障，
+                    // 无法区分「稍后重试」与「立即换路径」。
+                    let _ = self.write_line("421 4.4.2 Idle timeout").await;
                     return Err(MailError::Timeout);
                 }
                 Ok(Err(error)) => return Err(error),
@@ -384,6 +397,7 @@ where
     fn reset_transaction(&mut self) {
         self.mail_from = None;
         self.recipients.clear();
+        self.seen.clear();
     }
 
     async fn write_line(&mut self, line: &str) -> Result<()> {
@@ -656,6 +670,91 @@ mod tests {
         client.send("QUIT").await;
         let _ = client.line().await;
         let _ = server.await.unwrap().unwrap();
+        assert_eq!(alice.open_folder(INBOX, false).unwrap().messages.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_rcpt_is_answered_twice_but_delivered_once() {
+        let (_dir, alice, _bob) = fixture();
+        let mut router = MapRouter::new();
+        router.insert("alice@example.com", Arc::clone(&alice));
+        let context = Arc::new(LmtpContext {
+            router: Arc::new(router),
+            config: LmtpConfig::default(),
+            outbound: None,
+        });
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            serve_connection(server_io, &context, "127.0.0.1:1".parse().unwrap()).await
+        });
+        let mut client = Client::new(client_io);
+        assert!(client.line().await.starts_with("220 "));
+        client.send("LHLO test.example").await;
+        loop {
+            if client.line().await.starts_with("250 ") {
+                break;
+            }
+        }
+        client.send("MAIL FROM:<sender@example.org>").await;
+        assert!(client.line().await.starts_with("250 "));
+        client.send("RCPT TO:<Alice@Example.com>").await;
+        assert!(client.line().await.starts_with("250 "));
+        // 同址不同写法：仍回 250（对重试宽容），但不得投两份。
+        client.send("RCPT TO:<alice@example.com>").await;
+        assert!(client.line().await.starts_with("250 "));
+        client.send("DATA").await;
+        assert!(client.line().await.starts_with("354 "));
+        client.send("Subject: hi").await;
+        client.send("").await;
+        client.send("body").await;
+        client.send(".").await;
+        // 恰好一条逐收件人应答：若重复入队，这里会读到第二条 250。
+        assert!(client.line().await.starts_with("250 "));
+        client.send("QUIT").await;
+        assert!(client.line().await.starts_with("221 "));
+        let _ = server.await.unwrap().unwrap();
+        assert_eq!(alice.open_folder(INBOX, false).unwrap().messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_timeout_mid_data_replies_421_before_closing() {
+        let (_dir, alice, _bob) = fixture();
+        let mut router = MapRouter::new();
+        router.insert("alice@example.com", Arc::clone(&alice));
+        let context = Arc::new(LmtpContext {
+            router: Arc::new(router),
+            config: LmtpConfig {
+                read_timeout: Duration::from_millis(50),
+                ..LmtpConfig::default()
+            },
+            outbound: None,
+        });
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            serve_connection(server_io, &context, "127.0.0.1:1".parse().unwrap()).await
+        });
+        let mut client = Client::new(client_io);
+        assert!(client.line().await.starts_with("220 "));
+        client.send("LHLO test.example").await;
+        loop {
+            if client.line().await.starts_with("250 ") {
+                break;
+            }
+        }
+        client.send("MAIL FROM:<sender@example.org>").await;
+        assert!(client.line().await.starts_with("250 "));
+        client.send("RCPT TO:<alice@example.com>").await;
+        assert!(client.line().await.starts_with("250 "));
+        client.send("DATA").await;
+        assert!(client.line().await.starts_with("354 "));
+        // DATA 中途停止发送：读超时必须先回 421 再关闭（不能静默断开）。
+        let reply = client.line().await;
+        assert!(reply.starts_with("421 "), "{reply}");
+        // 会话以 Timeout 错误结束（超时本来就是错误路径）。
+        assert!(matches!(
+            server.await.unwrap(),
+            Err(MailError::Timeout) | Ok(LmtpExit::Closed(_))
+        ));
         assert_eq!(alice.open_folder(INBOX, false).unwrap().messages.len(), 0);
     }
 

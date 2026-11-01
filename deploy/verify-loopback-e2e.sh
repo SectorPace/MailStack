@@ -42,6 +42,10 @@ echo "  25 空闲"
 echo "  磁盘: $(df -h / | tail -1 | awk '{print $4" 可用"}')"
 
 say "1. 生成 fail-closed 夹具（字段判据见 crates/core/src/config.rs 与 smtpd/src/tls.rs）"
+# ROOT 可被环境变量覆盖；rm -rf 之前守住：空值与 / 一律拒绝执行。
+case "$ROOT" in
+  ""|"/") echo "  **ROOT 非法（'$ROOT'），拒绝 rm -rf**" >&2; exit 1 ;;
+esac
 rm -rf "$ROOT"
 mkdir -p "$ROOT/etc/mailstack" "$ROOT/etc/postfix" "$ROOT/var/lib/mailstack/queue" "$ROOT/etc/opendkim/keys" "$ROOT/etc/mailstack/tls/$DOMAIN"
 

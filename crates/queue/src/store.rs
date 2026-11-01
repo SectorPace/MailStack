@@ -31,6 +31,9 @@ use crate::error::{QueueError, QueueResult};
 /// 队列文件权限：报文含用户邮件正文，仅属主可读。
 const QUEUE_FILE_MODE: u32 = 0o600;
 
+/// [`QueueStore::enqueue_new`] 遇到 id 撞车时的重试次数。
+const ENQUEUE_NEW_ATTEMPTS: u32 = 5;
+
 /// 投递租约时长（5.10）。
 ///
 /// 一条条目从「开始投递」到「把结果写回磁盘」之间，磁盘上没有它的任何状态变化。
@@ -240,12 +243,69 @@ impl QueueStore {
     }
 
     /// 写入（或覆盖）一条条目。id 相同即覆盖，因此「更新重试状态」也是本方法。
+    ///
+    /// 覆盖语义是**重试回写所依赖的**：运行器把已投递的收件人摘掉后按原 id 写回。
+    /// 新条目（首封入队、DSN 退信）必须改走 [`QueueStore::enqueue_new`] ——
+    /// 那里才是「同 id 即覆盖」会变成丢信的地方。
     pub fn enqueue(&self, entry: &QueueEntry) -> QueueResult<()> {
         entry.validate()?;
         let path = self.entry_path(&entry.id)?;
         let payload = serde_json::to_vec_pretty(entry)?;
         atomic_as(&path, &payload, QUEUE_FILE_MODE, None)?;
         Ok(())
+    }
+
+    /// 新条目入队：**只新增，绝不覆盖**既有条目。
+    ///
+    /// `enqueue` 的覆盖语义对重试回写是必需的，但对新邮件是最坏行为：两个进程
+    /// 在同一毫秒生成了同一个 id（[`crate::entry::new_id`] 已混入进程级随机前缀
+    /// 把概率压到可忽略，但不是零）时，后写的一方会把先写的那封**无声覆盖** ——
+    /// 收件人视角就是丢信。
+    ///
+    /// 因此先用 `create_new`（真 O_EXCL，与 [`Self::try_claim`] 同型）**占住**
+    /// 目标文件名：判存在与占名字之间没有可被钻的空隙 —— 先检查 `exists()` 再写
+    /// 的话，两个进程可以都看到「不存在」，后一个 rename 仍会无声覆盖前一个。
+    /// 占位成功后内容经 [`atomic_as`]（临时文件 → fsync → rename）原子替换，
+    /// fsync 原子性与 `enqueue` 完全一致；占位失败（已存在）就重新生成 id 重试，
+    /// 最多 [`ENQUEUE_NEW_ATTEMPTS`] 次，仍失败才报错。撞车后 `entry.id` 会被
+    /// 就地改写，调用方拿到的就是最终落盘的 id。
+    pub fn enqueue_new(&self, entry: &mut QueueEntry) -> QueueResult<()> {
+        entry.validate()?;
+        let dir = self.entries_dir();
+        // 占位要求目录已存在（`try_claim` 对 claims 目录同款处理）。
+        fs::create_dir_all(&dir).map_err(|e| QueueError::io(&dir, e))?;
+        for _ in 0..ENQUEUE_NEW_ATTEMPTS {
+            let path = self.entry_path(&entry.id)?;
+            let reserved = match fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // 撞车：换一个 id 再试。连续撞车只可能是熵源被破坏，
+                    // 最终报错而不是回退成覆盖。
+                    entry.id = crate::entry::new_id();
+                    continue;
+                }
+                Err(error) => return Err(QueueError::io(&path, error)),
+            };
+            drop(reserved);
+            let payload = serde_json::to_vec_pretty(entry)?;
+            return match atomic_as(&path, &payload, QUEUE_FILE_MODE, None) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // 写入失败：占位里没有任何可交付的内容，把名字还回去 ——
+                    // 让调用方看到的是「这封邮件从未入队」，而不是一个空壳条目。
+                    let _ = fs::remove_file(&path);
+                    Err(error.into())
+                }
+            };
+        }
+        Err(QueueError::invalid(format!(
+            "queue id collision persisted after {ENQUEUE_NEW_ATTEMPTS} attempts (entry {})",
+            entry.id
+        )))
     }
 
     /// 读取全部条目（按 id 升序 = 入队时间序）。
@@ -537,6 +597,79 @@ mod tests {
             .any(|n| n.starts_with("00000000001-BAD0.json")));
         // 原始文件不应再留在 entries/ 下。
         assert!(!dir.join("00000000001-BAD0.json").exists());
+    }
+
+    /// 新条目入队绝不覆盖既有条目：目标已存在时换 id 重试，原邮件必须原样保留。
+    #[test]
+    fn enqueue_new_never_overwrites_an_existing_entry() {
+        let (_d, store) = temp_store();
+        let first = entry("AAAA");
+        store.enqueue(&first).unwrap();
+
+        // 模拟撞车：另一封不同的邮件拿到了同一个 id。
+        let mut collided = entry("BBBB");
+        collided.id = first.id.clone();
+
+        store.enqueue_new(&mut collided).unwrap();
+
+        // 先写的那封原样保留；后写的换了 id 落盘。
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded.len(), 2, "撞车不得覆盖任何一封邮件");
+        let original = loaded
+            .iter()
+            .find(|e| e.id == first.id)
+            .expect("先写的邮件必须原样保留");
+        assert_eq!(original.data, first.data);
+        assert_ne!(
+            collided.id, first.id,
+            "撞车的一方必须换到新 id"
+        );
+        assert!(loaded.iter().any(|e| e.id == collided.id));
+
+        // 无撞车时 id 保持不变。
+        let mut fresh = entry("CCCC");
+        let before = fresh.id.clone();
+        store.enqueue_new(&mut fresh).unwrap();
+        assert_eq!(fresh.id, before);
+    }
+
+    /// 撞车检测在写盘**之前**发生（O_EXCL 占位）：占住目标的 id 换新 id 后仍能
+    /// 正常落盘、原占位内容一字不动；且非法 id（校验失败）在进入撞车循环前就被拒绝。
+    #[test]
+    fn enqueue_new_validates_before_the_collision_loop() {
+        let (_d, store) = temp_store();
+        let mut invalid = entry("BBBB");
+        invalid.id = "../escape".to_string();
+        assert!(store.enqueue_new(&mut invalid).is_err());
+        assert!(store.load_all().unwrap().is_empty(), "非法条目不得落盘");
+
+        // 模拟撞车（等价于另一进程已 O_EXCL 占位，或崩溃残留）：目标名已存在，
+        // 后到的入队必须换 id，而不是覆盖占位内容。
+        fs::create_dir_all(store.entries_dir()).unwrap();
+        let occupied = store.entries_dir().join("00000000001-CCCC.json");
+        fs::write(&occupied, b"placeholder").unwrap();
+        let mut collided = entry("CCCC");
+        collided.id = "00000000001-CCCC".to_string();
+        store.enqueue_new(&mut collided).unwrap();
+
+        assert_ne!(collided.id, "00000000001-CCCC", "撞车必须换 id");
+        assert_eq!(
+            fs::read(&occupied).unwrap(),
+            b"placeholder",
+            "已占位的名字不得被覆盖"
+        );
+        assert!(store.load_all().unwrap().iter().any(|e| e.id == collided.id));
+    }
+
+    /// 首封入队时条目目录可能还不存在：占位前必须先建目录（与 `try_claim`
+    /// 对 claims 目录的处理一致），否则新装环境的第一封邮件直接失败。
+    #[test]
+    fn enqueue_new_creates_the_entries_directory_itself() {
+        let (_d, store) = temp_store();
+        assert!(!store.entries_dir().exists());
+        let mut fresh = entry("AAAA");
+        store.enqueue_new(&mut fresh).unwrap();
+        assert_eq!(store.load_all().unwrap().len(), 1);
     }
 
     #[test]

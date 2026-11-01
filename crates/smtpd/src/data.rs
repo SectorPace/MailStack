@@ -131,13 +131,25 @@ impl DataSink {
                     // 连续两个 CR：第一个属于行内容（非法但不致命），
                     // 第二个继续当作可能的行结束前缀。
                     b'\r' => {
-                        self.push(b'\r');
+                        // 大小边界可能正落在 CR 上：不能丢弃 push 的事件，
+                        // 否则「只报一次」的 TooLarge 永远发不出去（调用方
+                        // 收不到 552，直到结束标记也哑掉）。
+                        let event = self.push(b'\r');
                         self.state = State::SawCr;
-                        DataEvent::NeedMore
+                        event
                     }
                     other => {
-                        self.push(b'\r');
-                        self.push(other)
+                        let first = self.push(b'\r');
+                        let second = self.push(other);
+                        // 两次 push 里任何一次触发超限都要上报；溢出后
+                        // check_size 会短路，只有第一次有机会返回 TooLarge。
+                        if matches!(first, DataEvent::TooLarge)
+                            || matches!(second, DataEvent::TooLarge)
+                        {
+                            DataEvent::TooLarge
+                        } else {
+                            DataEvent::NeedMore
+                        }
                     }
                 }
             }
@@ -152,9 +164,15 @@ impl DataSink {
         // 写法上刻意不用「`line.is_empty() && byte == b'.'`」——超限后 `line`
         // 恒空，那样的判据会把任何以 `.` 开头**且之后还有字节**的行误判成结束标记。
         self.line_len = match self.line_len {
-            0 => u8::from(byte == b'.'),
+            // 只有「本行第一个字节就是 '.'」才可能构成单点行；
+            // 其余任何字节（包括后续行内的 '.'）都让这一行变成「其它」。
+            // 此前写成 `0 => u8::from(byte == b'.')`：非点字节把计数留在 0，
+            // 于是 `Thanks.` / `1.` 这类「非点开头、点结尾」的行最终落在 1，
+            // 被误判成结束标记 —— 正文在那里被截断（数据丢失），
+            // 且剩余字节会被当命令解析（走私面）。
+            0 if byte == b'.' => 1,
+            0 => 2,
             // 已有 1 字节：再收一个 '.' 就是长度 2（不是单点），收别的也是长度 2。
-            1 => 2,
             _ => 2,
         };
         // 超限后**不再累积**。这不是优化，是内存上限：
@@ -265,6 +283,33 @@ mod tests {
     }
 
     #[test]
+    fn a_body_line_ending_with_a_single_dot_is_not_a_terminator() {
+        // 回归：此前 line_len 对非点字节停留在 0，「Thanks.」这类
+        // 「非点开头、点结尾」的行最终计数为 1，被误判成结束标记 ——
+        // 正文在该行截断（数据丢失），剩余字节被当命令解析（走私面）。
+        let message = collect(
+            &[b"Thanks.\r\nHi.\r\n1.\r\n.\r\n"],
+            BareNewlinePolicy::Reject,
+        )
+        .unwrap();
+        assert_eq!(message, b"Thanks.\r\nHi.\r\n1.\r\n");
+    }
+
+    #[test]
+    fn oversized_data_reports_too_large_when_the_boundary_lands_after_cr() {
+        // 回归：大小边界落在 SawCr 状态时，第一次 push 的 TooLarge 事件曾被
+        // 丢弃，之后 check_size 短路 —— 552 永远发不出去，客户端挂死等回复。
+        let mut sink = DataSink::new(8, BareNewlinePolicy::Reject);
+        let chunk: &[u8] = b"01234567\rX\r\n";
+        let (event, consumed) = sink.feed(chunk);
+        assert_eq!(event, DataEvent::TooLarge);
+        let (event, _) = sink.feed(&chunk[consumed..]);
+        assert_eq!(event, DataEvent::NeedMore);
+        let (event, _) = sink.feed(b".\r\n");
+        assert_eq!(event, DataEvent::Complete { data: None });
+    }
+
+    #[test]
     fn an_empty_message_is_terminated_immediately() {
         // 354 之后直接 `.` —— 起点等价于「刚过 CRLF」，必须识别为空邮件。
         let message = collect(&[b".\r\n"], BareNewlinePolicy::Reject).unwrap();
@@ -370,6 +415,10 @@ mod tests {
             }
         }
         assert_eq!(event, DataEvent::TooLarge);
+        // 先用 CRLF 结束那条被丢弃的巨型行，再喂真正的结束标记。
+        // 此前这里依赖的正是「非点字节不更新计数」的缺陷 —— 巨型行结尾的
+        // '.' 被误判成结束标记；修复后它必须作为普通行内容被正确忽略。
+        assert_eq!(sink.feed(b"\r\n").0, DataEvent::NeedMore);
         assert_eq!(sink.feed(b".\r\n").0, DataEvent::Complete { data: None });
     }
 
@@ -430,7 +479,10 @@ mod tests {
             sink.line.len()
         );
 
-        // 结束标记仍必须被认出来（否则会话会挂到超时）。
+        // 结束标记仍必须被认出来（否则会话会挂到超时）。与上一条同理：
+        // 先 CRLF 结束那条从未终止的巨型行（它结尾的 '.' 不是结束标记），
+        // 再喂真正的 `.` 行。
+        assert_eq!(sink.feed(b"\r\n").0, DataEvent::NeedMore);
         assert_eq!(sink.feed(b".\r\n").0, DataEvent::Complete { data: None });
     }
 

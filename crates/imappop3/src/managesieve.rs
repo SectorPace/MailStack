@@ -10,6 +10,8 @@
 //!
 //! * **先认证、后取存储**：认证通过后用部署层注入的 [`MailboxResolver`] 找到该用户
 //!   的 Maildir；未知用户拒绝。脚本只落在本人 Maildir 的 `sieve/` 下。
+//! * **认证必须走 TLS**：明文连接上的 `AUTHENTICATE` 直接 `NO`（RFC 5804 §2.1）；
+//!   隐式 TLS 与 STARTTLS 完成后的会话放行。口令不能走明文链路。
 //! * **上传即校验**：`PUTSCRIPT` / `CHECKSCRIPT` 用同一套 [`crate::sieve`] 编译器
 //!   验证；本服务端不支持的扩展（如 `vacation`）会在这里被明确拒绝，而不是存下一个
 //!   永不生效的脚本。
@@ -29,6 +31,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
 use crate::auth::{AuthBackend, AuthOutcome, AuthRequest};
+use crate::blocking;
 use crate::error::{MailError, Result};
 use crate::lineio::LineIo;
 use crate::maildir::MailStore;
@@ -197,13 +200,18 @@ where
             "SETACTIVE" => self.handle_setactive(&command).await?,
             "DELETESCRIPT" => self.handle_deletescript(&command).await?,
             "RENAMESCRIPT" => self.handle_renamescript(&command).await?,
-            "HAVESPACE" => self.ok("space available").await?,
+            "HAVESPACE" => self.handle_havespace(&command).await?,
             _ => self.no("unknown command").await?,
         }
         Ok(Control::Continue)
     }
 
     async fn handle_authenticate(&mut self, command: &Command) -> Result<()> {
+        // RFC 5804 §2.1：TLS 之上才允许认证（隐式 TLS 与 STARTTLS 完成后的
+        // 会话 `secured` 都为 true；明文连接一律拒绝，防止口令裸奔）。
+        if !self.secured {
+            return self.no("TLS required for authentication").await;
+        }
         if self.user.is_some() {
             return self.no("already authenticated").await;
         }
@@ -252,7 +260,9 @@ where
         let Some(store) = self.store.clone() else {
             return self.no("authenticate first").await;
         };
-        for (name, active) in sieve::list_scripts(&store)? {
+        // 目录扫描是同步 fs I/O，交给 blocking 线程池，别卡住 Tokio worker。
+        let scripts = blocking::maildir(&store, sieve::list_scripts).await?;
+        for (name, active) in scripts {
             let quoted = quote(&name);
             if active {
                 self.line(&format!("{quoted} ACTIVE")).await?;
@@ -267,10 +277,11 @@ where
         let Some(store) = self.store.clone() else {
             return self.no("authenticate first").await;
         };
-        let Some(name) = command.args.first() else {
+        let Some(name) = command.args.first().cloned() else {
             return self.no("GETSCRIPT requires a name").await;
         };
-        match sieve::get_script(&store, name)? {
+        let found = blocking::maildir(&store, move |store| sieve::get_script(store, &name)).await?;
+        match found {
             None => self.no("script not found").await,
             Some(source) => {
                 self.io
@@ -293,19 +304,18 @@ where
         if literal.len() > MAX_SCRIPT {
             return self.no("script exceeds 64 KiB").await;
         }
-        let source = String::from_utf8_lossy(literal);
+        let source = String::from_utf8_lossy(literal).into_owned();
         if let Err(error) = sieve::compile(&source) {
             return self.no(&format!("script is invalid: {error}")).await;
         }
         if check_only {
             return self.ok("CHECKSCRIPT completed").await;
         }
-        let Some(name) = command.args.first() else {
+        let Some(name) = command.args.first().cloned() else {
             return self.no("PUTSCRIPT requires a name").await;
         };
-        if let Err(error) = sieve::put_script(&store, name, &source) {
-            return self.no(&error.to_string()).await;
-        }
+        // 落盘（临时文件 + fsync + rename）在 blocking 线程里完成。
+        blocking::maildir(&store, move |store| sieve::put_script(store, &name, &source)).await?;
         self.ok("PUTSCRIPT completed").await
     }
 
@@ -317,11 +327,9 @@ where
         let active = if name.is_empty() {
             None
         } else {
-            Some(name.as_str())
+            Some(name)
         };
-        if let Err(error) = sieve::set_active(&store, active) {
-            return self.no(&error.to_string()).await;
-        }
+        blocking::maildir(&store, move |store| sieve::set_active(store, active.as_deref())).await?;
         self.ok("SETACTIVE completed").await
     }
 
@@ -329,12 +337,10 @@ where
         let Some(store) = self.store.clone() else {
             return self.no("authenticate first").await;
         };
-        let Some(name) = command.args.first() else {
+        let Some(name) = command.args.first().cloned() else {
             return self.no("DELETESCRIPT requires a name").await;
         };
-        if let Err(error) = sieve::delete_script(&store, name) {
-            return self.no(&error.to_string()).await;
-        }
+        blocking::maildir(&store, move |store| sieve::delete_script(store, &name)).await?;
         self.ok("DELETESCRIPT completed").await
     }
 
@@ -345,10 +351,42 @@ where
         if command.args.len() < 2 {
             return self.no("RENAMESCRIPT requires old and new names").await;
         }
-        if let Err(error) = sieve::rename_script(&store, &command.args[0], &command.args[1]) {
-            return self.no(&error.to_string()).await;
-        }
+        let from = command.args[0].clone();
+        let to = command.args[1].clone();
+        blocking::maildir(&store, move |store| sieve::rename_script(store, &from, &to)).await?;
         self.ok("RENAMESCRIPT completed").await
+    }
+
+    /// RFC 5804 §3.6：`HAVESPACE name size` —— 如实回答「这个名字、这个大小的
+    /// 脚本现在放不放得下」。
+    ///
+    /// 此前无条件回「space available」，而 `PUTSCRIPT` 实际受单脚本 64 KiB
+    /// （[`sieve::MAX_SCRIPT_BYTES`]）与脚本数量（[`sieve::MAX_SCRIPTS`]）双重
+    /// 约束：客户端依据虚假的肯定回答上传，只会在 `PUTSCRIPT` 阶段撞墙。
+    /// 回答语义与 `PUTSCRIPT` 的执行路径完全对齐：预算内（或同名脚本已存在、
+    /// 属于覆盖不占新名额）回 OK，否则 NO 并说明原因。`name` 本身只用于判定
+    /// 「是否覆盖」；大小预算按单脚本上限计（没有跨脚本的共享配额）。
+    async fn handle_havespace(&mut self, command: &Command) -> Result<()> {
+        let Some(store) = self.store.clone() else {
+            return self.no("authenticate first").await;
+        };
+        if command.args.len() < 2 {
+            return self.no("HAVESPACE requires a name and a size").await;
+        }
+        let Ok(size) = command.args[1].parse::<usize>() else {
+            return self.no("HAVESPACE size must be a number").await;
+        };
+        if size > sieve::MAX_SCRIPT_BYTES {
+            return self.no("script exceeds 64 KiB").await;
+        }
+        // 目录扫描是同步 fs I/O，交给 blocking 线程池（与 LISTSCRIPTS 同一纪律）。
+        let scripts = blocking::maildir(&store, move |store| sieve::list_scripts(store)).await?;
+        let name = command.args[0].as_str();
+        let is_overwrite = scripts.iter().any(|(present, _)| present == name);
+        if !is_overwrite && scripts.len() >= sieve::MAX_SCRIPTS {
+            return self.no("script limit reached").await;
+        }
+        self.ok("space available").await
     }
 
     async fn send_capabilities(&mut self) -> Result<()> {
@@ -783,6 +821,18 @@ mod tests {
         Client,
         tokio::task::JoinHandle<Result<ManageSieveExit<DuplexStream>>>,
     ) {
+        spawn_with(context, true)
+    }
+
+    /// `secured` 决定会话是否视为已在 TLS 上：认证只在 TLS 上放行，所以
+    /// 完整生命周期测试走 secured=true；明文拒绝用 secured=false。
+    fn spawn_with(
+        context: ManageSieveContext,
+        secured: bool,
+    ) -> (
+        Client,
+        tokio::task::JoinHandle<Result<ManageSieveExit<DuplexStream>>>,
+    ) {
         let context = Arc::new(context);
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
         let handle = tokio::spawn(async move {
@@ -790,12 +840,36 @@ mod tests {
                 server_io,
                 &context,
                 "192.0.2.10:50000".parse().unwrap(),
-                false,
+                secured,
                 false,
             )
             .await
         });
         (Client::new(client_io), handle)
+    }
+
+    #[tokio::test]
+    async fn authenticate_is_rejected_on_plaintext_connections() {
+        // RFC 5804 §2.1：明文连接上的 AUTHENTICATE 必须 NO，会话保持可用
+        // （STARTTLS 之后可以重试）。
+        let (_dir, _store, context) = setup();
+        let (mut client, handle) = spawn_with(context, false);
+
+        let _ = client.until_terminal().await;
+        client
+            .send(&format!("AUTHENTICATE \"PLAIN\" \"{}\"", plain_b64()))
+            .await;
+        let reply = client.until_terminal().await;
+        assert!(reply[0].starts_with("NO"), "{reply:?}");
+        assert!(reply[0].contains("TLS required"), "{reply:?}");
+
+        // 连接没有被断开：NOOP 仍然应答。
+        client.send("NOOP").await;
+        assert!(client.until_terminal().await[0].starts_with("OK"));
+
+        client.send("LOGOUT").await;
+        let _ = client.until_terminal().await;
+        let _ = handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -899,5 +973,64 @@ mod tests {
     async fn self_read(client: &mut Client, buffer: &mut [u8]) -> usize {
         use tokio::io::AsyncReadExt;
         client.io.read(buffer).await.unwrap()
+    }
+
+    /// `HAVESPACE` 必须按 `PUTSCRIPT` 的真实预算作答：大小上限、脚本数量上限、
+    /// 覆盖已有脚本不占新名额。
+    #[tokio::test]
+    async fn havespace_answers_honestly_within_the_putscript_budgets() {
+        let (_dir, _store, context) = setup();
+        let (mut client, handle) = spawn(context);
+
+        let _ = client.until_terminal().await;
+        client
+            .send(&format!("AUTHENTICATE \"PLAIN\" \"{}\"", plain_b64()))
+            .await;
+        let _ = client.until_terminal().await;
+
+        // 预算内 → OK。
+        client.send("HAVESPACE \"new\" 1024").await;
+        assert!(client.until_terminal().await[0].starts_with("OK"));
+
+        // 超过单脚本上限 → NO（与 PUTSCRIPT 的 64 KiB 红线一致）。
+        client.send("HAVESPACE \"new\" 65537").await;
+        let reply = client.until_terminal().await;
+        assert!(reply[0].starts_with("NO"), "{reply:?}");
+        assert!(reply[0].contains("64 KiB"), "{reply:?}");
+
+        // 缺参 / 非数字 → NO。
+        client.send("HAVESPACE \"new\"").await;
+        assert!(client.until_terminal().await[0].starts_with("NO"));
+        client.send("HAVESPACE \"new\" \"many\"").await;
+        assert!(client.until_terminal().await[0].starts_with("NO"));
+
+        // 灌满脚本数：新名字的 HAVESPACE 转 NO，PUTSCRIPT 同样拒绝；
+        // 已有名字（覆盖）仍然 OK —— 两边必须给出一致的答案。
+        for i in 0..sieve::MAX_SCRIPTS {
+            client
+                .send_literal(&format!("PUTSCRIPT \"s{i:02}\""), "keep;")
+                .await;
+            assert!(
+                client.until_terminal().await[0].starts_with("OK"),
+                "第 {i} 个脚本应能上传"
+            );
+        }
+        client.send("HAVESPACE \"new\" 10").await;
+        let reply = client.until_terminal().await;
+        assert!(reply[0].starts_with("NO"), "脚本数到上限后必须如实说没空间：{reply:?}");
+        assert!(reply[0].contains("limit"), "{reply:?}");
+        client.send("HAVESPACE \"s00\" 10").await;
+        assert!(
+            client.until_terminal().await[0].starts_with("OK"),
+            "覆盖已有脚本不占新名额，必须如实说有空间"
+        );
+        client.send_literal("PUTSCRIPT \"extra\"", "keep;").await;
+        assert!(client.until_terminal().await[0].starts_with("NO"));
+        client.send_literal("PUTSCRIPT \"s00\"", "keep;").await;
+        assert!(client.until_terminal().await[0].starts_with("OK"));
+
+        client.send("LOGOUT").await;
+        let _ = client.until_terminal().await;
+        let _ = handle.await.unwrap().unwrap();
     }
 }

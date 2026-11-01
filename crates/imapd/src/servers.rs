@@ -246,7 +246,7 @@ pub async fn run(
 
     let assembly = assemble(paths, &config)?;
     let tls = acceptor(&config)?;
-    let grace = config.listeners;
+    let listener_configs = config.listeners;
     // 每个协议一份注册表；/metrics 一次抓取全部，渲染时带 protocol 标签。
     let imap_metrics = Arc::clone(&assembly.imap.metrics);
     let pop3_metrics = Arc::new(Metrics::new("pop3"));
@@ -254,7 +254,7 @@ pub async fn run(
 
     let mut tasks: tokio::task::JoinSet<std::io::Result<()>> = tokio::task::JoinSet::new();
 
-    if let Some(bind) = grace.imap {
+    if let Some(bind) = listener_configs.imap {
         let server = ImapServer::new(
             assembly.imap.clone(),
             imap_server_config(bind, false, config.max_connections),
@@ -264,7 +264,7 @@ pub async fn run(
         let shutdown = shutdown.clone();
         tasks.spawn(async move { server.serve(shutdown).await });
     }
-    if let Some(bind) = grace.imaps {
+    if let Some(bind) = listener_configs.imaps {
         let server = ImapServer::new(
             assembly.imap.clone(),
             imap_server_config(bind, true, config.max_connections),
@@ -274,7 +274,7 @@ pub async fn run(
         let shutdown = shutdown.clone();
         tasks.spawn(async move { server.serve(shutdown).await });
     }
-    if let Some(bind) = grace.pop3 {
+    if let Some(bind) = listener_configs.pop3 {
         let server = Pop3Server::new(
             assembly.pop3.clone(),
             pop3_server_config(bind, false, config.max_connections),
@@ -284,7 +284,7 @@ pub async fn run(
         let shutdown = shutdown.clone();
         tasks.spawn(async move { server.serve(shutdown).await });
     }
-    if let Some(bind) = grace.pop3s {
+    if let Some(bind) = listener_configs.pop3s {
         let server = Pop3Server::new(
             assembly.pop3.clone(),
             pop3_server_config(bind, true, config.max_connections),
@@ -294,7 +294,7 @@ pub async fn run(
         let shutdown = shutdown.clone();
         tasks.spawn(async move { server.serve(shutdown).await });
     }
-    if let Some(bind) = grace.managesieve {
+    if let Some(bind) = listener_configs.managesieve {
         let server = ManageSieveServer::new(
             assembly.managesieve,
             managesieve_server_config(bind, config.max_connections),

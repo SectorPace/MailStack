@@ -1,9 +1,9 @@
 // DKIM 与 DNS —— 域名密钥（轮换/发布状态）+ DNS 解析记录清单（dkim.rotate / dns.records）
-import { useEffect, useState, useContext } from "react";
+import { useCallback, useEffect, useRef, useState, useContext } from "react";
 import { useSettings } from "../store/settings";
 import { rpc } from "../api/client";
 import { RefreshContext } from "../App";
-import { PageHeader, Card, DataPanel, StatusBadge, toast } from "../components/ui";
+import { PageHeader, Card, DataPanel, StatusBadge, LoadError, toast } from "../components/ui";
 import { IconKey, IconRefresh, IconCheck, IconX } from "../components/icons";
 
 type DkimKey = { domain: string; selector: string; keySize: number; lastRotated: string; published: boolean };
@@ -14,24 +14,42 @@ export default function DkimDns() {
   const refreshN = useContext(RefreshContext);
   const [keys, setKeys] = useState<DkimKey[]>([]);
   const [records, setRecords] = useState<DnsRecord[]>([]);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+  // seq 请求序守卫：轮换后的补拉与并发刷新竞速时，只让最新一次响应落地。
+  const seq = useRef(0);
+
+  // dkim.rotate 会生成新 selector → DKIM TXT 记录内容随之改变，因此密钥与 DNS
+  // 记录**必须一起**重拉（原先只刷 keys，DNS 面板停在旧公钥上）。
+  const loadAll = useCallback(() => {
+    const id = ++seq.current;
+    rpc<DkimKey[]>("dkim.keys").then((r) => {
+      if (seq.current !== id) return;
+      if (r.ok) setKeys(r.data ?? []);
+      else setLoadErr(r.error);
+    });
+    rpc<DnsRecord[]>("dns.records").then((r) => {
+      if (seq.current !== id) return;
+      if (r.ok) setRecords(r.data ?? []);
+      else setLoadErr(r.error);
+    });
+  }, []);
 
   useEffect(() => {
-    rpc<DkimKey[]>("dkim.keys").then((r) => r.ok && setKeys(r.data));
-    rpc<DnsRecord[]>("dns.records").then((r) => r.ok && setRecords(r.data));
-  }, [refreshN]);
+    loadAll();
+  }, [loadAll, refreshN]);
 
   async function rotate(domain: string) {
     const r = await rpc<{ selector: string }>("dkim.rotate", { domain });
     if (r.ok) {
-      toast(`${domain} · s/${r.data.selector} ✓`);
-      const list = await rpc<DkimKey[]>("dkim.keys");
-      if (list.ok) setKeys(list.data);
+      toast(`${domain} · s/${r.data?.selector ?? "?"} ✓`);
+      loadAll();
     } else toast(r.error, "err");
   }
 
   return (
     <div className="p-4">
       <PageHeader title={t("dkim_title")} sub={t("dkim_sub")} />
+      {loadErr && <div className="mb-3"><LoadError message={loadErr} onRetry={loadAll} /></div>}
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
         {/* DKIM 密钥 */}

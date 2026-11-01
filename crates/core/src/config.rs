@@ -96,6 +96,36 @@ pub const SETTINGS_WRITE_WHITELIST: &[&str] = &[
     "timezone",
 ];
 
+/// 数值字段的防御性钳制（INV-43 的另一半：白名单只挡**键名**，不挡**取值**）。
+///
+/// `transparency=4e9`、`maxMessageSizeMb=0` 这类值原本会原样落盘再原样生效。
+/// 钳到有意义的区间而不是拒绝整包：这些字段的前端控件本来就是滑块/下拉，
+/// 越界值只可能来自手改请求，钳制是最不出人意料的处置。
+fn clamp_settings(settings: &mut Settings) {
+    // 百分比类：0..=100。
+    settings.transparency = settings.transparency.clamp(0, 100);
+    settings.backdrop_blur = settings.backdrop_blur.clamp(0, 100);
+    settings.spam_threshold = settings.spam_threshold.clamp(0, 100);
+    // 单封邮件上限（MB）：至少 1，至多 1 GB。
+    settings.max_message_size_mb = settings.max_message_size_mb.clamp(1, 1024);
+    // 每小时发信限额：0 会让限流变成「全拒」，钳到 1..=1_000_000。
+    settings.rate_limit_per_hour = settings.rate_limit_per_hour.clamp(1, 1_000_000);
+}
+
+/// 白名单数值键的语义区间（与 `clamp_settings` 一致）。
+///
+/// 钳制必须发生在 **JSON 层**、反序列化**之前**：字段都是 u32，像
+/// `rateLimitPerHour: 99999999999`（≈1e11）这样的越界值根本进不了
+/// `from_value` —— 若只在反序列化后钳制，整包会被类型错误拒掉，
+/// 「钳到有意义的区间」就成了一句空话。
+const SETTING_VALUE_RANGES: &[(&str, f64, f64)] = &[
+    ("transparency", 0.0, 100.0),
+    ("backdropBlur", 0.0, 100.0),
+    ("spamThreshold", 0.0, 100.0),
+    ("maxMessageSizeMb", 1.0, 1024.0),
+    ("rateLimitPerHour", 1.0, 1_000_000.0),
+];
+
 /// 应用一次局部更新，丢弃白名单外的键。
 ///
 /// 返回被应用的键名列表，便于审计与测试。
@@ -112,7 +142,21 @@ pub fn apply_settings_patch(
         if !SETTINGS_WRITE_WHITELIST.contains(&key.as_str()) {
             continue;
         }
-        obj.insert(key.clone(), value.clone());
+        let mut value = value.clone();
+        // 数值键先在 JSON 层钳到语义区间（见 SETTING_VALUE_RANGES）；
+        // 非数值的错型值不在此处理 —— 让 6.14 的整包拒绝语义接管。
+        if value.is_number() {
+            if let Some((_, min, max)) = SETTING_VALUE_RANGES
+                .iter()
+                .find(|(range_key, _, _)| range_key == key)
+            {
+                if let Some(number) = value.as_f64() {
+                    let clamped = number.round().clamp(*min, *max) as u32;
+                    value = serde_json::Value::from(clamped);
+                }
+            }
+        }
+        obj.insert(key.clone(), value);
         accepted.push(key.clone());
     }
 
@@ -125,7 +169,7 @@ pub fn apply_settings_patch(
     //
     // 现在的语义：要么整包生效并回报被接受的键，要么一个都不生效并回报空列表，
     // 同时留一条 warn 供排查。
-    let updated = match serde_json::from_value::<Settings>(current) {
+    let mut updated = match serde_json::from_value::<Settings>(current) {
         Ok(updated) => updated,
         Err(error) => {
             crate::warn::warn(&format!(
@@ -134,6 +178,7 @@ pub fn apply_settings_patch(
             return Vec::new();
         }
     };
+    clamp_settings(&mut updated);
     *settings = updated;
     accepted
 }
@@ -231,6 +276,14 @@ pub fn read_admin_config(paths: &Paths) -> Option<AdminConfig> {
 }
 
 /// 指定路径读取。损坏时报 `warn` 并返回 `None`。
+///
+/// ## 为什么这里 fail-open 是刻意的
+///
+/// 凭证文件损坏时若返回错误/拒绝服务，操作员将被**永久锁在门外**：修复这份
+/// 文件的唯一入口（重新完成初始设置 / 改密）本身就需要先读它。回落 `None`
+/// 让系统回到「未配置」状态，操作员得以自救。但这必须**大声**：解析失败在
+/// 这里 `warn`，随后的恢复性覆写在 [`admin_set`] 里落审计
+/// （`admin.config.recovered`）—— 静默恢复等于掩盖「凭证文件曾不可读」的痕迹。
 pub fn read_admin_config_at(path: &Path) -> Option<AdminConfig> {
     match std::fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<AdminConfig>(&text) {
@@ -283,6 +336,14 @@ pub fn admin_set(paths: &Paths, username: &str, password: &str) -> CoreResult<Ad
 
     crate::atomic::locked(path, || {
         let old = read_admin_config_at(path);
+        // 退化检测：文件**存在且非空**却解析不出 —— 这不是「首次配置」，而是
+        // 一次真实损坏/不可读之后的恢复（`read_admin_config_at` 按 fail-open
+        // 回落 `None`，理由见其文档）。恢复覆写绝不无声：见
+        // [`audit_admin_config_recovery`]。缺失或空文件 = 正常首次配置。
+        let degraded = old.is_none()
+            && std::fs::metadata(path)
+                .map(|meta| meta.len() > 0)
+                .unwrap_or(false);
 
         if password.is_empty() {
             // 仅改用户名：必须已有配置，且名字合法。
@@ -294,27 +355,50 @@ pub fn admin_set(paths: &Paths, username: &str, password: &str) -> CoreResult<Ad
             }
             config.username = username.to_string();
             write_admin_config(path, &config)?;
+            audit_admin_config_recovery(paths, path, degraded)?;
             return Ok(admin_public(paths));
         }
 
         let record = crate::password::password_record(username, password)?;
-        let mut config = AdminConfig {
+        let config = AdminConfig {
             username: record.username,
             algorithm: record.algorithm,
             iterations: record.iterations,
             salt: record.salt,
             hash: record.hash,
             updated_at: record.updated_at,
-            // INV-30：改密不得清空 2FA。
+            // INV-30：改密不得清空 2FA —— 原样保留既有块（可能为 None）。
             totp: old.and_then(|c| c.totp),
         };
-        // 规范化：确保 2FA 块在序列化时保留。
-        if config.totp.is_none() {
-            config.totp = None;
-        }
         write_admin_config(path, &config)?;
+        audit_admin_config_recovery(paths, path, degraded)?;
         Ok(admin_public(paths))
     })
+}
+
+/// 退化恢复留痕：`admin.json` 存在且非空却读不出来时，[`read_admin_config_at`]
+/// 按 fail-open 回落 `None`（否则操作员被永久锁在门外），随后的 [`admin_set`]
+/// 会用全新配置**覆写**旧文件 —— 这是恢复的唯一出路，但「凭证文件被重写」是
+/// 安全相关事件，必须进审计链，绝不能静默发生。
+///
+/// `degraded` 为 `false`（正常首次配置 / 正常改密）时不产生任何记录。
+/// 审计失败如实上抛：此时配置虽已恢复，但重试 `admin_set` 会发现文件已可
+/// 解析（`degraded` 变 `false`）、不再需要审计，自愈完成。
+fn audit_admin_config_recovery(paths: &Paths, path: &Path, degraded: bool) -> CoreResult<()> {
+    if !degraded {
+        return Ok(());
+    }
+    crate::audit::audit(
+        &paths.audit_log,
+        "admin.config.recovered",
+        true,
+        "",
+        &format!(
+            "{} (previous file existed but was corrupt/unreadable; overwritten with a fresh config)",
+            path.display()
+        ),
+    )?;
+    Ok(())
 }
 
 /// 在 `locked()` 临界区内对 `admin.json` 做**完整的读-改-写**（INV-32）。
@@ -323,6 +407,10 @@ pub fn admin_set(paths: &Paths, username: &str, password: &str) -> CoreResult<Ad
 /// 一次 `read → 改 → write` 仍会丢更新。两次并发的恢复码消费会各自基于
 /// 「码还在」的同一份快照写回，于是同一张恢复码被用掉两次（double spend）。
 /// 因此**所有**对 `admin.json` 的修改都必须经由本函数，而不是各自 read 后 write。
+///
+/// 闭包没有实际改动（`next == current`）时**不写盘**：登录路径上每个失败的
+/// 2FA 尝试都会经过这里，无变化也覆写一次就是纯粹的写放大 —— admin.json
+/// 每次 fsync 都在损耗写寿命，且扩大半写窗口。
 ///
 /// 配置不存在时返回错误而不是凭空创建：2FA 只能在已有管理员凭证之上启用。
 pub(crate) fn update_admin_config<T>(
@@ -333,7 +421,9 @@ pub(crate) fn update_admin_config<T>(
         let current = read_admin_config_at(path)
             .ok_or_else(|| CoreError::invalid("administrator credentials are not configured"))?;
         let (next, out) = f(&current)?;
-        write_admin_config(path, &next)?;
+        if next != current {
+            write_admin_config(path, &next)?;
+        }
         Ok(out)
     })
 }
@@ -364,6 +454,12 @@ pub struct SetupConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub expected_spf: Option<String>,
+    /// 初始化向导是否已走完（`setup.wizard.complete` 置位）。
+    ///
+    /// 与 `identityConfigured`（第一步完成即为真）不同，这个字段区分「向导走完了」
+    /// 与「向导弃了一半」：旧 `setup.json` 没有该字段，`default` 回落 `false`。
+    #[serde(rename = "wizardCompleted", default)]
+    pub wizard_completed: bool,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
 }
@@ -414,9 +510,42 @@ pub fn read_setup_config_at(path: &Path) -> Option<SetupConfig> {
 }
 
 /// 原子写入 `setup.json`（0600）。
+///
+/// 与 [`mark_setup_wizard_complete_at`] 共用同一把 `atomic::locked`：
+/// 整份重写（`setup.identity.apply`）与向导收尾的读-改-写必须互斥 ——
+/// 否则交错会把刚应用的身份（连同已 rotate 的 DKIM 密钥）回退成旧配置。
 pub fn write_setup_config(paths: &Paths, config: &SetupConfig) -> CoreResult<()> {
     let data = format!("{}\n", serde_json::to_string_pretty(config)?);
-    atomic_as(&paths.setup_config, data.as_bytes(), 0o600, None)
+    crate::atomic::locked(&paths.setup_config, || {
+        atomic_as(&paths.setup_config, data.as_bytes(), 0o600, None)
+    })
+}
+
+/// 把 `setup.json` 的 `wizardCompleted` 置为 true（幂等）。
+///
+/// 读-改-写整段持锁（与 `update_admin_config` 同一把 `atomic::locked`）：
+/// 向导收尾与并发的 `setup.identity.apply`（整份重写 setup.json）不得互相覆盖。
+/// 身份未配置（没有 `setup.json`）时拒绝 —— 向导完成标记必须长在真实身份之上，
+/// 凭空造一份「已完成的向导」比拒绝更糟。重复调用是成功的空操作（不重写文件）。
+pub fn mark_setup_wizard_complete(paths: &Paths) -> CoreResult<()> {
+    mark_setup_wizard_complete_at(&paths.setup_config)
+}
+
+/// 同 [`mark_setup_wizard_complete`]，作用于显式路径（测试用）。
+pub fn mark_setup_wizard_complete_at(path: &Path) -> CoreResult<()> {
+    crate::atomic::locked(path, || {
+        let Some(mut config) = read_setup_config_at(path) else {
+            return Err(CoreError::invalid(
+                "setup identity is not configured; complete the identity step first",
+            ));
+        };
+        if config.wizard_completed {
+            return Ok(());
+        }
+        config.wizard_completed = true;
+        let data = format!("{}\n", serde_json::to_string_pretty(&config)?);
+        atomic_as(path, data.as_bytes(), 0o600, None)
+    })
 }
 
 #[cfg(test)]
@@ -577,6 +706,101 @@ mod tests {
         assert_eq!(s.transparency, 42);
     }
 
+    /// 写放大守卫：闭包没有实际改动时**不得**触发写盘。
+    ///
+    /// 登录路径上每个失败的 2FA 尝试都会经过 `update_admin_config`；
+    /// 无变化也覆写一次 admin.json 就是纯粹的 fsync 放大。用 mtime 观测：
+    /// 真的写了盘，原子写会换成新文件，mtime 必然前进。
+    #[test]
+    fn update_admin_config_skips_the_write_when_the_closure_changed_nothing() {
+        let f = Fixture::new("nowrite");
+        admin_set(&f.paths, "admin", "Tr0ubadour9x").unwrap();
+        let before = fs::metadata(&f.paths.admin_config)
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let outcome: () = update_admin_config(&f.paths.admin_config, |current| {
+            Ok((current.clone(), ()))
+        })
+        .unwrap();
+
+        let after = fs::metadata(&f.paths.admin_config)
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(outcome, ());
+        assert_eq!(
+            before, after,
+            "闭包没有改动的 update_admin_config 不得写盘"
+        );
+    }
+
+    #[test]
+    fn update_admin_config_still_writes_when_the_closure_changes_something() {
+        let f = Fixture::new("dowrite");
+        admin_set(&f.paths, "admin", "Tr0ubadour9x").unwrap();
+        let before = fs::metadata(&f.paths.admin_config)
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        update_admin_config(&f.paths.admin_config, |current| {
+            let mut next = current.clone();
+            next.username = "supervisor".to_string();
+            Ok((next, ()))
+        })
+        .unwrap();
+
+        let after = fs::metadata(&f.paths.admin_config)
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_ne!(before, after, "有真实改动时必须写盘");
+        let public = admin_public(&f.paths);
+        assert_eq!(public.username, "supervisor");
+    }
+
+    /// 数值取值钳制：白名单只挡键名，`transparency=4e9` 之类的值不得原样落盘。
+    #[test]
+    fn settings_patch_values_are_clamped_to_sane_ranges() {
+        let mut s = Settings::default();
+        let patch: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            r#"{
+                "transparency": 4000000000,
+                "backdropBlur": 999,
+                "maxMessageSizeMb": 0,
+                "rateLimitPerHour": 99999999999,
+                "spamThreshold": 5000
+            }"#,
+        )
+        .unwrap();
+
+        let applied = apply_settings_patch(&mut s, &patch);
+
+        assert_eq!(applied.len(), 5, "五个键都在白名单内，应被接受");
+        assert_eq!(s.transparency, 100, "百分比上限 100");
+        assert_eq!(s.backdrop_blur, 100);
+        assert_eq!(s.max_message_size_mb, 1, "邮件上限至少 1 MB");
+        assert_eq!(s.rate_limit_per_hour, 1_000_000);
+        assert_eq!(s.spam_threshold, 100);
+    }
+
+    #[test]
+    fn settings_patch_leaves_in_range_values_untouched() {
+        let mut s = Settings::default();
+        let patch: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            r#"{ "transparency": 30, "maxMessageSizeMb": 25, "rateLimitPerHour": 500 }"#,
+        )
+        .unwrap();
+        apply_settings_patch(&mut s, &patch);
+        assert_eq!(s.transparency, 30);
+        assert_eq!(s.max_message_size_mb, 25);
+        assert_eq!(s.rate_limit_per_hour, 500);
+    }
+
     #[test]
     fn admin_public_never_exposes_secret_fields() {
         let f = Fixture::new("adminpublic");
@@ -675,6 +899,42 @@ mod tests {
         assert!(raw.contains("pbkdf2-sha256"));
     }
 
+    /// 退化恢复必须留痕：损坏的 admin.json 被 `admin_set` 覆写恢复时，审计链里
+    /// 必须有 `admin.config.recovered` 记录 —— 恢复本身是 fail-open 的唯一出路，
+    /// 但「凭证文件被重写」绝不能静默发生。
+    #[test]
+    fn a_corrupt_admin_file_recovery_is_audited() {
+        let f = Fixture::new("adminrecovery");
+        fs::create_dir_all(&f.paths.etc).unwrap();
+        fs::write(&f.paths.admin_config, "{corrupt json").unwrap();
+
+        admin_set(&f.paths, "admin", "Tr0ubadour9x").unwrap();
+
+        let log = fs::read_to_string(&f.paths.audit_log).unwrap();
+        assert!(
+            log.contains("admin.config.recovered"),
+            "退化恢复必须进审计链：{log}"
+        );
+        // 恢复后的配置可用（覆写前 read_admin_config_at 一直是 None）。
+        assert!(admin_public(&f.paths).password_configured);
+    }
+
+    /// 正常首次配置不是恢复：不得产生 recovery 审计记录（日志要么没建、
+    /// 要么不含该动作）。
+    #[test]
+    fn a_first_boot_admin_set_writes_no_recovery_record() {
+        let f = Fixture::new("adminfirstboot");
+        admin_set(&f.paths, "admin", "Tr0ubadour9x").unwrap();
+        match fs::read_to_string(&f.paths.audit_log) {
+            Ok(log) => assert!(
+                !log.contains("admin.config.recovered"),
+                "首次配置不得记为退化恢复：{log}"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn admin_config_is_written_0640() {
@@ -709,6 +969,7 @@ mod tests {
             server_ip: "203.0.113.10".into(),
             dkim_selector: "mail".into(),
             expected_spf: Some("v=spf1 mx -all".into()),
+            wizard_completed: true,
             updated_at: crate::now_iso8601_utc(),
         };
         write_setup_config(&f.paths, &config).unwrap();
@@ -735,9 +996,68 @@ mod tests {
             server_ip: "203.0.113.10".into(),
             dkim_selector: "mail".into(),
             expected_spf: None,
+            wizard_completed: false,
             updated_at: crate::now_iso8601_utc(),
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(!json.contains("expectedSpf"));
+    }
+
+    /// 旧版 `setup.json`（没有 `wizardCompleted` 字段）必须能读出 `false`，
+    /// `mark_setup_wizard_complete` 置位后能读回 `true`，且重复置位幂等。
+    #[test]
+    fn wizard_completion_falls_back_to_false_for_old_files_and_marks_idempotently() {
+        let f = Fixture::new("wizardcomplete");
+        // 旧版文件形状：不含 wizardCompleted。
+        fs::create_dir_all(f.paths.setup_config.parent().unwrap()).unwrap();
+        fs::write(
+            &f.paths.setup_config,
+            r#"{
+  "domain": "example.com",
+  "mailHost": "mail.example.com",
+  "serverIp": "203.0.113.10",
+  "dkimSelector": "mail",
+  "updatedAt": "2026-10-01T00:00:00Z"
+}"#,
+        )
+        .unwrap();
+        assert!(
+            !read_setup_config(&f.paths)
+                .unwrap()
+                .wizard_completed,
+            "旧文件必须回落 false"
+        );
+
+        mark_setup_wizard_complete(&f.paths).unwrap();
+        let marked = read_setup_config(&f.paths).unwrap();
+        assert!(marked.wizard_completed);
+        assert_eq!(
+            marked.domain, "example.com",
+            "置位不得改动其余字段"
+        );
+        let raw_first = fs::read_to_string(&f.paths.setup_config).unwrap();
+
+        // 幂等：重复置位是成功的空操作（文件内容不再变化）。
+        mark_setup_wizard_complete(&f.paths).unwrap();
+        assert!(read_setup_config(&f.paths).unwrap().wizard_completed);
+        assert_eq!(
+            fs::read_to_string(&f.paths.setup_config).unwrap(),
+            raw_first,
+            "重复置位不得重写文件"
+        );
+    }
+
+    #[test]
+    fn wizard_completion_is_refused_without_an_identity() {
+        let f = Fixture::new("wizardnoidentity");
+        let error = mark_setup_wizard_complete(&f.paths).unwrap_err();
+        assert!(
+            error.to_string().contains("not configured"),
+            "身份未配置必须拒绝：{error}"
+        );
+        assert!(
+            !f.paths.setup_config.exists(),
+            "被拒的置位不得凭空造出 setup.json"
+        );
     }
 }

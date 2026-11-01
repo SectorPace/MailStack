@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mailstack_core::exec::{CommandRunner, SystemCommandRunner};
+use mailstack_core::exec::{CommandOutput, CommandRunner, SystemCommandRunner};
 use serde_json::{json, Value};
 
 /// 毫秒时钟。注入是为了让「环形缓冲是否到期」这类断言不随真实时间漂移。
@@ -60,6 +60,12 @@ const PAGE_SIZE_BYTES: u64 = 4096;
 
 /// 磁盘用量刷新间隔（与基线的 60 秒定时器一致）。
 const DISK_REFRESH_MS: i64 = 60_000;
+
+/// `df` / `postqueue` 的最长等待时长。
+///
+/// 子进程卡死时按「读不到」处理：宁可丢一个读数，不可让一次挂起的
+/// `postqueue` 把采样（连同它持有的内部缓存锁）无限期占住。
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 守护进程展示顺序（即基线对象字面量的插入顺序）。
 const DAEMON_ORDER: &[&str] = &[
@@ -253,7 +259,7 @@ impl TelemetryCollector {
 
     /// 采一个样并推入各档环形缓冲。
     fn sample(&self) -> Point {
-        let mut inner = self.inner.lock().expect("遥测锁");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         self.sample_locked(&mut inner)
     }
 
@@ -268,7 +274,10 @@ impl TelemetryCollector {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                this.sample();
+                // 采样持锁做 /proc 遍历并跑子进程 —— 必须搬进阻塞线程池，
+                // 否则一个挂起的 `postqueue` 就把 async worker 整个占住。
+                let sampler = Arc::clone(&this);
+                let _ = tokio::task::spawn_blocking(move || sampler.sample()).await;
             }
         })
     }
@@ -282,7 +291,7 @@ impl TelemetryCollector {
             .unwrap_or(DEFAULT_RANGE_INDEX);
         let interval_ms = RANGES[index].1;
 
-        let mut inner = self.inner.lock().expect("遥测锁");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
         // `points` 取的是**本轮采样之前**的快照：环里本来没有点时，
         // `samplingCount` 就该是 0（基线同样如此），即时采样只填 `current`。
@@ -555,16 +564,43 @@ impl TelemetryCollector {
     /// 基线用的 `df -k /` 在设备名过长时会把记录折成两行，只认 `lines[1]`
     /// 会解析到残缺行；换成 `-P` 后列序与含义都不变，但不再折行。
     fn read_disk(&self) -> Option<DiskInfo> {
-        let output = self.runner.run("df", &["-kP", "/"]).ok()?;
+        let output = self.run_subprocess("df", &["-kP", "/"])?;
         if output.status != 0 {
             return None;
         }
         parse_df_k(output.stdout.as_str())
     }
 
+    /// 跑一个外部采样命令，带超时；超时/失败按「读不到」处理（`None`）。
+    ///
+    /// 优先用 runner 自带的 `run_with_timeout`（真实现会 kill 超时子进程并
+    /// 回收）；只实现 `run` 的测试 runner，其默认 `run_with_timeout` 会显式
+    /// 报错 —— 此时退回本地镜像：临时线程里跑 `run`，超过时限就**放弃等待**
+    /// （读数按缺省处理；被放弃的子进程自身是只读短命命令，自行结束）。
+    /// 与 `mailstack_core::exec` 的纪律一致：不可让调用方无限期挂住。
+    fn run_subprocess(&self, program: &str, args: &[&str]) -> Option<CommandOutput> {
+        if let Ok(output) = self
+            .runner
+            .run_with_timeout(program, args, SUBPROCESS_TIMEOUT)
+        {
+            return Some(output);
+        }
+        let runner = Arc::clone(&self.runner);
+        let program = program.to_string();
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // CommandRunner::run 收 `&[&str]`：引用视图在闭包内构造，
+            // 借用被移动进来的 args —— 生命周期整个落在闭包里，不逃逸。
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let _ = tx.send(runner.run(&program, &arg_refs).ok());
+        });
+        rx.recv_timeout(SUBPROCESS_TIMEOUT).ok().flatten()
+    }
+
     /// `postqueue -j`：逐行 JSON 统计总数与延迟数。
     fn queue_metrics(&self) -> QueueMetrics {
-        let Ok(output) = self.runner.run("postqueue", &["-j"]) else {
+        let Some(output) = self.run_subprocess("postqueue", &["-j"]) else {
             return QueueMetrics::default();
         };
         if output.status != 0 {

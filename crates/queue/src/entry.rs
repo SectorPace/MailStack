@@ -160,10 +160,16 @@ pub fn is_safe_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// 生成队列 ID：毫秒时间戳（十六进制）+ 进程内序号。
+/// 生成队列 ID：毫秒时间戳（十六进制）+ 进程级随机前缀 + 进程内序号。
 ///
 /// 时间戳在前，因此字典序即时间序，便于运维按顺序查看队列；序号保证同一毫秒内
 /// 的多条消息不重名。
+///
+/// 中间那段随机前缀是**跨进程撞车**的防线：原实现只有「时间戳 + 进程内序号」，
+/// 两个进程只要在同一毫秒各自从 0 开始计数，就会生成**同一个 id** —— 而入队是
+/// 覆盖写，后写的一方会把先写的那封邮件无声覆盖掉。前缀来自进程生命周期内的
+/// 一次随机采样（见 [`random_prefix`]），把跨进程撞车概率压到 2^-32 量级；
+/// store 侧的 [`crate::store::QueueStore::enqueue_new`] 再兜底最后一层。
 pub fn new_id() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let millis = SystemTime::now()
@@ -171,7 +177,50 @@ pub fn new_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{:011X}{:04X}", millis, seq & 0xFFFF)
+    format!("{:011X}{:08X}{:04X}", millis, random_prefix(), seq & 0xFFFF)
+}
+
+/// 进程生命周期内固定的 32 位随机前缀。
+///
+/// 熵来源按序退化：unix 上先取 `/dev/urandom` 的 4 字节；拿不到（非 unix、
+/// 文件缺失、读取失败）就用 `RandomState` 的种子哈希 pid 与纳秒时钟 ——
+/// `RandomState` 每次构造都带操作系统注入的随机性，对「避免巧合相等」足够。
+/// 用 [`std::sync::OnceLock`] 保证整个进程只生成一次：同一个进程内不存在重置问题。
+fn random_prefix() -> u32 {
+    static PREFIX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PREFIX.get_or_init(|| os_entropy().unwrap_or_else(fallback_entropy))
+}
+
+/// unix：从 `/dev/urandom` 读恰好 4 字节。
+///
+/// 刻意不用 `fs::read`：`/dev/urandom` 是**无限**文件，整体读入会把进程挂死；
+/// 必须按定长 `read_exact`。
+#[cfg(unix)]
+fn os_entropy() -> Option<u32> {
+    use std::io::Read;
+    let mut file = std::fs::File::open("/dev/urandom").ok()?;
+    let mut bytes = [0u8; 4];
+    file.read_exact(&mut bytes).ok()?;
+    Some(u32::from_be_bytes(bytes))
+}
+
+/// 非 unix 平台没有 `/dev/urandom`，直接走回退。
+#[cfg(not(unix))]
+fn os_entropy() -> Option<u32> {
+    None
+}
+
+/// 回退熵：哈希 `RandomState` 种子 + pid + 纳秒时钟。
+fn fallback_entropy() -> u32 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    std::process::id().hash(&mut hasher);
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0)
+        .hash(&mut hasher);
+    hasher.finish() as u32
 }
 
 #[cfg(test)]
@@ -232,6 +281,23 @@ mod tests {
     fn rejects_oversized_addresses() {
         let long = format!("{}@example.net", "a".repeat(MAX_ADDRESS_LEN));
         assert!(entry("s@example.org", &[long.as_str()]).is_err());
+    }
+
+    /// 随机前缀把跨进程撞车压到可忽略：大批量连续生成也不得重复，
+    /// 且「时间戳在前、字典序即时间序」的形状不得被破坏。
+    #[test]
+    fn ids_stay_unique_across_many_generations() {
+        let ids: std::collections::HashSet<String> = (0..10_000).map(|_| new_id()).collect();
+        assert_eq!(
+            ids.len(),
+            10_000,
+            "批量生成的 id 出现重复 —— 随机前缀缺失或过短"
+        );
+
+        // 形状契约：11 位毫秒时间戳 + 8 位随机前缀 + 4 位序号，仍是文件名安全的。
+        let sample = new_id();
+        assert_eq!(sample.len(), 23, "id 形状被改变：{sample}");
+        assert!(is_safe_id(&sample));
     }
 
     #[test]

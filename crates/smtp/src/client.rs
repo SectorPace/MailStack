@@ -70,7 +70,18 @@ pub enum MessageOutcome {
     /// 服务器接受。
     Accepted { response: Response },
     /// 服务器拒绝。`permanent` 为真表示 5xx（永久失败，重试无意义）。
-    Rejected { response: Response, permanent: bool },
+    ///
+    /// `accepted` 是**在失败发生之前已被对端接受并成功投递**的收件人。SMTP 投递可以
+    /// 部分成功（部分 `RCPT` 通过后其余被拒，或 `RCPT` 全过但正文被拒），已投出去的
+    /// 这批人 —— 调用方（队列）必须把他们从重试/退信集合里摘除，否则整批按失败
+    /// 处理时他们会**再投一遍**。RCPT 阶段的拒绝现在逐个尝试、不再终止事务：
+    /// 有人通过且正文投递成功时，`accepted` 带回全部已投者、`response` 带回一个
+    /// 代表性的拒绝响应；正文阶段失败时保守填充空集（整批重试，宁重投不丢信）。
+    Rejected {
+        response: Response,
+        permanent: bool,
+        accepted: Vec<String>,
+    },
 }
 
 impl MessageOutcome {
@@ -135,7 +146,7 @@ impl LineIo {
         self.inner.is_encrypted()
     }
 
-    /// 读一行（含结尾换行；EOF 前无换行时返回残余内容）。
+    /// 读一行（含结尾换行）。
     ///
     /// ## 为什么这里必须限长
     ///
@@ -180,9 +191,17 @@ impl LineIo {
                         "connection closed by server",
                     ));
                 }
-                let line = String::from_utf8_lossy(&self.buf).into_owned();
+                // EOF 时缓冲里还压着没有换行的残余字节：那是一条**不完整**的应答，
+                // 不能当成完整行交出去 —— 截断出来的半行会被上层按「前 3 字节
+                // 状态码」解析成一条看似合法的应答（见 `parse_response_line`），
+                // 把未知结果伪装成已判定结果，比直接断开更危险。与「超限按协议
+                // 错误断开」同一立场：不完整的应答不参与任何投递判定。
+                let leftover = String::from_utf8_lossy(&self.buf).into_owned();
                 self.buf.clear();
-                return Ok(line);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("connection closed with an incomplete response: {leftover:?}"),
+                ));
             }
             self.buf.extend_from_slice(&chunk[..n]);
         }
@@ -252,8 +271,17 @@ impl SmtpSession {
             let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
             let (this_code, continued) = parse_response_line(&trimmed)?;
 
-            if code.is_none() {
-                code = Some(this_code);
+            // 多行应答的每一行都必须携带**同一个**状态码（RFC 5321 §4.2）。
+            // 原实现只记首行：混码应答（`250-…` 续到 `550 …`）会被折算成首行的
+            // 250 当作成功 —— 对端可控的判定翻转。
+            match code {
+                None => code = Some(this_code),
+                Some(first) if first == this_code => {}
+                Some(first) => {
+                    return Err(SmtpError::Protocol(format!(
+                        "multiline reply mixed status codes: {first} then {this_code}"
+                    )));
+                }
             }
             lines.push(trimmed);
 
@@ -316,8 +344,27 @@ impl SmtpSession {
     }
 
     /// AUTH PLAIN / LOGIN。
+    ///
+    /// ## 凭证先过闸，机制先核对
+    ///
+    /// 1. **凭证不含 CR/LF/NUL/空白**：线上载荷虽经 base64（命令流注入不成立），
+    ///    但 PLAIN 的消息格式是 `\0{user}\0{pass}`，凭证里的 NUL 会让字段错位；
+    ///    CR/LF 与空白则让凭证无法在 sasl_passwd 这类空白分隔的载体里往返
+    ///    （见 `validate.rs` 与 `relay_store::parse_sasl_passwd`）。在入口拒绝，
+    ///    宁可报错也不把可疑凭证发上网络。错误信息**不带凭证原文**（避免口令进日志）。
+    /// 2. **对端没声明机制就不发凭证**：原实现在能力集为空时回落到盲试 PLAIN，
+    ///    会把 base64 凭证发给一个从未声明支持认证的对端。回落已删除：
+    ///    PLAIN/LOGIN 都必须在对端 EHLO 里出现过。
     pub async fn authenticate(&mut self, username: &str, password: &str) -> SmtpResult<Response> {
-        if self.capabilities.supports("PLAIN") || self.capabilities.auth_mechanisms.is_empty() {
+        for (label, value) in [("username", username), ("password", password)] {
+            if value.contains(['\r', '\n', '\0', ' ', '\t']) {
+                return Err(SmtpError::HeaderInjection(format!(
+                    "SMTP {label} must not contain CR, LF, NUL or whitespace"
+                )));
+            }
+        }
+
+        if self.capabilities.supports("PLAIN") {
             let payload = base64(&format!("\0{username}\0{password}"));
             return self.command(&format!("AUTH PLAIN {payload}")).await;
         }
@@ -355,10 +402,9 @@ impl SmtpSession {
             .await?;
         match outcome {
             MessageOutcome::Accepted { response } => Ok(response),
-            MessageOutcome::Rejected {
-                response,
-                permanent: _,
-            } => Err(SmtpError::Rejected(response.banner())),
+            MessageOutcome::Rejected { response, .. } => {
+                Err(SmtpError::Rejected(response.banner()))
+            }
         }
     }
 
@@ -381,43 +427,103 @@ impl SmtpSession {
             return Ok(MessageOutcome::Rejected {
                 permanent: mail.code >= 500,
                 response: mail,
+                accepted: Vec::new(),
             });
         }
 
+        // 空收件人列表（上游入口不应发生，防御性兜底）：不开事务按已判定失败返回。
+        if recipients.is_empty() {
+            return Ok(MessageOutcome::Rejected {
+                permanent: true,
+                response: Response {
+                    code: 554,
+                    lines: vec!["no valid recipients".to_string()],
+                },
+                accepted: Vec::new(),
+            });
+        }
+
+        // 逐个尝试全部收件人：此前「第一个被拒即终止」会让同批其余有效收件人
+        // 从未被尝试、整批按失败退信 —— 真实邮件丢失。现在收集拒绝并继续；
+        // 只要还有人被接受就继续 DATA（事务里本来就只含 RCPT 通过的人）。
+        let mut rcpt_accepted: Vec<String> = Vec::new();
+        let mut first_transient: Option<Response> = None;
+        let mut first_permanent: Option<Response> = None;
         for rcpt in recipients {
             let response = self
                 .command(&format!("RCPT TO:<{}>", checked_addr(rcpt)?))
                 .await?;
-            if !response.is_positive_completion() {
-                return Ok(MessageOutcome::Rejected {
-                    permanent: response.code >= 500,
-                    response,
-                });
+            if response.is_positive_completion() {
+                rcpt_accepted.push(rcpt.clone());
+            } else if response.code >= 500 {
+                first_permanent = first_permanent.or(Some(response));
+            } else {
+                first_transient = first_transient.or(Some(response));
             }
+        }
+
+        // 失败回执携带的响应必须与分类语义一致：队列按响应码判临时/永久，
+        // 混合拒绝时优先带回临时拒绝，让重试只处理还没死透的收件人。
+        // 按引用选取再 clone：first_transient 稍后还要参与 permanent 判定。
+        let rcpt_rejection = first_transient
+            .as_ref()
+            .or(first_permanent.as_ref())
+            .cloned();
+
+        if rcpt_accepted.is_empty() {
+            let response = rcpt_rejection.expect("全部被拒时至少存在一个拒绝响应");
+            return Ok(MessageOutcome::Rejected {
+                permanent: first_transient.is_none(),
+                response,
+                accepted: Vec::new(),
+            });
         }
 
         let data_cmd = self.command("DATA").await?;
         if data_cmd.code != 354 {
+            // RCPT 已有人通过但事务没能继续：正文未被任何人收到，
+            // 保守起见不带 accepted（整批重试），宁可重投不可丢信。
             return Ok(MessageOutcome::Rejected {
                 permanent: data_cmd.code >= 500,
                 response: data_cmd,
+                accepted: Vec::new(),
             });
         }
 
         // DATA 阶段：内容后跟单独一行的 "."，且必须对行首句点做 dot-stuffing。
+        // 正文可能远超单次超时的承受量（大附件 × 慢链路）：按块写、每块限时，
+        // 整体耗时随载荷伸缩，但每一块都被超时兜住，连接健康时不再误判超时。
         let terminated = terminate_data(data);
-        tokio::time::timeout(self.timeout, self.io.write_line_raw(&terminated))
+        for chunk in terminated.as_bytes().chunks(DATA_WRITE_CHUNK_BYTES) {
+            tokio::time::timeout(self.timeout, self.io.write_chunk_raw(chunk))
+                .await
+                .map_err(|_| SmtpError::Protocol("timed out writing message body".into()))?
+                .map_err(SmtpError::Io)?;
+        }
+        tokio::time::timeout(self.timeout, self.io.flush_raw())
             .await
-            .map_err(|_| SmtpError::Protocol("timed out writing message body".into()))?
+            .map_err(|_| SmtpError::Protocol("timed out flushing message body".into()))?
             .map_err(SmtpError::Io)?;
 
         let response = self.read_response().await?;
         if response.is_positive_completion() {
-            Ok(MessageOutcome::Accepted { response })
+            match rcpt_rejection {
+                // 全部收件人被接受：原有成功路径。
+                None => Ok(MessageOutcome::Accepted { response }),
+                // 混合：正文已投给 RCPT 通过的人；拒绝者随失败带回，队列
+                // 摘除已投者后按各自拒绝响应退信/重试。
+                Some(response) => Ok(MessageOutcome::Rejected {
+                    permanent: first_transient.is_none(),
+                    response,
+                    accepted: rcpt_accepted,
+                }),
+            }
         } else {
+            // DATA 本身失败：已接受者是否收到不可知，保守重投整批。
             Ok(MessageOutcome::Rejected {
                 permanent: response.code >= 500,
                 response,
+                accepted: Vec::new(),
             })
         }
     }
@@ -428,12 +534,21 @@ impl SmtpSession {
 }
 
 impl LineIo {
-    /// 原样写入（调用方已负责 CRLF 与终止符）。
-    async fn write_line_raw(&mut self, payload: &str) -> std::io::Result<()> {
-        self.inner.write_all(payload.as_bytes()).await?;
+    /// 追加写入一块字节（不 flush）。DATA 大正文按块写入时使用：
+    /// 分块边界可能落在多字节字符中间，所以收 `&[u8]` 而不是 `&str`。
+    async fn write_chunk_raw(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(payload).await
+    }
+
+    /// 冲刷写缓冲。
+    async fn flush_raw(&mut self) -> std::io::Result<()> {
         self.inner.flush().await
     }
 }
+
+/// DATA 正文单块写入的字节数。块越小超时粒度越细，越大调度开销越低；
+/// 32 KiB 在慢链路（每秒几 KB）下也能在一轮超时内稳定写完。
+const DATA_WRITE_CHUNK_BYTES: usize = 32 * 1024;
 
 /// 校验一个即将拼进命令行的信封地址。
 ///
@@ -807,6 +922,7 @@ mod tests {
                 lines: vec!["450 try later".to_string()],
             },
             permanent: false,
+            accepted: Vec::new(),
         };
         assert!(!transient.is_accepted());
         assert!(!transient.is_permanent_failure(), "4xx 是可重试的临时失败");
@@ -818,6 +934,7 @@ mod tests {
                 lines: vec!["550 no such user".to_string()],
             },
             permanent: true,
+            accepted: Vec::new(),
         };
         assert!(
             permanent.is_permanent_failure(),

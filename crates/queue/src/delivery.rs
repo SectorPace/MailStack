@@ -393,8 +393,17 @@ impl SmtpRemoteTransport {
             MessageOutcome::Accepted { .. } => Ok(DeliveryReceipt {
                 accepted: recipients.len(),
             }),
-            MessageOutcome::Rejected { response, .. } => {
-                Err(classify_response(response.code, response.banner()))
+            MessageOutcome::Rejected {
+                response,
+                accepted,
+                ..
+            } => {
+                // 部分成功必须如实上报：拒绝发生之前已被对端接受的收件人要随失败
+                // 带回给队列（`DeliveryFailure::accepted`），否则整批按失败处理时
+                // 他们会在重试里**再投一遍**。LMTP 路径（`lmtp_transport.rs`）一直是
+                // 这个语义；这里把远端 SMTP 路径补齐 —— outcome 未携带 accepted 集
+                // 时它就是空集，行为与原先完全一致。
+                Err(classify_response(response.code, response.banner()).with_accepted(accepted))
             }
         }
     }
@@ -479,6 +488,12 @@ impl SmtpRemoteTransport {
                     // 已判定的永久失败（如 550 用户不存在）换一台 MX 也不会变好；
                     // 只有连接层/临时失败才值得换下一台。
                     if failure.is_permanent() {
+                        return Err(failure);
+                    }
+                    // 部分成功（这台 MX 已接受了其中一些人）：换下一台会把已接受的
+                    // 人**再投一遍**。如实上报部分结果并停止尝试 —— 队列会把已投递
+                    // 者从重试集合里摘除。
+                    if !failure.accepted.is_empty() {
                         return Err(failure);
                     }
                     last = Some(failure);

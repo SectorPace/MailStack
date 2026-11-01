@@ -1,6 +1,6 @@
-# MailStack v0.8.1-beta1 部署文档（Rust 重写）
+# MailStack v1.0.0 部署文档（Rust 重写）
 
-> 对应规格书 `docs/REWRITE_TO_RUST.md`（v2）。本版本完成 **Phase 0 + Phase 1（只读面）**，
+> 对应规格书 `docs/REWRITE_TO_RUST.md`（v2）。v1.0.0 已完成全部协议面与 Web 管理台（详见 README），
 > 见文末「当前进度」。
 
 ## 1. 产物

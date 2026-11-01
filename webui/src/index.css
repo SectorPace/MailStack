@@ -1,972 +1,1148 @@
+/* Layer 顺序必须先于 @import 声明（cascade layer 的首次声明定序）：
+   tokens → theme(Tailwind) → base → components → utilities。
+   这样 Tailwind 工具类（hidden / sm:inline-flex …）稳定压过自定义组件类 ——
+   修复了未分层 .btn/.badge 的 `display:inline-flex` 压过 `hidden` 导致的
+   443px 移动端溢出（P1，曾被记录为“hidden 类在手机上不生效”）。 */
+@layer tokens, theme, base, components, utilities;
 @import "tailwindcss";
 
 /* ============================================================
-   MailStack Admin Console — iOS 27 Liquid Glass design system
-   所有玻璃效果必须经由本文件的材质 token / 材质类实现，
-   禁止在组件里散装堆 blur()。
+   MailStack Admin Console — design-system foundation
+   macOS 27 “Golden Gate” 桌面内容设计 / iOS 27 移动内容设计。
+   仅页面内容设计：不伪造 OS chrome（无红绿灯 / 菜单栏 / Dock / 状态条 / Home Indicator）。
+
+   架构（重要）：
+   - 本文件是唯一 token / 材质来源；组件里禁止散装堆 blur()。
+   - 双平台 profile：:root = 桌面（macOS 度量，紧凑）；[data-platform="ios"] 与
+     @media (max-width: 767px) = 移动（iOS 度量，44px 控件 / 17px 正文）。
+     data-platform 由 public/theme-init.js 首帧写入（初值）；媒体查询是运行期的
+     唯一真源（JS 不参与换档）。两个 ios 块内容需保持同步。
+   - 材质预算（glass budget）：玻璃只属于 chrome（侧栏/工具栏/菜单/浮层/滚动条）。
+     main 内容区的 .glass* 统一降级为近实心 --surface，无 backdrop-filter ——
+     全页 backdrop-filter 图层从 ~27 降到 chrome 的个位数。
+   - 圆角体系：--radius-control/panel/window 三档 + 同心规则（内层半径 = 外层半径 −
+     内边距）；支持 corner-shape 的浏览器渐进启用 squircle。
    ============================================================ */
 
-/* ---------- 1. 主题 token ---------- */
+/* ============================================================
+   1. TOKENS —— 主题 / 平台 / 密度（唯一来源）
+   ============================================================ */
+@layer tokens {
+  :root {
+    color-scheme: light;
 
-:root {
-  color-scheme: light;
+    /* ---- 平台度量：macOS “Golden Gate” 桌面内容（默认 profile） ---- */
+    --control-h: 28px;                  /* 控件行高：按钮/输入框/图标钮/侧栏行 */
+    --control-h-lg: 32px;               /* 大号控件：页签/设置行 */
+    --font-body: 13px;                  /* 正文 */
+    --font-caption: 11px;               /* 脚注/组头/徽标文字 */
+    --font-title: 16px;                 /* 页面标题（旧 25px 样式收缩档；ui.tsx PageHeader 采纳用） */
+    --radius-control: 6px;              /* 控件 */
+    --radius-panel: 10px;               /* 面板/卡片 */
+    --radius-window: 12px;              /* 窗口级：弹层/对话框 */
+    --radius-sheet: 16px;               /* 抽屉/表单纸（桌面回落档；iOS profile 覆盖为 26px） */
+    --sidebar-width: 240px;             /* 桌面全高侧栏宽（贴边，无外边距） */
+    --sidebar-rail-width: 56px;         /* 折叠图标栏宽 */
+    --sidebar-inset: 0px;               /* 侧栏/抽屉与屏幕边缘的间隙（桌面贴边 = 0） */
+    --toolbar-height: 48px;             /* 全宽工具栏高 */
+    --badge-h: 22px;                    /* 徽标高度 */
 
-  /* 强调色：Apple systemBlue */
-  --accent-rgb: 0 122 255;            /* #007AFF */
-  --accent: rgb(var(--accent-rgb));
-  --accent-deep-rgb: 0 100 220;
+    /* 内容表面（glass budget）：近实心卡片面，替代内容区玻璃 */
+    --surface-rgb: 255 255 255;
+    --surface: rgb(var(--surface-rgb) / 0.92);
 
-  /* 语义色（双编码：颜色 + 图标/文字） */
-  --ok-rgb: 52 199 89;                /* green   */
-  --warn-rgb: 255 159 10;             /* amber   */
-  --err-rgb: 255 59 48;               /* red     */
-  --hold-rgb: 255 149 0;              /* orange  */
+    /* 强调色：Apple systemBlue */
+    --accent-rgb: 0 122 255;            /* #007AFF */
+    --accent: rgb(var(--accent-rgb));
+    --accent-deep-rgb: 0 100 220;
 
-  /* 画布与文字 */
-  --canvas: #f2f2f7;
-  --text-1: rgba(10, 15, 26, 0.92);
-  --text-2: rgba(10, 15, 26, 0.58);
-  --text-3: rgba(10, 15, 26, 0.40);
-  --hairline: rgba(15, 32, 60, 0.10);
-  --hairline-strong: rgba(15, 32, 60, 0.16);
+    /* 语义色（双编码：颜色 + 图标/文字） */
+    --ok-rgb: 52 199 89;                /* green   */
+    --warn-rgb: 255 159 10;             /* amber   */
+    --err-rgb: 255 59 48;               /* red     */
+    --hold-rgb: 255 149 0;              /* orange  */
 
-  /* 玻璃基色（rgb 三元组）与透明度 —— 对齐展板的高通透质感：卡片能透出照片水纹 */
-  --glass-rgb: 255 255 255;
-  --glass-a: 0.44;
-  --glass-a-top: 0.12;
-  --glass-blur: 22px;
-  --glass-sat: 1.8;
-  --glass-shadow: 0 10px 28px rgba(23, 43, 77, 0.09), 0 2px 6px rgba(23, 43, 77, 0.05);
-  --glass-shadow-hover: 0 14px 34px rgba(23, 43, 77, 0.14), 0 2px 6px rgba(23, 43, 77, 0.07);
+    /* 画布与文字 */
+    --canvas: #f2f2f7;
+    --text-1: rgba(10, 15, 26, 0.92);
+    --text-2: rgba(10, 15, 26, 0.58);
+    --text-3: rgba(10, 15, 26, 0.40);
+    --hairline: rgba(15, 32, 60, 0.10);
+    --hairline-strong: rgba(15, 32, 60, 0.16);
 
-  /* 配对边缘高光：内侧镜面高光 + 外侧结构轮廓 */
-  --edge-spec: rgba(255, 255, 255, 0.85);
-  --edge-inner: rgba(255, 255, 255, 0.30);
-  --edge-bottom: rgba(255, 255, 255, 0.5);
-  --edge-outer: rgba(23, 43, 77, 0.14);
-  --edge-lens: rgba(255, 255, 255, 0.45);
-  /* 顶部柔光 sheen（hwyuanzi/LiquidGlass-UI 双层高光的第二层，固定光源不追鼠标） */
-  --sheen: 0.10;
+    /* 玻璃基色（rgb 三元组）与透明度 —— 仅 chrome 材质消费 */
+    --glass-rgb: 255 255 255;
+    --glass-a: 0.44;
+    --glass-a-top: 0.12;
+    --glass-blur: 22px;
+    --glass-sat: 1.8;
+    --glass-shadow: 0 10px 28px rgba(23, 43, 77, 0.09), 0 2px 6px rgba(23, 43, 77, 0.05);
+    --glass-shadow-hover: 0 14px 34px rgba(23, 43, 77, 0.14), 0 2px 6px rgba(23, 43, 77, 0.07);
 
-  /* 几何体系：胶囊 / 控件 10 / 面板 16 / 弹层 20 / 侧栏 26 */
-  --r-control: 10px;
-  --r-panel: 16px;
-  --r-overlay: 20px;
-  --r-sidebar: 26px;
+    /* 配对边缘高光：内侧镜面高光 + 外侧结构轮廓 */
+    --edge-spec: rgba(255, 255, 255, 0.85);
+    --edge-inner: rgba(255, 255, 255, 0.30);
+    --edge-bottom: rgba(255, 255, 255, 0.5);
+    --edge-outer: rgba(23, 43, 77, 0.14);
+    --edge-lens: rgba(255, 255, 255, 0.45);
+    /* 顶部柔光 sheen（双层高光的第二层，固定光源不追鼠标） */
+    --sheen: 0.10;
 
-  /* 滚动边缘工具栏 */
-  --toolbar-a: 0.42;
-  --toolbar-blur: 14px;
+    /* 旧几何 token（保留别名：组件文件仍引用 --r-*，勿删） */
+    --r-control: var(--radius-control);
+    --r-panel: var(--radius-panel);
+    --r-overlay: var(--radius-window);
+    --r-sidebar: var(--radius-sheet);
 
-  --chart-line: var(--accent-rgb);
-  --bar-track: rgba(15, 32, 60, 0.08);
+    /* 滚动边缘工具栏 */
+    --toolbar-a: 0.42;
+    --toolbar-blur: 14px;
+
+    --chart-line: var(--accent-rgb);
+    --bar-track: rgba(15, 32, 60, 0.08);
+  }
+
+  [data-theme="dark"] {
+    color-scheme: dark;
+
+    --accent-rgb: 10 132 255;           /* #0A84FF */
+    --accent-deep-rgb: 8 106 214;
+
+    --ok-rgb: 48 209 88;
+    --warn-rgb: 255 214 10;
+    --err-rgb: 255 105 97;
+    --hold-rgb: 255 159 10;
+
+    /* 画布近黑（禁止纯黑铺底） */
+    --canvas: #0b0d12;
+    --text-1: rgba(240, 244, 250, 0.94);
+    --text-2: rgba(226, 234, 246, 0.62);
+    --text-3: rgba(226, 234, 246, 0.42);
+    --hairline: rgba(255, 255, 255, 0.09);
+    --hairline-strong: rgba(255, 255, 255, 0.16);
+
+    /* 内容表面（dark：深灰蓝近实心） */
+    --surface-rgb: 22 24 30;
+    --surface: rgb(var(--surface-rgb) / 0.92);
+
+    /* Dark 玻璃必须是「更亮的中调玻璃」——比背景更浅更亮 */
+    --glass-rgb: 168 188 216;
+    --glass-a: 0.18;
+    --glass-a-top: 0.10;
+    --glass-blur: 20px;
+    --glass-sat: 1.35;
+    --glass-shadow: 0 8px 26px rgba(0, 0, 0, 0.42), 0 1px 3px rgba(0, 0, 0, 0.35);
+    --glass-shadow-hover: 0 12px 34px rgba(0, 0, 0, 0.52), 0 2px 6px rgba(0, 0, 0, 0.4);
+
+    --edge-spec: rgba(255, 255, 255, 0.26);
+    --edge-inner: rgba(255, 255, 255, 0.12);
+    --edge-bottom: rgba(200, 228, 255, 0.14);
+    --edge-outer: rgba(0, 0, 0, 0.52);
+    --edge-lens: rgba(255, 255, 255, 0.16);
+    --sheen: 0.05;
+
+    --toolbar-a: 0.12;
+    --toolbar-blur: 16px;
+
+    --bar-track: rgba(255, 255, 255, 0.10);
+  }
+
+  /* ---- 平台度量：iOS 27 移动内容 profile ----
+     初值由 public/theme-init.js 写到 <html data-platform>；运行期换档只由下面的
+     媒体查询驱动（宽度 ≤767px，任务指定 width-based）。两个块需保持同步。 */
+  [data-platform="ios"] {
+    --control-h: 44px;                  /* iOS 触控行高 */
+    --control-h-lg: 44px;
+    --font-body: 17px;
+    --font-caption: 13px;
+    --radius-control: 10px;
+    --radius-sheet: 26px;               /* 抽屉/表单纸圆角 */
+    --tabbar-height: 49px;              /* 预留：未来移动标签栏 */
+    --sidebar-inset: 10px;              /* 抽屉与屏幕边缘间隙 */
+    --badge-h: 26px;
+  }
+  @media (max-width: 767px) {
+    :root {
+      --control-h: 44px;
+      --control-h-lg: 44px;
+      --font-body: 17px;
+      --font-caption: 13px;
+      --radius-control: 10px;
+      --radius-sheet: 26px;
+      --tabbar-height: 49px;
+      --sidebar-inset: 10px;
+      --badge-h: 26px;
+    }
+  }
+
+  /* 减少透明度：token 级覆写（class 级在 components 层）。
+     settings.tsx 在此开关打开时会移除内联 --glass-a*，让这里的值生效。 */
+  [data-a11y-reduced-transparency="true"] {
+    --glass-a: 0.97;
+    --glass-a-top: 0.01;
+    --toolbar-a: 0.97;
+  }
+
+  /* 增加对比度（token 级；必须位于 :root / [data-theme] 之后才能覆盖） */
+  [data-a11y-contrast="true"] {
+    --text-2: rgba(10, 15, 26, 0.78);
+    --text-3: rgba(10, 15, 26, 0.6);
+    --hairline: rgba(15, 32, 60, 0.22);
+    --hairline-strong: rgba(15, 32, 60, 0.34);
+    --edge-outer: rgba(15, 32, 60, 0.3);
+  }
+  [data-theme="dark"][data-a11y-contrast="true"] {
+    --text-2: rgba(235, 241, 250, 0.8);
+    --text-3: rgba(235, 241, 250, 0.62);
+    --hairline: rgba(255, 255, 255, 0.2);
+    --hairline-strong: rgba(255, 255, 255, 0.3);
+  }
 }
 
-[data-theme="dark"] {
-  color-scheme: dark;
+/* ============================================================
+   2. BASE —— 元素默认值 + 内容画布
+   ============================================================ */
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
 
-  --accent-rgb: 10 132 255;           /* #0A84FF */
-  --accent-deep-rgb: 8 106 214;
+  body {
+    margin: 0;
+    /* SF Pro 优先（Apple 设备原生），Windows/Linux 用 Inter（OFL，最接近 SF Pro 的开源字体），
+       中文回退 PingFang / 雅黑 / 思源 */
+    font-family: -apple-system, BlinkMacSystemFont, "Inter Variable", "SF Pro Text",
+      "SF Pro Display", "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+      "Microsoft YaHei UI", "Noto Sans SC", sans-serif;
+    font-size: var(--font-body);
+    line-height: 1.5;
+    color: var(--text-1);
+    background: var(--canvas);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow: hidden;
+  }
 
-  --ok-rgb: 48 209 88;
-  --warn-rgb: 255 214 10;
-  --err-rgb: 255 105 97;
-  --hold-rgb: 255 159 10;
+  ::selection {
+    background: rgb(var(--accent-rgb) / 0.25);
+  }
 
-  /* 画布近黑（禁止纯黑铺底） */
-  --canvas: #0b0d12;
-  --text-1: rgba(240, 244, 250, 0.94);
-  --text-2: rgba(226, 234, 246, 0.62);
-  --text-3: rgba(226, 234, 246, 0.42);
-  --hairline: rgba(255, 255, 255, 0.09);
-  --hairline-strong: rgba(255, 255, 255, 0.16);
+  :focus-visible {
+    outline: 2px solid rgb(var(--accent-rgb) / 0.65);
+    outline-offset: 2px;
+    border-radius: var(--radius-control);
+  }
 
-  /* Dark 玻璃必须是「更亮的中调玻璃」——比背景更浅更亮 */
-  --glass-rgb: 168 188 216;
-  --glass-a: 0.18;
-  --glass-a-top: 0.10;
-  --glass-blur: 20px;
-  --glass-sat: 1.35;
-  --glass-shadow: 0 8px 26px rgba(0, 0, 0, 0.42), 0 1px 3px rgba(0, 0, 0, 0.35);
-  --glass-shadow-hover: 0 12px 34px rgba(0, 0, 0, 0.52), 0 2px 6px rgba(0, 0, 0, 0.4);
+  /* 滚动条：iOS 式完全隐藏（滚轮 / 触摸板 / 触摸滚动不受影响） */
+  * {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  *::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+    display: none;
+  }
 
-  --edge-spec: rgba(255, 255, 255, 0.26);
-  --edge-inner: rgba(255, 255, 255, 0.12);
-  --edge-bottom: rgba(200, 228, 255, 0.14);
-  --edge-outer: rgba(0, 0, 0, 0.52);
-  --edge-lens: rgba(255, 255, 255, 0.16);
-  --sheen: 0.05;
-
-  --toolbar-a: 0.12;
-  --toolbar-blur: 16px;
-
-  --bar-track: rgba(255, 255, 255, 0.10);
+  /* ---- 内容画布（照片预算） ----
+     全屏 alpine-lake 光场（.lightfield，z-0）只作为登录/设置页与 chrome 边缘的背景。
+     main 铺一层不透明画布压在光场之上：登录后照片只从侧栏玻璃与缝隙里透出，
+     内容区回到中性画布。App.tsx 已把 .lightfield 的渲染条件收紧为
+     「未登录 || 向导未完成」—— 双层防线：画布遮罩 + 条件渲染。 */
+  main {
+    background: var(--canvas);
+  }
 }
 
-/* ---------- 2. 基础 ---------- */
+/* ============================================================
+   3. COMPONENTS —— 材质 / 控件 / 弹层（全部可被 utilities 覆盖）
+   ============================================================ */
+@layer components {
+  .mono {
+    font-family: "SF Mono", ui-monospace, "Cascadia Mono", Consolas, "JetBrains Mono", monospace;
+    font-feature-settings: "calt" 1;
+  }
 
-html,
-body,
-#root {
-  height: 100%;
-}
+  .tnum { font-variant-numeric: tabular-nums; }
 
-body {
-  margin: 0;
-  /* SF Pro 优先（Apple 设备原生），Windows/Linux 用 Inter（OFL，最接近 SF Pro 的开源字体），
-     中文回退 PingFang / 雅黑 / 思源 */
-  font-family: -apple-system, BlinkMacSystemFont, "Inter Variable", "SF Pro Text",
-    "SF Pro Display", "Segoe UI", "PingFang SC", "Hiragino Sans GB",
-    "Microsoft YaHei UI", "Noto Sans SC", sans-serif;
-  font-size: 14px;
-  line-height: 1.5;
-  color: var(--text-1);
-  background: var(--canvas);
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-  overflow: hidden;
-}
+  /* ---------- 3.1 背景活动光场（玻璃折射的对象；登录/设置页全幅可见） ----------
+     真实照片打底 + 主题罩层 + 一团缓慢漂移的柔光。登录后 main 铺不透明画布，
+     且 App.tsx 已把光场渲染条件收紧到「未登录 || 向导未完成」——
+     照片仅在 chrome 边缘透出。
+     Ken-Burns / 漂移幅度已按报告调低（scale 1.06→1.03，位移减半）。 */
 
-::selection {
-  background: rgb(var(--accent-rgb) / 0.25);
-}
+  .lightfield {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    overflow: hidden;
+    pointer-events: none;
+    background: var(--canvas);
+  }
+  .lightfield .lf-photo {
+    position: absolute;
+    inset: -3%;
+    background: url("/alpine-lake.png") center 48% / cover no-repeat;
+    animation: lf-kenburns 180s ease-in-out infinite alternate;
+    will-change: transform;
+  }
+  @keyframes lf-kenburns {
+    from { transform: scale(1) translate3d(0, 0, 0); }
+    to   { transform: scale(1.03) translate3d(-0.75%, -0.75%, 0); }
+  }
+  .lightfield .lf-veil {
+    position: absolute;
+    inset: 0;
+    background: rgba(238, 247, 255, 0.3);
+  }
+  .lightfield .blob {
+    position: absolute;
+    border-radius: 50%;
+    filter: blur(84px);
+    will-change: transform;
+    animation: lf-drift ease-in-out infinite alternate;
+  }
+  .lightfield .b1 {
+    width: 57vw; height: 58vh; left: 32%; top: -24%;
+    background: rgba(232, 246, 255, 0.18);
+    animation-duration: 36s;
+  }
+  @keyframes lf-drift {
+    from { transform: translate3d(-4%, -1%, 0) scale(1); }
+    to   { transform: translate3d(4%, 4%, 0) scale(1.04); }
+  }
 
-:focus-visible {
-  outline: 2px solid rgb(var(--accent-rgb) / 0.65);
-  outline-offset: 2px;
-  border-radius: 6px;
-}
+  [data-theme="dark"] .lightfield .lf-veil { background: rgba(7, 18, 32, 0.81); }
+  [data-theme="dark"] .lightfield .b1 { background: rgba(58, 110, 163, 0.1); }
 
-/* 滚动条：iOS 式完全隐藏（滚轮 / 触摸板 / 触摸滚动不受影响） */
-* {
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-}
-*::-webkit-scrollbar {
-  width: 0;
-  height: 0;
-  display: none;
-}
+  /* ---------- 3.2 玻璃材质系统（唯一玻璃来源；glass budget：chrome 专用） ----------
+     变体 = token 组合，不允许组件内自定义模糊。
+     .glass            regular 玻璃（chrome 常规面板）
+     .glass--clear     clear 玻璃（内容之上的浮层/弹层）
+     .glass--toolbar   工具栏（滚动后获得硬磨砂 + 底部刻线）
+     .glass--sidebar   侧边栏
+     .glass--control   控件（按钮/输入框/胶囊）
+     .glass--well      内嵌凹槽（反向高光）
+     .glass--data      结构化数据表面（低模糊、克制、可读优先）
+     .glass--surface   近实心内容表面（无 backdrop-filter；glass budget 的显式档）
+     main 内容区内的 .glass* 由下方「内容表面」规则统一降级为 --surface。 */
 
-.mono {
-  font-family: "SF Mono", ui-monospace, "Cascadia Mono", Consolas, "JetBrains Mono", monospace;
-  font-feature-settings: "calt" 1;
-}
+  .glass,
+  .glass--clear,
+  .glass--toolbar,
+  .glass--sidebar,
+  .glass--control,
+  .glass--well,
+  .glass--data,
+  .glass--surface {
+    position: relative;
+    border: none;
+    color: var(--text-1);
+  }
 
-.tnum { font-variant-numeric: tabular-nums; }
+  .glass,
+  .glass--sidebar,
+  .glass--data {
+    background:
+      linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 22%),
+      linear-gradient(
+        180deg,
+        rgb(var(--glass-rgb) / calc(var(--glass-a) + var(--glass-a-top))),
+        rgb(var(--glass-rgb) / var(--glass-a))
+      );
+    /* HIG：regular 材质「blurs and adjusts the luminosity of background content」 */
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
+    backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 -1px 0 var(--edge-bottom),
+      inset 0 0 0 1px var(--edge-inner),
+      0 0 0 1px var(--edge-outer),
+      var(--glass-shadow);
+  }
 
-/* ---------- 3. 背景活动光场（玻璃折射的对象） ----------
-   对齐示意图的「晨光山湖」：真实照片打底 + 主题罩层 + 一团缓慢漂移的柔光。
-   （照片来自 WorkBuddy 参考工程 public/alpine-lake.png）
-   Light：rgba(238,247,255,.30) 罩层保持通透晨光；Dark：rgba(7,18,32,.81) 深夜罩层。 */
+  /* 侧边栏（chrome）：比卡片更通透，背景水色透出来 */
+  .glass--sidebar {
+    background:
+      linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 22%),
+      linear-gradient(
+        180deg,
+        rgb(var(--glass-rgb) / calc(var(--glass-a) + var(--glass-a-top) - 0.04)),
+        rgb(var(--glass-rgb) / calc(var(--glass-a) - 0.04))
+      );
+  }
 
-.lightfield {
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  overflow: hidden;
-  pointer-events: none;
-  background: var(--canvas);
-}
-.lightfield .lf-photo {
-  position: absolute;
-  inset: -3%;
-  background: url("/alpine-lake.png") center 48% / cover no-repeat;
-  animation: lf-kenburns 150s ease-in-out infinite alternate;
-  will-change: transform;
-}
-@keyframes lf-kenburns {
-  from { transform: scale(1) translate3d(0, 0, 0); }
-  to   { transform: scale(1.06) translate3d(-1.5%, -1.5%, 0); }
-}
-.lightfield .lf-veil {
-  position: absolute;
-  inset: 0;
-  background: rgba(238, 247, 255, 0.3);
-}
-.lightfield .blob {
-  position: absolute;
-  border-radius: 50%;
-  filter: blur(84px);
-  will-change: transform;
-  animation: lf-drift ease-in-out infinite alternate;
-}
-.lightfield .b1 {
-  width: 57vw; height: 58vh; left: 32%; top: -24%;
-  background: rgba(232, 246, 255, 0.18);
-  animation-duration: 24s;
-}
-@keyframes lf-drift {
-  from { transform: translate3d(-7%, -2%, 0) scale(1); }
-  to   { transform: translate3d(7%, 7%, 0) scale(1.07); }
-}
+  .glass--clear {
+    background:
+      linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 20%),
+      linear-gradient(
+        180deg,
+        rgb(var(--glass-rgb) / calc(var(--glass-a) + 0.22)),
+        rgb(var(--glass-rgb) / calc(var(--glass-a) + 0.08))
+      );
+    -webkit-backdrop-filter: blur(30px) saturate(var(--glass-sat)) brightness(1.04);
+    backdrop-filter: blur(30px) saturate(var(--glass-sat)) brightness(1.04);
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 0 0 1px var(--edge-inner),
+      0 0 0 1px var(--edge-outer),
+      0 18px 48px rgba(9, 20, 40, 0.22);
+  }
 
-[data-theme="dark"] .lightfield .lf-veil { background: rgba(7, 18, 32, 0.81); }
-[data-theme="dark"] .lightfield .b1 { background: rgba(58, 110, 163, 0.1); }
+  .glass--toolbar {
+    background:
+      linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 20%),
+      linear-gradient(
+        180deg,
+        rgb(var(--glass-rgb) / calc(var(--toolbar-a) + 0.10)),
+        rgb(var(--glass-rgb) / var(--toolbar-a))
+      );
+    -webkit-backdrop-filter: blur(var(--toolbar-blur)) saturate(var(--glass-sat)) brightness(1.04);
+    backdrop-filter: blur(var(--toolbar-blur)) saturate(var(--glass-sat)) brightness(1.04);
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 0 0 1px var(--edge-inner),
+      0 0 0 1px var(--edge-outer),
+      0 2px 10px rgba(15, 32, 60, 0.05);
+    transition: background 0.35s ease, box-shadow 0.35s ease, border-color 0.35s ease, -webkit-backdrop-filter 0.35s ease, backdrop-filter 0.35s ease;
+  }
+  .glass--toolbar.is-scrolled {
+    --toolbar-a: calc(var(--glass-a) + 0.16);
+    --toolbar-blur: 26px;
+  }
 
-/* ---------- 4. 玻璃材质系统（唯一玻璃来源） ----------
-   变体 = token 组合，不允许组件内自定义模糊。
-   .glass            regular 玻璃（常规面板）
-   .glass--clear     clear 玻璃（内容之上的浮层/弹层）
-   .glass--toolbar   工具栏（滚动后获得硬磨砂 + 1px 底部刻线）
-   .glass--sidebar   侧边栏
-   .glass--control   控件（按钮/输入框/胶囊）
-   .glass--well      内嵌凹槽（反向高光）
-   .glass--data      结构化数据表面（低模糊、克制、可读优先）
-*/
-
-.glass,
-.glass--clear,
-.glass--toolbar,
-.glass--sidebar,
-.glass--control,
-.glass--well,
-.glass--data {
-  position: relative;
-  border: none;
-  color: var(--text-1);
-}
-
-.glass,
-.glass--sidebar,
-.glass--data {
-  background:
-    linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 22%),
-    linear-gradient(
+  .glass--control {
+    background: linear-gradient(
       180deg,
-      rgb(var(--glass-rgb) / calc(var(--glass-a) + var(--glass-a-top))),
-      rgb(var(--glass-rgb) / var(--glass-a))
-    );
-  /* HIG：regular 材质「blurs and adjusts the luminosity of background content」 */
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
-  box-shadow:
-    inset 0 1px 0 var(--edge-spec),
-    inset 0 -1px 0 var(--edge-bottom),
-    inset 0 0 0 1px var(--edge-inner),
-    0 0 0 1px var(--edge-outer),
-    var(--glass-shadow);
-}
-
-/* 侧边栏：展板中比卡片更通透，山湖水色透出来 */
-.glass--sidebar {
-  background:
-    linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 22%),
-    linear-gradient(
-      180deg,
-      rgb(var(--glass-rgb) / calc(var(--glass-a) + var(--glass-a-top) - 0.04)),
+      rgb(var(--glass-rgb) / calc(var(--glass-a) + 0.14)),
       rgb(var(--glass-rgb) / calc(var(--glass-a) - 0.04))
     );
-}
+    -webkit-backdrop-filter: blur(12px) saturate(var(--glass-sat));
+    backdrop-filter: blur(12px) saturate(var(--glass-sat));
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      0 0 0 1px var(--edge-outer);
+  }
 
-.glass--clear {
-  background:
-    linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 20%),
-    linear-gradient(
-      180deg,
-      rgb(var(--glass-rgb) / calc(var(--glass-a) + 0.22)),
-      rgb(var(--glass-rgb) / calc(var(--glass-a) + 0.08))
-    );
-  -webkit-backdrop-filter: blur(30px) saturate(var(--glass-sat)) brightness(1.04);
-  backdrop-filter: blur(30px) saturate(var(--glass-sat)) brightness(1.04);
-  box-shadow:
-    inset 0 1px 0 var(--edge-spec),
-    inset 0 0 0 1px var(--edge-inner),
-    0 0 0 1px var(--edge-outer),
-    0 18px 48px rgba(9, 20, 40, 0.22);
-}
+  .glass--well {
+    background: rgb(var(--text-1) / 0.045);
+    box-shadow:
+      inset 0 1px 2px rgba(10, 20, 40, 0.10),
+      inset 0 0 0 1px var(--hairline);
+  }
+  [data-theme="dark"] .glass--well {
+    background: rgba(0, 0, 0, 0.24);
+    box-shadow:
+      inset 0 1px 3px rgba(0, 0, 0, 0.45),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  }
 
-.glass--toolbar {
-  background:
-    linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 20%),
-    linear-gradient(
-      180deg,
-      rgb(var(--glass-rgb) / calc(var(--toolbar-a) + 0.10)),
-      rgb(var(--glass-rgb) / var(--toolbar-a))
-    );
-  -webkit-backdrop-filter: blur(var(--toolbar-blur)) saturate(var(--glass-sat)) brightness(1.04);
-  backdrop-filter: blur(var(--toolbar-blur)) saturate(var(--glass-sat)) brightness(1.04);
-  box-shadow:
-    inset 0 1px 0 var(--edge-spec),
-    inset 0 0 0 1px var(--edge-inner),
-    0 0 0 1px var(--edge-outer),
-    0 2px 10px rgba(15, 32, 60, 0.05);
-  transition: background 0.35s ease, box-shadow 0.35s ease, -webkit-backdrop-filter 0.35s ease, backdrop-filter 0.35s ease;
-}
-.glass--toolbar.is-scrolled {
-  --toolbar-a: calc(var(--glass-a) + 0.16);
-  --toolbar-blur: 26px;
-  box-shadow:
-    inset 0 1px 0 var(--edge-spec),
-    inset 0 0 0 1px var(--edge-inner),
-    0 0 0 1px var(--edge-outer),
-    0 1px 0 var(--hairline-strong),
-    0 8px 22px rgba(15, 32, 60, 0.10);
-}
-[data-theme="dark"] .glass--toolbar.is-scrolled {
-  box-shadow:
-    inset 0 1px 0 var(--edge-spec),
-    inset 0 0 0 1px var(--edge-inner),
-    0 0 0 1px var(--edge-outer),
-    0 1px 0 rgba(255, 255, 255, 0.14),
-    0 8px 22px rgba(0, 0, 0, 0.4);
-}
+  /* 数据表面（chrome 内使用；main 内会被降级为 --surface） */
+  .glass--data {
+    background: rgb(var(--glass-rgb) / 0.62);
+    -webkit-backdrop-filter: blur(10px) saturate(1.2) brightness(1.04);
+    backdrop-filter: blur(10px) saturate(1.2) brightness(1.04);
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 -1px 0 var(--edge-bottom),
+      0 0 0 1px var(--edge-outer);
+  }
+  [data-theme="dark"] .glass--data {
+    background: rgb(46 68 96 / 0.72);
+  }
 
-.glass--control {
-  background: linear-gradient(
-    180deg,
-    rgb(var(--glass-rgb) / calc(var(--glass-a) + 0.14)),
-    rgb(var(--glass-rgb) / calc(var(--glass-a) - 0.04))
-  );
-  -webkit-backdrop-filter: blur(12px) saturate(var(--glass-sat));
-  backdrop-filter: blur(12px) saturate(var(--glass-sat));
-  box-shadow:
-    inset 0 1px 0 var(--edge-spec),
-    0 0 0 1px var(--edge-outer);
-}
+  /* 近实心内容表面（glass budget 显式档）：1px 发丝描边，无 backdrop-filter */
+  .glass--surface {
+    background: var(--surface);
+    box-shadow:
+      0 0 0 1px var(--hairline),
+      var(--glass-shadow);
+  }
 
-.glass--well {
-  background: rgb(var(--text-1) / 0.045);
-  box-shadow:
-    inset 0 1px 2px rgba(10, 20, 40, 0.10),
-    inset 0 0 0 1px var(--hairline);
-}
-[data-theme="dark"] .glass--well {
-  background: rgba(0, 0, 0, 0.24);
-  box-shadow:
-    inset 0 1px 3px rgba(0, 0, 0, 0.45),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.06);
-}
-
-/* 数据表面：干脆、中性、高可读——照片背景下提高填充保持可读性 */
-.glass--data {
-  background: rgb(var(--glass-rgb) / 0.62);
-  -webkit-backdrop-filter: blur(10px) saturate(1.2) brightness(1.04);
-  backdrop-filter: blur(10px) saturate(1.2) brightness(1.04);
-  box-shadow:
-    inset 0 1px 0 var(--edge-spec),
-    inset 0 -1px 0 var(--edge-bottom),
-    0 0 0 1px var(--edge-outer);
-}
-[data-theme="dark"] .glass--data {
-  background: rgb(46 68 96 / 0.72);
-}
-
-/* 折射（Refraction，展板第 3 项）：Chromium 走 backdrop-filter: url(#ms-lens)
-   让玻璃下的背景在边缘真实弯折；其余浏览器自动回落到上面的基础磨砂声明。 */
-[data-refract="true"] .glass,
-[data-refract="true"] .glass--sidebar {
-  -webkit-backdrop-filter: url(#ms-lens) blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
-  backdrop-filter: url(#ms-lens) blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
-}
-[data-refract="true"] .glass--toolbar {
-  -webkit-backdrop-filter: url(#ms-lens) blur(var(--toolbar-blur)) saturate(var(--glass-sat)) brightness(1.04);
-  backdrop-filter: url(#ms-lens) blur(var(--toolbar-blur)) saturate(var(--glass-sat)) brightness(1.04);
-}
-[data-refract="true"] .glass--clear {
-  -webkit-backdrop-filter: url(#ms-lens) blur(30px) saturate(var(--glass-sat)) brightness(1.04);
-  backdrop-filter: url(#ms-lens) blur(30px) saturate(var(--glass-sat)) brightness(1.04);
-}
-
-/* 边缘透镜：环形区域轻微二次折射 + 亮度抬升，底部带一丝天空蓝折射色
-   （参考 rdev/liquid-glass-react 的色差思路——克制到「先注意到材质，再注意到色边」） */
-.edge-lens::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  padding: 2.5px;
-  background: linear-gradient(
-    180deg,
-    var(--edge-lens) 0%,
-    rgba(255, 255, 255, 0.04) 42%,
-    rgb(var(--accent-rgb) / 0.10) 100%
-  );
-  -webkit-backdrop-filter: blur(2.5px) brightness(1.05);
-  backdrop-filter: blur(2.5px) brightness(1.05);
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  mask-composite: exclude;
-  pointer-events: none;
-}
-
-/* 交互玻璃：悬停抬升 2px + 高光增强（hwyuanzi 参考实现：0.24s + decel 曲线）；
-   按下弹性压缩由 Motion spring 完成 */
-.glass-hover {
-  transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.24s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.glass-hover:hover {
-  transform: translateY(-2px);
-  box-shadow:
-    inset 0 1px 0 var(--edge-spec),
-    inset 0 0 0 1px var(--edge-inner),
-    0 0 0 1px var(--edge-outer),
-    var(--glass-shadow-hover);
-}
-.glass-hover:active { transform: translateY(0) scale(0.985); }
-
-/* ---------- 5. 导航胶囊（Light = systemBlue 实色；Dark = 比周边更深的玻璃） ---------- */
-
-.nav-capsule-light {
-  background: linear-gradient(180deg, rgb(var(--accent-rgb) / 1), rgb(var(--accent-deep-rgb) / 1));
-  color: #fff;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.28),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.12),
-    0 3px 10px rgb(var(--accent-rgb) / 0.35);
-}
-[data-theme="dark"] .nav-capsule-dark {
-  /* 深色激活胶囊：比周边玻璃更深的深色玻璃（带蓝调）+ 亮色文字 */
-  background: linear-gradient(180deg, rgba(12, 22, 38, 0.92), rgba(10, 18, 32, 0.85));
-  color: var(--text-1);
-  box-shadow:
-    inset 0 1px 0 rgba(170, 205, 255, 0.12),
-    inset 0 0 0 1px rgba(150, 190, 255, 0.07),
-    0 0 0 1px rgba(0, 0, 0, 0.45),
-    0 4px 14px rgba(0, 0, 0, 0.38);
-}
-[data-theme="dark"] .nav-capsule-dark .nav-label { color: var(--text-1); }
-
-/* ---------- 6. 控件 ---------- */
-
-.btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  height: 34px;
-  padding: 0 14px;
-  border-radius: var(--r-control);
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-1);
-  cursor: pointer;
-  user-select: none;
-  white-space: nowrap;
-}
-.btn:disabled { opacity: 0.45; cursor: default; pointer-events: none; }
-
-.btn-accent {
-  background: linear-gradient(180deg, rgb(var(--accent-rgb)), rgb(var(--accent-deep-rgb)));
-  color: #fff;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.25),
-    0 2px 8px rgb(var(--accent-rgb) / 0.32);
-}
-.btn-accent:hover { filter: brightness(1.06); }
-.btn-accent:active { filter: brightness(0.97); }
-
-.icon-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 34px;
-  height: 34px;
-  border-radius: var(--r-control);
-  color: var(--text-2);
-  cursor: pointer;
-  position: relative;
-}
-.icon-btn:hover { color: var(--text-1); }
-.icon-btn:active { transform: scale(0.94); }
-
-.input {
-  height: 34px;
-  width: 100%;
-  padding: 0 12px;
-  border-radius: var(--r-control);
-  border: none;
-  font-size: 13px;
-  color: var(--text-1);
-  background: rgb(var(--text-1) / 0.05);
-  box-shadow: inset 0 0 0 1px var(--hairline);
-  outline: none;
-  transition: box-shadow 0.2s ease, background 0.2s ease;
-}
-.input::placeholder { color: var(--text-3); }
-.input:focus {
-  background: rgb(var(--glass-rgb) / 0.5);
-  box-shadow:
-    inset 0 0 0 1px rgb(var(--accent-rgb) / 0.7),
-    0 0 0 3px rgb(var(--accent-rgb) / 0.18);
-}
-[data-theme="dark"] .input { background: rgba(0, 0, 0, 0.26); }
-[data-theme="dark"] .input:focus { background: rgba(0, 0, 0, 0.16); }
-
-.kbd {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 18px;
-  height: 18px;
-  padding: 0 4px;
-  border-radius: 5px;
-  font-size: 11px;
-  font-family: inherit;
-  color: var(--text-3);
-  background: rgb(var(--text-1) / 0.06);
-  box-shadow: inset 0 0 0 1px var(--hairline), inset 0 -1px 0 var(--hairline);
-}
-
-/* ---------- 7. 徽标 / 状态（颜色 + 图标 + 文字 双编码） ---------- */
-
-.badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 22px;
-  padding: 0 9px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 500;
-  white-space: nowrap;
-}
-.badge .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.badge-ok   { color: rgb(var(--ok-rgb) / 1);   background: rgb(var(--ok-rgb) / 0.13);   box-shadow: inset 0 0 0 1px rgb(var(--ok-rgb) / 0.25); }
-.badge-warn { color: rgb(var(--warn-rgb) / 1); background: rgb(var(--warn-rgb) / 0.14); box-shadow: inset 0 0 0 1px rgb(var(--warn-rgb) / 0.28); }
-.badge-err  { color: rgb(var(--err-rgb) / 1);  background: rgb(var(--err-rgb) / 0.12);  box-shadow: inset 0 0 0 1px rgb(var(--err-rgb) / 0.26); }
-.badge-info { color: rgb(var(--accent-rgb) / 1); background: rgb(var(--accent-rgb) / 0.12); box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 0.26); }
-.badge-hold { color: rgb(var(--hold-rgb) / 1); background: rgb(var(--hold-rgb) / 0.14); box-shadow: inset 0 0 0 1px rgb(var(--hold-rgb) / 0.28); }
-.badge-neutral { color: var(--text-2); background: rgb(var(--text-1) / 0.07); box-shadow: inset 0 0 0 1px var(--hairline); }
-
-[data-a11y-contrast="true"] .badge-ok   { color: rgb(16 120 48 / 1); }
-[data-a11y-contrast="true"] .badge-err  { color: rgb(196 30 22 / 1); }
-[data-a11y-contrast="true"] .badge-warn { color: rgb(150 96 0 / 1); }
-[data-theme="dark"][data-a11y-contrast="true"] .badge-ok { color: rgb(110 230 140 / 1); }
-[data-theme="dark"][data-a11y-contrast="true"] .badge-err { color: rgb(255 140 134 / 1); }
-[data-theme="dark"][data-a11y-contrast="true"] .badge-warn { color: rgb(255 224 100 / 1); }
-
-/* ---------- 8. 数据表面：表格 ---------- */
-
-.data-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12.5px;
-}
-.data-table thead th {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  text-align: left;
-  font-weight: 600;
-  font-size: 11.5px;
-  letter-spacing: 0.02em;
-  color: var(--text-2);
-  padding: 9px 12px;
-  background: rgb(var(--glass-rgb) / 0.72);
-  -webkit-backdrop-filter: blur(10px);
-  backdrop-filter: blur(10px);
-  border-bottom: 1px solid var(--hairline-strong);
-  white-space: nowrap;
-  user-select: none;
-}
-[data-theme="dark"] .data-table thead th { background: rgb(22 28 40 / 0.88); }
-.data-table thead th.sortable { cursor: pointer; }
-.data-table thead th.sortable:hover { color: var(--text-1); }
-.data-table tbody td {
-  padding: 9px 12px;
-  border-bottom: 1px solid var(--hairline);
-  color: var(--text-1);
-  white-space: nowrap;
-}
-.data-table tbody tr:last-child td { border-bottom: none; }
-.data-table tbody tr { transition: background 0.15s ease; }
-.data-table tbody tr:hover { background: rgb(var(--accent-rgb) / 0.055); }
-
-/* ---------- 9. 占比条 ---------- */
-
-.bar {
-  height: 5px;
-  border-radius: 999px;
-  background: var(--bar-track);
-  overflow: hidden;
-}
-.bar > i {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, rgb(var(--accent-rgb) / 0.75), rgb(var(--accent-rgb)));
-  transition: width 0.6s cubic-bezier(0.32, 0.72, 0, 1);
-}
-.bar > i.ok { background: linear-gradient(90deg, rgb(var(--ok-rgb) / 0.75), rgb(var(--ok-rgb))); }
-.bar > i.warn { background: linear-gradient(90deg, rgb(var(--warn-rgb) / 0.8), rgb(var(--warn-rgb))); }
-.bar > i.err { background: linear-gradient(90deg, rgb(var(--err-rgb) / 0.8), rgb(var(--err-rgb))); }
-
-/* ---------- 10. Radix 弹层挂载材质 ---------- */
-
-.radix-pop {
-  z-index: 60;
-  min-width: 180px;
-  border-radius: var(--r-overlay);
-  padding: 6px;
-  outline: none;
-  animation: pop-in 0.22s cubic-bezier(0.32, 0.72, 0, 1);
-}
-@keyframes pop-in {
-  from { opacity: 0; transform: translateY(-4px) scale(0.98); }
-  to   { opacity: 1; transform: translateY(0) scale(1); }
-}
-.radix-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 7px 10px;
-  border-radius: 8px;
-  font-size: 13px;
-  color: var(--text-1);
-  cursor: pointer;
-  outline: none;
-  border: none;
-  background: transparent;
-  text-align: left;
-}
-.radix-item[data-highlighted] { background: rgb(var(--accent-rgb) / 0.14); color: var(--text-1); }
-.radix-item[data-disabled] { opacity: 0.4; pointer-events: none; }
-.radix-sep { height: 1px; margin: 5px 8px; background: var(--hairline); }
-
-.radix-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 70;
-  background: rgba(10, 16, 28, 0.35);
-  -webkit-backdrop-filter: blur(6px);
-  backdrop-filter: blur(6px);
-  animation: fade-in 0.25s ease;
-}
-[data-theme="dark"] .radix-overlay { background: rgba(0, 0, 0, 0.5); }
-@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
-
-.radix-dialog {
-  position: fixed;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-  z-index: 80;
-  width: min(420px, calc(100vw - 48px));
-  border-radius: var(--r-overlay);
-  padding: 22px;
-  outline: none;
-  animation: dialog-in 0.32s cubic-bezier(0.32, 0.72, 0, 1);
-}
-@keyframes dialog-in {
-  from { opacity: 0; transform: translate(-50%, -47%) scale(0.96); }
-  to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-}
-
-/* Radix Slider / Switch 视觉（iOS 式） */
-.radix-slider { position: relative; display: flex; align-items: center; height: 28px; touch-action: none; user-select: none; }
-.radix-track { position: relative; height: 5px; flex: 1; border-radius: 999px; background: var(--bar-track); box-shadow: inset 0 1px 2px rgba(10, 20, 40, 0.08); }
-[data-theme="dark"] .radix-track { box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.5); }
-.radix-range { position: absolute; height: 100%; border-radius: 999px; background: rgb(var(--accent-rgb)); }
-.radix-thumb {
-  display: block;
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  background: #fff;
-  box-shadow: 0 1px 4px rgba(10, 22, 40, 0.35), 0 0 0 1px rgba(10, 22, 40, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.9);
-  cursor: grab;
-}
-.radix-thumb:active { cursor: grabbing; box-shadow: 0 1px 4px rgba(10, 22, 40, 0.35), 0 0 0 4px rgb(var(--accent-rgb) / 0.25); }
-
-.radix-switch {
-  position: relative;
-  width: 44px;
-  height: 26px;
-  border-radius: 999px;
-  background: rgb(var(--text-1) / 0.16);
-  box-shadow: inset 0 1px 3px rgba(10, 20, 40, 0.14);
-  transition: background 0.25s ease;
-  cursor: pointer;
-  flex: none;
-}
-[data-theme="dark"] .radix-switch { background: rgba(255, 255, 255, 0.14); box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.4); }
-.radix-switch[data-checked="true"] { background: rgb(var(--ok-rgb)); box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.06); }
-.radix-switch .knob {
-  display: block;
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  background: #fff;
-  box-shadow: 0 2px 5px rgba(10, 22, 40, 0.3), 0 0 0 1px rgba(10, 22, 40, 0.04);
-  transform: translateX(2px);
-  transition: transform 0.25s cubic-bezier(0.32, 0.72, 0, 1);
-}
-.radix-switch[data-checked="true"] .knob { transform: translateX(20px); }
-
-/* Tabs：设置页白瓷浮起胶囊；队列页 accent 胶囊（tabs-pill，对齐示意图 Mail Queue 激活态） */
-.tab-trigger {
-  height: 32px;
-  padding: 0 14px;
-  border-radius: 999px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-2);
-  cursor: pointer;
-  white-space: nowrap;
-  border: none;
-  background: transparent;
-  transition: color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
-}
-.tab-trigger:hover { color: var(--text-1); }
-.tab-trigger[data-state="active"] {
-  color: var(--text-1);
-  background: rgb(255 255 255 / 0.88);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.9),
-    0 0 0 1px var(--hairline),
-    0 2px 6px rgba(15, 32, 60, 0.12);
-}
-[data-theme="dark"] .tab-trigger[data-state="active"] {
-  background: rgba(255, 255, 255, 0.13);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.10),
-    0 0 0 1px rgba(255, 255, 255, 0.06),
-    0 2px 6px rgba(0, 0, 0, 0.3);
-}
-
-/* 设置页竖排标签（展板形态）：激活项浅蓝胶囊 + accent 文字 */
-.vtab {
-  display: flex;
-  width: 100%;
-  align-items: center;
-  gap: 8px;
-  height: 38px;
-  flex: none;
-  padding: 0 12px;
-  border: none;
-  border-radius: 10px;
-  background: transparent;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-2);
-  cursor: pointer;
-  text-align: left;
-  transition: color 0.2s ease, background 0.2s ease;
-}
-.vtab:hover { color: var(--text-1); background: rgb(var(--text-1) / 0.05); }
-.vtab[data-state="active"] {
-  color: rgb(var(--accent-rgb));
-  background: rgb(var(--accent-rgb) / 0.11);
-  box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 0.2);
-}
-
-/* 队列页 pill tabs：激活 = systemBlue 实色胶囊（示意图样式） */
-.tabs-pill { gap: 4px; }
-.tabs-pill .tab-trigger { height: 30px; padding: 0 16px; }
-.tabs-pill .tab-trigger[data-state="active"] {
-  background: linear-gradient(180deg, rgb(var(--accent-rgb)), rgb(var(--accent-deep-rgb)));
-  color: #fff;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.25),
-    0 2px 8px rgb(var(--accent-rgb) / 0.35);
-}
-[data-theme="dark"] .tabs-pill .tab-trigger[data-state="active"] {
-  background: linear-gradient(180deg, rgb(var(--accent-rgb) / 0.92), rgb(var(--accent-deep-rgb) / 0.92));
-  color: #fff;
-}
-
-/* 设置页主题三选一：独立玻璃选项卡，激活 = accent 描边 + 浅蓝晕 */
-.option-card {
-  flex: 1;
-  height: 44px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 7px;
-  border-radius: 12px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-2);
-  cursor: pointer;
-  background: linear-gradient(
-    180deg,
-    rgb(var(--glass-rgb) / calc(var(--glass-a) + 0.14)),
-    rgb(var(--glass-rgb) / calc(var(--glass-a) - 0.04))
-  );
-  -webkit-backdrop-filter: blur(12px) saturate(var(--glass-sat));
-  backdrop-filter: blur(12px) saturate(var(--glass-sat));
-  box-shadow:
-    inset 0 1px 0 var(--edge-spec),
-    0 0 0 1px var(--edge-outer);
-  transition: box-shadow 0.25s ease, color 0.25s ease, transform 0.25s ease;
-}
-.option-card:hover { color: var(--text-1); }
-.option-card:active { transform: scale(0.98); }
-.option-card[data-active="true"] {
-  color: rgb(var(--accent-rgb));
-  box-shadow:
-    inset 0 1px 0 var(--edge-spec),
-    inset 0 0 0 1.5px rgb(var(--accent-rgb)),
-    0 0 0 3px rgb(var(--accent-rgb) / 0.16),
-    0 2px 8px rgb(var(--accent-rgb) / 0.18);
-}
-
-/* Liquid Glass 透明度五档预设（超清澈 → 柔和暗色），激活 = accent 描边 */
-.preset-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
-.preset-box {
-  border-radius: 12px;
-  padding: 7px 6px 8px;
-  text-align: center;
-  cursor: pointer;
-  background: rgb(var(--text-1) / 0.035);
-  box-shadow: inset 0 0 0 1px var(--hairline);
-  transition: box-shadow 0.25s ease, transform 0.25s ease;
-}
-.preset-box:hover { transform: translateY(-1px); }
-.preset-box[data-active="true"] {
-  box-shadow:
-    inset 0 0 0 1.5px rgb(var(--accent-rgb)),
-    0 0 0 3px rgb(var(--accent-rgb) / 0.16);
-}
-.preset-swatch {
-  display: block;
-  position: relative;
-  height: 38px;
-  border-radius: 8px;
-  overflow: hidden;
-  background: linear-gradient(135deg, #6ea6e4 0%, #c2d6ef 42%, #e8cfa8 76%, #8fbfa8 100%);
-  box-shadow: inset 0 0 0 1px rgba(15, 32, 60, 0.14);
-}
-[data-theme="dark"] .preset-swatch {
-  background: linear-gradient(135deg, #1a3450 0%, #26344a 42%, #322c46 76%, #17323c 100%);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
-}
-.preset-swatch > i {
-  position: absolute;
-  inset: 5px;
-  border-radius: 6px;
-  background: rgb(255 255 255 / var(--sw, 0.55));
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.8),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.3);
-}
-[data-theme="dark"] .preset-swatch > i {
-  background: rgb(168 188 216 / var(--sw, 0.3));
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.25),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.12);
-}
-.preset-box .pl { margin-top: 6px; font-size: 10.5px; color: var(--text-2); line-height: 1.2; }
-.preset-box .pv { font-size: 9.5px; color: var(--text-3); }
-.preset-box[data-active="true"] .pl { color: rgb(var(--accent-rgb)); font-weight: 600; }
-
-/* ---------- 11. 可访问性降级（三个开关真实生效） ---------- */
-
-/* 减少透明度：玻璃接近不透明、去掉折射与透镜 */
-[data-a11y-reduced-transparency="true"] {
-  --glass-a: 0.97;
-  --glass-a-top: 0.01;
-  --toolbar-a: 0.97;
-}
-[data-a11y-reduced-transparency="true"] .glass,
-[data-a11y-reduced-transparency="true"] .glass--clear,
-[data-a11y-reduced-transparency="true"] .glass--toolbar,
-[data-a11y-reduced-transparency="true"] .glass--sidebar,
-[data-a11y-reduced-transparency="true"] .glass--control,
-[data-a11y-reduced-transparency="true"] .glass--data,
-[data-a11y-reduced-transparency="true"] .edge-lens::before {
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
-}
-[data-a11y-reduced-transparency="true"] .edge-lens::before { background: none; }
-[data-a11y-reduced-transparency="true"] .lightfield .blob { opacity: 0.22; animation: none; }
-
-/* 增加对比度 */
-[data-a11y-contrast="true"] {
-  --text-2: rgba(10, 15, 26, 0.78);
-  --text-3: rgba(10, 15, 26, 0.6);
-  --hairline: rgba(15, 32, 60, 0.22);
-  --hairline-strong: rgba(15, 32, 60, 0.34);
-  --edge-outer: rgba(15, 32, 60, 0.3);
-}
-[data-theme="dark"][data-a11y-contrast="true"] {
-  --text-2: rgba(235, 241, 250, 0.8);
-  --text-3: rgba(235, 241, 250, 0.62);
-  --hairline: rgba(255, 255, 255, 0.2);
-  --hairline-strong: rgba(255, 255, 255, 0.3);
-}
-
-/* 减少动态效果（JS 侧同时把 Motion spring 换成 fade） */
-[data-a11y-reduced-motion="true"] .lightfield .blob { animation: none; }
-[data-a11y-reduced-motion="true"] .glass-hover { transition: none; }
-[data-a11y-reduced-motion="true"] .radix-pop,
-[data-a11y-reduced-motion="true"] .radix-dialog,
-[data-a11y-reduced-motion="true"] .radix-overlay { animation: none; }
-
-@media (prefers-reduced-motion: reduce) {
-  .lightfield .blob { animation: none; }
-}
-
-/* 强制色彩模式（系统级无障碍）：材质退化为系统画布 + 描边 */
-@media (forced-colors: active) {
-  .glass, .glass--clear, .glass--toolbar, .glass--sidebar,
-  .glass--control, .glass--well, .glass--data {
-    background: Canvas;
+  /* ---- 内容表面降级（glass budget 核心） ----
+     main 里的 .glass* 不再消耗 backdrop-filter：近实心 --surface + 发丝描边。
+     portal 到 body 的浮层（下拉/对话框）不在 main 内，保持真玻璃。
+     [data-theme] 前缀 companion 用于压过上面的 dark .glass--data 特异性。 */
+  main .glass,
+  main .glass--clear,
+  main .glass--control,
+  main .glass--data {
+    background: var(--surface);
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
-    box-shadow: none;
-    forced-color-adjust: auto;
+    box-shadow:
+      0 0 0 1px var(--hairline),
+      var(--glass-shadow);
   }
-  .glass, .glass--clear, .glass--toolbar, .glass--sidebar, .glass--control, .glass--data {
-    box-shadow: inset 0 0 0 1px CanvasText;
+  [data-theme="dark"] main .glass--data {
+    background: var(--surface);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
   }
-  .btn-accent { background: ButtonFace; color: ButtonText; box-shadow: inset 0 0 0 1px ButtonText; }
-  .edge-lens::before { background: none; -webkit-backdrop-filter: none; backdrop-filter: none; }
+
+  /* 表头（内容表面，sticky 需要遮住滚过的行）：近实心 + 无模糊
+     （--surface-rgb 随主题自适应，无需 dark companion） */
+  .data-table thead th {
+    background: rgb(var(--surface-rgb) / 0.97);
+  }
+
+  /* ---- 折射（Refraction）：仅限 chrome 容器 ----
+     Chromium 走 backdrop-filter: url(#ms-lens) 让玻璃下的背景在边缘真实弯折；
+     其余浏览器自动回落到基础磨砂声明。旧规则作用于所有 .glass（含内容卡片），
+     现收窄到 chrome：.app-sidebar / .app-toolbar / [data-chrome] / .scroll-rail。 */
+  [data-refract="true"] .app-sidebar {
+    -webkit-backdrop-filter: url(#ms-lens) blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
+    backdrop-filter: url(#ms-lens) blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
+  }
+  [data-refract="true"] .app-toolbar {
+    -webkit-backdrop-filter: url(#ms-lens) blur(var(--toolbar-blur)) saturate(var(--glass-sat)) brightness(1.04);
+    backdrop-filter: url(#ms-lens) blur(var(--toolbar-blur)) saturate(var(--glass-sat)) brightness(1.04);
+  }
+  [data-refract="true"] [data-chrome],
+  [data-refract="true"] .scroll-rail {
+    -webkit-backdrop-filter: url(#ms-lens) blur(30px) saturate(var(--glass-sat)) brightness(1.04);
+    backdrop-filter: url(#ms-lens) blur(30px) saturate(var(--glass-sat)) brightness(1.04);
+  }
+
+  /* ---- 边缘透镜（edge-lens）：仅限 chrome ----
+     默认 no-op（content:none）；只有 chrome 容器内的 .edge-lens 渲染镜面环。
+     页面里遗留的 18 处 .edge-lens（Dashboard 等）由此静默失效，无需改页面。 */
+  .edge-lens::before {
+    content: none;
+  }
+  .app-sidebar.edge-lens::before,
+  .app-toolbar.edge-lens::before,
+  [data-chrome].edge-lens::before,
+  .scroll-rail.edge-lens::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 2.5px;
+    background: linear-gradient(
+      180deg,
+      var(--edge-lens) 0%,
+      rgba(255, 255, 255, 0.04) 42%,
+      rgb(var(--accent-rgb) / 0.10) 100%
+    );
+    -webkit-backdrop-filter: blur(2.5px) brightness(1.05);
+    backdrop-filter: blur(2.5px) brightness(1.05);
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    mask-composite: exclude;
+    pointer-events: none;
+  }
+
+  /* 交互玻璃：悬停抬升 2px + 高光增强（0.24s + decel 曲线）；
+     按下弹性压缩由 Motion spring 完成 */
+  .glass-hover {
+    transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .glass-hover:hover {
+    transform: translateY(-2px);
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 0 0 1px var(--edge-inner),
+      0 0 0 1px var(--edge-outer),
+      var(--glass-shadow-hover);
+  }
+  .glass-hover:active { transform: translateY(0) scale(0.985); }
+
+  /* ---------- 3.3 chrome 覆写：Golden Gate 全高侧栏 / 全宽工具栏 ---------- */
+
+  /* 桌面侧栏：贴边全高（无外边距/圆角），仅右侧发丝分隔；
+     抽屉形态保留纸张圆角与完整玻璃描边。 */
+  .app-sidebar {
+    border-radius: 0;
+    box-shadow: inset -1px 0 0 var(--hairline);
+  }
+  .app-sidebar[data-variant="drawer"] {
+    border-radius: var(--radius-sheet);
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 0 0 1px var(--edge-inner),
+      0 0 0 1px var(--edge-outer),
+      var(--glass-shadow);
+  }
+
+  /* 工具栏：全宽贴顶（非浮动胶囊），底部 0.5px 发丝线；
+     滚动后刻线加强 + 硬磨砂（--toolbar-a/--toolbar-blur 由 .glass--toolbar.is-scrolled 提供）。 */
+  .app-toolbar {
+    border-bottom: 0.5px solid var(--hairline);
+    box-shadow: inset 0 1px 0 var(--edge-spec);
+  }
+  .app-toolbar.is-scrolled {
+    border-bottom-color: var(--hairline-strong);
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      0 8px 22px rgba(15, 32, 60, 0.10);
+  }
+  [data-theme="dark"] .app-toolbar.is-scrolled {
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      0 8px 22px rgba(0, 0, 0, 0.4);
+  }
+
+  /* ---------- 3.4 导航胶囊（选中态 = accent） ---------- */
+
+  .nav-capsule-light {
+    background: linear-gradient(180deg, rgb(var(--accent-rgb) / 1), rgb(var(--accent-deep-rgb) / 1));
+    color: #fff;
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.28),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.12),
+      0 3px 10px rgb(var(--accent-rgb) / 0.35);
+  }
+  [data-theme="dark"] .nav-capsule-dark {
+    /* 深色选中胶囊：accent 染色玻璃 + accent 文字（Golden Gate 源列表选中态） */
+    background: linear-gradient(180deg, rgb(var(--accent-rgb) / 0.28), rgb(var(--accent-rgb) / 0.16));
+    color: rgb(var(--accent-rgb));
+    box-shadow:
+      inset 0 0 0 1px rgb(var(--accent-rgb) / 0.28),
+      inset 0 1px 0 rgba(255, 255, 255, 0.10);
+  }
+  [data-theme="dark"] .nav-capsule-dark .nav-label { color: rgb(var(--accent-rgb)); }
+
+  /* ---------- 3.5 控件（度量消费平台 token） ---------- */
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: var(--control-h);
+    padding: 0 12px;
+    border-radius: var(--radius-control);
+    font-size: var(--font-body);
+    font-weight: 500;
+    color: var(--text-1);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+  }
+  .btn:disabled { opacity: 0.45; cursor: default; pointer-events: none; }
+
+  .btn-accent {
+    background: linear-gradient(180deg, rgb(var(--accent-rgb)), rgb(var(--accent-deep-rgb)));
+    color: #fff;
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.25),
+      0 2px 8px rgb(var(--accent-rgb) / 0.32);
+  }
+  .btn-accent:hover { filter: brightness(1.06); }
+  .btn-accent:active { filter: brightness(0.97); }
+
+  .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--control-h);
+    height: var(--control-h);
+    border-radius: var(--radius-control);
+    color: var(--text-2);
+    cursor: pointer;
+    position: relative;
+  }
+  .icon-btn:hover { color: var(--text-1); }
+  .icon-btn:active { transform: scale(0.94); }
+
+  .input {
+    height: var(--control-h);
+    width: 100%;
+    padding: 0 12px;
+    border-radius: var(--radius-control);
+    border: none;
+    font-size: var(--font-body);
+    color: var(--text-1);
+    background: rgb(var(--text-1) / 0.05);
+    box-shadow: inset 0 0 0 1px var(--hairline);
+    outline: none;
+    transition: box-shadow 0.2s ease, background 0.2s ease;
+  }
+  .input::placeholder { color: var(--text-3); }
+  .input:focus {
+    background: rgb(var(--glass-rgb) / 0.5);
+    box-shadow:
+      inset 0 0 0 1px rgb(var(--accent-rgb) / 0.7),
+      0 0 0 3px rgb(var(--accent-rgb) / 0.18);
+  }
+  [data-theme="dark"] .input { background: rgba(0, 0, 0, 0.26); }
+  [data-theme="dark"] .input:focus { background: rgba(0, 0, 0, 0.16); }
+
+  .kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: calc(var(--font-caption) + 7px);
+    height: calc(var(--font-caption) + 7px);
+    padding: 0 4px;
+    border-radius: 5px;
+    font-size: var(--font-caption);
+    font-family: inherit;
+    color: var(--text-3);
+    background: rgb(var(--text-1) / 0.06);
+    box-shadow: inset 0 0 0 1px var(--hairline), inset 0 -1px 0 var(--hairline);
+  }
+
+  /* Squircle（渐进增强）：仅在浏览器支持 corner-shape 时启用；
+     不支持的走普通 border-radius。同心规则：内层半径 = 外层半径 − 内边距
+     （例如卡片 --radius-panel 10px 内嵌按钮 --radius-control 6px，pad 4px）。
+     胶囊类（badge/tab/nav-capsule/switch）保持全圆，不参与 squircle。 */
+  @supports (corner-shape: squircle) {
+    .btn,
+    .icon-btn,
+    .input,
+    .kbd,
+    .option-card,
+    .preset-box,
+    .preset-swatch,
+    .skeleton,
+    .radix-pop,
+    .radix-dialog,
+    .glass,
+    .glass--clear,
+    .glass--control,
+    .glass--data,
+    .glass--surface {
+      corner-shape: squircle;
+    }
+  }
+
+  /* ---------- 3.6 徽标 / 状态（颜色 + 图标 + 文字 双编码） ---------- */
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: var(--badge-h);
+    padding: 0 9px;
+    border-radius: 999px;
+    font-size: var(--font-caption);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .badge-ok   { color: rgb(var(--ok-rgb) / 1);   background: rgb(var(--ok-rgb) / 0.13);   box-shadow: inset 0 0 0 1px rgb(var(--ok-rgb) / 0.25); }
+  .badge-warn { color: rgb(var(--warn-rgb) / 1); background: rgb(var(--warn-rgb) / 0.14); box-shadow: inset 0 0 0 1px rgb(var(--warn-rgb) / 0.28); }
+  .badge-err  { color: rgb(var(--err-rgb) / 1);  background: rgb(var(--err-rgb) / 0.12);  box-shadow: inset 0 0 0 1px rgb(var(--err-rgb) / 0.26); }
+  .badge-info { color: rgb(var(--accent-rgb) / 1); background: rgb(var(--accent-rgb) / 0.12); box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 0.26); }
+  .badge-hold { color: rgb(var(--hold-rgb) / 1); background: rgb(var(--hold-rgb) / 0.14); box-shadow: inset 0 0 0 1px rgb(var(--hold-rgb) / 0.28); }
+  .badge-neutral { color: var(--text-2); background: rgb(var(--text-1) / 0.07); box-shadow: inset 0 0 0 1px var(--hairline); }
+
+  [data-a11y-contrast="true"] .badge-ok   { color: rgb(16 120 48 / 1); }
+  [data-a11y-contrast="true"] .badge-err  { color: rgb(196 30 22 / 1); }
+  [data-a11y-contrast="true"] .badge-warn { color: rgb(150 96 0 / 1); }
+  [data-theme="dark"][data-a11y-contrast="true"] .badge-ok { color: rgb(110 230 140 / 1); }
+  [data-theme="dark"][data-a11y-contrast="true"] .badge-err { color: rgb(255 140 134 / 1); }
+  [data-theme="dark"][data-a11y-contrast="true"] .badge-warn { color: rgb(255 224 100 / 1); }
+
+  /* ---------- 3.7 数据表面：表格（12px 表体 / caption 表头） ---------- */
+
+  .data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .data-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    text-align: left;
+    font-weight: 600;
+    font-size: var(--font-caption);
+    letter-spacing: 0.02em;
+    color: var(--text-2);
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--hairline-strong);
+    white-space: nowrap;
+    user-select: none;
+    /* 背景由 3.2 节「内容表面」规则提供（近实心、无模糊） */
+  }
+  .data-table thead th.sortable { cursor: pointer; }
+  .data-table thead th.sortable:hover { color: var(--text-1); }
+  .data-table tbody td {
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--hairline);
+    color: var(--text-1);
+    white-space: nowrap;
+  }
+  .data-table tbody tr:last-child td { border-bottom: none; }
+  .data-table tbody tr { transition: background 0.15s ease; }
+  .data-table tbody tr:hover { background: rgb(var(--accent-rgb) / 0.055); }
+
+  /* ---------- 3.8 占比条 ---------- */
+
+  .bar {
+    height: 5px;
+    border-radius: 999px;
+    background: var(--bar-track);
+    overflow: hidden;
+  }
+  .bar > i {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, rgb(var(--accent-rgb) / 0.75), rgb(var(--accent-rgb)));
+    transition: width 0.6s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  .bar > i.ok { background: linear-gradient(90deg, rgb(var(--ok-rgb) / 0.75), rgb(var(--ok-rgb))); }
+  .bar > i.warn { background: linear-gradient(90deg, rgb(var(--warn-rgb) / 0.8), rgb(var(--warn-rgb))); }
+  .bar > i.err { background: linear-gradient(90deg, rgb(var(--err-rgb) / 0.8), rgb(var(--err-rgb))); }
+
+  /* ---------- 3.9 Radix 弹层挂载材质（chrome：真玻璃 + data-chrome 作用域） ---------- */
+
+  .radix-pop {
+    z-index: 60;
+    min-width: 180px;
+    border-radius: var(--r-overlay);
+    padding: 6px;
+    outline: none;
+    animation: pop-in 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  @keyframes pop-in {
+    from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  .radix-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 10px;
+    border-radius: var(--radius-control);
+    font-size: var(--font-body);
+    color: var(--text-1);
+    cursor: pointer;
+    outline: none;
+    border: none;
+    background: transparent;
+    text-align: left;
+  }
+  .radix-item[data-highlighted] { background: rgb(var(--accent-rgb) / 0.14); color: var(--text-1); }
+  .radix-item[data-disabled] { opacity: 0.4; pointer-events: none; }
+  .radix-sep { height: 1px; margin: 5px 8px; background: var(--hairline); }
+
+  .radix-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 70;
+    background: rgba(10, 16, 28, 0.35);
+    -webkit-backdrop-filter: blur(6px);
+    backdrop-filter: blur(6px);
+    animation: fade-in 0.25s ease;
+  }
+  [data-theme="dark"] .radix-overlay { background: rgba(0, 0, 0, 0.5); }
+  @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+
+  .radix-dialog {
+    position: fixed;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 80;
+    width: min(420px, calc(100vw - 48px));
+    border-radius: var(--r-overlay);
+    padding: 22px;
+    outline: none;
+    animation: dialog-in 0.32s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  @keyframes dialog-in {
+    from { opacity: 0; transform: translate(-50%, -47%) scale(0.96); }
+    to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  }
+
+  /* Radix Slider / Switch 视觉（iOS 式） */
+  .radix-slider { position: relative; display: flex; align-items: center; height: 28px; touch-action: none; user-select: none; }
+  .radix-track { position: relative; height: 5px; flex: 1; border-radius: 999px; background: var(--bar-track); box-shadow: inset 0 1px 2px rgba(10, 20, 40, 0.08); }
+  [data-theme="dark"] .radix-track { box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.5); }
+  .radix-range { position: absolute; height: 100%; border-radius: 999px; background: rgb(var(--accent-rgb)); }
+  .radix-thumb {
+    display: block;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 4px rgba(10, 22, 40, 0.35), 0 0 0 1px rgba(10, 22, 40, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    cursor: grab;
+  }
+  .radix-thumb:active { cursor: grabbing; box-shadow: 0 1px 4px rgba(10, 22, 40, 0.35), 0 0 0 4px rgb(var(--accent-rgb) / 0.25); }
+
+  .radix-switch {
+    position: relative;
+    width: 44px;
+    height: 26px;
+    border-radius: 999px;
+    background: rgb(var(--text-1) / 0.16);
+    box-shadow: inset 0 1px 3px rgba(10, 20, 40, 0.14);
+    transition: background 0.25s ease;
+    cursor: pointer;
+    flex: none;
+  }
+  [data-theme="dark"] .radix-switch { background: rgba(255, 255, 255, 0.14); box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.4); }
+  .radix-switch[data-checked="true"] { background: rgb(var(--ok-rgb)); box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.06); }
+  .radix-switch .knob {
+    display: block;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 2px 5px rgba(10, 22, 40, 0.3), 0 0 0 1px rgba(10, 22, 40, 0.04);
+    transform: translateX(2px);
+    transition: transform 0.25s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  .radix-switch[data-checked="true"] .knob { transform: translateX(20px); }
+
+  /* Tabs：设置页白瓷浮起胶囊；队列页 accent 胶囊（tabs-pill） */
+  .tab-trigger {
+    height: var(--control-h-lg);
+    padding: 0 14px;
+    border-radius: 999px;
+    font-size: var(--font-body);
+    font-weight: 500;
+    color: var(--text-2);
+    cursor: pointer;
+    white-space: nowrap;
+    border: none;
+    background: transparent;
+    transition: color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
+  }
+  .tab-trigger:hover { color: var(--text-1); }
+  .tab-trigger[data-state="active"] {
+    color: var(--text-1);
+    background: rgb(255 255 255 / 0.88);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.9),
+      0 0 0 1px var(--hairline),
+      0 2px 6px rgba(15, 32, 60, 0.12);
+  }
+  [data-theme="dark"] .tab-trigger[data-state="active"] {
+    background: rgba(255, 255, 255, 0.13);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.10),
+      0 0 0 1px rgba(255, 255, 255, 0.06),
+      0 2px 6px rgba(0, 0, 0, 0.3);
+  }
+
+  /* 设置页竖排标签：激活项浅蓝胶囊 + accent 文字 */
+  .vtab {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: 8px;
+    height: var(--control-h-lg);
+    flex: none;
+    padding: 0 12px;
+    border: none;
+    border-radius: var(--radius-control);
+    background: transparent;
+    font-size: var(--font-body);
+    font-weight: 500;
+    color: var(--text-2);
+    cursor: pointer;
+    text-align: left;
+    transition: color 0.2s ease, background 0.2s ease;
+  }
+  .vtab:hover { color: var(--text-1); background: rgb(var(--text-1) / 0.05); }
+  .vtab[data-state="active"] {
+    color: rgb(var(--accent-rgb));
+    background: rgb(var(--accent-rgb) / 0.11);
+    box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 0.2);
+  }
+
+  /* 队列页 pill tabs：激活 = systemBlue 实色胶囊 */
+  .tabs-pill { gap: 4px; }
+  .tabs-pill .tab-trigger { height: var(--control-h); padding: 0 16px; }
+  .tabs-pill .tab-trigger[data-state="active"] {
+    background: linear-gradient(180deg, rgb(var(--accent-rgb)), rgb(var(--accent-deep-rgb)));
+    color: #fff;
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.25),
+      0 2px 8px rgb(var(--accent-rgb) / 0.35);
+  }
+  [data-theme="dark"] .tabs-pill .tab-trigger[data-state="active"] {
+    background: linear-gradient(180deg, rgb(var(--accent-rgb) / 0.92), rgb(var(--accent-deep-rgb) / 0.92));
+    color: #fff;
+  }
+
+  /* 设置页主题三选一：近实心选项卡（内容表面），激活 = accent 描边 + 浅蓝晕 */
+  .option-card {
+    flex: 1;
+    height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    border-radius: var(--radius-control);
+    font-size: var(--font-body);
+    font-weight: 500;
+    color: var(--text-2);
+    cursor: pointer;
+    background: rgb(var(--surface-rgb) / 0.6);
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 0 0 1px var(--hairline);
+    transition: box-shadow 0.25s ease, color 0.25s ease, transform 0.25s ease;
+  }
+  .option-card:hover { color: var(--text-1); }
+  .option-card:active { transform: scale(0.98); }
+  .option-card[data-active="true"] {
+    color: rgb(var(--accent-rgb));
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 0 0 1.5px rgb(var(--accent-rgb)),
+      0 0 0 3px rgb(var(--accent-rgb) / 0.16),
+      0 2px 8px rgb(var(--accent-rgb) / 0.18);
+  }
+
+  /* Liquid Glass 透明度五档预设（超清澈 → 柔和暗色），激活 = accent 描边 */
+  .preset-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+  .preset-box {
+    border-radius: var(--radius-control);
+    padding: 7px 6px 8px;
+    text-align: center;
+    cursor: pointer;
+    background: rgb(var(--text-1) / 0.035);
+    box-shadow: inset 0 0 0 1px var(--hairline);
+    transition: box-shadow 0.25s ease, transform 0.25s ease;
+  }
+  .preset-box:hover { transform: translateY(-1px); }
+  .preset-box[data-active="true"] {
+    box-shadow:
+      inset 0 0 0 1.5px rgb(var(--accent-rgb)),
+      0 0 0 3px rgb(var(--accent-rgb) / 0.16);
+  }
+  .preset-swatch {
+    display: block;
+    position: relative;
+    height: 38px;
+    border-radius: var(--radius-control);
+    overflow: hidden;
+    background: linear-gradient(135deg, #6ea6e4 0%, #c2d6ef 42%, #e8cfa8 76%, #8fbfa8 100%);
+    box-shadow: inset 0 0 0 1px rgba(15, 32, 60, 0.14);
+  }
+  [data-theme="dark"] .preset-swatch {
+    background: linear-gradient(135deg, #1a3450 0%, #26344a 42%, #322c46 76%, #17323c 100%);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+  }
+  .preset-swatch > i {
+    position: absolute;
+    inset: 5px;
+    border-radius: 6px;
+    background: rgb(255 255 255 / var(--sw, 0.55));
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.8),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.3);
+  }
+  [data-theme="dark"] .preset-swatch > i {
+    background: rgb(168 188 216 / var(--sw, 0.3));
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.25),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+  }
+  .preset-box .pl { margin-top: 6px; font-size: 10.5px; color: var(--text-2); line-height: 1.2; }
+  .preset-box .pv { font-size: 9.5px; color: var(--text-3); }
+  .preset-box[data-active="true"] .pl { color: rgb(var(--accent-rgb)); font-weight: 600; }
+
+  /* ---------- 3.10 滚动边缘工具栏（chrome） ---------- */
+
+  .scroll-rail {
+    position: fixed;
+    right: 14px;
+    top: 50%;
+    z-index: 45;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding: 6px;
+    border-radius: 999px;
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 0 0 1px var(--edge-inner),
+      0 0 0 1px var(--edge-outer),
+      0 10px 28px rgba(15, 32, 60, 0.18);
+  }
+  .rail-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: none;
+    background: transparent;
+    color: var(--text-1);
+    opacity: 0.78;
+    cursor: pointer;
+    transition: background 0.2s ease, color 0.2s ease, opacity 0.2s ease;
+  }
+  .rail-btn:hover { background: rgb(var(--accent-rgb) / 0.14); color: rgb(var(--accent-rgb)); opacity: 1; }
+  .rail-btn:active { transform: scale(0.92); }
+  .rail-sep { width: 20px; height: 1px; margin: 3px 0; background: var(--hairline-strong); }
+
+  /* ---------- 3.11 可访问性降级（三个开关真实生效；class 级规则） ---------- */
+
+  /* 减少透明度：chrome 玻璃接近不透明、去掉折射与透镜
+     （token 覆写在 tokens 层；这里关掉滤镜与透镜本体） */
+  [data-a11y-reduced-transparency="true"] .glass,
+  [data-a11y-reduced-transparency="true"] .glass--clear,
+  [data-a11y-reduced-transparency="true"] .glass--toolbar,
+  [data-a11y-reduced-transparency="true"] .glass--sidebar,
+  [data-a11y-reduced-transparency="true"] .glass--control,
+  [data-a11y-reduced-transparency="true"] .glass--data,
+  [data-a11y-reduced-transparency="true"] .edge-lens::before {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  [data-a11y-reduced-transparency="true"] .edge-lens::before { content: none; background: none; }
+  [data-a11y-reduced-transparency="true"] .lightfield .blob { opacity: 0.22; animation: none; }
+
+  /* 减少动态效果（JS 侧同时把 Motion spring 换成 fade） */
+  [data-a11y-reduced-motion="true"] .lightfield .blob { animation: none; }
+  [data-a11y-reduced-motion="true"] .glass-hover { transition: none; }
+  [data-a11y-reduced-motion="true"] .radix-pop,
+  [data-a11y-reduced-motion="true"] .radix-dialog,
+  [data-a11y-reduced-motion="true"] .radix-overlay { animation: none; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .lightfield .blob { animation: none; }
+  }
+
+  /* 强制色彩模式（系统级无障碍）：材质退化为系统画布 + 描边 */
+  @media (forced-colors: active) {
+    .glass, .glass--clear, .glass--toolbar, .glass--sidebar,
+    .glass--control, .glass--well, .glass--data, .glass--surface {
+      background: Canvas;
+      -webkit-backdrop-filter: none;
+      backdrop-filter: none;
+      box-shadow: none;
+      forced-color-adjust: auto;
+    }
+    .glass, .glass--clear, .glass--toolbar, .glass--sidebar,
+    .glass--control, .glass--data, .glass--surface {
+      box-shadow: inset 0 0 0 1px CanvasText;
+    }
+    .btn-accent { background: ButtonFace; color: ButtonText; box-shadow: inset 0 0 0 1px ButtonText; }
+    .edge-lens::before { content: none; background: none; -webkit-backdrop-filter: none; backdrop-filter: none; }
+  }
+
+  /* ---------- 3.12 其它 ---------- */
+
+  .hairline-b { box-shadow: 0 1px 0 var(--hairline); }
+
+  .page-scroll {
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+  }
+
+  .skeleton {
+    border-radius: var(--radius-control);
+    background: rgb(var(--text-1) / 0.06);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 }
-
-/* ---------- 12. 滚动边缘工具栏（Scroll-edge toolbar，展板第 4 项） ---------- */
-
-.scroll-rail {
-  position: fixed;
-  right: 14px;
-  top: 50%;
-  z-index: 45;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  padding: 6px;
-  border-radius: 999px;
-  box-shadow:
-    inset 0 1px 0 var(--edge-spec),
-    inset 0 0 0 1px var(--edge-inner),
-    0 0 0 1px var(--edge-outer),
-    0 10px 28px rgba(15, 32, 60, 0.18);
-}
-.rail-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
-  border: none;
-  background: transparent;
-  color: var(--text-1);
-  opacity: 0.78;
-  cursor: pointer;
-  transition: background 0.2s ease, color 0.2s ease, opacity 0.2s ease;
-}
-.rail-btn:hover { background: rgb(var(--accent-rgb) / 0.14); color: rgb(var(--accent-rgb)); opacity: 1; }
-.rail-btn:active { transform: scale(0.92); }
-.rail-sep { width: 20px; height: 1px; margin: 3px 0; background: var(--hairline-strong); }
-
-/* ---------- 13. 其它 ---------- */
-
-.hairline-b { box-shadow: 0 1px 0 var(--hairline); }
-
-.page-scroll {
-  overflow-y: auto;
-  overflow-x: hidden;
-  overscroll-behavior: contain;
-}
-
-.skeleton {
-  border-radius: var(--r-control);
-  background: rgb(var(--text-1) / 0.06);
-  animation: pulse 1.6s ease-in-out infinite;
-}
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }

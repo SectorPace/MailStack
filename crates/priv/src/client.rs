@@ -86,6 +86,15 @@ impl std::fmt::Display for CallError {
 
 impl std::error::Error for CallError {}
 
+/// 显式杀掉 sudo 子进程并等待退出（尽力而为）。
+///
+/// `kill_on_drop` 只覆盖「Child 被 drop」的路径；stdin 写入失败时 child 仍在
+/// 我们手里，必须 start_kill + wait，否则一个卡住的 root 子进程会一直活着。
+async fn kill_and_reap(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
 /// 特权调用客户端。
 #[derive(Debug, Clone)]
 pub struct PrivilegedCaller {
@@ -230,6 +239,9 @@ impl PrivilegedCaller {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // 兜底：future 被丢弃的所有路径（客户端取消、wait 超时）都会连带
+            // drop 掉 Child —— 显式 kill 覆盖不到的那些路径由它收尾。
+            .kill_on_drop(true)
             .spawn()
             .map_err(|error| {
                 CallError::unavailable(format!(
@@ -238,14 +250,28 @@ impl PrivilegedCaller {
                 ))
             })?;
 
-        // 写 stdin 后必须 drop 句柄，否则子进程会一直等 EOF。
+        // 写 stdin 必须有自己的超时：包装器卡在读请求上时不能把调用方钉死。
+        // 失败 / 超时路径必须**显式**杀掉子进程并等待退出 —— 一个卡住的
+        // sudo 子进程是 root 进程泄漏（kill_on_drop 只兜 future 被 drop 的路）。
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
-            if let Err(error) = stdin.write_all(&payload).await {
-                return Err(CallError::business(format!(
-                    "writing request to privileged helper failed: {error}"
-                )));
+            let write = tokio::time::timeout(self.timeout, stdin.write_all(&payload)).await;
+            match write {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    kill_and_reap(&mut child).await;
+                    return Err(CallError::business(format!(
+                        "writing request to privileged helper failed: {error}"
+                    )));
+                }
+                Err(_) => {
+                    kill_and_reap(&mut child).await;
+                    return Err(CallError::mid_timeout(
+                        "writing request to the privileged helper timed out",
+                    ));
+                }
             }
+            // 写完必须 drop 句柄，否则子进程会一直等 EOF。
             drop(stdin);
         }
 
@@ -257,6 +283,8 @@ impl PrivilegedCaller {
                 )))
             }
             Err(_) => {
+                // 超时路径拿不回 Child（已被 future 持有并随超时 drop），
+                // kill_on_drop(true) 负责在这里把 root 子进程杀掉。
                 return Err(CallError::mid_timeout(
                     "privileged helper timed out mid-flight",
                 ))

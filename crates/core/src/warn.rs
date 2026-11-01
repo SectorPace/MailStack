@@ -40,25 +40,24 @@ pub fn warn_with_detail(context: &str, detail: &str) {
 
 fn warn_key(key: String, detail: String) {
     // `warn()` 本身永不抛出：整个函数体都在容错范围内。
+    //
+    // 「查重 → 写 stderr → 登记」必须在**同一次持锁**内完成。原实现查重后
+    // 释放锁、写完 stderr 再重新拿锁插入 —— 两个线程会在窗口内同时看到
+    // 「还没报过」并各自输出一遍（check-then-act 竞态），去重失效。
+    // stderr 写入很短，持锁跨过它不会造成可观测的争用。
     let result = std::panic::catch_unwind(|| {
-        {
-            let guard = match warned().lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if guard.contains(&key) {
-                return;
-            }
+        let mut guard = match warned().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.contains(&key) {
+            return;
         }
 
         let line = format!("mailstack: {key} failed{detail}\n");
         let mut stderr = std::io::stderr();
         // 只有真正写成功才登记，否则「写失败会把该 context 永久静音」。
         if stderr.write_all(line.as_bytes()).is_ok() && stderr.flush().is_ok() {
-            let mut guard = match warned().lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
             guard.insert(key);
         }
     });

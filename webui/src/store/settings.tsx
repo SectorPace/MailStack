@@ -32,6 +32,9 @@ type Prefs = {
   reduceTransparency: boolean;
   increaseContrast: boolean;
   reduceMotion: boolean;
+  /** 桌面全高侧栏折叠为图标栏（Sidebar.tsx 应改为读取该偏好，而不是自己的
+      localStorage 键 —— 旧键由 load() 迁移进来并删除，见 LEGACY_COLLAPSE_KEY）。 */
+  sidebarCollapsed: boolean;
 };
 
 const DEFAULTS: Prefs = {
@@ -42,16 +45,62 @@ const DEFAULTS: Prefs = {
   reduceTransparency: false,
   increaseContrast: false,
   reduceMotion: false,
+  sidebarCollapsed: false,
 };
 
 const STORE_KEY = "mailstack.prefs.v1";
 const BG_KEY = "mailstack.customBg";
+/** 旧版 Sidebar.tsx 的独立折叠键（components/Sidebar.tsx COLLAPSE_KEY）。 */
+const LEGACY_COLLAPSE_KEY = "mailstack.sidebar-collapsed";
 
 function load(): Prefs {
+  // 一次性迁移：旧版 Sidebar 的独立键 mailstack.sidebar-collapsed（"0"/"1"）并入
+  // 统一 prefs 后删除旧键。Sidebar.tsx 应改为读取 prefs.sidebarCollapsed /
+  // setSidebarCollapsed()（本次不改动 Sidebar.tsx —— 它仍写旧键的话，下次加载会
+  // 再次迁移，行为收敛一致，无数据丢失）。
+  try {
+    const legacy = localStorage.getItem(LEGACY_COLLAPSE_KEY);
+    if (legacy !== null) {
+      localStorage.removeItem(LEGACY_COLLAPSE_KEY);
+      try {
+        const raw = localStorage.getItem(STORE_KEY);
+        const j: Record<string, unknown> = raw ? JSON.parse(raw) : {};
+        if (j && typeof j === "object" && j.sidebarCollapsed === undefined) {
+          j.sidebarCollapsed = legacy === "1";
+          localStorage.setItem(STORE_KEY, JSON.stringify({ ...DEFAULTS, ...j }));
+        }
+      } catch {
+        /* prefs 本体损坏时放弃合并，走下方逐字段校验回落默认值 */
+      }
+    }
+  } catch {
+    /* localStorage 不可用（隐私模式等）：跳过迁移 */
+  }
   try {
     const raw = localStorage.getItem(STORE_KEY);
     if (!raw) return DEFAULTS;
-    return { ...DEFAULTS, ...(JSON.parse(raw) as Partial<Prefs>) };
+    // localStorage 可被外部/其他版本改写：原先只 `as Partial<Prefs>` 合并，
+    // 坏数据（字符串数字、越界值、错枚举）会直接进城。逐字段校验类型并钳制
+    // 取值范围，不合法的键回落默认值。
+    const j = JSON.parse(raw) as Record<string, unknown>;
+    const bool = (v: unknown, d: boolean): boolean => (typeof v === "boolean" ? v : d);
+    return {
+      theme:
+        j.theme === "light" || j.theme === "dark" || j.theme === "system" ? j.theme : DEFAULTS.theme,
+      lang: j.lang === "zh" || j.lang === "en" ? j.lang : DEFAULTS.lang,
+      accent:
+        typeof j.accent === "string" && (j.accent as string) in ACCENTS
+          ? (j.accent as Accent)
+          : DEFAULTS.accent,
+      glassLevel:
+        typeof j.glassLevel === "number" && Number.isFinite(j.glassLevel)
+          ? Math.min(100, Math.max(0, Math.round(j.glassLevel)))
+          : DEFAULTS.glassLevel,
+      reduceTransparency: bool(j.reduceTransparency, DEFAULTS.reduceTransparency),
+      increaseContrast: bool(j.increaseContrast, DEFAULTS.increaseContrast),
+      reduceMotion: bool(j.reduceMotion, DEFAULTS.reduceMotion),
+      sidebarCollapsed: bool(j.sidebarCollapsed, DEFAULTS.sidebarCollapsed),
+    };
   } catch {
     return DEFAULTS;
   }
@@ -71,6 +120,8 @@ type SettingsCtx = {
   setAccent: (a: Accent) => void;
   setGlassLevel: (n: number) => void;
   setFlag: (k: "reduceTransparency" | "increaseContrast" | "reduceMotion", v: boolean) => void;
+  /** Sidebar.tsx 折叠态应迁移到该 setter（替代其本地 localStorage 键）。 */
+  setSidebarCollapsed: (v: boolean) => void;
   t: (key: DictKey, params?: Record<string, string | number>) => string;
 };
 
@@ -89,11 +140,12 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     try { return localStorage.getItem(BG_KEY); } catch { return null; }
   });
   const setCustomBg = useCallback((v: string | null) => {
+    // 状态先落地（持久化失败时至少当前会话生效），但**不吞** localStorage 的
+    // QuotaExceededError：Settings 的调用方包了 try/catch 等 toast「存储已满」，
+    // 这里静默会让外层 catch 永远不触发、用户看到的是虚假的「已保存」。
     setCustomBgState(v);
-    try {
-      if (v) localStorage.setItem(BG_KEY, v);
-      else localStorage.removeItem(BG_KEY);
-    } catch { /* 存储超限时仅当前会话生效 */ }
+    if (v) localStorage.setItem(BG_KEY, v);
+    else localStorage.removeItem(BG_KEY);
   }, []);
 
   useEffect(() => {
@@ -165,6 +217,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       setAccent: (a) => set("accent", a),
       setGlassLevel: (n) => set("glassLevel", n),
       setFlag: (k, v2) => set(k, v2),
+      setSidebarCollapsed: (v2) => set("sidebarCollapsed", v2),
       t: (key, params) => translate(prefs.lang, key, params),
     }),
     [prefs, resolvedTheme, customBg, setCustomBg, set],

@@ -1,9 +1,10 @@
 // TLS 证书 —— 证书列表 + 续期（certs.list / certs.renew）
-import { useEffect, useState, useContext } from "react";
+import { useContext, useState } from "react";
 import { useSettings } from "../store/settings";
 import { rpc } from "../api/client";
+import { useApiList } from "../hooks/useApiList";
 import { RefreshContext } from "../App";
-import { PageHeader, DataPanel, StatusBadge, ConfirmDialog, toast } from "../components/ui";
+import { PageHeader, DataPanel, StatusBadge, ConfirmDialog, LoadError, toast } from "../components/ui";
 import { DataTable, type Column } from "../components/DataTable";
 import { IconRefresh, IconShield, IconWarn } from "../components/icons";
 
@@ -40,20 +41,17 @@ function daysLeftColor(n: number): "ok" | "warn" | "err" {
 export default function TlsCerts() {
   const { t } = useSettings();
   const refreshN = useContext(RefreshContext);
-  const [rows, setRows] = useState<CertRow[]>([]);
+  // useApiList 自带 seq 请求序守卫：续期后补拉的响应若晚于并发刷新到达，不再覆写新数据
+  // （原先无任何排序保护，旧响应可后到）；undefined 载荷兜底 []，失败显示重试横幅。
+  const { rows, error, reload } = useApiList<CertRow>("certs.list", [refreshN]);
   const [renew, setRenew] = useState<string | null>(null);
-
-  useEffect(() => {
-    rpc<CertRow[]>("certs.list").then((r) => r.ok && setRows(r.data));
-  }, [refreshN]);
 
   async function doRenew() {
     if (!renew) return;
     const r = await rpc("certs.renew", { domain: renew });
     if (r.ok) {
       toast(`${renew} ✓`);
-      const list = await rpc<CertRow[]>("certs.list");
-      if (list.ok) setRows(list.data);
+      reload();
     } else toast(r.error, "err");
   }
 
@@ -128,6 +126,7 @@ export default function TlsCerts() {
   return (
     <div className="p-4">
       <PageHeader title={t("tls_title")} sub={t("tls_sub")} />
+      {error && <div className="mb-3"><LoadError message={error} onRetry={reload} /></div>}
       <DataPanel>
         <DataTable columns={cols} rows={rows} rowKey={(r) => r.domain} pageSize={10} filterKeys={(r) => `${r.domain} ${r.issuer}`} filterPlaceholder={t("domain")} />
       </DataPanel>

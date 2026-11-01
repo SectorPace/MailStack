@@ -37,6 +37,22 @@ impl Default for BackoffPolicy {
     }
 }
 
+/// `lastError` 文本的长度上限。
+///
+/// 失败描述可能整段来自**对端服务器的应答文本**（不可信输入）：不设上限的话，
+/// 一个恶意远端可以用超长应答把每条队列条目撑到任意大（条目要随状态一起落盘）。
+const MAX_LAST_ERROR_LEN: usize = 500;
+
+/// 净化要存进条目的失败描述。
+///
+/// 控制字符（CR/LF/NUL 等）退化为空格并截断到 [`MAX_LAST_ERROR_LEN`]：
+/// `lastError` 会进 DSN 的诊断文本与管理台展示，原样存储等于把对端的任意
+/// 字节写进后续的报文与界面（净化逻辑与 [`crate::dsn::sanitize_header`] 同源）。
+fn sanitize_last_error(text: String) -> String {
+    let cleaned = crate::dsn::sanitize_header(&text);
+    cleaned.chars().take(MAX_LAST_ERROR_LEN).collect()
+}
+
 impl BackoffPolicy {
     /// 第 `attempt` 次失败后的等待秒数（`attempt` 从 1 开始）。
     ///
@@ -91,7 +107,7 @@ impl BackoffPolicy {
         last_code: Option<u16>,
     ) -> bool {
         entry.attempts = entry.attempts.saturating_add(1);
-        entry.last_error = last_error;
+        entry.last_error = last_error.map(sanitize_last_error);
         entry.last_code = last_code;
         let exhausted = self.exhausted(entry.attempts);
         let delay = self.delay_secs(entry.attempts, &entry.id) as i64;
@@ -235,6 +251,35 @@ mod tests {
             "达到最大尝试次数时必须报告耗尽（调用方据此退信）"
         );
         assert_eq!(e.attempts, p.max_attempts);
+    }
+
+    /// 对端返回的应答文本是不可信输入：控制字符退化为空格、超长截断，
+    /// 否则会被原样写进条目（进而进 DSN 诊断与管理台）。
+    #[test]
+    fn last_error_is_sanitised_and_capped() {
+        let p = policy();
+        let mut e = entry("QQ03");
+        p.on_failure(
+            &mut e,
+            0,
+            Some("450 busy\r\nBcc: attacker@evil\0more".to_string()),
+            Some(450),
+        );
+        let stored = e.last_error.as_deref().unwrap_or_default();
+        assert!(
+            !stored.contains(['\r', '\n', '\0']),
+            "控制字符必须被净化：{stored:?}"
+        );
+        assert!(stored.contains("Bcc: attacker@evil"), "可读文本应保留（行内）");
+
+        // 超长截断到上限。
+        let mut e2 = entry("QQ04");
+        p.on_failure(&mut e2, 0, Some("x".repeat(10_000)), None);
+        assert_eq!(
+            e2.last_error.as_deref().map(str::len),
+            Some(MAX_LAST_ERROR_LEN),
+            "失败描述必须被截断，不得把条目撑大"
+        );
     }
 
     #[test]

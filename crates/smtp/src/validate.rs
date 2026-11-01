@@ -83,7 +83,7 @@ pub fn validate_relay(
         _ => return Err(SmtpError::TlsRequired),
     };
 
-    // 凭证：长度上限 + 禁止 CR/LF/NUL（SMTP 头注入防护）
+    // 凭证：长度上限 + 禁止 CR/LF/NUL（SMTP 头注入防护）+ 禁止空白（载体保真）。
     if request.username.len() > 256 {
         return Err(SmtpError::InvalidEndpoint(
             "SMTP username must be at most 256 characters".to_string(),
@@ -98,9 +98,13 @@ pub fn validate_relay(
         ("username", &request.username),
         ("password", &request.password),
     ] {
-        if value.contains(['\r', '\n', '\0']) {
+        // CR/LF/NUL：命令流注入。空格/Tab：`sasl_passwd` 是**空白分隔**的载体
+        // （见 `relay_store::parse_sasl_passwd`），含空白的凭证写进去再读回来
+        // 会被静默截断 —— 「apply 显示成功、实际认证永远失败」比直接报错更糟。
+        // 与 `client::SmtpSession::authenticate` 的线上闸同一套字符集。
+        if value.contains(['\r', '\n', '\0', ' ', '\t']) {
             return Err(SmtpError::InvalidEndpoint(format!(
-                "SMTP {label} must not contain CR, LF or NUL"
+                "SMTP {label} must not contain CR, LF, NUL or whitespace"
             )));
         }
     }
@@ -270,6 +274,29 @@ mod tests {
             assert!(
                 matches!(err, SmtpError::InvalidEndpoint(_)),
                 "含控制字符的凭证必须被拒绝"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_whitespace_in_relay_credentials() {
+        // sasl_passwd 按空白切字段：含空格/Tab 的凭证写进去再读回来会被静默截断
+        // （`relay_store::parse_sasl_passwd`）。与其「apply 成功、认证永远失败」，
+        // 不如在入口硬拒。
+        for (user, pass) in [
+            ("api key", "x"),
+            ("apikey", "sec ret"),
+            ("apikey", "sec\tret"),
+            (" apikey", "x"),
+            ("apikey ", "x"),
+        ] {
+            let mut req = base_request();
+            req.username = user.to_string();
+            req.password = pass.to_string();
+            let err = validate_relay(&req, false).unwrap_err();
+            assert!(
+                matches!(err, SmtpError::InvalidEndpoint(_)),
+                "含空白的凭证必须被拒绝（user={user:?}, pass={pass:?}），实际: {err:?}"
             );
         }
     }

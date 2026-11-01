@@ -60,9 +60,12 @@ impl Shutdown {
 
 /// 等待 SIGINT / SIGTERM，然后触发 `shutdown`。
 ///
+/// 借用而不是取得所有权：调用方（`run` 的收尾循环）在**任务失败**路径上也要
+/// 触发同一个信号，触发权必须留在调用方手里。
+///
 /// 非 Unix 平台回落到 `ctrl_c`。信号处理器安装失败时也回落到 `ctrl_c` —— 宁可少认
 /// 一个信号，也不要出现「没有任何办法让它优雅退出」的状态。
-pub async fn watch_signals(shutdown: Shutdown) {
+pub async fn watch_signals(shutdown: &Shutdown) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};

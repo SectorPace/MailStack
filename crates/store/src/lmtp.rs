@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 
 use crate::error::{StoreError, StoreResult};
@@ -29,6 +29,14 @@ use crate::error::{StoreError, StoreResult};
 /// Dovecot 自带默认值（基线配置未覆盖 `service lmtp`），去掉 Postfix 之后不再有
 /// `/var/spool/postfix/private/dovecot-lmtp` 这个 postfix 专属路径。
 pub const DEFAULT_LMTP_SOCKET: &str = "/run/dovecot/lmtp";
+
+/// 单行应答的长度上限。
+///
+/// 正常的 LMTP 应答远短于此（Dovecot 的应答几十字节）。对端失控 —— 或被替换成
+/// 恶意实现 —— 时，一条永不出换行的应答原本可以让 `read_line` **无界**吃内存。
+/// 超限按协议错误断开：截断出的半行会被上层当完整应答解析（状态码恰好在前
+/// 3 字节），那比直接断开更危险。
+const MAX_RESPONSE_LINE_BYTES: usize = 4096;
 
 /// LMTP 端点。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,10 +81,8 @@ impl LmtpEndpoint {
             }
         }
         if let Ok(addr) = std::env::var("MAILSTACK_LMTP_ADDR") {
-            if let Some((host, port)) = addr.trim().rsplit_once(':') {
-                if let Ok(port) = port.parse::<u16>() {
-                    return LmtpEndpoint::Tcp(host.to_string(), port);
-                }
+            if let Some((host, port)) = parse_tcp_endpoint(&addr) {
+                return LmtpEndpoint::Tcp(host, port);
             }
         }
         default
@@ -166,6 +172,20 @@ impl LmtpClient {
     ) -> StoreResult<LmtpDelivery> {
         if recipients.is_empty() {
             return Err(StoreError::Lmtp("no recipients to deliver".to_string()));
+        }
+        // 信封地址会被 `format!` 直接拼进协议行（`MAIL FROM:<…>` / `RCPT TO:<…>`）。
+        // 地址里的 CR/LF 等于在事务里**注入额外命令**（与入站走私同型的注入，
+        // 只是方向相反）；NUL 则会让对端把命令截断成另一条。在入口统一拒绝，
+        // 而不是相信每个上游生产者都校验过。
+        if mail_from.contains(['\r', '\n', '\0'])
+            || recipients
+                .iter()
+                .any(|recipient| recipient.contains(['\r', '\n', '\0']))
+        {
+            return Err(StoreError::Lmtp(
+                "envelope address must not contain CR, LF or NUL (SMTP command injection)"
+                    .to_string(),
+            ));
         }
 
         let stream = self.connect().await?;
@@ -274,10 +294,17 @@ impl LmtpClient {
                     .map_err(|e| {
                         StoreError::Lmtp(format!("cannot connect to unix:{}: {e}", path.display()))
                     }),
-                LmtpEndpoint::Tcp(host, port) => TcpStream::connect((host.as_str(), *port))
-                    .await
-                    .map(Stream::Tcp)
-                    .map_err(|e| StoreError::Lmtp(format!("cannot connect to {host}:{port}: {e}"))),
+                LmtpEndpoint::Tcp(host, port) => {
+                    // 端点可能来自配置或环境变量的「书写形式」：IPv6 字面量带方括号。
+                    // `TcpStream::connect` 要的是**裸地址**，方括号不剥掉就永远连不上。
+                    let host = strip_host_brackets(host);
+                    TcpStream::connect((host, *port))
+                        .await
+                        .map(Stream::Tcp)
+                        .map_err(|e| {
+                            StoreError::Lmtp(format!("cannot connect to {host}:{port}: {e}"))
+                        })
+                }
             }
         };
 
@@ -303,16 +330,7 @@ impl LmtpClient {
         let mut lines: Vec<String> = Vec::new();
 
         loop {
-            let mut line = String::new();
-            let read = tokio::time::timeout(self.timeout, io.read_line(&mut line))
-                .await
-                .map_err(|_| StoreError::Lmtp("timed out waiting for LMTP response".to_string()))?
-                .map_err(|e| StoreError::Lmtp(format!("read failed: {e}")))?;
-            if read == 0 {
-                return Err(StoreError::Lmtp(
-                    "connection closed by LMTP server".to_string(),
-                ));
-            }
+            let line = self.read_line_bounded(io).await?;
             let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
             let (this_code, continued) = parse_status_line(&trimmed)?;
             if code.is_none() {
@@ -325,6 +343,59 @@ impl LmtpClient {
         }
 
         Ok((code.unwrap_or(0), lines.join(" ")))
+    }
+
+    /// 读一行应答，**带长度上限**（[`MAX_RESPONSE_LINE_BYTES`]）。
+    ///
+    /// `BufReader::read_line` 没有上限：它会一直 append 到出现 `\n` 为止，对端
+    /// 只要不发换行就能让内存无界增长。这里用 `fill_buf` + `consume` 手工实现
+    /// 「读到换行、但累计不超过上限」—— 走的仍是 `BufReader` 的内部缓冲，
+    /// 不会越过它读到底层流而丢掉已缓冲字节。超限按协议错误断开（不截断半行）。
+    async fn read_line_bounded(&self, io: &mut BufReader<Stream>) -> StoreResult<String> {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut line: Vec<u8> = Vec::new();
+        loop {
+            let available = tokio::time::timeout(self.timeout, io.fill_buf())
+                .await
+                .map_err(|_| StoreError::Lmtp("timed out waiting for LMTP response".to_string()))?
+                .map_err(|e| StoreError::Lmtp(format!("read failed: {e}")))?;
+            if available.is_empty() {
+                if line.is_empty() {
+                    return Err(StoreError::Lmtp(
+                        "connection closed by LMTP server".to_string(),
+                    ));
+                }
+                // EOF 前的残余（无结尾换行）：与 read_line 的行为一致，交给
+                // 上层按「格式错误」处理。
+                break;
+            }
+            match available.iter().position(|&byte| byte == b'\n') {
+                Some(index) => {
+                    if line.len() + index + 1 > MAX_RESPONSE_LINE_BYTES {
+                        return Err(StoreError::Lmtp(format!(
+                            "LMTP response line exceeds {MAX_RESPONSE_LINE_BYTES} bytes"
+                        )));
+                    }
+                    line.extend_from_slice(&available[..=index]);
+                    io.consume(index + 1);
+                    break;
+                }
+                None => {
+                    if line.len() + available.len() > MAX_RESPONSE_LINE_BYTES {
+                        return Err(StoreError::Lmtp(format!(
+                            "LMTP response line exceeds {MAX_RESPONSE_LINE_BYTES} bytes"
+                        )));
+                    }
+                    line.extend_from_slice(available);
+                    let filled = available.len();
+                    io.consume(filled);
+                }
+            }
+        }
+        // 与 read_line 一致：非法 UTF-8 是读错误，而不是静默替换字节。
+        String::from_utf8(line)
+            .map_err(|e| StoreError::Lmtp(format!("read failed: invalid utf-8: {e}")))
     }
 
     async fn write_all(&self, io: &mut BufReader<Stream>, bytes: &[u8]) -> StoreResult<()> {
@@ -419,6 +490,34 @@ fn is_positive(code: u16) -> bool {
     (200..300).contains(&code)
 }
 
+/// 剥掉 IPv6 字面量的方括号（`[::1]` → `::1`）。
+///
+/// 方括号只是**书写形式**里的分隔标点（区分地址与端口）；`TcpStream::connect`
+/// 要的是裸地址。放在连接点而不是只放在配置解析点：端点可能来自多处
+/// （环境变量、配置文件、测试），任何一处带括号都不得让连接永远失败。
+fn strip_host_brackets(host: &str) -> &str {
+    let trimmed = host.trim();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|stripped| stripped.strip_suffix(']'))
+        .unwrap_or(trimmed)
+}
+
+/// 解析 `host:port` 形式的地址（`MAILSTACK_LMTP_ADDR`）。
+///
+/// 用 `rsplit_once(':')` 取**最后一个**冒号，因此带方括号的 IPv6（`[::1]:24`）
+/// 能正确分出地址与端口；方括号在此剥掉。无效端口 / 空主机返回 `None`，
+/// 让调用方回落到默认端点，而不是拿着一个必然失败的端点继续。
+fn parse_tcp_endpoint(addr: &str) -> Option<(String, u16)> {
+    let (host, port) = addr.trim().rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    let host = strip_host_brackets(host);
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), port))
+}
+
 /// 把逐位填充的 `slots` 收拢成结果列表。
 ///
 /// 每个位置要么在 RCPT 阶段定案、要么在 DATA 之后定案，因此 `None` 只可能意味着
@@ -437,19 +536,45 @@ fn collect(slots: Vec<Option<RecipientResult>>) -> StoreResult<Vec<RecipientResu
 /// 与 `smtp::client::dot_stuff` 逐条一致，包括**按裸 LF 切行**：
 /// 只按 `\r\n` 切分会让 `<裸 LF>.` 开头的行逃过转义，Dovecot 在那一行判定
 /// DATA 结束，剩余正文被当作 LMTP 命令解析。
+///
+/// 实现是**单次扫描**、在输出缓冲上就地插入：原实现 `split('\n') → map →
+/// collect → join` 会对整封邮件做约 4 次全量复制，而这是每封信的热路径。
+/// 语义逐条对应原实现：`CRLF`/裸 `LF` 都归一为 `CRLF` 行尾；紧贴 `LF` 之前
+/// （或数据末尾）的单个 `CR` 属于行终止符、被剥掉，其余 `CR` 原样保留；
+/// 行首 `.` 加倍。多字节 UTF-8 不受影响（多字节序列不含 0x0A/0x0D 字节，
+/// 复制与 ASCII 插入不破坏编码）。
 fn dot_stuff(data: &str) -> String {
-    data.split('\n')
-        .map(|line| {
-            // 去掉切分带来的 `\r`（它属于行终止符，不属于行内容）。
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            if line.starts_with('.') {
-                format!(".{line}")
-            } else {
-                line.to_string()
+    let bytes = data.as_bytes();
+    // 常见情形（无行首句点、行尾已归一）输出不比输入长，+16 免去正常邮件的重分配。
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 16);
+    let mut at_line_start = true;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\n' {
+            out.extend_from_slice(b"\r\n");
+            at_line_start = true;
+            index += 1;
+            continue;
+        }
+        if at_line_start && byte == b'.' {
+            out.push(b'.');
+        }
+        at_line_start = false;
+        if byte == b'\r' {
+            // `CR` 只在「恰好在 `LF` 之前或数据末尾」时是行终止符的一部分：
+            // 此时跳过它（由 `LF` 分支补成 `CRLF`，或在末尾剥掉）。
+            let is_terminator = index + 1 == bytes.len() || bytes[index + 1] == b'\n';
+            if is_terminator {
+                index += 1;
+                continue;
             }
-        })
-        .collect::<Vec<_>>()
-        .join("\r\n")
+        }
+        out.push(byte);
+        index += 1;
+    }
+    // 输入是 &str、插入的都是 ASCII 字节，输出必然是合法 UTF-8 —— 此处不可达。
+    String::from_utf8(out).expect("dot_stuff 输出必然是合法 UTF-8")
 }
 
 #[cfg(test)]
@@ -489,5 +614,121 @@ mod tests {
             "裸 LF 后的句点行必须被加倍"
         );
         assert_eq!(dot_stuff("a\r\n.b\n.c"), "a\r\n..b\r\n..c");
+    }
+
+    /// 与原实现逐条一致的边界：行内的裸 `CR` 不是行终止符，必须原样保留；
+    /// 只有紧贴 `LF`（或数据末尾）的那个 `CR` 才被剥掉。
+    #[test]
+    fn lone_cr_inside_a_line_is_preserved() {
+        assert_eq!(dot_stuff("a\r\rb"), "a\r\rb", "行内裸 CR 不是行尾");
+        assert_eq!(dot_stuff("a\r\r\nb"), "a\r\r\nb", "只剥属于行尾的那一个 CR");
+        assert_eq!(dot_stuff("x\r"), "x", "数据末尾的单个 CR 属于行尾");
+        assert_eq!(dot_stuff("x\r\r"), "x\r");
+        // 多字节内容不受逐字节扫描影响。
+        assert_eq!(dot_stuff("正文\n.x"), "正文\r\n..x");
+    }
+
+    /// IPv6 字面量的方括号是书写标点：解析与连接两层都要剥掉，
+    /// 否则 `[::1]:24` 永远连不上。
+    #[test]
+    fn tcp_endpoint_parsing_strips_ipv6_brackets() {
+        assert_eq!(
+            parse_tcp_endpoint("[::1]:24"),
+            Some(("::1".to_string(), 24))
+        );
+        assert_eq!(
+            parse_tcp_endpoint(" 127.0.0.1:24 "),
+            Some(("127.0.0.1".to_string(), 24))
+        );
+        // 无效端口与空主机不产生端点：回落默认端点，而不是拿着必然失败的端点。
+        assert_eq!(parse_tcp_endpoint("[::1]:lmtp"), None);
+        assert_eq!(parse_tcp_endpoint(":24"), None);
+    }
+
+    #[test]
+    fn host_brackets_are_stripped_at_the_connection_layer_too() {
+        // 端点也可能绕过 parse_tcp_endpoint 直接构造（配置文件路径），
+        // 所以连接点同样剥括号 —— 这里验证该纯函数本身。
+        assert_eq!(strip_host_brackets("[::1]"), "::1");
+        assert_eq!(strip_host_brackets(" 127.0.0.1 "), "127.0.0.1");
+        assert_eq!(strip_host_brackets("::1"), "::1");
+    }
+
+    /// 信封地址直接 `format!` 进协议行：CR/LF/NUL 必须在任何 I/O 之前被拒绝。
+    #[tokio::test]
+    async fn envelope_addresses_with_crlf_or_nul_are_rejected_before_any_io() {
+        // 用一个「连上必失败」的端点：若守卫未生效，错误将是连接错误而不是注入拒绝。
+        let client = LmtpClient::new(
+            LmtpEndpoint::Tcp("127.0.0.1".to_string(), 1),
+            "mail.example.org",
+            Duration::from_millis(200),
+        );
+
+        let injected = "r@example.org\r\nRCPT TO:<victim@x>";
+        let error = client
+            .deliver(
+                "s@example.org",
+                &[injected.to_string()],
+                "Subject: t\r\n\r\nbody",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("CR, LF or NUL"),
+            "收件人注入必须在入口被拒绝：{error}"
+        );
+
+        let error = client
+            .deliver(
+                "s@example.org\r\nBcc: evil@x",
+                &["r@example.org".to_string()],
+                "body",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("CR, LF or NUL"),
+            "发件人注入必须在入口被拒绝：{error}"
+        );
+    }
+
+    /// 超长且不出换行的应答必须按协议错误断开，而不是无界吃内存
+    /// （`BufReader::read_line` 没有上限，这里验证手工限长生效）。
+    #[tokio::test]
+    async fn an_oversized_response_line_is_a_protocol_error_not_unbounded_memory() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            let (_, mut write) = socket.into_split();
+            let _ = write.write_all(b"220 ready\r\n").await;
+            let _ = write.flush().await;
+            // 一条超出上限且永不出换行的「应答」。
+            let junk = vec![b'x'; MAX_RESPONSE_LINE_BYTES + 64];
+            let _ = write.write_all(&junk).await;
+            let _ = write.flush().await;
+            // 挂住连接，让客户端（而不是服务端关闭）触发超限判定。
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let client = LmtpClient::new(
+            LmtpEndpoint::Tcp("127.0.0.1".to_string(), port),
+            "mail.example.org",
+            Duration::from_secs(5),
+        );
+        let error = client
+            .deliver(
+                "s@example.org",
+                &["r@example.org".to_string()],
+                "Subject: t\r\n\r\nbody",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds"),
+            "超长应答必须按协议错误断开：{error}"
+        );
     }
 }

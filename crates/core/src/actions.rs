@@ -67,6 +67,8 @@ pub const ALLOWED_ACTIONS_RW: &[&str] = &[
     "setup.relay.apply",
     "setup.cert.issue",
     "setup.mail.test",
+    // 向导收尾：置位 setup.json 的 wizardCompleted（写文件，归 RW；幂等、非破坏性）。
+    "setup.wizard.complete",
     // 发信（本机投递副作用）。
     "mail.test_loopback",
     // 域名 / 邮箱 / 别名 / 队列变更。users.status 会锁解账号，属 RW。

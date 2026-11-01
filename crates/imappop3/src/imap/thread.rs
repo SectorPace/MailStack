@@ -216,6 +216,16 @@ fn render_references(messages: &[ThreadMessage]) -> String {
     out
 }
 
+/// REFERENCES 渲染的递归深度上限。环已由调用方断开，但一条 10 万封的深链
+/// 线程会把递归推到同样深 —— 超过上限的子树按孤立消息输出（与环形处理
+/// 一致），保证最坏情况的栈深度是常数。
+///
+/// **已声明的 RFC 5256 偏差**：规范要求被搜索的每封消息都出现在 THREAD
+/// 响应里；超过本上限的子树中除根节点外的消息会被省略。这是栈安全与
+/// 规范完备性之间的显式取舍 —— 真实邮箱的引用链深度远达不到 512，
+/// 只有刻意构造的超深链才会触发。
+const MAX_REFERENCE_DEPTH: usize = 512;
+
 fn render_reference_node(
     out: &mut String,
     messages: &[ThreadMessage],
@@ -223,8 +233,9 @@ fn render_reference_node(
     index: usize,
     stack: &mut Vec<usize>,
 ) {
-    if stack.contains(&index) || stack.len() > messages.len() {
-        // 环形 References（畸形邮件）按孤立消息输出，避免无限递归。
+    if stack.contains(&index) || stack.len() > MAX_REFERENCE_DEPTH {
+        // 环形 References（畸形邮件）或超过深度上限的嵌套按孤立消息输出，
+        // 避免无限递归 / 深递归爆栈；热路径不记日志，输出保持确定性。
         out.push('(');
         out.push_str(&messages[index].number.to_string());
         out.push(')');
@@ -304,5 +315,23 @@ mod tests {
         two.in_reply_to = Some("a".into());
         let rendered = render(ThreadAlgorithm::References, &[one, two]);
         assert!(rendered.contains('('), "{rendered}");
+    }
+
+    #[test]
+    fn reference_rendering_is_depth_capped() {
+        // 600 层的回复链：超过 MAX_REFERENCE_DEPTH 的子树按孤立消息输出，
+        // 递归深度保持有界（不会因邮箱大而爆栈）。
+        let messages: Vec<ThreadMessage> = (1u32..=600)
+            .map(|number| {
+                let mut message = message(number, "topic", number as i64);
+                if number > 1 {
+                    message.references = vec![format!("id{}", number - 1)];
+                }
+                message
+            })
+            .collect();
+        let rendered = render(ThreadAlgorithm::References, &messages);
+        assert!(rendered.contains("(514)"), "{rendered}");
+        assert!(!rendered.contains("(515)"), "超限的更深层不应输出: {rendered}");
     }
 }

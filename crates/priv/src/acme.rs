@@ -283,15 +283,27 @@ impl Acme {
                 }
             }
 
-            // 校验全部通过，以下开始产生副作用。
-            std::fs::create_dir_all(&out_dir).map_err(|e| HandlerError::new(e.to_string()))?;
+        // 校验全部通过，以下开始产生副作用。
+        std::fs::create_dir_all(&out_dir).map_err(|e| HandlerError::new(e.to_string()))?;
 
-            let issued = self
-                .runner
-                .run_with_timeout(ACME_BIN, &issue_args, ISSUE_TIMEOUT)?;
-            if !issued.success() {
+        let issue_outcome = self
+            .runner
+            .run_with_timeout(ACME_BIN, &issue_args, ISSUE_TIMEOUT);
+        match issue_outcome {
+            Ok(output) if output.success() => {}
+            // 签发失败：尽力把刚建的（此刻还是空的）目标目录清掉 —— 与
+            // 「校验先于建目录」的纪律同源，失败路径不在 /etc/mailstack/tls/
+            // 下留一个没人清理的空目录。`remove_dir` 只删空目录，acme.sh 若
+            // 已经写了别的文件进来则原样保留（best-effort）。
+            Ok(_) => {
+                self.remove_empty_dir_best_effort(&out_dir);
                 return Err(HandlerError::new("ACME certificate issue failed"));
             }
+            Err(error) => {
+                self.remove_empty_dir_best_effort(&out_dir);
+                return Err(error.into());
+            }
+        }
 
             self.probes.write_file(
                 Path::new(RELOAD_SCRIPT),
@@ -347,27 +359,49 @@ impl Acme {
                 .runner
                 .run("postconf", &["-e", "smtpd_tls_security_level = may"]);
         }
-        let _ = service_ctl(
+        // reload 是**尽力而为**的收尾，成败不能固定报 true：运维要据此判断
+        // 新证书是否已实际生效 —— reload 失败时旧证书仍在跑，必须让人看见。
+        let postfix_reloaded = service_ctl(
             self.services.as_ref(),
             self.runner.as_ref(),
             "postfix",
             ServiceVerb::Reload,
-        );
-        let _ = service_ctl(
+        )
+        .success();
+        let dovecot_reloaded = service_ctl(
             self.services.as_ref(),
             self.runner.as_ref(),
             "dovecot",
             ServiceVerb::Reload,
-        );
+        )
+        .success();
 
         Ok(json!({
             "status": "ok",
             "method": method,
-            "reloaded": true,
+            "reloaded": postfix_reloaded && dovecot_reloaded,
+            "reloads": {
+                "postfix": postfix_reloaded,
+                "dovecot": dovecot_reloaded,
+            },
             "cert": crate::readers::certificate_to_json(
                 mailstack_core::certs::read_certificate(&self.paths.etc, &domain, self.now_dt())
             ),
         }))
+    }
+
+    /// best-effort 删除一个**空**目录（签发失败后的目标目录清理）。
+    ///
+    /// 只用 `remove_dir`：非空（acme.sh 已经写过东西）就原样保留，不做递归删除。
+    fn remove_empty_dir_best_effort(&self, dir: &Path) {
+        if let Err(error) = std::fs::remove_dir(dir) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                mailstack_core::warn::warn_with_detail(
+                    "remove empty certificate directory after failed issuance",
+                    &format!("{}: {error}", dir.display()),
+                );
+            }
+        }
     }
 
     /// 校验自定义证书与私钥是否匹配、是否覆盖该域名、是否未过期。
@@ -525,6 +559,8 @@ mod tests {
         renew_status: i32,
         issue_status: i32,
         install_status: i32,
+        /// 非 acme.sh 程序（`service_ctl` 的 service/reload、postconf）的状态码。
+        service_status: i32,
         /// `x509 -checkhost` 的输出；不含 `does match` 即表示 SAN 不匹配。
         checkhost_output: String,
         cert_pubkey: String,
@@ -542,6 +578,7 @@ mod tests {
                 renew_status: 0,
                 issue_status: 0,
                 install_status: 0,
+                service_status: 0,
                 checkhost_output: "Hostname example.com does match certificate".to_string(),
                 cert_pubkey: "PUBKEY".to_string(),
                 key_pubkey: "PUBKEY".to_string(),
@@ -623,7 +660,7 @@ mod tests {
             let status = if program == ACME_BIN {
                 self.acme_status(&strings)
             } else {
-                0
+                self.service_status
             };
             Ok(mailstack_core::exec::CommandOutput {
                 status,
@@ -675,7 +712,11 @@ mod tests {
         ) -> mailstack_core::CoreResult<mailstack_core::exec::CommandOutput> {
             self.record(program, args, None, Some(timeout));
             let strings: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-            let status = self.acme_status(&strings);
+            let status = if program == ACME_BIN {
+                self.acme_status(&strings)
+            } else {
+                self.service_status
+            };
             if status == 0
                 && self.materialize_on_install
                 && strings.iter().any(|a| a == "--install-cert")
@@ -1142,6 +1183,9 @@ mod tests {
             }))
             .unwrap_err();
         assert_eq!(err.to_string(), "ACME certificate issue failed");
+        // 签发失败不得在 /etc/mailstack/tls/ 下留下一个空目录 —— 与
+        // 「校验先于建目录」同一纪律，失败路径不留痕。
+        assert!(!f.paths.etc.join("tls").join("example.com").exists());
 
         let install_runner = Arc::new(FakeRunner {
             install_status: 1,
@@ -1161,6 +1205,37 @@ mod tests {
             }))
             .unwrap_err();
         assert_eq!(err.to_string(), "ACME certificate installation failed");
+    }
+
+    #[test]
+    fn acme_issue_reports_actual_reload_results() {
+        // reload 是尽力而为的收尾：成败不能固定报 true —— reload 失败时
+        // 旧证书仍在跑，运维必须能看见。
+        let f = Fixture::new("acmereloadfail");
+        let runner = Arc::new(FakeRunner {
+            service_status: 1,
+            materialize_on_install: true,
+            ..FakeRunner::default()
+        });
+        // `service` 可用（service_ctl 会真的跑 `service <unit> reload`），
+        // 但命令返回非 0。
+        let a = f.acme(
+            Arc::new(FakeProbes::ready()),
+            runner,
+            FakeServices::with_service(),
+        );
+
+        let out = a
+            .issue(&json!({
+                "domain": "example.com",
+                "method": "standalone",
+                "email": "ops@example.com",
+            }))
+            .unwrap();
+        assert_eq!(out["status"], "ok");
+        assert_eq!(out["reloaded"], false, "reload 失败不得报 true: {out}");
+        assert_eq!(out["reloads"]["postfix"], false);
+        assert_eq!(out["reloads"]["dovecot"], false);
     }
 
     #[test]

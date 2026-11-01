@@ -111,6 +111,13 @@ pub struct SessionConfig {
     pub offer_auth: bool,
     /// 会话是否**已经**在 TLS 之上（隐式 TLS，如 465 端口）。
     pub tls_active: bool,
+    /// 提交口策略：未认证会话是否被禁止开新事务（`MAIL` → `530 5.7.0`）。
+    ///
+    /// 只有**提交端口**（587）由装配层显式置位；默认 `false` 保持既有行为 ——
+    /// MX 收信口（25）的双方都是服务器、不存在「登录」的概念，绝不能误开这道门。
+    /// 拦在 `MAIL`（而不是 `RCPT`）是刻意的：事务入口处拒绝最省双方的力气，
+    /// 客户端还没开始发正文，认证重试也不必重传任何数据。
+    pub require_auth_for_submission: bool,
 }
 
 impl Default for SessionConfig {
@@ -126,6 +133,7 @@ impl Default for SessionConfig {
             offer_starttls: false,
             offer_auth: false,
             tls_active: false,
+            require_auth_for_submission: false,
         }
     }
 }
@@ -318,7 +326,9 @@ impl<'a> Session<'a> {
     fn ehlo_reply(&self) -> Reply {
         let mut lines = vec![format!("{} {}", self.config.hostname, texts::EHLO_OK)];
         lines.push(format!("SIZE {}", self.config.max_message_size));
-        lines.push("8BITMIME".to_string());
+        // 不通告 8BITMIME：本管道把报文建模为 UTF-8 `String`（见 `crate::sink`
+        // 的文档），非 UTF-8 的 8bit 正文会被 554 拒收。通告一个兑现不了的能力
+        // 等于邀请对端发我们注定要退的信。
         lines.push("ENHANCEDSTATUSCODES".to_string());
         if self.config.offer_starttls && !self.tls_active {
             lines.push("STARTTLS".to_string());
@@ -343,6 +353,16 @@ impl<'a> Session<'a> {
                 return Action::Reply(Reply::with_enhanced(552, "5.3.4", texts::MESSAGE_TOO_LARGE));
             }
         }
+        // 提交口策略（RFC 8314 §5 / RFC 4954）：要求认证的提交口上，未认证会话
+        // 不得开事务。放在全部序列/尺寸检查**之后** —— 只拦「这条 MAIL 本来会
+        // 成功」的请求，序列错误（503）与超限（552）仍按各自的语义先报。
+        if self.config.require_auth_for_submission && !self.authenticated {
+            return Action::Reply(Reply::with_enhanced(
+                530,
+                "5.7.0",
+                texts::SUBMISSION_AUTH_REQUIRED,
+            ));
+        }
         self.mail_from = Some(from);
         self.recipients.clear();
         self.phase = Phase::Mail;
@@ -356,7 +376,9 @@ impl<'a> Session<'a> {
 
         // `<postmaster>` 没有域，按 RFC 5321 §4.1.1.3 必须接受 —— 但补哪个域是
         // **本机策略**，不是猜测。没有配置就明确拒绝。
-        let to = if to == "postmaster" {
+        // 大小写不敏感：RFC 规定 <POSTMASTER>（任意大小写）与 <postmaster> 等价，
+        // 精确等值比较会把合规客户端的保留地址投递拒成 550。
+        let to = if to.eq_ignore_ascii_case("postmaster") {
             match &self.config.postmaster {
                 Some(address) => {
                     let address = address.clone();
@@ -445,6 +467,18 @@ impl<'a> Session<'a> {
             return Action::Reply(Reply::with_enhanced(503, "5.5.1", texts::NO_RECIPIENTS));
         }
         Action::EnterData(Reply::with_enhanced(354, "2.0.0", texts::DATA_START))
+    }
+
+    /// 超限丢弃路径的事务重置。
+    ///
+    /// RFC 5321 §4.1.1.4：DATA 的最终应答（超限时是 552）**同样结束事务**。
+    /// 不重置的话 `mail_from`/`recipients` 残留在会话里 —— 客户端的下一条
+    /// `MAIL` 撞 503「嵌套 MAIL」，重复 `DATA` 会把新正文投给上一位收件人。
+    /// 与 [`Session::finish_data`] 的区别：这里没有报文可结算，只做状态归位。
+    pub fn discard_data(&mut self) {
+        self.mail_from = None;
+        self.recipients.clear();
+        self.phase = Phase::Greeted;
     }
 
     /// DATA 收完后的结算。返回应答与（成功时）被接受的邮件。
@@ -692,7 +726,8 @@ mod tests {
             rendered.contains("SIZE "),
             "必须通告 SIZE，否则客户端不会先报大小"
         );
-        assert!(rendered.contains("8BITMIME"));
+        // 管道只收 UTF-8 报文（QueueEntry 建模为 String），不得通告兑现不了的 8BITMIME。
+        assert!(!rendered.contains("8BITMIME"));
         // 没配置 TLS / AUTH 时**不得**通告 —— 通告了却做不到会误导客户端。
         assert!(!rendered.contains("STARTTLS"));
         assert!(!rendered.contains("AUTH"));
@@ -1266,6 +1301,81 @@ mod tests {
             "实际 {action:?}"
         );
         assert!(!session.awaiting_auth_response());
+    }
+
+    // ─────────────────────────── 提交口认证策略（587） ───────────────────────────
+
+    /// 置位了「提交先认证」策略的会话（587 装配层的形状）。
+    fn submission_session_requiring_auth() -> Session<'static> {
+        session_with(
+            &["example.org"],
+            SessionConfig {
+                offer_auth: true,
+                tls_active: true,
+                require_auth_for_submission: true,
+                ..SessionConfig::default()
+            },
+        )
+    }
+
+    /// 反例守卫：策略置位 + 未认证 ⇒ `MAIL` 必须在事务入口处被 530 拦下。
+    #[test]
+    fn a_submission_session_that_requires_auth_refuses_an_unauthenticated_mail_with_530() {
+        let mut session = submission_session_requiring_auth();
+        let _ = session.handle(Command::Ehlo("c.test".into()));
+        let Action::Reply(reply) = session.handle(Command::Mail {
+            from: "alice@example.org".into(),
+            params: MailParams::default(),
+        }) else {
+            panic!("应回应答");
+        };
+        assert_eq!(reply.code, 530, "未认证的提交必须被 530 拒绝");
+        assert_eq!(reply.enhanced, Some("5.7.0"));
+        assert!(reply.first_line().contains("Authentication required"));
+        assert!(
+            session.mail_from().is_none(),
+            "被拒的事务不得置位发件人"
+        );
+        // 会话没有错位：认证之后同一状态机可以正常开事务（见下一用例）。
+    }
+
+    /// 认证之后，策略不再拦截 —— 事务照常建立。
+    #[test]
+    fn an_authenticated_submission_passes_the_auth_gate() {
+        let mut session = submission_session_requiring_auth();
+        let _ = session.handle(Command::Ehlo("c.test".into()));
+        let _ = session.handle(auth_plain(Some("AGJvYg==")));
+        let _ = session.complete_auth(AuthOutcome::Success {
+            user: "alice@example.org".to_string(),
+        });
+
+        let _ = session.handle(Command::Mail {
+            from: "alice@example.org".into(),
+            params: MailParams::default(),
+        });
+        let action = session.handle(Command::Rcpt {
+            to: "alice@example.org".into(),
+        });
+        assert!(
+            matches!(action, Action::Reply(ref reply) if reply.is_positive_completion()),
+            "认证后的提交应放行：{action:?}"
+        );
+    }
+
+    /// 回归守卫：策略未置位（默认）时行为与引入之前完全一致 ——
+    /// 未认证 `MAIL` 照常 250，25 端口的既有语义不得被误伤。
+    #[test]
+    fn without_the_flag_the_previous_unauthenticated_behaviour_is_preserved() {
+        let mut session = submission_session();
+        let _ = session.handle(Command::Ehlo("c.test".into()));
+        let action = session.handle(Command::Mail {
+            from: "someone@example.org".into(),
+            params: MailParams::default(),
+        });
+        assert!(
+            matches!(action, Action::Reply(ref reply) if reply.code == 250),
+            "默认配置下未认证 MAIL 必须照旧接受：{action:?}"
+        );
     }
 
     // ────────────────────── 本地收件人存在性（反枚举 / 反 backscatter）──────────────────────

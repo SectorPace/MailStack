@@ -8,7 +8,8 @@
 //!    翻译成一个**已经校验过**的 [`RuntimeConfig`]（见 [`config`]）。
 //! 2. 按端口绑定入站监听，并让三个监听**共用同一份**限速器与封禁表（见 [`listeners`]）。
 //! 3. 起出站队列调度，并绑定特权 RPC 的两个 Unix socket（见 [`rpc`]）。
-//! 4. 收到 SIGINT/SIGTERM 时让**所有**部分一起停下（见 [`shutdown`]）。
+//! 4. 收到 SIGINT/SIGTERM 时让**所有**部分一起停下（见 [`shutdown`]）；
+//!    任一任务异常退出也触发整体停机 —— 宁可整体重启，也不要「半个服务」继续跑。
 //!
 //! ## 启动期的取舍：宁可不起，也不要带病起
 //!
@@ -145,12 +146,6 @@ pub async fn run(paths: Paths, ports: Vec<u16>) -> Result<(), DaemonError> {
         });
     }
 
-    // 最后接管信号源：`waiter()` 的借用到这里全部结束。
-    tasks.spawn(async move {
-        shutdown::watch_signals(shutdown).await;
-        Ok(())
-    });
-
     tracing::info!("服务已就绪");
 
     // 5.19：收齐**每一个**任务的结果。
@@ -159,16 +154,61 @@ pub async fn run(paths: Paths, ports: Vec<u16>) -> Result<(), DaemonError> {
     // 异常退出都只留下日志。systemd 看到的是正常退出，于是不重启：
     // 「进程活着但半个服务没了」，退出码也看不出来。
     // 现在把失败汇总成非零退出，让 supervisor 能真正接管。
+    //
+    // 并且**第一块**异常退出时就触发停机信号，让其余部分走各自的优雅收尾，
+    // 而不是带着半死的服务继续跑。停机的两条来路在同一个 select 里汇合：
+    //   * SIGINT/SIGTERM —— `watch_signals` 内部触发（它改为借用 `shutdown`，
+    //     因此 `run` 在任务失败路径上仍握有触发权）；
+    //   * 任务失败 —— 这里主动触发，只触发**一次**，重复触发没有意义。
+    // 无论哪条路先到，都把剩余任务的收尾结果收完，再按失败集决定退出码。
+    // `join_next` 是 cancel-safe，在 select 里反复轮询不会丢结果。
     let mut failures: Vec<String> = Vec::new();
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok(Ok(())) => {}
-            Ok(Err(message)) => failures.push(message),
-            Err(join_error) => {
-                // panic / 被取消。同样属于「这一块服务没了」。
-                if join_error.is_panic() {
-                    failures.push(format!("task panicked: {join_error}"));
+    let mut shutdown_triggered = false;
+    let mut signals = std::pin::pin!(shutdown::watch_signals(&shutdown));
+    loop {
+        tokio::select! {
+            joined = tasks.join_next() => {
+                let Some(joined) = joined else { break };
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(message)) => {
+                        if !shutdown_triggered {
+                            shutdown_triggered = true;
+                            tracing::error!(
+                                %message,
+                                "任务异常退出，触发其余部分的优雅停机（收尾完成后以非零退出）"
+                            );
+                            shutdown.trigger();
+                        }
+                        failures.push(message);
+                    }
+                    Err(join_error) => {
+                        // panic / 被取消。panic 同样属于「这一块服务没了」；取消不是。
+                        if join_error.is_panic() {
+                            let message = format!("task panicked: {join_error}");
+                            if !shutdown_triggered {
+                                shutdown_triggered = true;
+                                tracing::error!(
+                                    %message,
+                                    "任务 panic，触发其余部分的优雅停机（收尾完成后以非零退出）"
+                                );
+                                shutdown.trigger();
+                            }
+                            failures.push(message);
+                        }
+                    }
                 }
+            }
+            // 信号已到，`watch_signals` 内部已触发停机；标记后继续在循环里收尾，
+            // 直到所有任务结束（None）再按失败集决定退出码。
+            //
+            // `if !shutdown_triggered` 是**必须**的门：async fn 生成的 future
+            // 完成后再被 poll 会 panic（"resumed after completion"）。没有门控时，
+            // 信号先到的正常停机路径会在下一轮 select 里重新轮询已完成的
+            // `signals`，把收尾过程整个炸掉。触发过就永久停用该分支 ——
+            // 无论停机来路是信号还是任务失败，都不需要第二次。
+            _ = &mut signals, if !shutdown_triggered => {
+                shutdown_triggered = true;
             }
         }
     }

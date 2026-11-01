@@ -110,6 +110,8 @@ mod tests {
             server_ip: "203.0.113.10".to_string(),
             dkim_selector: "mailstack".to_string(),
             expected_spf: None,
+            // 仅补齐新字段以通过编译；本 crate 的断言与向导完成标志无关。
+            wizard_completed: false,
             updated_at: "2026-10-01T00:00:00Z".to_string(),
         }
     }

@@ -162,7 +162,7 @@ impl TableStore {
             // Postfix 的 virtual_alias_domains 只关心 key；`OK` 是基线的占位值，
             // 保持逐字一致以免 .db 内容与历史部署出现差异。
             table.push(vec![domain, "OK".to_string()]);
-            self.write_rows(&path, &table)?;
+            require_postfix_sync(self.write_rows(&path, &table)?)?;
             Ok(self.domains())
         })
     }
@@ -188,8 +188,13 @@ impl TableStore {
                 });
 
                 // 两张表都读成功后才开始写，避免第二张表不可读时先删掉域名。
-                self.write_rows(&domains_path, &domains)?;
-                self.write_rows(&aliases_path, &aliases)?;
+                //
+                // 写入顺序：**先别名表（引用这个域的一方），后域名表**。两步之间
+                // 崩溃时留下的是「域名还在、别名已删」的中间态 —— 无害，重试即
+                // 修复；反过来（先删域名）崩溃时留下孤儿别名，Postfix 会继续为
+                // 一个已删除的域路由收信。
+                require_postfix_sync(self.write_rows(&aliases_path, &aliases)?)?;
+                require_postfix_sync(self.write_rows(&domains_path, &domains)?)?;
                 Ok(self.domains())
             })
         })
@@ -256,7 +261,7 @@ impl TableStore {
             let mut row = vec![source];
             row.extend(normalised);
             table.push(row);
-            self.write_rows(&path, &table)?;
+            require_postfix_sync(self.write_rows(&path, &table)?)?;
             Ok(self.aliases())
         })
     }
@@ -279,7 +284,7 @@ impl TableStore {
         locked_with(&path, || {
             let mut table = read_rows_for_update(&path)?;
             table.retain(|row| row.first() != Some(&source));
-            self.write_rows(&path, &table)?;
+            require_postfix_sync(self.write_rows(&path, &table)?)?;
             Ok(self.aliases())
         })
     }
@@ -298,6 +303,32 @@ impl TableStore {
             path,
         ))
     }
+}
+
+/// 把 postmap 序列的结果钉成调用方可见的错误。
+///
+/// [`postmap_and_reload`] 刻意不返回 `Result`（写表本身已成功，每步失败都非致命
+/// 并已 `warn`）；但「表文件写成了、Postfix 却还在读旧表」若被压成 `Ok`，改路由
+/// 不生效就成了无日志的悬案。这里把失败步聚合成一个显式错误向上传播 ——
+/// 调用方（管理台/CLI）能给运维一句可行动的结论。
+fn require_postfix_sync(outcome: PostmapOutcome) -> StoreResult<()> {
+    let mut failed: Vec<&'static str> = Vec::new();
+    if !outcome.postmap_ok {
+        failed.push("postmap");
+    }
+    if !outcome.check_ok {
+        failed.push("postfix check");
+    }
+    if !outcome.reload_ok {
+        failed.push("postfix reload");
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    Err(StoreError::Postmap(format!(
+        "table file written, but Postfix update failed at: {}",
+        failed.join(", ")
+    )))
 }
 
 /// 读表文件（`rows`）：跳过空行与 `#` 注释、按空白分词；文件缺失视为空表。
@@ -817,6 +848,85 @@ mod tests {
             .add_alias("sales@example.com", &["alice".to_string()])
             .unwrap();
         assert_eq!(f.runner.programs(), vec!["postmap", "postfix", "postfix"]);
+    }
+
+    /// 所有命令都失败（非零状态）的运行器。
+    struct FailingRunner;
+
+    impl CommandRunner for FailingRunner {
+        fn run(
+            &self,
+            _program: &str,
+            _args: &[&str],
+        ) -> mailstack_core::CoreResult<CommandOutput> {
+            Ok(CommandOutput {
+                status: 1,
+                stdout: String::new(),
+                stderr: "simulated failure".to_string(),
+            })
+        }
+
+        fn run_with_timeout(
+            &self,
+            program: &str,
+            args: &[&str],
+            _timeout: std::time::Duration,
+        ) -> mailstack_core::CoreResult<CommandOutput> {
+            self.run(program, args)
+        }
+    }
+
+    /// 表文件写成功但 Postfix 侧（postmap/check/reload）失败：必须作为错误上报，
+    /// 而不是压成 Ok —— 否则「改了路由却没生效」就是一个无日志的悬案。
+    #[test]
+    fn a_failed_postmap_is_surfaced_as_an_error_not_swallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        std::fs::create_dir_all(&paths.postfix).unwrap();
+        let store = TableStore::with_parts(paths.clone(), Arc::new(FailingRunner), Arc::new(FixedEnv));
+
+        let error = store.add_domain("example.com").unwrap_err();
+        assert_eq!(error.kind(), "PostmapError");
+        assert!(
+            error.to_string().contains("postmap"),
+            "错误应指明失败在哪一步：{error}"
+        );
+
+        // 错误的语义是「Postfix 未同步」，不是「写入失败」—— 表文件本身已落盘。
+        assert_eq!(store.domains(), vec!["example.com".to_string()]);
+    }
+
+    /// 删除域时**先写别名表、后写域名表**（postmap 的先后 = 写入的先后）。
+    /// 两步之间崩溃留下「域名在、别名已删」的无害中间态，重试即修复；
+    /// 反过来的顺序会留下继续为已删域路由收信的孤儿别名。
+    #[test]
+    fn delete_domain_writes_the_aliases_table_before_the_domains_table() {
+        let f = Fixture::new();
+        f.store.add_domain("example.com").unwrap();
+        f.store
+            .add_alias("sales@example.com", &["alice".to_string()])
+            .unwrap();
+        f.runner.calls.lock().unwrap().clear();
+
+        f.store.delete_domain("example.com").unwrap();
+
+        let postmap_targets: Vec<String> = f
+            .runner
+            .calls()
+            .iter()
+            .filter(|(program, _)| program == "postmap")
+            .map(|(_, args)| args[0].clone())
+            .collect();
+        assert_eq!(postmap_targets.len(), 2);
+        assert_eq!(
+            postmap_targets[0],
+            f.paths.aliases.to_string_lossy().to_string(),
+            "别名表（引用域的一方）必须先写"
+        );
+        assert_eq!(
+            postmap_targets[1],
+            f.paths.domains.to_string_lossy().to_string()
+        );
     }
 
     #[test]

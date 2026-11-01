@@ -100,6 +100,7 @@ where
         offer_starttls: plan.offer_starttls,
         tls_active: plan.mode == TlsMode::Implicit,
         offer_auth: plan.offer_auth,
+        require_auth_for_submission: plan.require_auth_for_submission,
         ..config.session.clone()
     };
     let server_config = ServerConfig {
@@ -250,6 +251,7 @@ mod tests {
                 mode: TlsMode::StartTls,
                 offer_starttls: false,
                 offer_auth: false,
+                require_auth_for_submission: false,
             },
             None,
             Arc::clone(&sink),

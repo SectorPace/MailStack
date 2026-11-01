@@ -18,6 +18,12 @@
 //! 握手（那正是攻击者想让我们花的 CPU）。而「封禁检查命中」不计入失败 —— 否则
 //! 一个已经被封的 IP 会因为不断重连而把 `strike` 越滚越高。
 //!
+//! 整条连接还受**会话级总时限**（`SESSION_TOTAL_TIMEOUT`，15 分钟）约束：从
+//! accept 起算，覆盖 STARTTLS 升级前后的两轮 `serve`，到点尽力回 `421 4.4.2`
+//! 后断开。per-read 超时（`ServerLimits`）只约束**单次**读取，管不住每次都在
+//! 超时前喂 1 字节的滴水客户端；会话级上限把「占住连接许可不放」这件事本身
+//! 变成有时限的。
+//!
 //! ## 时间源是注入的
 //!
 //! [`Clock`] 让「限速窗口」与「封禁到期」这类行为的验证不需要 `sleep`。生产用
@@ -43,6 +49,20 @@ use crate::reply::{texts, Reply};
 use crate::sasl::{AuthBackend, Authenticator, UnavailableAuthenticator};
 use crate::session::{RecipientChecker, Session, SessionConfig};
 use crate::tls::{BoxedStream, TlsMode};
+
+/// TLS 握手超时。IMAP 侧同为 15 秒；没有它，每个卡住的握手都会永久占用一个
+/// 连接许可（`max_connections`），少量 IP 即可耗尽全部许可造成全端口拒绝服务。
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 会话级总时限：一条 TCP 连接从 accept 到关闭的最长占用时间。
+///
+/// 15 分钟 = 25 × `data_timeout`（600s）。对慢链路上的合法大报文投递足够宽裕
+/// （DATA 阶段单次读超时是 10 分钟，整条会话的预算还有 25 倍于它的余量），同时
+/// 给「滴水」客户端划上硬上界：per-read 超时只约束**单次** read 等了多久，一个
+/// 每次都在超时前喂 1 字节的客户端可以把连接（连同它的连接许可）无限期占下去
+/// —— 没有会话级上限，slowloris 式占位就没有终点。时钟从 accept 起算，覆盖
+/// STARTTLS 升级前后的**两轮** `serve`；到点先尽力回 `421 4.4.2` 再断开。
+const SESSION_TOTAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// 时间源。注入的目的是让时间相关行为可被确定性验证。
 pub trait Clock: Send + Sync + 'static {
@@ -135,6 +155,9 @@ pub struct MailServer<S: MessageSink + ?Sized> {
     bans: Arc<BanList>,
     /// 与 `config.recipients` 同源，但单独持有一份以便在每条连接上借用。
     recipients: Option<Arc<dyn RecipientChecker>>,
+    /// 会话级总时限。生产固定为 [`SESSION_TOTAL_TIMEOUT`]；可注入是为了让
+    /// 同模块测试能在真实时钟下用秒级时限验证滴水防线（不依赖 test-util）。
+    session_timeout: Duration,
 }
 
 impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
@@ -183,6 +206,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
             rate,
             bans,
             recipients,
+            session_timeout: SESSION_TOTAL_TIMEOUT,
         })
     }
 
@@ -211,6 +235,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
             rate,
             bans,
             recipients,
+            session_timeout,
         } = self;
 
         let semaphore = Arc::new(Semaphore::new(config.max_connections.max(1)));
@@ -246,6 +271,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
                                 rate: Arc::clone(&rate),
                                 bans: Arc::clone(&bans),
                                 recipients: recipients.clone(),
+                                session_timeout,
                             };
                             tasks.spawn(async move {
                                 let _permit = permit;
@@ -308,6 +334,8 @@ struct ConnectionContext<S: MessageSink + ?Sized> {
     rate: Arc<RateLimiter>,
     bans: Arc<BanList>,
     recipients: Option<Arc<dyn RecipientChecker>>,
+    /// 会话级总时限（自 `MailServer.session_timeout` 注入；生产为 15 分钟）。
+    session_timeout: Duration,
 }
 
 impl<S: MessageSink + ?Sized> ConnectionContext<S> {
@@ -350,10 +378,22 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
                     .tls
                     .as_ref()
                     .expect("隐式 TLS 已在构造时校验 acceptor 存在");
-                match acceptor.accept(stream).await {
-                    Ok(encrypted) => Box::new(encrypted),
-                    Err(error) => {
+                match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    Ok(Ok(encrypted)) => Box::new(encrypted),
+                    Ok(Err(error)) => {
                         tracing::warn!(peer = %peer, error = %error, "隐式 TLS 握手失败");
+                        self.bans.record_failure(ip, self.clock.now_millis() / 1000);
+                        return;
+                    }
+                    Err(_) => {
+                        // 握手没有超时会永久占用一个连接许可（max_connections）：
+                        // 对端收到 TCP 后不发 ClientHello，少量 IP 就能耗尽全部
+                        // 许可，把所有启用 TLS 的端口拖成全端口拒绝服务。
+                        tracing::warn!(
+                            peer = %peer,
+                            timeout_secs = TLS_HANDSHAKE_TIMEOUT.as_secs(),
+                            "TLS 握手超时"
+                        );
                         self.bans.record_failure(ip, self.clock.now_millis() / 1000);
                         return;
                     }
@@ -379,27 +419,51 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
         };
 
         // ── 4) 会话（可能因 STARTTLS 重入一次）──
+        //
+        // 会话级总时限：deadline 是在 accept 时取定的**绝对时刻**，两轮 `serve` 与
+        // STARTTLS 握手的每个 await 都受**同一个** deadline 约束 —— 若每轮 serve
+        // 各自起算，升级重入会把占位时限重置回满额，滴水客户端就能无限期续命。
+        // 到点先尽力回 `421 4.4.2` 再断开：连接随即关闭，连接许可随之释放。
+        //
+        // 用 `timeout_at(deadline, …)` 包每个 await 点而不是把整个循环包进一个
+        // `timeout`：STARTTLS 分支要把明文流 move 进握手，整体包装会迫使循环体
+        // 按值捕获 `stream` —— 超时弃掉 future 时流会被一并丢弃，421 就无处可写。
+        let deadline = tokio::time::Instant::now() + self.session_timeout;
         loop {
-            let outcome = if upgraded {
-                serve_after_upgrade(
-                    &mut stream,
-                    &mut session,
-                    &*self.sink,
-                    auth,
-                    peer,
-                    self.config.limits.clone(),
+            let served = if upgraded {
+                tokio::time::timeout_at(
+                    deadline,
+                    serve_after_upgrade(
+                        &mut stream,
+                        &mut session,
+                        &*self.sink,
+                        auth,
+                        peer,
+                        self.config.limits.clone(),
+                    ),
                 )
                 .await
             } else {
-                serve(
-                    &mut stream,
-                    &mut session,
-                    &*self.sink,
-                    auth,
-                    peer,
-                    self.config.limits.clone(),
+                tokio::time::timeout_at(
+                    deadline,
+                    serve(
+                        &mut stream,
+                        &mut session,
+                        &*self.sink,
+                        auth,
+                        peer,
+                        self.config.limits.clone(),
+                    ),
                 )
                 .await
+            };
+
+            let outcome = match served {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    session_deadline_elapsed(&mut stream, peer, self.session_timeout).await;
+                    return;
+                }
             };
 
             match outcome {
@@ -441,11 +505,37 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
                         tracing::error!(peer = %peer, "收到 STARTTLS 但没有可用的 TLS 配置");
                         return;
                     };
-                    let next: BoxedStream = match acceptor.accept(stream).await {
-                        Ok(encrypted) => Box::new(encrypted),
-                        Err(error) => {
+                    // 握手受「15s 握手超时」与「会话级总时限」中**先到**者的约束。
+                    // 总时限先到时不写 421：TLS 协商进行到一半，明文应答只会是对端
+                    // 解不了的噪声 —— 直接断开。
+                    let next: BoxedStream = match tokio::time::timeout_at(
+                        deadline,
+                        tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Ok(encrypted))) => Box::new(encrypted),
+                        Ok(Ok(Err(error))) => {
                             tracing::warn!(peer = %peer, error = %error, "STARTTLS 握手失败");
                             self.bans.record_failure(ip, self.clock.now_millis() / 1000);
+                            return;
+                        }
+                        Ok(Err(_)) => {
+                            // 与隐式 TLS 同理：无超时的握手会永久占用连接许可。
+                            tracing::warn!(
+                                peer = %peer,
+                                timeout_secs = TLS_HANDSHAKE_TIMEOUT.as_secs(),
+                                "STARTTLS 握手超时"
+                            );
+                            self.bans.record_failure(ip, self.clock.now_millis() / 1000);
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                peer = %peer,
+                                timeout_secs = self.session_timeout.as_secs(),
+                                "会话总时限在 STARTTLS 握手期间到点，关闭连接"
+                            );
                             return;
                         }
                     };
@@ -454,6 +544,18 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
                     upgraded = true;
                 }
                 Err(error) => {
+                    // 客户端主动断开（回程 RST / 半关）不是攻击行为：记进封禁表
+                    // 只会惩罚 NAT 后的正常用户（默认 8 次/600 秒即封 1 小时），
+                    // 还会用 TCP 重置噪音灌满封禁表。
+                    let benign_disconnect = matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                    );
+                    if benign_disconnect {
+                        return;
+                    }
                     tracing::warn!(peer = %peer, error = %error, "会话 I/O 错误");
                     self.bans.record_failure(ip, self.clock.now_millis() / 1000);
                     return;
@@ -461,6 +563,19 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
             }
         }
     }
+}
+
+/// 会话总时限在 `serve` 期间到点：尽力发出 `421 4.4.2` 后由调用方断开。
+///
+/// 「尽力」：对端可能早已不在，写失败不改变「连接即将关闭」的结果。
+async fn session_deadline_elapsed(stream: &mut BoxedStream, peer: SocketAddr, timeout: Duration) {
+    tracing::warn!(
+        peer = %peer,
+        timeout_secs = timeout.as_secs(),
+        "会话总时限已到，关闭连接"
+    );
+    let reply = Reply::with_enhanced(421, "4.4.2", texts::SESSION_TIMEOUT);
+    let _ = write_reply(stream, &reply).await;
 }
 
 /// 连接准入判定：封禁优先于限速，限速触发即计入失败。
@@ -627,6 +742,104 @@ mod tests {
         assert!(
             !second.rate_limiter().check(ip(), 0).is_allowed(),
             "端口之间不得各自记账"
+        );
+    }
+
+    /// 滴水客户端（持续喂零散字节，永远凑不出一行命令）必须在会话级总时限处
+    /// 收到 `421 4.4.2` 并被断开。
+    ///
+    /// ## 这条测试为什么必须「滴水」而不是干等
+    ///
+    /// 客户端不发字节时，per-read 超时（300s）先于会话总时限到点，
+    /// 那条路径安静地回 `Closed`、没有 421 —— 它验证不了本条防线。只有让每次
+    /// read 都在超时前恰好等到 1 字节，per-read 超时被不断重置，才轮得到会话级
+    /// 上限出场 —— 这正是 slowloris 的真实形态。
+    ///
+    /// 时限是**可注入**的（`MailServer.session_timeout`）：测试用 500ms 的真实
+    /// 时钟时限，滴水间隔 50ms 远小于 per-read 超时 —— 不依赖 `test-util`
+    /// 的虚拟时钟。
+    #[tokio::test]
+    async fn a_dribbling_session_is_bounded_by_the_total_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct NullSink;
+        impl MessageSink for NullSink {
+            fn accept<'a>(
+                &'a self,
+                _message: crate::session::AcceptedMessage,
+                _peer: SocketAddr,
+            ) -> crate::connection::SinkFuture<'a> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = MailServer::new(
+            listener,
+            ServerConfig::default(),
+            None,
+            TlsMode::StartTls,
+            Arc::new(NullSink),
+            Arc::new(SystemClock),
+        )
+        .expect("构造监听");
+        // 秒级总时限：滴水间隔（50ms）仍远小于 per-read 超时（300s），
+        // 防线的「被滴水不断喂活」前提不变，但真实时钟下瞬时走完。
+        server.session_timeout = Duration::from_millis(500);
+        tokio::spawn(async move { server.run(std::future::pending()).await });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // 先读完整的 220 问候行（以 CRLF 结尾），确认会话已进入命令阶段。
+        let mut greeting = Vec::new();
+        let mut chunk = [0u8; 128];
+        while !greeting.windows(2).any(|window| window == b"\r\n") {
+            let read = client.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "连接在问候行之前就断了");
+            greeting.extend_from_slice(&chunk[..read]);
+        }
+        assert!(
+            greeting.starts_with(b"220 "),
+            "应先收到问候再开始滴水：{:?}",
+            String::from_utf8_lossy(&greeting)
+        );
+
+        // 滴水节奏 50ms < per-read 超时 300s：每次 read 都在超时前被喂活，
+        // per-read 超时永远到不了点。写失败（连接已被服务端关掉）即退出。
+        // tokio 的 TcpStream 不能 try_clone —— 拆成读写两半，写半给滴水任务。
+        let (mut reader, mut writer) = client.into_split();
+        tokio::spawn(async move {
+            for _ in 0..40 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if writer.write_all(b"A").await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        // 读到 421（或对端关闭）。外层给一个真实上限：回归（总时限失效）时
+        // 滴水 eventually 耗尽、连接安静关闭，断言会给出明确失败而不是挂死。
+        let mut seen = Vec::new();
+        let mut chunk = [0u8; 128];
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let read = reader.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&chunk[..read]);
+                if seen.windows(3).any(|window| window == b"421") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("会话总时限未生效：虚拟 24 小时内没有 421 也没有断开");
+
+        let out = String::from_utf8_lossy(&seen);
+        assert!(
+            out.contains("421 4.4.2 session timeout"),
+            "滴水会话必须在总时限处收到 421，实际：{out}"
         );
     }
 }

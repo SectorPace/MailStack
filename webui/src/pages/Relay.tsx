@@ -1,11 +1,26 @@
 // 出站中继 —— 对齐原版 SmtpRelayView 功能：服务商卡片 / 凭据表单 / 中继连通测试 / 端口检测 / 应用
+//
+// 真实数据源：当前中继 host 在 `snapshot.queue.relayHost`（crates/priv/src/readers.rs
+// queue_summary，读 relay.json；空 = 直接投递）。settings.get 的 Settings 结构体里
+// **没有** relay* 字段，此页不再把「当前配置」寄托在它上面。
 import { useEffect, useState } from "react";
 import { useSettings } from "../store/settings";
 import { rpc } from "../api/client";
 import { PageHeader, Card, ToggleRow, toast } from "../components/ui";
 import { IconSend, IconCheck } from "../components/icons";
 
-type Settings = { relayProvider: string; relayAuthUser: string; relayTls: string; relayWeight: number };
+// settings.get 只取可能存在的凭据用户名（真后端没有该字段 → 空串）。
+type Settings = { relayAuthUser?: string };
+type SnapshotRelay = { queue?: { relayHost?: string } };
+// setup.relay.apply 成功：{ applied, relayhost(回读值), wrappermode, mode?, test? }；
+// 「先测后写」失败：200 + { applied:false, rolledBack, test:{ error:{ message } } }。
+type ApplyResult = {
+  applied?: boolean;
+  mode?: string;
+  relayhost?: string;
+  error?: { message?: string };
+  test?: { error?: { message?: string } };
+};
 type RelayId = "direct" | "oracle" | "ses" | "sendgrid" | "custom";
 
 export default function Relay() {
@@ -13,25 +28,49 @@ export default function Relay() {
   const zh = prefs.lang === "zh";
   const [form, setForm] = useState<Settings | null>(null);
   const [relayId, setRelayId] = useState<RelayId>("direct");
+  // 服务器当前生效的中继 host（snapshot.queue.relayHost；null = 尚未加载）。
+  const [currentHost, setCurrentHost] = useState<string | null>(null);
   const [relayHost, setRelayHost] = useState("");
   const [relayPort, setRelayPort] = useState(587);
   const [relayPass, setRelayPass] = useState("");
+  const [applying, setApplying] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
-  const [ports, setPorts] = useState<{ port: number; open: boolean; latencyMs: number }[] | null>(null);
+  const [ports, setPorts] = useState<{ port: number; open: boolean; latencyMs: number; err: boolean }[] | null>(null);
   const [checking, setChecking] = useState(false);
 
   useEffect(() => {
-    rpc<Settings & { relayHost?: string }>("settings.get").then((r) => {
-      if (!r.ok) return;
-      const d = r.data as Settings & { relayHost?: string };
-      setForm(d);
-      setRelayId((d.relayProvider as RelayId) || "direct");
-      setRelayHost(d.relayHost ?? "");
+    let live = true;
+    rpc<Settings>("settings.get").then((r) => {
+      // {ok:true} 无载荷时保持 form=null（骨架屏），不把 undefined 塞进 state。
+      if (!live || !r.ok || !r.data) return;
+      setForm(r.data);
     });
+    // 当前生效的中继只认 snapshot：settings.get 没有该数据（绝不显示编造值）。
+    rpc<SnapshotRelay>("snapshot").then((r) => {
+      if (!live) return;
+      const host = r.ok ? (r.data?.queue?.relayHost ?? "") : "";
+      setCurrentHost(host);
+      // 有中继 → 选中「自定义」卡并回填。apply 落盘的是 Postfix 方括号语法
+      // `[host]:port`（不做 MX 解析）；表单字段是主机名 + 端口，回填前拆开，
+      // 否则二次应用会把整串再包一层括号。凭据不回显（后端不返回明文密码）。
+      if (host) {
+        const m = /^\[(.+)\]:(\d+)$/.exec(host);
+        setRelayId("custom");
+        if (m) {
+          setRelayHost(m[1]);
+          setRelayPort(Number(m[2]) || 587);
+        } else {
+          setRelayHost(host);
+        }
+      }
+    });
+    return () => {
+      live = false;
+    };
   }, []);
 
-  if (!form) return <div className="p-4"><div className="skeleton h-64" /></div>;
+  if (currentHost === null) return <div className="p-4"><div className="skeleton h-64" /></div>;
 
   const providers: { id: RelayId; name: string; desc: string; host: string; port: number }[] = [
     { id: "direct", name: zh ? "直接投递" : "Direct delivery", desc: zh ? "使用本机 Postfix；需云厂商开放出站 25 端口" : "Local Postfix; requires outbound port 25", host: "", port: 25 },
@@ -51,8 +90,41 @@ export default function Relay() {
       tlsMode: relayPort === 465 ? "SSL/TLS" : "STARTTLS",
       username: form?.relayAuthUser ?? "",
       password: relayPass,
-      ...(relayId === "direct" ? { direct: true } : {}),
     };
+  }
+
+  /**
+   * 应用出站配置。选中「直接投递」即**撤销语义**：发 {direct: true} 清除已配置的
+   * 中继（幂等、不连通远端），成功回 {applied, mode:"direct", relayhost:""}。
+   * 「先测后写」：测试不过时后端回 200 + applied:false + 失败详情，一行配置都没写 ——
+   * 必须显式检视 applied，applied:false 一律报错 toast，绝不显示「已保存」。
+   */
+  async function applyRelay() {
+    setApplying(true);
+    const direct = relayId === "direct";
+    const r = await rpc<ApplyResult>("setup.relay.apply", direct ? { direct: true } : relayPayload());
+    setApplying(false);
+    if (r.ok && r.data?.applied === false) {
+      toast(
+        r.data.error?.message ?? r.data.test?.error?.message ?? (zh ? "中继测试未通过，配置未写入" : "relay test failed, nothing written"),
+        "err",
+      );
+      return;
+    }
+    if (!r.ok) {
+      toast(r.error, "err");
+      return;
+    }
+    if (direct) {
+      setCurrentHost("");
+      setRelayPass("");
+      toast(zh ? "已清除中继，回到直接投递" : "Relay cleared — direct delivery");
+    } else {
+      // apply 的 relayhost 是**回读**得到的观察值（含 [host]:port 方括号语法），
+      // 以它为当前真相，不拿表单值冒充。
+      setCurrentHost(r.data?.relayhost || relayHost);
+      toast(t("saved"));
+    }
   }
 
   async function runTest() {
@@ -80,10 +152,13 @@ export default function Relay() {
 
   async function checkPorts() {
     setChecking(true);
-    const out: { port: number; open: boolean; latencyMs: number }[] = [];
+    const out: { port: number; open: boolean; latencyMs: number; err: boolean }[] = [];
     for (const p of [25, 465, 587]) {
-      const r = await rpc<{ open: boolean; latencyMs: number }>("network.check_port", { port: p, host: relayHost || "127.0.0.1" });
-      out.push({ port: p, open: r.ok && r.data.open, latencyMs: r.ok ? r.data.latencyMs : 0 });
+      const r = await rpc<{ open?: boolean; latencyMs?: number }>("network.check_port", { port: p, host: relayHost || "127.0.0.1" });
+      // 请求失败 ≠ 端口被拦截：err 单列，界面显示「—」而不是把传输失败渲染成
+      // 「拦截」（那会引导用户去查防火墙，方向完全错）。{ok:true} 无载荷同理。
+      const err = !r.ok || r.data == null;
+      out.push({ port: p, open: !err && r.data.open === true, latencyMs: !err ? r.data.latencyMs ?? 0 : 0, err });
     }
     setPorts(out);
     setChecking(false);
@@ -95,7 +170,15 @@ export default function Relay() {
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
         <Card>
-          <h2 className="mb-3 text-[14px] font-semibold text-[var(--text-1)]">{zh ? "出站通道" : "Outbound Channel"}</h2>
+          <h2 className="mb-2.5 text-[14px] font-semibold text-[var(--text-1)]">{zh ? "出站通道" : "Outbound Channel"}</h2>
+          {/* 当前生效值来自 snapshot.queue.relayHost（读 relay.json 的真实回读），
+              空 = 直接投递。这是「现在是什么」，下面卡片选择是「想改成什么」。 */}
+          <div className="glass--well mb-3 flex items-center justify-between gap-3 rounded-[12px] p-3 text-[12px]">
+            <span className="text-[var(--text-3)]">{zh ? "当前生效" : "Currently active"}</span>
+            <span className="mono truncate text-[var(--text-1)]" title={currentHost || undefined}>
+              {currentHost || (zh ? "直接投递" : "Direct delivery")}
+            </span>
+          </div>
           <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
             {providers.map((p) => (
               <button
@@ -104,7 +187,6 @@ export default function Relay() {
                   setRelayId(p.id);
                   setRelayHost(p.host);
                   setRelayPort(p.port);
-                  setForm({ ...form, relayProvider: p.id });
                 }}
                 className="rounded-[12px] p-3.5 text-left transition-all"
                 style={{
@@ -125,24 +207,38 @@ export default function Relay() {
             <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
               <FieldL label={zh ? "中继 SMTP 服务器" : "Relay host"} value={relayHost} onChange={setRelayHost} />
               <FieldL label={zh ? "中继端口（587 / 465）" : "Relay port"} value={String(relayPort)} onChange={(v) => setRelayPort(Number(v) || 587)} />
-              <FieldL label={t("auth_user")} value={form.relayAuthUser} onChange={(v) => setForm({ ...form, relayAuthUser: v })} />
+              <FieldL label={t("auth_user")} value={form?.relayAuthUser ?? ""} onChange={(v) => setForm({ ...(form ?? {}), relayAuthUser: v })} />
               <FieldL label={zh ? "SMTP 授权密码" : "SMTP password"} type="password" value={relayPass} onChange={setRelayPass} />
             </div>
           )}
 
-          <div className="mt-3">
-            <ToggleRow title={t("tls_mode") + ": " + form.relayTls} sub="smtp_tls_security_level" checked={form.relayTls === "required"} onChange={(v) => setForm({ ...form, relayTls: v ? "required" : "may" })} />
+          {/* 原先是「TLS required/may」开关（smtp_tls_security_level）：form.relayTls 只写
+              本地 state，relayPayload() 的 tlsMode 由端口推导、Apply 从不携带该值，且
+              后端 setup.relay.apply 只接受 STARTTLS / SSL/TLS 两种枚举（明文中继一律被拒，
+              见 crates/smtp/src/validate.rs，Relay.tsx 契约注释）—— 纯死控件。改为诚实
+              展示：禁用 + 提示真实生效的 TLS 模式随端口决定。 */}
+          <div
+            className="mt-3"
+            title={zh ? "TLS 模式由端口决定：587 → STARTTLS，465 → SSL/TLS（后端仅接受这两种，不支持手工覆写）" : "TLS mode follows the port: 587 → STARTTLS, 465 → SSL/TLS. The backend accepts no manual override."}
+          >
+            <ToggleRow
+              title={`${t("tls_mode")}: ${relayPort === 465 ? "SSL/TLS" : "STARTTLS"}`}
+              sub="smtp_tls_security_level"
+              checked
+              disabled
+              onChange={() => {}}
+            />
           </div>
 
           <div className="mt-3 flex flex-wrap gap-2">
-            <button
-              className="btn btn-accent"
-              onClick={async () => {
-                const r = await rpc("setup.relay.apply", relayPayload());
-                toast(r.ok ? t("saved") : r.error, r.ok ? "ok" : "err");
-              }}
-            >
-              <IconCheck size={14} /> {t("apply")}
+            {/* 选中「直接投递」时按钮即撤销入口：显式发 {direct: true} 清除中继。 */}
+            <button className="btn btn-accent" disabled={applying} onClick={() => void applyRelay()}>
+              <IconCheck size={14} />
+              {applying
+                ? "…"
+                : relayId === "direct"
+                  ? zh ? "直接投递（清除中继）" : "Direct delivery (clear relay)"
+                  : t("apply")}
             </button>
             <button className="btn glass--control" disabled={testing} onClick={runTest}>
               <IconSend size={14} /> {testing ? "…" : zh ? "测试中继连通性" : "Test relay"}
@@ -168,9 +264,9 @@ export default function Relay() {
                 {ports.map((p) => (
                   <div key={p.port} className="flex items-center justify-between text-[12.5px]">
                     <span className="mono text-[var(--text-1)]">:{p.port}</span>
-                    <span className="badge" style={p.open ? { background: "rgb(var(--ok-rgb) / 0.13)", color: "rgb(var(--ok-rgb))" } : { background: "rgb(var(--err-rgb) / 0.12)", color: "rgb(var(--err-rgb))" }}>
+                    <span className="badge" style={p.err ? { background: "rgb(var(--text-1) / 0.08)", color: "var(--text-3)" } : p.open ? { background: "rgb(var(--ok-rgb) / 0.13)", color: "rgb(var(--ok-rgb))" } : { background: "rgb(var(--err-rgb) / 0.12)", color: "rgb(var(--err-rgb))" }}>
                       <span className="dot" />
-                      {p.open ? (zh ? "开放" : "Open") : zh ? "拦截" : "Blocked"} · {p.latencyMs}ms
+                      {p.err ? "—" : p.open ? (zh ? "开放" : "Open") : zh ? "拦截" : "Blocked"}{p.err ? "" : ` · ${p.latencyMs}ms`}
                     </span>
                   </div>
                 ))}

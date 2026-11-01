@@ -18,8 +18,9 @@ echo "TOTAL=$total"
 
 echo
 echo "### 不变量覆盖（INV → 测试函数）"
-grep -rhoE 'fn [a-z0-9_]+' crates/*/src/*.rs \
-  | sed 's/^fn //' | sort -u > /tmp/all_fns.txt
+# 早先这里还把全部函数名 sort -u 进固定的 /tmp/all_fns.txt —— 固定路径可被
+# 其他用户用符号链接预占（symlink race），而该文件随后从未被读过：整段是
+# 纯死写入，直接删除。
 grep -rhE 'INV-[0-9]+' crates/*/src/*.rs | grep -oE 'INV-[0-9]+' | sort -u -V | tr '\n' ' '
 echo
 

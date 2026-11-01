@@ -171,7 +171,14 @@ impl BanList {
         let mut guard = self.lock();
 
         if guard.len() >= config.max_entries && !guard.contains_key(&ip) {
-            evict(&mut guard, config.max_entries);
+            let freed = evict(&mut guard, config.max_entries, now);
+            // 淘汰不动（表被永久/手工/活跃封禁填满）时不再插入：条目数越过
+            // `max_entries` 的无界增长正是内存保护要防的。此刻丢掉一次 strike
+            // 是可接受的取舍 —— 表已饱和说明需要运维清理，而不是让守护进程
+            // 无界吃内存。
+            if !freed && !guard.contains_key(&ip) {
+                return None;
+            }
         }
 
         let entry = guard.entry(ip).or_default();
@@ -300,36 +307,59 @@ impl BanList {
     }
 }
 
-/// 内存上限保护：优先淘汰「未封禁且无计数」的陈旧条目，其次淘汰最久未活动者。
-/// 永久封禁的条目**不参与**淘汰 —— 淘汰它等于悄悄解封。
+/// 内存上限保护：优先淘汰「未封禁且无计数」的陈旧条目，其次淘汰「已过期封禁」，
+/// 最后才是最久未活动的窗口内计数者。**绝不**淘汰永久/手工封禁，也**绝不**淘汰
+/// 仍在生效期内的临时封禁 —— 淘汰活跃封禁等于悄悄解封，此前第二阶段的过滤只排除了
+/// permanent/manual，表满时最旧的活跃临时封禁会被静默删除。
+///
+/// 「已过期封禁」必须参与淘汰：`banned_until` 只在**按 IP 触达时**被惰性清理，
+/// 没有任何后台清扫会把过期条目变成空壳 —— 若把它们排除在候选之外，表一旦被
+/// 过期条目+永久条目填满，`evict` 将永远腾不出位置，配合调用方的「淘汰不动就
+/// 不插入」，攻击者可以用陈旧封禁把整个封禁表变成只进不出的死表。
 ///
 /// `manual` 单独再判一次：手工封禁当前必然是永久的，所以这条判断今天不会改变行为；
 /// 它存在是为了让「手工封禁不可被淘汰」成为本函数自己的约束，而不是依赖
 /// [`BanList::apply_manual`] 恰好把它设成了永久。
-fn evict(entries: &mut HashMap<IpAddr, Entry>, max_entries: usize) {
+///
+/// 返回本次是否真的腾出了位置；淘汰不动时调用方不得再插入新条目，
+/// 否则表会越过 `max_entries` 无界增长（内存保护本身失效）。
+fn evict(entries: &mut HashMap<IpAddr, Entry>, max_entries: usize, now: i64) -> bool {
     entries.retain(|_, entry| {
         entry.permanent
             || entry.manual
-            || entry.banned_until.is_some()
+            || entry.banned_until.map_or(false, |until| until > now)
             || !entry.failures.is_empty()
     });
 
     if entries.len() < max_entries {
-        return;
+        return true;
     }
 
-    let mut ages: Vec<(IpAddr, i64)> = entries
+    // 候选 = 永久/手工之外、且当前**未在封禁中**的条目。优先级：
+    // 已过期封禁（strike 历史价值最低）排最前，其后是无失败历史的空壳
+    //（第 1 步通常会清掉），最后按最久未活动淘汰窗口内的计数者。
+    let mut candidates: Vec<(IpAddr, i64, i64)> = entries
         .iter()
-        .filter(|(_, entry)| !entry.permanent && !entry.manual)
-        .map(|(ip, entry)| (*ip, entry.last_seen))
+        .filter(|(_, entry)| {
+            !entry.permanent
+                && !entry.manual
+                && entry.banned_until.map_or(true, |until| until <= now)
+        })
+        .map(|(ip, entry)| {
+            let expired_ban = entry.banned_until.map_or(false, |until| until <= now);
+            let history_value = i64::from(!expired_ban && !entry.failures.is_empty());
+            (*ip, entry.last_seen, history_value)
+        })
         .collect();
-    ages.sort_by_key(|(_, last)| *last);
+    // 历史价值低者先走，同组内最旧者优先。
+    candidates.sort_by_key(|(_, last_seen, history_value)| (*history_value, *last_seen));
 
     let target = max_entries.saturating_sub(1);
     let remove_count = entries.len().saturating_sub(target);
-    for (victim, _) in ages.into_iter().take(remove_count) {
+    for (victim, _, _) in candidates.into_iter().take(remove_count) {
         entries.remove(&victim);
     }
+    entries.len() < max_entries
 }
 
 #[cfg(test)]

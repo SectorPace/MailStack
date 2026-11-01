@@ -30,15 +30,29 @@
 //! 脚本从 `<maildir>/.sieve` 读取（UTF-8，≤64 KiB）。
 
 use crate::error::{MailError, Result};
-use crate::maildir::{FlagSet, MailStore, NewMessage, INBOX};
+use crate::maildir::{write_atomic, with_lock, FlagSet, MailStore, NewMessage, INBOX};
 use crate::mime;
 use crate::outbound::OutboundSink;
 
 const SCRIPT_FILE: &str = ".sieve";
-const MAX_SCRIPT_BYTES: usize = 64 * 1024;
+/// 单脚本字节数上限（[`put_script`] 与 ManageSieve 的 `HAVESPACE` 共用）。
+///
+/// `pub` 是因为 ManageSieve 的 `HAVESPACE` 必须按与 `PUTSCRIPT` 完全相同的
+/// 预算如实作答 —— 预算只能有一个来源，抄一份常量迟早走样。
+pub const MAX_SCRIPT_BYTES: usize = 64 * 1024;
+/// 每个用户的脚本数量上限（[`put_script`] 与 ManageSieve 的 `HAVESPACE` 共用）。
+///
+/// 只有单脚本 64 KiB 上限是不够的：脚本名仅受 ≤128 字节约束，反复 `PUTSCRIPT`
+/// 可以把 `sieve/` 目录刷成上千个小文件。`pub` 是因为 ManageSieve 的
+/// `HAVESPACE` 必须按与 `PUTSCRIPT` 完全相同的预算如实作答。
+pub const MAX_SCRIPTS: usize = 20;
 const VACATION_STATE: &str = ".mailstack-vacation";
+/// vacation 状态读改写的 flock sidecar（同一把锁串行化「判定去重 + 写回」）。
+const VACATION_LOCK: &str = ".mailstack-vacation.lock";
 const MAX_STEPS: usize = 20_000;
 const MAX_DEPTH: usize = 32;
+/// 解析器的递归深度上限（Eval 的 MAX_DEPTH 只约束求值，管不住解析栈）。
+const MAX_PARSE_DEPTH: usize = 128;
 const MAX_ACTIONS: usize = 256;
 
 /// 一个已求值的动作。
@@ -186,7 +200,11 @@ pub fn get_script(store: &MailStore, name: &str) -> Result<Option<String>> {
     }
 }
 
-/// 原子写入脚本（临时文件 + rename）。
+/// 原子写入脚本（唯一临时文件 + fsync + rename）。
+///
+/// 临时名必须唯一：固定的 `.{name}.tmp.{pid}` 会让两个并发 PUTSCRIPT 互相
+/// 截断同一个临时文件，rename 出去的是半份脚本；fsync 保证 rename 之后
+/// 掉电也不会留下空脚本顶替旧版本。
 pub fn put_script(store: &MailStore, name: &str, source: &str) -> Result<()> {
     validate_script_name(name)?;
     if source.len() > MAX_SCRIPT_BYTES {
@@ -194,13 +212,14 @@ pub fn put_script(store: &MailStore, name: &str, source: &str) -> Result<()> {
     }
     let dir = scripts_dir(store);
     std::fs::create_dir_all(&dir).map_err(|error| MailError::io(&dir, error))?;
-    let path = dir.join(name);
-    let temp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
-    std::fs::write(&temp, source.as_bytes()).map_err(|error| MailError::io(&temp, error))?;
-    std::fs::rename(&temp, &path).map_err(|error| {
-        let _ = std::fs::remove_file(&temp);
-        MailError::io(&path, error)
-    })
+    // 数量上限：只有**新**脚本占名额（覆盖已有脚本不算新增）。检查与写入之间
+    // 不加锁 —— 并发 PUTSCRIPT 理论上可以略超上限，超出的也只是 64 KiB 内的
+    // 小文件；这是资源护栏而非安全边界，不值得为它引入目录级互斥。
+    let existing = list_scripts(store)?;
+    if existing.len() >= MAX_SCRIPTS && !existing.iter().any(|(present, _)| present == name) {
+        return Err(MailError::invalid("too many Sieve scripts"));
+    }
+    write_atomic(&dir.join(name), source.as_bytes())
 }
 
 /// 设置（`Some`）或清除（`None`）活动脚本。
@@ -265,7 +284,12 @@ pub fn rename_script(store: &MailStore, from: &str, to: &str) -> Result<()> {
 /// 编译脚本。语法错误、未知命令或不受支持的 `require` 都会返回错误。
 pub fn compile(source: &str) -> Result<Script> {
     let tokens = Lexer::new(source).tokenize()?;
-    let commands = Parser { tokens, pos: 0 }.parse()?;
+    let commands = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+    }
+    .parse()?;
     validate_requires(&commands)?;
     Ok(Script { commands })
 }
@@ -278,6 +302,8 @@ pub fn actions(script: &Script, message: &[u8]) -> Vec<Action> {
         steps: 0,
         actions: Vec::new(),
         stopped: false,
+        body_text: None,
+        body_raw: None,
     };
     eval.run(&script.commands, 0);
     eval.actions
@@ -403,17 +429,25 @@ pub fn deliver_envelope(
     if let Some(reason) = plan.reject {
         return Ok(Delivery::Rejected(reason));
     }
+    if plan.folders.is_empty() {
+        // 显式 discard：什么都不投，也不报错。
+        return Ok(Delivery::Delivered {
+            folders: Vec::new(),
+            uids: Vec::new(),
+        });
+    }
+    // 多目标投递走一次跨文件夹的原子 append：逐文件夹 append_many 会在中途
+    // 失败时留下「部分文件夹有一份」的半成品。
+    let targets: Vec<&str> = plan.folders.iter().map(String::as_str).collect();
+    let new_message = NewMessage {
+        data: message.to_vec(),
+        flags: FlagSet::new(),
+        internal_date: None,
+    };
+    let results = store.append_many_folders(&targets, &new_message)?;
     let mut folders = Vec::new();
     let mut uids = Vec::new();
-    for folder in plan.folders {
-        let (_, appended) = store.append_many(
-            &folder,
-            &[NewMessage {
-                data: message.to_vec(),
-                flags: FlagSet::new(),
-                internal_date: None,
-            }],
-        )?;
+    for (folder, (_, appended)) in plan.folders.into_iter().zip(results) {
         uids.extend(appended);
         folders.push(folder);
     }
@@ -440,21 +474,29 @@ fn submit_vacation(
     }
     let now = store.clock().now_secs();
     let window = i64::from(days.max(1)) * 86_400;
-    let mut replies = read_vacation_state(store);
     let key = from.to_ascii_lowercase();
-    if let Some(last) = replies.get(&key) {
-        if now.saturating_sub(*last) < window {
-            return;
-        }
-    }
     let reply = build_vacation_reply(&headers, to, from, subject, body);
-    if let Err(error) = sink.submit("", from, reply.as_bytes()) {
-        tracing::warn!(%error, to = %from, "Sieve vacation send failed");
-        return;
-    }
-    replies.insert(key, now);
-    if let Err(error) = write_vacation_state(store, &replies, now) {
-        tracing::warn!(%error, "failed to persist vacation state");
+    // 读-判定-写放进同一把 flock 临界区：否则两个并发投递都读到「窗口内没
+    // 回过」，发出重复自动回复。外发失败不动状态文件（下次投递可再试）。
+    let lock = store.root().join(VACATION_LOCK);
+    if let Err(error) = with_lock(&lock, || {
+        let mut replies = read_vacation_state(store);
+        if let Some(last) = replies.get(&key) {
+            if now.saturating_sub(*last) < window {
+                return Ok(());
+            }
+        }
+        if let Err(error) = sink.submit("", from, reply.as_bytes()) {
+            tracing::warn!(%error, to = %from, "Sieve vacation send failed");
+            return Ok(());
+        }
+        replies.insert(key.clone(), now);
+        if let Err(error) = write_vacation_state(store, &replies, now) {
+            tracing::warn!(%error, "failed to persist vacation state");
+        }
+        Ok(())
+    }) {
+        tracing::warn!(%error, "failed to serialize vacation state access");
     }
 }
 
@@ -567,7 +609,9 @@ fn write_vacation_state(
         buffer.push('\n');
     }
     let path = vacation_state_path(store);
-    std::fs::write(&path, buffer).map_err(|error| MailError::io(&path, error))
+    // 原子写入（临时文件 + fsync + rename）：中途崩溃不能把状态文件截断，
+    // 否则去重记录全丢，恢复后会对同一发件人重复自动回复。
+    write_atomic(&path, buffer.as_bytes())
 }
 
 fn push_unique(list: &mut Vec<String>, value: &str) {
@@ -841,6 +885,10 @@ impl<'a> Lexer<'a> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// 当前 test/block 递归深度。`not not not…` 与嵌套 `if` 块都经由这里，
+    /// 超过 [`MAX_PARSE_DEPTH`] 直接报编译错误 —— 栈溢出会 abort 整个进程，
+    /// 不能指望 Eval 的步数上限兜底（解析发生在求值之前）。
+    depth: usize,
 }
 
 impl Parser {
@@ -1016,6 +1064,13 @@ impl Parser {
     }
 
     fn block(&mut self) -> Result<Vec<Command>> {
+        self.enter()?;
+        let result = self.block_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn block_inner(&mut self) -> Result<Vec<Command>> {
         self.expect(&Token::LBrace)?;
         let mut commands = Vec::new();
         loop {
@@ -1030,7 +1085,23 @@ impl Parser {
         }
     }
 
+    /// 进入一层递归（test / block 共用一个计数器）。
+    fn enter(&mut self) -> Result<()> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(MailError::invalid("Sieve script nesting is too deep"));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
     fn test(&mut self) -> Result<Test> {
+        self.enter()?;
+        let result = self.test_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn test_inner(&mut self) -> Result<Test> {
         let name = match self.next() {
             Some(Token::Ident(name)) => name.to_ascii_lowercase(),
             _ => return Err(MailError::invalid("expected a Sieve test")),
@@ -1173,6 +1244,11 @@ struct Eval<'a> {
     steps: usize,
     actions: Vec<Action>,
     stopped: bool,
+    /// `body :text` 的缓存：整份报文的收集/解码只做一次。MAX_STEPS 允许上千个
+    /// body 测试，逐个重扫整封邮件是 GB 级的重复工作。
+    body_text: Option<String>,
+    /// `body :raw` 的缓存（headers 之后的原始正文）。
+    body_raw: Option<String>,
 }
 
 impl Eval<'_> {
@@ -1292,16 +1368,37 @@ impl Eval<'_> {
                 key,
             } => {
                 let body = if *text {
-                    let mut out = Vec::new();
-                    collect_text(self.message, &mut out);
-                    out
+                    self.cached_body_text()
                 } else {
-                    let (_, body) = mime::split_headers_body(self.message);
-                    body.to_vec()
+                    self.cached_body_raw()
                 };
-                match_value(*match_type, &String::from_utf8_lossy(&body), key)
+                match_value(*match_type, &body, key)
             }
         }
+    }
+
+    /// `body :text`（RFC 5173）：解码后的文本部件。首次调用收集并缓存，
+    /// 后续 body 测试复用，不再重复扫描整封邮件。
+    fn cached_body_text(&mut self) -> String {
+        if let Some(text) = &self.body_text {
+            return text.clone();
+        }
+        let mut out = Vec::new();
+        collect_text(self.message, &mut out);
+        let text = String::from_utf8_lossy(&out).to_string();
+        self.body_text = Some(text.clone());
+        text
+    }
+
+    /// `body :raw`：headers 之后的原始正文，同样只取一次。
+    fn cached_body_raw(&mut self) -> String {
+        if let Some(raw) = &self.body_raw {
+            return raw.clone();
+        }
+        let (_, body) = mime::split_headers_body(self.message);
+        let raw = String::from_utf8_lossy(body).to_string();
+        self.body_raw = Some(raw.clone());
+        raw
     }
 }
 
@@ -1512,6 +1609,71 @@ mod tests {
         assert!(compile(r#"require ["fileinto"]; fileinto "X";"#).is_ok());
         assert!(compile(r#"require ["redirect"]; redirect "a@b";"#).is_ok());
         assert!(compile(r#"require ["vacation"]; vacation "away";"#).is_ok());
+    }
+
+    /// 脚本数量上限：新脚本到 `MAX_SCRIPTS` 即拒；覆盖已有脚本不占新名额；
+    /// 删掉一个之后又能放新的。`HAVESPACE` 的回答以这条执行路径为准。
+    #[test]
+    fn put_script_enforces_the_script_count_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MailStore::new(dir.path(), Arc::new(SystemClock)).unwrap();
+
+        for i in 0..MAX_SCRIPTS {
+            put_script(&store, &format!("s{i:02}"), "keep;").expect("上限内必须能上传");
+        }
+        assert!(put_script(&store, "overflow", "keep;").is_err(), "到上限后新脚本必须被拒");
+        // 覆盖已有脚本：数量不增长，放行。
+        put_script(&store, "s00", "keep;").expect("覆盖已有脚本不受数量限制");
+        // 删掉一个，名额让出。
+        delete_script(&store, "s00").unwrap();
+        put_script(&store, "overflow", "keep;").expect("有名额后必须能上传");
+    }
+
+    #[test]
+    fn deeply_nested_scripts_are_rejected_not_a_stack_overflow() {
+        // 64 KiB 全是 `not not not…`（约 1.6 万层）以前会直接打爆解析栈 abort
+        // 整个进程；现在按程序化构造的小输入验证同样的路径被干净拒绝。
+        let not_chain = format!("if {} true {{ keep; }}", "not ".repeat(MAX_PARSE_DEPTH + 10));
+        assert!(compile(&not_chain).is_err());
+
+        let nested_blocks = format!(
+            "{}{}",
+            "if true { ".repeat(MAX_PARSE_DEPTH + 10),
+            "keep; }".repeat(MAX_PARSE_DEPTH + 10)
+        );
+        assert!(compile(&nested_blocks).is_err());
+
+        let nested_anyof = format!(
+            "if {} true {{ keep; }}",
+            "anyof(".repeat(MAX_PARSE_DEPTH + 10) + "true" + &")".repeat(MAX_PARSE_DEPTH + 10)
+        );
+        assert!(compile(&nested_anyof).is_err());
+
+        // 合法深度（略低于上限）仍然编译通过。
+        let ok_chain = format!("if {} true {{ keep; }}", "not ".repeat(MAX_PARSE_DEPTH - 1));
+        assert!(compile(&ok_chain).is_ok());
+    }
+
+    #[test]
+    fn repeated_body_tests_all_see_the_same_decoded_content() {
+        // multipart/alternative，文本部件是 base64 编码的 "hello world"。
+        let message = b"Content-Type: multipart/alternative; boundary=\"B\"\r\n\r\n--B\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8gd29ybGQ=\r\n--B--\r\n";
+        // 多个 body 测试命中同一封邮件：缓存不得让后续测试拿到空/截断的正文。
+        let script = r#"
+            require ["body"];
+            if body :contains "hello" {
+                if body :matches "*world*" { discard; stop; }
+            }
+            keep;
+        "#;
+        assert_eq!(run(script, message), vec![Action::Discard]);
+
+        // 同一次求值里 :raw 与 :text 混用：两个缓存互不串。
+        let script = r#"
+            require ["body"];
+            if allof(body :raw :contains "aGVsbG8", body :contains "hello world") { discard; }
+        "#;
+        assert_eq!(run(script, message), vec![Action::Discard]);
     }
 
     #[test]

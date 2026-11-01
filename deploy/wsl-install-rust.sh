@@ -4,6 +4,11 @@
 # 本机网络要点：WSL 通过 Clash 混合端口出网。实测 **7897 会接受 TCP 连接但不能代理**
 # （/etc/profile.d/99-clash-proxy.sh 恰好优先探测 7897，且它探测成功 → 于是导出了一个
 # 不可用的代理），真正可用的是 **7890**。故本脚本显式使用 7890。
+#
+# rustup-init.sh 完整性：默认仅依赖 HTTPS 传输（TOFU）。三种模式：
+#   * MAILSTACK_RUSTUP_SHA256=<sha256> —— 钉住安装脚本哈希，不符即失败（任何模式）；
+#   * MAILSTACK_REQUIRE_SHA256=1      —— **未提供**钉扎值也直接失败（强制钉扎）；
+#   * 都不设置                        —— 宽松模式，仅打印无钉扎告警（现状默认）。
 set -euo pipefail
 
 # 6.7：代理不再写死开发机地址，默认值可被 MAILSTACK_PROXY 覆盖。
@@ -48,7 +53,8 @@ else
   #
   # 现在：mktemp -d 建私有目录（0700、名字不可预测），并支持显式哈希钉扎。
   # **诚实说明**：默认只依赖 HTTPS 传输完整性（TOFU），能挡传输损坏/截断/缓存
-  # 投毒，挡不住源站本身被攻破。需要更强保证时用 MAILSTACK_RUSTUP_SHA256 钉住。
+  # 投毒，挡不住源站本身被攻破。需要更强保证时用 MAILSTACK_RUSTUP_SHA256 钉住，
+  # 或设 MAILSTACK_REQUIRE_SHA256=1 使「无钉扎」直接失败（见文件头）。
   workdir=$(mktemp -d "${TMPDIR:-/tmp}/mailstack-rustup.XXXXXXXX") || {
     echo "无法创建临时目录" >&2; exit 1
   }
@@ -58,6 +64,7 @@ else
   curl -sSf --proto '=https' --tlsv1.2 \
     https://sh.rustup.rs -o "$workdir/rustup-init.sh"
 
+  require_sha256="${MAILSTACK_REQUIRE_SHA256:-0}"
   expected="${MAILSTACK_RUSTUP_SHA256:-}"
   if [ -n "$expected" ]; then
     actual=$(sha256sum "$workdir/rustup-init.sh" | awk '{print $1}')
@@ -68,9 +75,13 @@ else
       exit 1
     fi
     echo "已用 MAILSTACK_RUSTUP_SHA256 校验安装脚本"
+  elif [ "$require_sha256" = "1" ]; then
+    echo "MAILSTACK_REQUIRE_SHA256=1 但未设置 MAILSTACK_RUSTUP_SHA256：拒绝在无钉扎的情况下执行安装脚本" >&2
+    exit 1
   else
     echo "⚠️  未设置 MAILSTACK_RUSTUP_SHA256：仅依赖 HTTPS 传输完整性，未做独立哈希钉扎" >&2
-    echo "    生产构建建议先离线核对 sha256 再显式传入该变量。" >&2
+    echo "    生产构建建议先离线核对 sha256 再显式传入该变量；" >&2
+    echo "    强制钉扎可设 MAILSTACK_REQUIRE_SHA256=1（未钉扎即失败）。" >&2
   fi
 
   sh "$workdir/rustup-init.sh" -y --no-modify-path --profile minimal \

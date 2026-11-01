@@ -211,15 +211,57 @@ fn split_address(address: &str) -> (String, Option<String>) {
 ///
 /// 读不到的文件（Maildir 扫描期间内容在churn、spool 文件权限受限）一律按
 /// 「没匹配」处理：那是**预期**情况，不是错误。
+///
+/// 搜索是**流式**的（见 [`file_contains_token`]）：Maildir 里的信件可能很大，
+/// `read_to_string` 会把整个正文一次性读进内存，而一次环路自检要扫的候选目录
+/// 有好几个 —— 既没必要也不该做全量缓冲。
 fn directory_contains_token(dir: &Path, token: &str) -> bool {
     let Ok(read) = std::fs::read_dir(dir) else {
         return false;
     };
-    read.flatten().any(|entry| {
-        std::fs::read_to_string(entry.path())
-            .map(|text| text.contains(token))
-            .unwrap_or(false)
-    })
+    read.flatten()
+        .any(|entry| file_contains_token(&entry.path(), token))
+}
+
+/// 流式搜索块的尺寸（64 KiB：远大于环路 token，小到不构成内存压力）。
+const TOKEN_SCAN_CHUNK: usize = 64 * 1024;
+
+/// 按块读文件并在字节流里精确搜索 token，不整文件缓冲。
+///
+/// 相邻块之间保留 `token.len()-1` 字节的重叠，骑在块边界上的 token 不会漏；
+/// 读失败 / 非 UTF-8 内容按字节处理，与旧实现的 `contains` 判定结果一致。
+fn file_contains_token(path: &Path, token: &str) -> bool {
+    use std::io::Read;
+
+    let needle = token.as_bytes();
+    if needle.is_empty() {
+        // 与旧实现一致：空 token 等价于「任意可读文件都算命中」。
+        return std::fs::File::open(path).is_ok();
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut window: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; TOKEN_SCAN_CHUNK];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => return false,
+            Ok(n) => {
+                window.extend_from_slice(&chunk[..n]);
+                if window
+                    .windows(needle.len())
+                    .any(|candidate| candidate == needle)
+                {
+                    return true;
+                }
+                // 只保留跨块边界需要的尾部，内存占用恒有界。
+                let keep = needle.len().saturating_sub(1).min(window.len());
+                let drain = window.len() - keep;
+                window.drain(..drain);
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +368,48 @@ mod tests {
             "carol@example.com",
             "zzz"
         ));
+    }
+
+    #[test]
+    fn a_token_straddling_a_chunk_boundary_is_still_found() {
+        // 流式搜索（64 KiB 块）在块边界保留 token.len()-1 字节重叠：
+        // 骑在边界上的 token 不得被漏掉；多块大文件也要能完整扫完。
+        let dir = tempfile::tempdir().unwrap();
+        let new = dir
+            .path()
+            .join("home")
+            .join("alice")
+            .join("Maildir")
+            .join("new");
+        std::fs::create_dir_all(&new).unwrap();
+
+        let boundary = TOKEN_SCAN_CHUNK;
+        let mut body = vec![b'a'; boundary - 5];
+        body.extend_from_slice(b"ms-loopback-cafebabecafebabecafebabe");
+        std::fs::write(new.join("straddle"), &body).unwrap();
+        // 一份 3 块多、不含 token 的大文件：扫描不得把它误判成命中。
+        let big = vec![b'b'; 3 * boundary + 17];
+        std::fs::write(new.join("big"), &big).unwrap();
+
+        let token = "cafebabecafebabecafebabe";
+        assert!(
+            find_loopback_token(
+                &dir.path().join("var/vmail"),
+                dir.path(),
+                "alice@example.com",
+                token
+            ),
+            "骑在块边界上的 token 必须被找到"
+        );
+        assert!(
+            !find_loopback_token(
+                &dir.path().join("var/vmail"),
+                dir.path(),
+                "alice@example.com",
+                "ffffffffffffffffffffffff"
+            ),
+            "大文件里没有 token 不得误命中"
+        );
     }
 
     #[test]

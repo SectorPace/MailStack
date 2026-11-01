@@ -1,5 +1,6 @@
 // 高密度运营表格：排序 / 过滤 / 分页（行为对齐 TanStack Table 参考实现）
-// 数据面保持中性、可读；玻璃只出现在表头磨砂与工具区。
+// 数据面保持中性、可读：表体在内容表面（main .glass 降级规则 / thead 近实心由
+// index.css 提供），行高与发丝分隔走 macOS 列表密度。
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useSettings } from "../store/settings";
 import { GlassSelect } from "./ui";
@@ -14,17 +15,28 @@ export type Column<T> = {
   align?: "left" | "right" | "center";
 };
 
-/** 分页窗口：`« ‹ 1 … 5 6 7 … 125 › »`，避免把全部页码铺满页脚。 */
+/**
+ * 分页窗口：`« ‹ 1 2 3 … 6 7 8 … 125 › »`，首尾恒显、当前页 ±1。
+ * 原先 `current>3` 才插头部分隔符：current=3 时窗口 [2,4] 与首页 [0] 之间
+ * **跳过了第 2 页（索引 1）却不显示省略号** —— 页码凭空消失。现在：
+ * 头部固定窗 0..2 与当前窗相接时不插 gap，出现缺页必插 gap（两处都不静默丢页）。
+ */
 function pageWindow(current: number, total: number): (number | "gap")[] {
   if (total <= 7) return Array.from({ length: total }, (_, i) => i);
   const out: (number | "gap")[] = [];
   const add = (n: number) => {
     if (!out.includes(n)) out.push(n);
   };
+  const addRange = (a: number, b: number) => {
+    for (let i = a; i <= b; i++) add(i);
+  };
   add(0);
-  if (current > 3) out.push("gap");
-  for (let i = Math.max(1, current - 1); i <= Math.min(total - 2, current + 1); i++) add(i);
-  if (current < total - 4) out.push("gap");
+  addRange(1, Math.min(2, total - 2)); // 头部固定窗 0..2
+  const lo = Math.max(1, current - 1);
+  const hi = Math.min(total - 2, current + 1);
+  if (lo > 3) out.push("gap"); // 与头部窗之间缺页才插 gap（lo=3 时 2→3 连续）
+  addRange(lo, hi);
+  if (hi < total - 2) out.push("gap"); // 与尾页之间缺页
   add(total - 1);
   return out;
 }
@@ -128,7 +140,10 @@ export function DataTable<T extends object>({
         </div>
       )}
 
-      <div className="min-h-0 flex-1 overflow-auto rounded-[12px]" style={{ boxShadow: "inset 0 0 0 1px var(--hairline)" }}>
+      <div
+        className="min-h-0 flex-1 overflow-auto"
+        style={{ borderRadius: "var(--radius-panel)", boxShadow: "inset 0 0 0 1px var(--hairline)" }}
+      >
         <table className="data-table">
           <thead>
             <tr>
@@ -136,7 +151,9 @@ export function DataTable<T extends object>({
                 <th
                   key={c.key}
                   className={c.sortValue ? "sortable" : ""}
-                  style={{ width: c.width, textAlign: c.align }}
+                  // 行高密度走 --control-h（桌面 28 / iOS 44）；index.css 的 9px 纵向
+                  // 内边距是旧密度，这里内联收紧到 macOS 列表档（不改动 index.css）。
+                  style={{ width: c.width, textAlign: c.align, padding: "6px 12px" }}
                   aria-sort={sort?.key === c.key ? (sort.dir === 1 ? "ascending" : "descending") : undefined}
                 >
                   {c.sortValue ? (
@@ -183,13 +200,30 @@ export function DataTable<T extends object>({
                 <tr
                   key={k}
                   onClick={() => onRowClick?.(row)}
+                  onKeyDown={
+                    onRowClick
+                      ? (e) => {
+                          // 行聚焦后 Enter / Space 触发主操作（onRowClick）——
+                          // 没有主操作的表格不抢占 Tab 焦点序。
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            onRowClick(row);
+                          }
+                        }
+                      : undefined
+                  }
+                  tabIndex={onRowClick ? 0 : undefined}
                   style={{
                     cursor: onRowClick ? "pointer" : undefined,
+                    // 选中态：accent 低透明度着色（悬停着色由 .data-table CSS 提供）
                     background: active ? "rgb(var(--accent-rgb) / 0.10)" : undefined,
                   }}
                 >
                   {columns.map((c) => (
-                    <td key={c.key} style={{ textAlign: c.align }}>
+                    <td
+                      key={c.key}
+                      style={{ textAlign: c.align, padding: "5px 12px", height: "var(--control-h)" }}
+                    >
                       {c.render(row)}
                     </td>
                   ))}

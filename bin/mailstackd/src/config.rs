@@ -59,6 +59,12 @@ pub struct ListenerPlan {
     /// 只在**提交端口**（465/587）上开：25 是 MX 收信口，客户端提交不该走它，
     /// 在那里开放认证只是白白多出一个口令攻击面。
     pub offer_auth: bool,
+    /// 是否强制「提交先认证」（未认证 `MAIL` → `530 5.7.0`）。
+    ///
+    /// 587（submission）置位：不设防的提交口是垃圾邮件的免费通道 —— 认证前的
+    /// 会话仍然能投给本域收件人，等于给任何拨号进来的主机留了一个匿名入站口。
+    /// 465 与 25 维持既有行为（默认 `false`）。
+    pub require_auth_for_submission: bool,
 }
 
 impl ListenerPlan {
@@ -69,18 +75,21 @@ impl ListenerPlan {
                 mode: TlsMode::Implicit,
                 offer_starttls: false,
                 offer_auth: true,
+                require_auth_for_submission: false,
             },
             587 => Self {
                 port,
                 mode: TlsMode::StartTls,
                 offer_starttls: true,
                 offer_auth: true,
+                require_auth_for_submission: true,
             },
             _ => Self {
                 port,
                 mode: TlsMode::StartTls,
                 offer_starttls: true,
                 offer_auth: false,
+                require_auth_for_submission: false,
             },
         }
     }
@@ -306,6 +315,13 @@ fn request_host(request: &RelayValidationRequest) -> String {
 /// 方括号表示「不做 MX 解析，直接连该主机」（§5.9.5）。
 fn parse_relayhost(value: &str) -> Result<(String, u16), DaemonError> {
     let value = value.trim();
+    // 裸 IPv6（如 `::1`）无法与 `host:port` 区分：按下面的 rsplit 规则它会被拆成
+    // host=`::`、port=1，静默得到一个错误的中继端点。多个冒号即视为 IPv6 字面量
+    // （普通 `host:port` 只有一个冒号，不受影响），直接拒绝并给出可照做的写法
+    // —— Postfix 自己也要求 IPv6 字面量加方括号。
+    if value.matches(':').count() > 1 && !value.starts_with('[') {
+        return Err(DaemonError::RelayHostBareIpv6(value.to_string()));
+    }
     let (host_part, port) = match value.rsplit_once(':') {
         // `[::1]:25` 的最后一段是端口；`[::1]` 的最后一段落在方括号内，须排除。
         Some((head, tail)) if !tail.contains(']') => {
@@ -384,6 +400,14 @@ mod tests {
         (dir, paths)
     }
 
+    /// 修改进程级环境变量的测试串行执行用的锁（与 crates/core/src/warn.rs 测试同一模式）。
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     #[test]
     fn a_minimal_installation_assembles_all_three_default_listeners() {
         let (_dir, paths) = root();
@@ -432,7 +456,8 @@ mod tests {
                 port: 465,
                 mode: TlsMode::Implicit,
                 offer_starttls: false,
-                offer_auth: true
+                offer_auth: true,
+                require_auth_for_submission: false
             }
         );
         assert_eq!(
@@ -441,7 +466,9 @@ mod tests {
                 port: 587,
                 mode: TlsMode::StartTls,
                 offer_starttls: true,
-                offer_auth: true
+                offer_auth: true,
+                // 587 是提交口：未认证会话不得开事务（530 5.7.0）。
+                require_auth_for_submission: true
             }
         );
         assert_eq!(
@@ -451,7 +478,8 @@ mod tests {
                 mode: TlsMode::StartTls,
                 offer_starttls: true,
                 // 25 是 MX 收信口，不是提交口：在那里开放认证只是多一个口令攻击面。
-                offer_auth: false
+                offer_auth: false,
+                require_auth_for_submission: false
             }
         );
     }
@@ -561,6 +589,10 @@ mod tests {
 
     #[test]
     fn a_private_relay_is_only_allowed_when_the_deployment_opt_in_is_present() {
+        // 修改进程级环境变量的测试必须持有 env_lock：测试默认并行执行，
+        // 而环境变量是进程全局的，不加锁会与其他用例互踩（此前只在本用例里
+        // remove_var，与并行跑的其它测试存在竞态）。
+        let _env_guard = env_lock();
         // 公网档下私网中继必须被拒（INV-15 的部署策略侧）。
         // 判定只由 ACCESS_MODE 决定：清掉可能影响结果的环境变量，避免测试随开发机漂移。
         std::env::remove_var("MAILSTACK_SECURITY_PROFILE");
@@ -608,6 +640,16 @@ mod tests {
             "IPv6 字面量不得被当成端口"
         );
         assert_eq!(parse_relayhost("[::1]").unwrap(), ("::1".to_string(), 25));
+        // 裸 IPv6 无法与 `host:port` 区分，必须被拒并提示 [::1] 写法，
+        // 而不是被静默拆成 host="::"、port=1。
+        assert!(
+            matches!(
+                parse_relayhost("::1"),
+                Err(DaemonError::RelayHostBareIpv6(_))
+            ),
+            "裸 IPv6 必须被拒"
+        );
+        assert!(parse_relayhost("2001:db8::1").is_err());
         assert!(parse_relayhost("").is_err());
         assert!(parse_relayhost("[host]:not-a-port").is_err());
     }

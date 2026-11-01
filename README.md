@@ -3,7 +3,7 @@
 `MailStack` 从 Node/TypeScript 全栈重写为 Rust 的工程。规格书见
 [`docs/REWRITE_TO_RUST.md`](docs/REWRITE_TO_RUST.md)（本仓库外的源码包内）。
 
-- 版本：**0.8.1-beta1**（基线 `v0.8.0-beta.10`）
+- 版本：**1.0.0**（自 v0.8.0-beta.10 基线重写完成）
 - 目标形态：单一二进制，生产环境**无 node / 无 npm / 无 Python**
 - 保留 Dovecot 作为 IMAP/POP3 与 SASL 后端；自研替代 Postfix / OpenDKIM / fail2ban
 

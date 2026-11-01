@@ -401,10 +401,16 @@ pub fn is_inbox(name: &str) -> bool {
     name.eq_ignore_ascii_case(INBOX)
 }
 
+/// 侧车文件的保留前缀：磁盘路径是 `.{name}`，`mailstack-…` 会与
+/// `.mailstack-uidlist` 等私有文件撞名（大小写不敏感地拒绝，兼容大小写
+/// 不敏感的文件系统）。
+const RESERVED_FOLDER_PREFIX: &str = "mailstack-";
+
 /// 规范化并校验邮箱名。
 ///
 /// 允许层级（`.` 分隔），但拒绝：空段、前导/尾随点、控制字符、路径分隔符、
-/// Windows 保留字符、以及 LIST 通配符 `*`/`%`（允许它们会让 LIST 模式产生歧义）。
+/// Windows 保留字符、LIST 通配符 `*`/`%`（允许它们会让 LIST 模式产生歧义）、
+/// 以及保留前缀 `mailstack-`。
 pub fn normalize_folder_name(name: &str) -> Result<String> {
     if is_inbox(name) {
         return Ok(INBOX.to_string());
@@ -414,6 +420,12 @@ pub fn normalize_folder_name(name: &str) -> Result<String> {
     }
     if name.len() > MAX_FOLDER_NAME {
         return Err(MailError::invalid("mailbox name is too long"));
+    }
+    if name
+        .get(..RESERVED_FOLDER_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_FOLDER_PREFIX))
+    {
+        return Err(MailError::invalid("mailbox name is reserved"));
     }
     if name.starts_with(DELIMITER) || name.ends_with(DELIMITER) {
         return Err(MailError::invalid(
@@ -574,13 +586,21 @@ impl MailStore {
             })
             .collect();
         renames.sort();
+        // 已完成的改名（现路径, 原路径）：中途失败时按逆序 rename 回去，
+        // 否则一个冲突的子文件夹会让 rename 半途而废、邮箱树自相矛盾。
+        let mut completed: Vec<(PathBuf, PathBuf)> = vec![(destination, source)];
         for (from, to) in renames {
             let from_path = self.folder_path(&from)?;
             let to_path = self.folder_path(&to)?;
             if to_path.exists() {
+                rollback_renames(&completed);
                 return Err(MailError::already_exists(to));
             }
-            fs::rename(&from_path, &to_path).map_err(|error| MailError::io(&to_path, error))?;
+            if let Err(error) = fs::rename(&from_path, &to_path) {
+                rollback_renames(&completed);
+                return Err(MailError::io(&to_path, error));
+            }
+            completed.push((to_path, from_path));
             self.rewrite_subscription(&from, &to)?;
         }
         self.rewrite_subscription(&old, &new)?;
@@ -1201,6 +1221,110 @@ impl MailStore {
         }
     }
 
+    /// 把同一封邮件投递到多个文件夹（Sieve 的多目标 `fileinto`）。
+    ///
+    /// 与 [`Self::append_many`] 相同的三段式（全部写 tmp → 全部 rename → 分配
+    /// UID），但横跨多个文件夹：先校验**所有**目标、一次预留**所有**副本的配额，
+    /// 任一步失败都回滚全部已落盘文件并释放配额 —— 多目标投递要么每个文件夹各
+    /// 一份、要么一份都没有（进程崩溃落在 rename 中间是例外，未入映射的文件
+    /// 下次打开会补分配 UID，与 append_many 一致）。
+    ///
+    /// 返回值与 `folders` 顺序对齐：每个文件夹的 `(uidvalidity, [uid])`。
+    pub fn append_many_folders(
+        &self,
+        folders: &[&str],
+        message: &NewMessage,
+    ) -> Result<Vec<(u32, Vec<u32>)>> {
+        if folders.is_empty() {
+            return Err(MailError::invalid("no folders to deliver to"));
+        }
+        // 第一遍：解析并校验所有目标文件夹，不存在的在动第一份拷贝前就失败。
+        let mut paths = Vec::with_capacity(folders.len());
+        for folder in folders {
+            let path = self.folder_path(folder)?;
+            if !path.is_dir() {
+                return Err(MailError::not_found(folder.to_string()));
+            }
+            ensure_maildir_dirs(&path)?;
+            paths.push(path);
+        }
+
+        let total_bytes = message.data.len() as u64 * folders.len() as u64;
+        let reservation = self.reserve_quota(folders.len() as u64, total_bytes)?;
+
+        struct Staged {
+            tmp: PathBuf,
+            destination: PathBuf,
+            base: String,
+        }
+        let mut staged: Vec<Staged> = Vec::with_capacity(folders.len());
+        let staging: Result<()> = (|| {
+            for path in &paths {
+                let base = self.unique_base();
+                let destination = if message.flags.is_empty() {
+                    path.join("new").join(&base)
+                } else {
+                    let suffix = suffix_with_keyword_allocation(path, &message.flags)?;
+                    path.join("cur").join(format!("{base}:2,{suffix}"))
+                };
+                let tmp = write_tmp_file(path, &base, &message.data, message.internal_date)?;
+                staged.push(Staged {
+                    tmp,
+                    destination,
+                    base,
+                });
+            }
+            Ok(())
+        })();
+        if let Err(error) = staging {
+            for stage in &staged {
+                let _ = fs::remove_file(&stage.tmp);
+            }
+            self.release_quota(reservation);
+            return Err(error);
+        }
+
+        let mut renamed: Vec<PathBuf> = Vec::with_capacity(staged.len());
+        for stage in &staged {
+            if let Err(error) = fs::rename(&stage.tmp, &stage.destination) {
+                for path in &renamed {
+                    let _ = fs::remove_file(path);
+                }
+                for pending in &staged {
+                    let _ = fs::remove_file(&pending.tmp);
+                }
+                self.release_quota(reservation);
+                return Err(MailError::io(&stage.destination, error));
+            }
+            renamed.push(stage.destination.clone());
+        }
+
+        // 逐文件夹分配 UID（各持各的 uidlist 锁）。失败时撤掉所有已落盘文件：
+        // 已分配的映射条目由下次 open 的同步清理（文件已不在）。
+        let mut results = Vec::with_capacity(paths.len());
+        let assign: Result<()> = (|| {
+            for (index, path) in paths.iter().enumerate() {
+                let bases = vec![staged[index].base.clone()];
+                let (uidvalidity, uids) = assign_uids_many(path, &bases, self.clock.as_ref())?;
+                results.push((uidvalidity, uids));
+            }
+            Ok(())
+        })();
+        if let Err(error) = assign {
+            for path in &renamed {
+                let _ = fs::remove_file(path);
+            }
+            self.release_quota(reservation);
+            return Err(error);
+        }
+        for path in &paths {
+            for directory in ["cur", "new"] {
+                fsync_dir_best_effort(&path.join(directory));
+            }
+        }
+        Ok(results)
+    }
+
     /// 更新标志。返回更新后的元数据（会话用它刷新 EXISTS/FETCH 缓存）。
     pub fn set_flags(&self, folder: &str, uid: u32, flags: &FlagSet) -> Result<MessageMeta> {
         let path = self.folder_path(folder)?;
@@ -1273,16 +1397,22 @@ impl MailStore {
                 let Some((base, _)) = list.by_uid.get(uid) else {
                     continue;
                 };
-                if let Some((directory, filename)) = find_file(&path, base)? {
-                    let file = path.join(directory).join(&filename);
-                    if let Ok(metadata) = fs::metadata(&file) {
-                        removed_bytes = removed_bytes.saturating_add(metadata.len());
-                    }
-                    match fs::remove_file(&file) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(MailError::io(&file, error)),
-                    }
+                // 文件早已不在（外部删除 / 上次 expunge 已删但映射未及写回）：
+                // 用量统计里本就没有这封邮件，若仍计入 removed_uids，配额会按
+                // 「删掉一封」递减 ⇒ usage 永久偏低。映射条目留给下次 open 的
+                // 同步清理（sync_uidlist 只保留磁盘上存在的 base）。
+                let Some((directory, filename)) = find_file(&path, base)? else {
+                    continue;
+                };
+                let file = path.join(directory).join(&filename);
+                // 只为真实存在的文件计字节：stat 在 remove 之前。
+                if let Ok(metadata) = fs::metadata(&file) {
+                    removed_bytes = removed_bytes.saturating_add(metadata.len());
+                }
+                match fs::remove_file(&file) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(MailError::io(&file, error)),
                 }
                 removed_uids.push(*uid);
             }
@@ -1306,6 +1436,10 @@ impl MailStore {
 
     /// 复制多封邮件到另一文件夹。一次打开源邮箱、一次读取索引，避免
     /// 「每复制一封就全量扫描一遍源文件夹」的 O(k·n)。
+    ///
+    /// 全部源 UID 先经一次读取校验存在，再动第一份拷贝：否则第 k 个 UID 不存在
+    /// 时前 k-1 份已落盘，客户端收到 NO 却留下成堆副本。校验之后源邮件仍可能
+    /// 被并发删除（竞态不可避免）：此时报告错误并保留已完成的副本。
     pub fn copy_many(&self, from: &str, uids: &[u32], to: &str) -> Result<(u32, Vec<u32>)> {
         if uids.is_empty() {
             return Ok((0, Vec::new()));
@@ -1316,12 +1450,18 @@ impl MailStore {
             .iter()
             .map(|message| (message.uid, message))
             .collect();
+        let sources: Vec<&MessageMeta> = uids
+            .iter()
+            .map(|uid| {
+                by_uid
+                    .get(uid)
+                    .copied()
+                    .ok_or_else(|| MailError::not_found(format!("uid {uid}")))
+            })
+            .collect::<Result<_>>()?;
         let mut uidvalidity = 0;
-        let mut copies = Vec::with_capacity(uids.len());
-        for uid in uids {
-            let message = by_uid
-                .get(uid)
-                .ok_or_else(|| MailError::not_found(format!("uid {uid}")))?;
+        let mut copies = Vec::with_capacity(sources.len());
+        for message in sources {
             let data = self.read(message)?;
             let (validity, new_uid) = self.append_internal(
                 to,
@@ -1524,6 +1664,21 @@ fn move_directory_contents(from: &Path, to: &Path) -> Result<()> {
         fs::rename(entry.path(), &target).map_err(|error| MailError::io(&target, error))?;
     }
     Ok(())
+}
+
+/// 尽力回滚已完成的改名：按逆序 rename 回原路径，失败只记日志（返回给调用方
+/// 的仍是触发回滚的原始错误）。订阅清单不回滚 —— 与既有行为一致。
+fn rollback_renames(completed: &[(PathBuf, PathBuf)]) {
+    for (current, original) in completed.iter().rev() {
+        if let Err(error) = fs::rename(current, original) {
+            tracing::warn!(
+                from = %current.display(),
+                to = %original.display(),
+                %error,
+                "failed to roll back a completed folder rename"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2330,7 +2485,8 @@ impl MailStore {
 // 文件原语
 // ---------------------------------------------------------------------------
 
-fn with_lock<T>(lock_path: &Path, action: impl FnOnce() -> Result<T>) -> Result<T> {
+/// 模块级文件锁原语（`sieve` 的 vacation 状态也复用同一把锁纪律）。
+pub(crate) fn with_lock<T>(lock_path: &Path, action: impl FnOnce() -> Result<T>) -> Result<T> {
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).map_err(|error| MailError::io(parent, error))?;
     }
@@ -2367,7 +2523,8 @@ fn open_private(path: &Path, create_new: bool) -> std::io::Result<File> {
 }
 
 /// 临时文件 + rename。`rename` 在同目录内原子；调用方必须持有相应锁。
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+/// `sieve` 的脚本/vacation 状态写入复用同一实现（唯一临时名 + fsync）。
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temp = path.with_file_name(format!(
@@ -2777,6 +2934,123 @@ mod tests {
         assert_eq!(archive.messages.len(), 3);
         assert_eq!(archive.messages[0].uid, copies[0]);
         assert_eq!(archive.messages[2].uid, copies[2]);
+    }
+
+    #[test]
+    fn copy_many_rejects_a_missing_uid_before_copying_anything() {
+        let (_dir, _clock, store) = store();
+        store.create("Archive").unwrap();
+        for body in [&b"one\r\n"[..], b"two\r\n"] {
+            store.append("INBOX", body, &FlagSet::new(), None).unwrap();
+        }
+        let state = store.open_folder("INBOX", false).unwrap();
+        let first = state.messages[0].uid;
+        // 第二个 UID 不存在：整批必须在落盘前被拒绝，不能留下第一份副本。
+        let missing = state.messages.last().unwrap().uid + 999;
+        assert!(matches!(
+            store.copy_many("INBOX", &[first, missing], "Archive"),
+            Err(MailError::NotFound(_))
+        ));
+        assert_eq!(store.open_folder("Archive", false).unwrap().messages.len(), 0);
+    }
+
+    #[test]
+    fn multi_folder_delivery_is_all_or_nothing() {
+        let (_dir, _clock, store) = store();
+        store.create("Keep").unwrap();
+        let message = NewMessage {
+            data: b"Subject: x\r\n\r\nbody\r\n".to_vec(),
+            flags: FlagSet::new(),
+            internal_date: None,
+        };
+        // 第二个目标不存在：整个调用失败，第一个目标不得留下副本。
+        assert!(matches!(
+            store.append_many_folders(&["Keep", "Missing"], &message),
+            Err(MailError::NotFound(_))
+        ));
+        assert_eq!(store.open_folder("Keep", false).unwrap().messages.len(), 0);
+
+        // 全部目标可用：每个文件夹各一份，顺序与入参对齐。
+        store.create("Too").unwrap();
+        let results = store
+            .append_many_folders(&["Keep", "Too"], &message)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].1.len(), 1);
+        assert_eq!(results[1].1.len(), 1);
+        assert_eq!(store.open_folder("Keep", false).unwrap().messages.len(), 1);
+        assert_eq!(store.open_folder("Too", false).unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn reserved_mailstack_prefix_is_rejected_as_a_mailbox_name() {
+        let (_dir, _clock, store) = store();
+        // `.{name}` 会与 `.mailstack-uidlist` 等侧车文件撞名。
+        for name in [
+            "mailstack-uidlist",
+            "MailStack-UidList.lock",
+            "MAILSTACK-anything",
+        ] {
+            assert!(store.create(name).is_err(), "{name:?} 必须被拒绝");
+            assert!(normalize_folder_name(name).is_err(), "{name:?} 必须被拒绝");
+        }
+        // 不带保留前缀的近名不受影响。
+        assert!(store.create("mailstack").is_ok());
+        assert!(store.create("my-mailstack-uidlist").is_ok());
+    }
+
+    #[test]
+    fn failed_rename_leaves_the_mailbox_tree_unchanged() {
+        let (_dir, _clock, store) = store();
+        store.create("Old").unwrap();
+        store.create("Old.A").unwrap();
+        store.create("Old.B").unwrap();
+        // 预置一个冲突目录：父目录已改名、前几个子目录改完之后才会撞上它。
+        std::fs::create_dir_all(_dir.path().join(".New.B")).unwrap();
+
+        assert!(store.rename("Old", "New").is_err());
+        // 已改名的父目录与子目录全部回滚。
+        assert!(store.exists("Old").unwrap());
+        assert!(store.exists("Old.A").unwrap());
+        assert!(store.exists("Old.B").unwrap());
+        assert!(!store.exists("New").unwrap());
+        assert!(!store.exists("New.A").unwrap());
+    }
+
+    #[test]
+    fn expunge_does_not_release_quota_for_already_missing_files() {
+        let (_dir, _clock, store) = store();
+        store.set_quota(Some(2), None).unwrap();
+        let (_, first) = store
+            .append("INBOX", b"one\r\n", &FlagSet::new(), None)
+            .unwrap();
+        let (_, second) = store
+            .append("INBOX", b"two\r\n", &FlagSet::new(), None)
+            .unwrap();
+        // 外部删除第二封的文件（映射条目还在）：expunge 两封只应释放一封的用量。
+        let base = store.open_folder("INBOX", false).unwrap();
+        let second_base = base
+            .messages
+            .iter()
+            .find(|message| message.uid == second)
+            .unwrap()
+            .base
+            .clone();
+        // 文件在 new/（未带标志），按 base 找到并删除。
+        let new_dir = store.root().join("new");
+        let victim = std::fs::read_dir(&new_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(&second_base))
+            .unwrap();
+        std::fs::remove_file(victim).unwrap();
+
+        store.expunge("INBOX", &[first, second]).unwrap();
+        assert_eq!(
+            store.quota_status().unwrap().messages,
+            1,
+            "文件早已不在的 UID 不得再释放一封的配额"
+        );
     }
 
     #[test]

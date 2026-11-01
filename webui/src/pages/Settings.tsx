@@ -1,17 +1,22 @@
-// 系统设置 —— 展板形态：左侧竖排标签导航（基础/邮件服务/安全策略/通知/外观）+ 右侧内容面板。
-// 外观页含：主题三选一、Liquid Glass 透明度滑杆 + 五档预设、强调色、三个真实生效的降级开关、实时预览。
-import { useEffect, useState } from "react";
+// 系统设置 —— macOS System Settings 结构（golden screen）：
+// 左侧源列表分组导航（200-240px，sticky；通用/外观/邮件/安全 分组）+
+// 右侧内容面板 = 分组表单（inset grouped rows：标签左 / 控件右，行高走
+// --control-h-lg，发丝分隔从文本内缩，组容器 = --radius-panel + 发丝描边 +
+// --surface 近实心面 —— 不用玻璃，玻璃预算仍归 chrome）。
+// 功能与原竖排标签版完全一致：主题 / 强调色 / 透明度 / 背景 / 管理账户 / 2FA /
+// 会话 / 邮件服务 / 通知 —— 仅视觉重组。
+import { Fragment, useCallback, useEffect, useState, type ReactNode } from "react";
 import * as RTabs from "@radix-ui/react-tabs";
 import * as RSlider from "@radix-ui/react-slider";
 import * as RSwitch from "@radix-ui/react-switch";
 import { ACCENTS, useSettings, type Accent, type ThemeMode } from "../store/settings";
 import { rpc } from "../api/client";
-import { PageHeader, Card, ToggleRow, toast } from "../components/ui";
+import { PageHeader, LoadError, StatusBadge, toast } from "../components/ui";
+import { cssUrl } from "../lib/format";
 import { IconMoon, IconSun, IconGear, IconCheck, IconShield, IconBell, IconSparkles, IconMail, IconSend, IconPlus } from "../components/icons";
 import { BrandLogo } from "../components/BrandLogo";
 import AccountSecurity from "../components/AccountSecurity";
 import type { DictKey } from "../i18n";
-import type { ReactNode } from "react";
 
 // 后端 settings.get 返回的是 Settings（hostname / adminEmail / timezone /
 // maxMessageSizeMb / rateLimitPerHour …），**没有 serverName**；故这里只编辑
@@ -19,40 +24,72 @@ import type { ReactNode } from "react";
 type ServerSettings = { hostname: string; adminEmail: string };
 type ServiceRow = { key: string; running: boolean; detail: string };
 
-const TABS: { v: string; labelKey: DictKey; icon: ReactNode }[] = [
-  { v: "general", labelKey: "general", icon: <IconGear size={14} /> },
-  { v: "mail", labelKey: "settings_mail", icon: <IconMail size={14} /> },
-  { v: "security", labelKey: "security_set", icon: <IconShield size={14} /> },
-  { v: "notifications", labelKey: "notifications_set", icon: <IconBell size={14} /> },
-  { v: "appearance", labelKey: "appearance", icon: <IconSparkles size={14} /> },
+/** 源列表分组：分组头走 set_group_* 词典键，条目沿用原页签词典。 */
+const NAV_GROUPS: { id: string; labelKey: DictKey; items: { v: string; labelKey: DictKey; icon: ReactNode }[] }[] = [
+  {
+    id: "general",
+    labelKey: "set_group_general",
+    items: [
+      { v: "general", labelKey: "general", icon: <IconGear size={14} /> },
+      { v: "notifications", labelKey: "notifications_set", icon: <IconBell size={14} /> },
+    ],
+  },
+  {
+    id: "appearance",
+    labelKey: "set_group_appearance",
+    items: [{ v: "appearance", labelKey: "appearance", icon: <IconSparkles size={14} /> }],
+  },
+  {
+    id: "mail",
+    labelKey: "set_group_mail",
+    items: [{ v: "mail", labelKey: "settings_mail", icon: <IconMail size={14} /> }],
+  },
+  {
+    id: "security",
+    labelKey: "set_group_security",
+    items: [{ v: "security", labelKey: "security_set", icon: <IconShield size={14} /> }],
+  },
 ];
 
 export default function Settings() {
   const { t } = useSettings();
-  const [tab, setTab] = useState("appearance");
+  // System Settings 默认落在第一项（通用）
+  const [tab, setTab] = useState("general");
 
   return (
-    <div className="p-4">
+    <div className="p-4 pb-8">
       <PageHeader title={t("settings_title")} sub={t("settings_sub")} />
 
       <RTabs.Root
         value={tab}
         onValueChange={setTab}
         orientation="vertical"
-        className="grid grid-cols-1 items-start gap-3 lg:grid-cols-[196px_minmax(0,1fr)]"
+        className="grid grid-cols-1 items-start gap-5 lg:grid-cols-[224px_minmax(0,1fr)]"
       >
-        {/* 竖排标签（展板形态：激活项浅蓝胶囊） */}
-        <RTabs.List aria-label="settings sections" className="glass edge-lens flex flex-col gap-1 rounded-[var(--r-panel)] p-2">
-          {TABS.map((x) => (
-            <RTabs.Trigger key={x.v} value={x.v} className="vtab">
-              {x.icon}
-              {t(x.labelKey)}
-            </RTabs.Trigger>
+        {/* 源列表：透明底（画布上直接分组），桌面 sticky 跟随滚动 */}
+        <RTabs.List aria-label="settings sections" className="flex flex-col gap-4 lg:sticky lg:top-0">
+          {NAV_GROUPS.map((g) => (
+            <div key={g.id}>
+              <div className="mb-1 px-2.5" style={{ fontSize: "var(--font-caption)", color: "var(--text-3)" }}>
+                {t(g.labelKey)}
+              </div>
+              <div className="flex flex-col gap-0.5">
+                {g.items.map((it) => (
+                  <RTabs.Trigger key={it.v} value={it.v} className="vtab">
+                    {it.icon}
+                    {t(it.labelKey)}
+                  </RTabs.Trigger>
+                ))}
+              </div>
+            </div>
           ))}
-          <div className="mt-1 px-3 pb-1 pt-1 text-[10px] text-[var(--text-3)]">MailStack v0.8.0</div>
+          <div className="px-2.5 pt-1" style={{ fontSize: "var(--font-caption)", color: "var(--text-3)" }}>
+            MailStack
+          </div>
         </RTabs.List>
 
-        <div className="min-w-0">
+        {/* 内容面板：分组表单（近实心 --surface 组容器，非玻璃） */}
+        <div className="min-w-0 max-w-[640px]">
           <RTabs.Content value="general" className="focus-visible:outline-none">
             <GeneralTab />
           </RTabs.Content>
@@ -74,56 +111,218 @@ export default function Settings() {
   );
 }
 
-/* ---------------- 基础设置 ---------------- */
+/* ---------------- 分组表单基元（System Settings inset grouped rows） ---------------- */
 
-function GeneralTab() {
-  const { t } = useSettings();
-  const [form, setForm] = useState<ServerSettings | null>(null);
-
-  useEffect(() => {
-    rpc<ServerSettings>("settings.get").then((r) => r.ok && setForm(r.data));
-  }, []);
-
-  if (!form) return <Card className="h-40">&nbsp;</Card>;
-
+/** 组容器：--surface 近实心面 + --radius-panel + 发丝描边；组头 = caption 档灰字 */
+function Group({
+  title,
+  description,
+  children,
+  className = "",
+}: {
+  title?: string;
+  description?: string;
+  children: ReactNode;
+  className?: string;
+}) {
   return (
-    <div className="space-y-3">
-      <Card>
-        <h2 className="mb-3 text-[14px] font-semibold text-[var(--text-1)]">{t("general")}</h2>
-        <Field label={t("hostname")} value={form.hostname} onChange={(v) => setForm({ ...form, hostname: v })} />
-        <Field label={t("admin_email")} value={form.adminEmail} onChange={(v) => setForm({ ...form, adminEmail: v })} />
-        <button
-          className="btn btn-accent mt-2"
-          onClick={async () => {
-            const r = await rpc("settings.set", { ...form });
-            toast(r.ok ? t("saved") : r.error, r.ok ? "ok" : "err");
-          }}
-        >
-          {t("save_changes")}
-        </button>
-      </Card>
-      <Card>
-        <h2 className="mb-1 text-[14px] font-semibold text-[var(--text-1)]">RPC</h2>
-        <p className="mono text-[12px] leading-relaxed text-[var(--text-2)]">
-          POST /api/rpc {"{ action, data }"} → {"{ ok, data | error }"}
-          <br />
-          helper-ro.sock (RO) · helper.sock (RW) · uint32be + JSON
+    <section className={className}>
+      {title && (
+        <h2 className="mb-1.5 px-1 font-medium" style={{ fontSize: "var(--font-caption)", color: "var(--text-2)" }}>
+          {title}
+        </h2>
+      )}
+      {description && (
+        <p className="mb-2 px-1" style={{ fontSize: "var(--font-caption)", color: "var(--text-3)" }}>
+          {description}
         </p>
-      </Card>
+      )}
+      <div
+        className="overflow-hidden"
+        style={{ background: "var(--surface)", borderRadius: "var(--radius-panel)", boxShadow: "inset 0 0 0 1px var(--hairline)" }}
+      >
+        {children}
+      </div>
+    </section>
+  );
+}
+
+/** 组内发丝分隔：左右从文本内缩（mx-4 对齐 px-4），不顶到容器边 */
+function Sep() {
+  return <div className="mx-4 h-px" style={{ background: "var(--hairline)" }} />;
+}
+
+/** 设置行：标签（+ 脚注）左、控件右；行高 --control-h-lg（桌面 32 / iOS 44） */
+function Row({
+  label,
+  sub,
+  control,
+  sep = false,
+}: {
+  label: ReactNode;
+  sub?: string;
+  control: ReactNode;
+  sep?: boolean;
+}) {
+  return (
+    <div>
+      {sep && <Sep />}
+      <div className="flex items-center justify-between gap-6 px-4 py-2" style={{ minHeight: "var(--control-h-lg)" }}>
+        <div className="min-w-0">
+          <div className="font-medium text-[var(--text-1)]" style={{ fontSize: "var(--font-body)" }}>
+            {label}
+          </div>
+          {sub && (
+            <div className="mt-0.5" style={{ fontSize: "var(--font-caption)", color: "var(--text-2)" }}>
+              {sub}
+            </div>
+          )}
+        </div>
+        <div className="flex shrink-0 items-center gap-2">{control}</div>
+      </div>
     </div>
   );
 }
 
-function Field({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+/** 开关设置行（本页专用 32px 密度；ui.tsx 的 ToggleRow 保留给其他页面） */
+function SwitchRow({
+  label,
+  sub,
+  checked,
+  onChange,
+  disabled,
+  sep = false,
+}: {
+  label: string;
+  sub?: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+  sep?: boolean;
+}) {
   return (
-    <label className="mb-3 block">
-      <span className="mb-1.5 block text-[12.5px] font-medium text-[var(--text-2)]">{label}</span>
-      <input className="input" value={value} onChange={(e) => onChange(e.target.value)} />
-    </label>
+    <div>
+      {sep && <Sep />}
+      <div
+        className="flex items-center justify-between gap-6 px-4 py-2"
+        style={{ minHeight: "var(--control-h-lg)", opacity: disabled ? 0.6 : undefined }}
+      >
+        <div className="min-w-0">
+          <div className="font-medium text-[var(--text-1)]" style={{ fontSize: "var(--font-body)" }}>
+            {label}
+          </div>
+          {sub && (
+            <div className="mt-0.5" style={{ fontSize: "var(--font-caption)", color: "var(--text-2)" }}>
+              {sub}
+            </div>
+          )}
+        </div>
+        <RSwitch.Root
+          checked={checked}
+          onCheckedChange={onChange}
+          disabled={disabled}
+          data-checked={String(checked)}
+          className="radix-switch"
+          aria-label={label}
+        >
+          <span className="knob" />
+        </RSwitch.Root>
+      </div>
+    </div>
   );
 }
 
-/* ---------------- 邮件服务（展板新增标签页） ---------------- */
+/* ---------------- 通用设置 ---------------- */
+
+function GeneralTab() {
+  const { t } = useSettings();
+  const [form, setForm] = useState<ServerSettings | null>(null);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    rpc<ServerSettings>("settings.get").then((r) => {
+      // {ok:true} 无载荷时保持 null（骨架屏），不把 undefined 塞进 form；
+      // 失败不再静默 —— 原先失败页与加载页无法区分。
+      if (r.ok && r.data) {
+        setForm(r.data);
+        setLoadErr(null);
+      } else if (!r.ok) setLoadErr(r.error);
+    });
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  if (loadErr)
+    return (
+      <Group>
+        <div className="p-3">
+          <LoadError message={loadErr} onRetry={load} />
+        </div>
+      </Group>
+    );
+  if (!form)
+    return (
+      <Group>
+        <div className="skeleton m-4 h-24" />
+      </Group>
+    );
+
+  return (
+    <div className="space-y-5">
+      <Group title={t("general")}>
+        <Row
+          label={t("hostname")}
+          control={
+            <input
+              className="input"
+              style={{ width: 260, maxWidth: "52vw" }}
+              value={form.hostname}
+              onChange={(e) => setForm({ ...form, hostname: e.target.value })}
+            />
+          }
+        />
+        <Row
+          sep
+          label={t("admin_email")}
+          control={
+            <input
+              className="input"
+              style={{ width: 260, maxWidth: "52vw" }}
+              value={form.adminEmail}
+              onChange={(e) => setForm({ ...form, adminEmail: e.target.value })}
+            />
+          }
+        />
+        <Sep />
+        <div className="flex justify-end px-4 py-2.5">
+          <button
+            className="btn btn-accent"
+            onClick={async () => {
+              const r = await rpc("settings.set", { ...form });
+              toast(r.ok ? t("saved") : r.error, r.ok ? "ok" : "err");
+            }}
+          >
+            {t("save_changes")}
+          </button>
+        </div>
+      </Group>
+
+      <Group title="RPC">
+        <div className="p-4 pt-3">
+          <p className="mono leading-relaxed text-[var(--text-2)]" style={{ fontSize: 12 }}>
+            POST /api/rpc {"{ action, data }"} → {"{ ok, data | error }"}
+            <br />
+            helper-ro.sock (RO) · helper.sock (RW) · uint32be + JSON
+          </p>
+        </div>
+      </Group>
+    </div>
+  );
+}
+
+/* ---------------- 邮件服务 ---------------- */
 
 function MailTab() {
   const { t } = useSettings();
@@ -131,7 +330,10 @@ function MailTab() {
   const [testOut, setTestOut] = useState("");
 
   useEffect(() => {
-    rpc<ServiceRow[]>("services.list").then((r) => r.ok && setServices(r.data));
+    // {ok:true} 无载荷时保持 null（骨架屏），不把 undefined 塞进 state。
+    rpc<ServiceRow[]>("services.list").then((r) => {
+      if (r.ok && r.data) setServices(r.data);
+    });
   }, []);
 
   const NAME: Record<string, string> = {
@@ -144,42 +346,49 @@ function MailTab() {
   };
 
   return (
-    <div className="space-y-3">
-      <Card>
-        <h2 className="mb-3 text-[14px] font-semibold text-[var(--text-1)]">{t("settings_mail")}</h2>
-        <div className="space-y-2">
-          {(services ?? []).map((s) => (
-            <div key={s.key} className="flex items-center justify-between gap-3 rounded-[12px] px-3 py-2.5 text-[12.5px]" style={{ background: "rgb(var(--text-1) / 0.04)", boxShadow: "inset 0 0 0 1px var(--hairline)" }}>
-              <div className="leading-tight">
-                <div className="font-medium text-[var(--text-1)]">{NAME[s.key] ?? s.key}</div>
-                <div className="mono text-[11px] text-[var(--text-3)]">{s.detail}</div>
-              </div>
-              <span className={`badge ${s.running ? "badge-ok" : "badge-err"}`}>
-                <span className="dot" />
-                {s.running ? t("running") : t("stopped")}
-              </span>
-            </div>
-          ))}
-          {!services && <div className="skeleton h-24" />}
-        </div>
-      </Card>
+    <div className="space-y-5">
+      <Group title={t("settings_mail")}>
+        {(services ?? []).map((s, i) => (
+          <Fragment key={s.key}>
+            {i > 0 && <Sep />}
+            <Row
+              label={NAME[s.key] ?? s.key}
+              sub={s.detail}
+              control={
+                <StatusBadge
+                  variant="dot"
+                  kind={s.running ? "ok" : "err"}
+                  label={s.running ? t("running") : t("stopped")}
+                />
+              }
+            />
+          </Fragment>
+        ))}
+        {!services && <div className="skeleton m-4 h-20" />}
+      </Group>
 
-      <Card>
-        <h2 className="mb-2.5 text-[14px] font-semibold text-[var(--text-1)]">Loopback Test</h2>
-        <div className="glass--well mono min-h-[72px] rounded-[12px] p-3 text-[12px] leading-relaxed text-[var(--text-2)]">
-          {testOut || "$ mailstack mail test-loopback …"}
+      <Group title="Loopback Test">
+        <div className="px-4 pt-3">
+          <div
+            className="glass--well mono min-h-[64px] rounded-[var(--radius-control)] p-3 leading-relaxed text-[var(--text-2)]"
+            style={{ fontSize: 12 }}
+          >
+            {testOut || "$ mailstack mail test-loopback …"}
+          </div>
         </div>
-        <button
-          className="btn btn-accent mt-3"
-          onClick={async () => {
-            setTestOut(t("loading"));
-            const r = await rpc<{ success: boolean; message: string }>("mail.test_loopback", {});
-            setTestOut(r.ok ? `${r.data.success ? "✓" : "✕"} ${r.data.message}` : r.error);
-          }}
-        >
-          <IconSend size={14} /> Test
-        </button>
-      </Card>
+        <div className="flex justify-end px-4 py-2.5">
+          <button
+            className="btn btn-accent"
+            onClick={async () => {
+              setTestOut(t("loading"));
+              const r = await rpc<{ success: boolean; message: string }>("mail.test_loopback", {});
+              setTestOut(r.ok ? `${r.data.success ? "✓" : "✕"} ${r.data.message}` : r.error);
+            }}
+          >
+            <IconSend size={14} /> {t("test")}
+          </button>
+        </div>
+      </Group>
     </div>
   );
 }
@@ -187,7 +396,8 @@ function MailTab() {
 /* ---------------- 外观设置 ---------------- */
 
 function AppearanceTab() {
-  const { t, prefs, setTheme, setAccent, setGlassLevel, setFlag, customBg, setCustomBg } = useSettings();
+  const { t, prefs, resolvedTheme, setTheme, setAccent, setGlassLevel, setFlag, customBg, setCustomBg } = useSettings();
+  const zh = prefs.lang === "zh";
   const glassLabels = [t("ultra_clear"), t("clear"), t("balanced"), t("dimmed"), t("soft_dark")];
   const PRESETS = [
     { label: t("ultra_clear"), sw: "0.22" },
@@ -198,198 +408,235 @@ function AppearanceTab() {
   ];
 
   return (
-    <div className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,560px)_minmax(0,420px)]">
-      {/* 左列 */}
-      <Card>
-        {/* 主题三选一（蓝描边选项卡，对齐示意图） */}
-        <h2 className="text-[13.5px] font-semibold text-[var(--text-1)]">{t("theme_label")}</h2>
-        <div className="mt-2.5 flex gap-2">
-          {(
-            [
-              { v: "light", label: t("light"), icon: <IconSun size={15} /> },
-              { v: "dark", label: t("dark"), icon: <IconMoon size={15} /> },
-              { v: "system", label: t("system"), icon: <IconGear size={15} /> },
-            ] as { v: ThemeMode; label: string; icon: ReactNode }[]
-          ).map((o) => (
-            <button
-              key={o.v}
-              className="option-card"
-              data-active={prefs.theme === o.v}
-              aria-pressed={prefs.theme === o.v}
-              onClick={() => setTheme(o.v)}
-            >
-              {o.icon}
-              {o.label}
-            </button>
-          ))}
-        </div>
+    <div className="max-w-[640px] space-y-5">
+      {/* 主题三选一（蓝描边选项卡） */}
+      <Group>
+        <Row
+          label={t("theme_label")}
+          control={
+            <div className="flex w-[300px] max-w-[54vw] gap-2">
+              {(
+                [
+                  { v: "light", label: t("light"), icon: <IconSun size={15} /> },
+                  { v: "dark", label: t("dark"), icon: <IconMoon size={15} /> },
+                  { v: "system", label: t("system"), icon: <IconGear size={15} /> },
+                ] as { v: ThemeMode; label: string; icon: ReactNode }[]
+              ).map((o) => (
+                <button
+                  key={o.v}
+                  className="option-card"
+                  data-active={prefs.theme === o.v}
+                  aria-pressed={prefs.theme === o.v}
+                  onClick={() => setTheme(o.v)}
+                >
+                  {o.icon}
+                  {o.label}
+                </button>
+              ))}
+            </div>
+          }
+        />
+      </Group>
 
-        {/* Liquid Glass 个性化 */}
-        <h2 className="mt-6 text-[13.5px] font-semibold text-[var(--text-1)]">{t("glass_personalization")}</h2>
-        <p className="mt-0.5 text-[12px] text-[var(--text-2)]">{t("glass_personalization_sub")}</p>
-
-        <div className="mt-4">
-          <div className="mb-1 flex items-center justify-between text-[12.5px]">
-            <span className="font-medium text-[var(--text-1)]">{t("glass_opacity")}</span>
-            <span className="tnum badge badge-neutral">{prefs.glassLevel}%</span>
-          </div>
-          <RSlider.Root
-            className="radix-slider"
-            value={[prefs.glassLevel]}
-            min={0}
-            max={100}
-            step={5}
-            aria-label={t("glass_opacity")}
-            onValueChange={([v]) => setGlassLevel(v)}
-          >
-            <RSlider.Track className="radix-track">
-              <RSlider.Range className="radix-range" />
-            </RSlider.Track>
-            <RSlider.Thumb className="radix-thumb" aria-label={t("glass_opacity")} />
-          </RSlider.Root>
-          <div className="mt-1.5 flex justify-between text-[10.5px] text-[var(--text-3)]">
-            <span>{t("ultra_clear")} (0%)</span>
-            <span>{glassLabels[Math.min(4, Math.floor(prefs.glassLevel / 25))]}</span>
-            <span>{t("soft_dark")} (100%)</span>
-          </div>
-        </div>
-
-        {/* 五档预设（超清澈 0% → 柔和暗色 100%，对齐展板样式） */}
-        <div className="preset-row mt-3">
-          {PRESETS.map((p, i) => (
-            <button
-              key={p.label}
-              className="preset-box"
-              data-active={Math.abs(prefs.glassLevel - i * 25) < 12.5}
-              aria-label={`${p.label} ${i * 25}%`}
-              onClick={() => setGlassLevel(i * 25)}
-            >
-              <span className="preset-swatch" style={{ ["--sw" as string]: p.sw }}>
-                <i />
-              </span>
-              <div className="pl">{p.label}</div>
-              <div className="pv">({i * 25}%)</div>
-            </button>
-          ))}
-        </div>
-
-        {/* 强调色 */}
-        <h2 className="mt-6 text-[13.5px] font-semibold text-[var(--text-1)]">{t("accent_color")}</h2>
-        <div className="mt-2.5 flex items-center gap-2.5">
-          {(Object.keys(ACCENTS) as Accent[]).map((k) => {
-            const a = ACCENTS[k];
-            const active = prefs.accent === k;
-            return (
-              <button
-                key={k}
-                aria-label={a.label}
-                title={a.label}
-                onClick={() => setAccent(k)}
-                className="relative flex h-8 w-8 items-center justify-center rounded-full transition-transform"
-                style={{
-                  background: prefs.theme === "dark" ? a.dark : a.light,
-                  boxShadow: active
-                    ? "0 0 0 2px var(--canvas), 0 0 0 4px rgb(var(--accent-rgb)), inset 0 1px 0 rgba(255,255,255,.4)"
-                    : "inset 0 1px 0 rgba(255,255,255,.4), 0 1px 3px rgba(10,22,40,.25)",
-                  transform: active ? "scale(1.05)" : undefined,
-                }}
+      {/* Liquid Glass 个性化：滑杆 + 五档预设。
+          提示语说明作用域 —— 内容卡片已固定为近实心表面，滑杆只影响侧栏/工具栏等
+          chrome 玻璃（glass budget，见 index.css）。 */}
+      <Group title={t("glass_personalization")} description={t("glass_personalization_sub")}>
+        <Row
+          label={t("glass_opacity")}
+          sub={t("glass_opacity_hint")}
+          control={
+            <div className="flex w-[240px] max-w-[54vw] items-center gap-2.5">
+              <RSlider.Root
+                className="radix-slider flex-1"
+                value={[prefs.glassLevel]}
+                min={0}
+                max={100}
+                step={5}
+                aria-label={t("glass_opacity")}
+                onValueChange={([v]) => setGlassLevel(v)}
               >
-                {active && <IconCheck size={14} className="text-white" />}
+                <RSlider.Track className="radix-track">
+                  <RSlider.Range className="radix-range" />
+                </RSlider.Track>
+                <RSlider.Thumb className="radix-thumb" aria-label={t("glass_opacity")} />
+              </RSlider.Root>
+              <span className="tnum badge badge-neutral">{prefs.glassLevel}%</span>
+            </div>
+          }
+        />
+        <Sep />
+        <div className="p-4">
+          {/* 五档预设（超清澈 0% → 柔和暗色 100%） */}
+          <div className="preset-row">
+            {PRESETS.map((p, i) => (
+              <button
+                key={p.label}
+                className="preset-box"
+                data-active={Math.abs(prefs.glassLevel - i * 25) < 12.5}
+                aria-label={`${p.label} ${i * 25}%`}
+                onClick={() => setGlassLevel(i * 25)}
+              >
+                <span className="preset-swatch" style={{ ["--sw" as string]: p.sw }}>
+                  <i />
+                </span>
+                <div className="pl">{p.label}</div>
+                <div className="pv">({i * 25}%)</div>
               </button>
-            );
-          })}
+            ))}
+          </div>
+          <div className="mt-1.5 text-center" style={{ fontSize: "var(--font-caption)", color: "var(--text-3)" }}>
+            {glassLabels[Math.min(4, Math.floor(prefs.glassLevel / 25))]}
+          </div>
         </div>
+      </Group>
 
-        {/* 自定义背景 */}
-        <h2 className="mt-6 text-[13.5px] font-semibold text-[var(--text-1)]">{t("custom_bg")}</h2>
-        <p className="mt-0.5 text-[12px] text-[var(--text-2)]">{t("custom_bg_sub")}</p>
-        <div className="mt-2.5 flex items-center gap-3">
-          <div
-            className="h-[44px] w-[72px] shrink-0 overflow-hidden rounded-[10px]"
-            style={{
-              backgroundImage: "url(" + (customBg ?? "alpine-lake.png") + ")",
-              backgroundSize: "cover",
-              backgroundPosition: "center 48%",
-              boxShadow: "inset 0 0 0 1px var(--hairline)",
-            }}
-          />
-          <label className="btn glass--control cursor-pointer">
-            <IconPlus size={14} /> {t("upload_image")}
-            <input
-              type="file"
-              accept="image/*"
-              className="hidden!"
-              onChange={(e) => {
-                const file = e.target.files && e.target.files[0];
-                e.target.value = "";
-                if (!file) return;
-                const reader = new FileReader();
-                reader.onload = () => {
-                  const img = new Image();
-                  img.onload = () => {
-                    const max = 1920;
-                    const scale = Math.min(1, max / Math.max(img.width, img.height));
-                    const canvas = document.createElement("canvas");
-                    canvas.width = Math.round(img.width * scale);
-                    canvas.height = Math.round(img.height * scale);
-                    canvas.getContext("2d")?.drawImage(img, 0, 0, canvas.width, canvas.height);
-                    try {
-                      setCustomBg(canvas.toDataURL("image/jpeg", 0.85));
-                      toast(t("saved"));
-                    } catch {
-                      toast("storage full", "err");
-                    }
-                  };
-                  img.src = String(reader.result);
-                };
-                reader.readAsDataURL(file);
+      {/* 强调色（预览色用 resolvedTheme —— 「跟随系统」时取实际解析结果，不是原始偏好） */}
+      <Group>
+        <Row
+          label={t("accent_color")}
+          control={
+            <div className="flex items-center gap-2.5">
+              {(Object.keys(ACCENTS) as Accent[]).map((k) => {
+                const a = ACCENTS[k];
+                const active = prefs.accent === k;
+                return (
+                  <button
+                    key={k}
+                    aria-label={a.label}
+                    title={a.label}
+                    onClick={() => setAccent(k)}
+                    className="relative flex h-8 w-8 items-center justify-center rounded-full transition-transform"
+                    style={{
+                      background: resolvedTheme === "dark" ? a.dark : a.light,
+                      boxShadow: active
+                        ? "0 0 0 2px var(--canvas), 0 0 0 4px rgb(var(--accent-rgb)), inset 0 1px 0 rgba(255,255,255,.4)"
+                        : "inset 0 1px 0 rgba(255,255,255,.4), 0 1px 3px rgba(10,22,40,.25)",
+                      transform: active ? "scale(1.05)" : undefined,
+                    }}
+                  >
+                    {active && <IconCheck size={14} className="text-white" />}
+                  </button>
+                );
+              })}
+            </div>
+          }
+        />
+      </Group>
+
+      {/* 自定义背景：缩略图 + 上传；恢复默认单列一行 */}
+      <Group>
+        <Row
+          label={t("custom_bg")}
+          sub={t("custom_bg_sub")}
+          control={
+            <div className="flex items-center gap-3">
+              <div
+                className="h-[44px] w-[72px] shrink-0 overflow-hidden"
+                style={{
+                  borderRadius: "var(--radius-panel)",
+                  // localStorage 里的值可被外部改写：url() 带引号并转义（lib/format.cssUrl）
+                  backgroundImage: "url(" + cssUrl(customBg ?? "alpine-lake.png") + ")",
+                  backgroundSize: "cover",
+                  backgroundPosition: "center 48%",
+                  boxShadow: "inset 0 0 0 1px var(--hairline)",
+                }}
+              />
+              <label className="btn glass--control cursor-pointer">
+                <IconPlus size={14} /> {t("upload_image")}
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="hidden!"
+                  onChange={(e) => {
+                    const file = e.target.files && e.target.files[0];
+                    e.target.value = "";
+                    if (!file) return;
+                    const reader = new FileReader();
+                    // 读文件 / 解码图片都可能失败：原先两个回调缺失时按钮点了没任何反馈。
+                    reader.onerror = () => {
+                      toast(zh ? "图片读取失败，请重试" : "Failed to read the image. Please retry.", "err");
+                    };
+                    reader.onload = () => {
+                      const img = new Image();
+                      img.onerror = () => {
+                        toast(zh ? "图片解析失败，请换一张图片" : "Could not decode the image. Try another file.", "err");
+                      };
+                      img.onload = () => {
+                        const max = 1920;
+                        const scale = Math.min(1, max / Math.max(img.width, img.height));
+                        const canvas = document.createElement("canvas");
+                        canvas.width = Math.round(img.width * scale);
+                        canvas.height = Math.round(img.height * scale);
+                        canvas.getContext("2d")?.drawImage(img, 0, 0, canvas.width, canvas.height);
+                        try {
+                          setCustomBg(canvas.toDataURL("image/jpeg", 0.85));
+                          toast(t("saved"));
+                        } catch {
+                          toast("storage full", "err");
+                        }
+                      };
+                      img.src = String(reader.result);
+                    };
+                    reader.readAsDataURL(file);
+                  }}
+                />
+              </label>
+            </div>
+          }
+        />
+        <Row
+          sep
+          label={t("reset_default")}
+          control={
+            <button
+              className="btn glass--control"
+              disabled={!customBg}
+              style={{ opacity: customBg ? 1 : 0.45 }}
+              onClick={() => {
+                setCustomBg(null);
+                toast(t("saved"));
               }}
-            />
-          </label>
-          <button
-            className="btn glass--control"
-            disabled={!customBg}
-            style={{ opacity: customBg ? 1 : 0.45 }}
-            onClick={() => { setCustomBg(null); toast(t("saved")); }}
-          >
-            {t("reset_default")}
-          </button>
-        </div>
+            >
+              {t("reset_default")}
+            </button>
+          }
+        />
+      </Group>
 
-        {/* 辅助功能 */}
-        <h2 className="mt-6 text-[13.5px] font-semibold text-[var(--text-1)]">{t("accessibility")}</h2>
-        <div className="mt-1 flex flex-col gap-1">
-          <div className="hairline-b">
-            <ToggleRow
-              title={t("reduce_transparency")}
-              sub={t("reduce_transparency_sub")}
-              checked={prefs.reduceTransparency}
-              onChange={(v) => setFlag("reduceTransparency", v)}
-            />
-          </div>
-          <div className="hairline-b">
-            <ToggleRow
-              title={t("increase_contrast")}
-              sub={t("increase_contrast_sub")}
-              checked={prefs.increaseContrast}
-              onChange={(v) => setFlag("increaseContrast", v)}
-            />
-          </div>
-          <ToggleRow
-            title={t("reduce_motion")}
-            sub={t("reduce_motion_sub")}
-            checked={prefs.reduceMotion}
-            onChange={(v) => setFlag("reduceMotion", v)}
-          />
-        </div>
-      </Card>
+      {/* 辅助功能：三个真实生效的降级开关 */}
+      <Group title={t("accessibility")}>
+        <SwitchRow
+          label={t("reduce_transparency")}
+          sub={t("reduce_transparency_sub")}
+          checked={prefs.reduceTransparency}
+          onChange={(v) => setFlag("reduceTransparency", v)}
+        />
+        <SwitchRow
+          sep
+          label={t("increase_contrast")}
+          sub={t("increase_contrast_sub")}
+          checked={prefs.increaseContrast}
+          onChange={(v) => setFlag("increaseContrast", v)}
+        />
+        <SwitchRow
+          sep
+          label={t("reduce_motion")}
+          sub={t("reduce_motion_sub")}
+          checked={prefs.reduceMotion}
+          onChange={(v) => setFlag("reduceMotion", v)}
+        />
+      </Group>
 
-      {/* 右列：实时预览 */}
-      <Card>
-        <h2 className="mb-3 text-[13.5px] font-semibold text-[var(--text-1)]">{t("live_preview")}</h2>
-        <LivePreview />
-        <p className="mt-3 text-center text-[11.5px] text-[var(--text-3)]">{t("changes_apply_live")}</p>
-      </Card>
+      {/* 实时预览 */}
+      <Group title={t("live_preview")}>
+        <div className="p-4">
+          <LivePreview />
+          <p className="mt-3 text-center" style={{ fontSize: "var(--font-caption)", color: "var(--text-3)" }}>
+            {t("changes_apply_live")}
+          </p>
+        </div>
+      </Group>
     </div>
   );
 }
@@ -485,22 +732,14 @@ function LivePreview() {
 /* ---------------- 通知设置 ---------------- */
 
 function NotificationsTab() {
+  // 通知设置尚未在后端实现（settings.get / settings.set 均无对应字段）。原先这里
+  // 摆了三个只写本地 useState 的假开关（SMTP / 队列 / 证书），从不持久化、也控制
+  // 不了任何行为 —— 纯虚假 UI，已删除（同 Login.tsx 移除「保持登录」的先例）。
+  // 待后端补上通知配置字段后再恢复真实开关。
   const { t } = useSettings();
-  const [mail, setMail] = useState(true);
-  const [queue, setQueue] = useState(true);
-  const [certs, setCerts] = useState(true);
   return (
-    <Card className="max-w-[560px]">
-      <h2 className="mb-1 text-[14px] font-semibold text-[var(--text-1)]">{t("notifications_set")}</h2>
-      <ToggleRow title="SMTP" sub="postfix@mailstack" checked={mail} onChange={setMail} />
-      <ToggleRow title={t("mail_queue")} sub="queue.action" checked={queue} onChange={setQueue} />
-      <ToggleRow title={t("tls_title")} sub="certs.renew" checked={certs} onChange={setCerts} />
-      <div className="mt-4 flex items-center gap-2.5 rounded-[12px] p-3" style={{ background: "rgb(var(--accent-rgb) / 0.08)" }}>
-        <RSwitch.Root checked disabled data-checked="true" className="radix-switch" aria-label="system">
-          <span className="knob" />
-        </RSwitch.Root>
-        <span className="text-[12px] text-[var(--text-2)]">System alerts · always on</span>
-      </div>
-    </Card>
+    <Group title={t("notifications_set")}>
+      <SwitchRow label={t("system_alerts_always")} checked disabled onChange={() => {}} />
+    </Group>
   );
 }

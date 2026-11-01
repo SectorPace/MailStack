@@ -15,6 +15,7 @@ import { Card, PageHeader, GlassSelect, StatusBadge } from "../components/ui";
 import { LineChart, type ChartPoint } from "../components/LineChart";
 import { DonutChart, GaugeRing } from "../components/Donut";
 import { normalizeLog, type RawLog, type LogRow } from "../lib/logs";
+import { formatTime } from "../lib/format";
 import {
   IconCheck,
   IconGlobe,
@@ -37,6 +38,7 @@ type SnapRaw = {
   queues?: { status?: string }[];
   services?: { id?: string; name?: string; status?: string }[];
   queue?: {
+    // 真后端 queue_summary：backlog = 全部条目数（含 active），另有 corrupt / relayHost。
     backlog?: number;
     corrupt?: number;
     // mock 的富队列字段
@@ -70,7 +72,8 @@ type VM = {
   healthPanel: { overall: number; items: { key: string; label: string; status: string; value?: number }[] } | null;
   smtp: { running: boolean; connections: Num; sentToday: Num; successRate: Num; ports: number[] } | null;
   dovecot: { running: boolean; connections: Num; loggedIn: Num; successRate: Num; ports: number[] } | null;
-  resources: { cpu: number; memory: number; disk: number };
+  // snapshot.resources 与 metrics.system 都拿不到时为 null：渲染 —，绝不编 0%。
+  resources: { cpu: number; memory: number; disk: number } | null;
 };
 
 /** 数字 → 展示串；后端没有该数据时显示占位符而不是编造一个 0。 */
@@ -93,9 +96,13 @@ function buildVM(raw: SnapRaw, users: UserRow[], metrics: { cpu: number; memory:
       ? { total: users.length, active: users.filter((u) => u.active).length, disabled: users.filter((u) => !u.active).length }
       : { total: null, active: null, disabled: null };
 
-  // 真后端的 queues 是队列条目数组，可按 status 统计；sending/pending 是唯二取值。
-  const sending = raw.queue?.sending ?? (raw.queues ? raw.queues.filter((q) => q.status === "sending").length : null);
-  const pending = raw.queue?.pending ?? raw.queue?.backlog ?? (raw.queues ? raw.queues.filter((q) => q.status === "pending").length : null);
+  // 真后端的 queues 是队列条目数组，status 只有 active（到期在投）与 deferred
+  // （等下次重试）两种（readers.rs queue_item_json）；snapshot.queue 只有
+  // backlog/corrupt/relayHost，没有 sending/pending 计数。sending/pending 唯一
+  // 的来源是 mock 富快照的字段 —— 真数据按真实 status 值统计，不用 backlog
+  // （它是含 active 的总数，拿来当「待处理」是错位）。
+  const sending = raw.queue?.sending ?? (raw.queues ? raw.queues.filter((q) => q.status === "active").length : null);
+  const pending = raw.queue?.pending ?? (raw.queues ? raw.queues.filter((q) => q.status === "deferred").length : null);
   const queue = {
     pending,
     sending,
@@ -122,7 +129,9 @@ function buildVM(raw: SnapRaw, users: UserRow[], metrics: { cpu: number; memory:
     healthPanel: raw.healthPanel ?? null,
     smtp: raw.smtp ? { running: raw.smtp.running, connections: raw.smtp.connections, sentToday: raw.smtp.sentToday, successRate: raw.smtp.successRate, ports: raw.smtp.ports } : null,
     dovecot: raw.dovecot ? { running: raw.dovecot.running, connections: raw.dovecot.connections, loggedIn: raw.dovecot.loggedIn, successRate: raw.dovecot.successRate, ports: raw.dovecot.ports } : null,
-    resources: raw.resources ?? metrics ?? { cpu: 0, memory: 0, disk: 0 },
+    // 原先兜底 {cpu:0,memory:0,disk:0}：两个数据源都失败时凭空渲染「CPU 0% / 内存 0% /
+    // 磁盘 0%」，看起来像真实读数。改为 null → 渲染占位符。
+    resources: raw.resources ?? metrics,
   };
 }
 
@@ -152,7 +161,7 @@ export default function Dashboard() {
       }
       const s = snapR.data ?? {};
       setRaw(s);
-      setVm(buildVM(s, usersR.ok ? usersR.data ?? [] : [], metricsR.ok ? metricsR.data : null));
+      setVm(buildVM(s, usersR.ok ? usersR.data ?? [] : [], metricsR.ok ? metricsR.data ?? null : null));
     });
     rpc<ActivityItem[]>("activity.list").then((r) => live && r.ok && setActivity(r.data ?? []));
     rpc<RawLog[]>("logs.list").then((r) => live && r.ok && setLogs((r.data ?? []).map(normalizeLog).slice(0, 5)));
@@ -367,9 +376,9 @@ export default function Dashboard() {
             </div>
             <div className="space-y-4">
               {[
-                { label: t("cpu_usage"), v: res.cpu },
-                { label: t("mem_usage"), v: res.memory },
-                { label: t("disk_usage"), v: res.disk },
+                { label: t("cpu_usage"), v: res?.cpu ?? null },
+                { label: t("mem_usage"), v: res?.memory ?? null },
+                { label: t("disk_usage"), v: res?.disk ?? null },
               ].map((r0) => (
                 <div key={r0.label} className="flex items-center gap-3">
                   <span
@@ -381,10 +390,11 @@ export default function Dashboard() {
                   <div className="min-w-0 flex-1">
                     <div className="mb-1.5 flex items-center justify-between text-[12.5px]">
                       <span className="text-[var(--text-2)]">{r0.label}</span>
-                      <span className="tnum font-medium text-[var(--text-1)]">{r0.v}%</span>
+                      {/* 数据源失败时显示 —（绝不虚假 UI），条形宽度归零 */}
+                      <span className="tnum font-medium text-[var(--text-1)]">{r0.v == null ? "—" : `${r0.v}%`}</span>
                     </div>
                     <div className="bar">
-                      <i style={{ width: `${r0.v}%` }} className={r0.v > 85 ? "err" : r0.v > 70 ? "warn" : ""} />
+                      <i style={{ width: r0.v == null ? "0%" : `${Math.min(100, Math.max(0, r0.v))}%` }} className={r0.v == null ? "" : r0.v > 85 ? "err" : r0.v > 70 ? "warn" : ""} />
                     </div>
                   </div>
                 </div>
@@ -592,7 +602,8 @@ export default function Dashboard() {
                 />
                 <div className="min-w-0 flex-1 leading-tight">
                   <div className="truncate text-[12px] text-[var(--text-1)]" title={l.message}>{l.message}</div>
-                  <div className="tnum text-[10.5px] text-[var(--text-3)]">{l.time.slice(11, 16)}</div>
+                  {/* 后端是 ISO8601（UTC）：slice(11,16) 会把 UTC 当本地时间展示，用共享助手转本地时区 */}
+                  <div className="tnum text-[10.5px] text-[var(--text-3)]">{formatTime(l.time)}</div>
                 </div>
               </div>
             ))}

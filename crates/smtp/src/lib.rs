@@ -41,8 +41,8 @@ pub use mx::{
 pub use policy::{select_outbound_route, OutboundRoute, RelayDecision, RelayPolicy};
 pub use probe::{direct_mode_verdict, DirectModeVerdict, PortProbeResult, PortStatus};
 pub use relay_apply::{
-    apply_relay, plan_relay_apply, RelayApplyFailure, RelayApplyResult, RelayConfigStore,
-    RelayPlan, ERR_RELAYHOST_VERIFY_FAILED,
+    apply_relay, clear_relay, plan_relay_apply, RelayApplyFailure, RelayApplyResult,
+    RelayConfigStore, RelayPlan, ERR_RELAYHOST_VERIFY_FAILED,
 };
 pub use relay_store::{
     parse_sasl_passwd, CommandOutput, CommandRunner, NativeRelayStore, PostfixRelayStore,

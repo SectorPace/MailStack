@@ -16,16 +16,25 @@ export no_proxy="$NO_PROXY"
 
 cd "$SRC_DIR" || exit 1
 
-echo "=== cargo fetch（重试） ==="
+echo "=== cargo fetch（最多重试 5 次；最终失败即退出非零） ==="
+# 早先的问题：同一轮里先 `| tail -5` 再静默跑第二遍（成功时实际执行了两次），
+# 且 5 次全部失败后循环只是继续往下走，fetch 失败并不致命。
+# 现在每轮只跑一次，最终失败显式 exit 1 —— 本脚本的门禁语义保持 fail-closed。
+FETCH_OK=0
 for attempt in 1 2 3 4 5; do
   if cargo fetch 2>&1 | tail -5; then
-    if cargo fetch 2>/dev/null; then
-      echo "FETCH_OK"
-      break
-    fi
+    echo "FETCH_OK"
+    FETCH_OK=1
+    break
   fi
-  sleep 3
+  if [ "$attempt" -lt 5 ]; then
+    sleep 3
+  fi
 done
+if [ "$FETCH_OK" -ne 1 ]; then
+  echo "ERROR: cargo fetch 连续 5 次尝试均失败" >&2
+  exit 1
+fi
 
 echo
 echo "=== 解析结果 ==="

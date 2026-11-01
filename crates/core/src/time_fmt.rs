@@ -5,7 +5,11 @@ pub fn now_iso8601_utc() -> String {
     format_iso8601(time::OffsetDateTime::now_utc())
 }
 
-/// 当前本地时间，ISO 8601（对应 `datetime.now().isoformat()`，无偏移）。
+/// 当前本地时间，ISO 8601 **带本地偏移**（±HH:MM，与 [`format_iso8601`] 一致；
+/// 无法取得本地时区时回落 UTC 偏移）。
+///
+/// 注意：Python 的 `datetime.now().isoformat()` 是**无偏移**的，这里不是它的
+/// 对应物 —— 输出形态更接近 `datetime.now().astimezone().isoformat()`。
 pub fn now_iso8601_local() -> String {
     let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     format_iso8601(now)

@@ -14,6 +14,14 @@ pub const MAX_PASSWORD_LENGTH: usize = 256;
 /// （INV-37），不得为了「性能」下调。
 pub const PBKDF2_ITERATIONS: u32 = 310_000;
 
+/// 校验路径接受的迭代数**上限**。
+///
+/// 记录里的 `iterations` 是攻击者可控的持久化字段：只抬下界的话，一条被改成
+/// `iterations = 4_000_000_000` 的记录会让**认证路径**跑约 40 亿次 HMAC ——
+/// 一次登录请求就能把 CPU 打满。超出上限按上限计算；本实现写出的记录永远是
+/// [`PBKDF2_ITERATIONS`]，因此合法记录不受影响。
+pub const MAX_PBKDF2_ITERATIONS: u32 = 2_000_000;
+
 /// 口令记录的算法标识。**写与读共用同一个常量**：校验端要靠它拒绝
 /// 「不是本实现产生的」记录，写入端不能再内联字面量 —— 两处各写一遍
 /// 就等于给漂移留了缝。
@@ -217,12 +225,14 @@ pub fn password_record(username: &str, password: &str) -> CoreResult<PasswordRec
 /// 其它任何损坏形态（salt 非 hex、hash 非 hex）都 fail-closed，唯独这一形态
 /// fail-open —— 必须显式挡住。
 ///
-/// ## 为什么 `iterations` 取下界
+/// ## 为什么 `iterations` 取下界、也取上界
 ///
 /// 记录里的 `iterations` 是**攻击者可控**的持久化字段。只挡 `0` 的话，
 /// `iterations = 1` 让 PBKDF2 退化成一次 HMAC，口令哈希可以被廉价爆破 ——
 /// 而 `admin.json` 只有 root 与 `mailstack-admin` 组可读，但备份会带着它走。
 /// 因此不足 [`PBKDF2_ITERATIONS`] 的一律按后者计算。
+/// 反过来，被抬到天文数字的迭代数会把**认证路径**变成 CPU DoS（一次登录
+/// 跑几十亿次 HMAC），所以 [`MAX_PBKDF2_ITERATIONS`] 之上按上限计算。
 pub fn verify_password(record: &PasswordRecord, password: &str) -> bool {
     // 记录形状校验：算法必须是我们唯一会写出的那个。
     if record.algorithm != PASSWORD_ALGORITHM {
@@ -244,7 +254,10 @@ pub fn verify_password(record: &PasswordRecord, password: &str) -> bool {
     if expected.len() != HASH_LEN || salt.len() != SALT_LEN {
         return false;
     }
-    let iterations = record.iterations.max(PBKDF2_ITERATIONS);
+    let iterations = record
+        .iterations
+        .max(PBKDF2_ITERATIONS)
+        .min(MAX_PBKDF2_ITERATIONS);
     let actual = pbkdf2_sha256(password.as_bytes(), &salt, iterations, expected.len());
     constant_time_eq(&actual, &expected)
 }
@@ -263,16 +276,19 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// PBKDF2-HMAC-SHA256（RFC 2898）。迭代 310,000 次与现状一致。
 fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-
     let h_len = 32usize;
     let blocks = dk_len.div_ceil(h_len);
     let mut out = Vec::with_capacity(blocks * h_len);
 
+    // HMAC 的 ipad/opad 两个内部 SHA-256 状态只**构建一次**，每次迭代 `clone`
+    // 这份已就绪的状态再喂数据。原实现每次迭代都 `Hmac::new(password)` 重算
+    // 密钥编排 —— 对 310k 次迭代等于把工作量凭空翻倍。clone 出的状态与
+    // 新建的状态逐字节相同，输出语义完全不变。
+    let mac_template = Hmac::new(password);
     for block_index in 1..=blocks {
         // U1 = HMAC(password, salt || INT32BE(block_index))
         let mut u = {
-            let mut mac = Hmac::new(password);
+            let mut mac = mac_template.clone();
             mac.update(salt);
             mac.update(&(block_index as u32).to_be_bytes());
             mac.finalize()
@@ -281,7 +297,7 @@ fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -
 
         for _ in 1..iterations {
             u = {
-                let mut mac = Hmac::new(password);
+                let mut mac = mac_template.clone();
                 mac.update(&u);
                 mac.finalize()
             };
@@ -293,17 +309,34 @@ fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -
     }
 
     out.truncate(dk_len);
-    let _ = Sha256::new(); // 保持 sha2 依赖显式可见
     out
 }
 
 /// HMAC-SHA256 的最小实现，避免为一个原语引入整条 openssl 依赖链（§3.4 禁止项）。
+///
+/// `Clone` 是性能路径的一部分：PBKDF2 每次迭代 clone 一份已就绪的
+/// ipad/opad 状态，而不是重跑一遍密钥编排。
 struct Hmac {
     inner: Sha256Stream,
     outer: Sha256Stream,
 }
 
+impl Clone for Hmac {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            outer: self.outer.clone(),
+        }
+    }
+}
+
 struct Sha256Stream(sha2::Sha256);
+
+impl Clone for Sha256Stream {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
 impl Sha256Stream {
     fn new(data: &[u8]) -> Self {
@@ -558,6 +591,35 @@ mod tests {
         assert!(
             !verify_password(&record, "wrong"),
             "抬下界不应把错误口令也放进来"
+        );
+    }
+
+    /// 反例守卫：被抬到天文数字的 `iterations` 不得把认证路径变成 CPU DoS。
+    ///
+    /// 本实现写出的记录永远是 [`PBKDF2_ITERATIONS`]；一条 `iterations = u32::MAX`
+    /// 的记录只能是篡改产物。钳到 [`MAX_PBKDF2_ITERATIONS`] 后按上限重算，
+    /// 摘要与 310k 生成时不一致 —— 如实拒绝，但计算成本被钉在 ~2e6 次 HMAC，
+    /// 而不是 ~4e9 次。
+    #[test]
+    fn an_inflated_iteration_count_is_clamped_to_the_documented_maximum() {
+        let mut record = password_record("admin", "Tr0ubadour9x").unwrap();
+        record.iterations = u32::MAX;
+        assert!(
+            !verify_password(&record, "Tr0ubadour9x"),
+            "被抬高迭代数的记录按上限重算后摘要必然不符：篡改产物不得通过"
+        );
+    }
+
+    /// 等价性锚点：把预构建 HMAC 的 clone 语义钉在 RFC 向量上 ——
+    /// 若 clone 改变输出，这条会先红。
+    #[test]
+    fn pbkdf2_matches_reference_vectors_for_multi_iteration_inputs() {
+        // RFC 6070 风格向量（HMAC-SHA256 变体，Python hashlib 独立算出）：
+        // password="password", salt="salt", 2 次迭代, 32 字节输出。
+        let got = pbkdf2_sha256(b"password", b"salt", 2, 32);
+        assert_eq!(
+            hex::encode(got),
+            "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
         );
     }
 

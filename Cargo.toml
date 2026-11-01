@@ -24,7 +24,7 @@ members = [
 #   "crates/webmail"
 
 [workspace.package]
-version = "0.8.1-beta1"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.85"
 license = "SEE LICENSE IN LICENSE"

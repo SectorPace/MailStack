@@ -142,6 +142,7 @@ pub mod texts {
     pub const UNKNOWN_COMMAND: &str = "Command unrecognized";
     pub const TOO_MANY_RECIPIENTS: &str = "Too many recipients";
     pub const MESSAGE_TOO_LARGE: &str = "Message size exceeds fixed maximum message size";
+    pub const DATA_BACKPRESSURE: &str = "Server is busy accepting other messages, try again later";
     pub const BARE_LINE_FEED: &str = "Bare line feed in message data (use CRLF)";
     pub const STARTTLS_UNAVAILABLE: &str = "STARTTLS not available";
     pub const ALREADY_TLS: &str = "TLS already active";
@@ -168,6 +169,14 @@ pub mod texts {
     pub const RATE_LIMITED: &str = "Too many connections from your address";
     pub const BANNED_TEMPORARILY: &str = "Your address is temporarily blocked";
     pub const BANNED_PERMANENTLY: &str = "Your address is permanently blocked";
+
+    // ── 会话级时限（slowloris 防线，见 `listener` 的 `SESSION_TOTAL_TIMEOUT`）──
+    /// 421 4.4.2：整条连接的占用时长超过会话级上限，服务端主动断开。
+    pub const SESSION_TIMEOUT: &str = "session timeout";
+
+    // ── 提交口策略（587，RFC 8314 submission 语义）──
+    /// 530 5.7.0：提交口要求先认证（`AUTH`）才能开事务。
+    pub const SUBMISSION_AUTH_REQUIRED: &str = "Authentication required";
 
     // ── 入站认证与入队 ──
     /// 认证评估本身失败（无法判定），按临时错误处理而不是放行。

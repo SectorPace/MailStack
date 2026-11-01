@@ -1,5 +1,5 @@
 // 干净的分析型折线图（SVG 手绘，无图表库依赖）
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 
 export type ChartPoint = { t: string; v: number };
 
@@ -36,6 +36,9 @@ export function LineChart({
   area?: boolean;
 }) {
   const [hover, setHover] = useState<number | null>(null);
+  // 渐变 id 全局唯一：原先写死 "lc-area"，同页多个实例会生成重复 DOM id，
+  // 后挂载实例的 <defs> 抢占引用，面积填充可能用错（或丢失）渐变。
+  const gid = useId();
   const W = 640;
   const H = height;
   const padL = 34;
@@ -61,11 +64,15 @@ export function LineChart({
 
   const xLabelEvery = Math.ceil(points.length / 7);
 
+  // 数据点变短（切换时间范围等）后，旧 hover 索引可能越界 → coords[hover] 为
+  // undefined → 渲染崩溃。渲染期钳制：索引不再有效就当作无悬停。
+  const h = hover != null && hover < coords.length ? hover : null;
+
   return (
     <div className="relative w-full" style={{ fontSize: 10.5 }}>
       <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="delivery latency chart">
         <defs>
-          <linearGradient id="lc-area" x1="0" y1="0" x2="0" y2="1">
+          <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="rgb(var(--accent-rgb))" stopOpacity="0.22" />
             <stop offset="100%" stopColor="rgb(var(--accent-rgb))" stopOpacity="0.02" />
           </linearGradient>
@@ -92,7 +99,7 @@ export function LineChart({
           ) : null,
         )}
         {/* 面积与折线 */}
-        {area && <path d={areaPath} fill="url(#lc-area)" stroke="none" />}
+        {area && <path d={areaPath} fill={`url(#${gid})`} stroke="none" />}
         <path d={path} fill="none" stroke="rgb(var(--accent-rgb))" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
         {/* 数据点 */}
         {coords.map((c, i) => (
@@ -100,11 +107,11 @@ export function LineChart({
             key={`d-${i}`}
             cx={c.x}
             cy={c.y}
-            r={hover === i ? 4 : 2.4}
+            r={h === i ? 4 : 2.4}
             fill="rgb(var(--accent-rgb))"
             stroke="white"
-            strokeWidth={hover === i ? 1.6 : 0}
-            opacity={hover == null || hover === i ? 1 : 0.55}
+            strokeWidth={h === i ? 1.6 : 0}
+            opacity={h == null || h === i ? 1 : 0.55}
           />
         ))}
         {/* 悬停热区 */}
@@ -121,24 +128,24 @@ export function LineChart({
           />
         ))}
         {/* 悬停竖线 */}
-        {hover != null && (
-          <line x1={coords[hover].x} x2={coords[hover].x} y1={padT} y2={H - padB} stroke="rgb(var(--accent-rgb) / 0.4)" strokeWidth="1" />
+        {h != null && (
+          <line x1={coords[h].x} x2={coords[h].x} y1={padT} y2={H - padB} stroke="rgb(var(--accent-rgb) / 0.4)" strokeWidth="1" />
         )}
       </svg>
-      {hover != null && (
+      {h != null && (
         <div
           className="glass--clear pointer-events-none absolute z-10 rounded-lg px-2.5 py-1.5 text-[11.5px] text-[var(--text-1)]"
           style={{
-            left: `${(coords[hover].x / W) * 100}%`,
+            left: `${(coords[h].x / W) * 100}%`,
             top: 0,
-            transform: `translateX(${coords[hover].x > W * 0.7 ? "-108%" : "8%"})`,
+            transform: `translateX(${coords[h].x > W * 0.7 ? "-108%" : "8%"})`,
           }}
         >
           <span className="tnum font-semibold">
-            {coords[hover].p.v}
+            {coords[h].p.v}
             {unit}
           </span>
-          <span className="ml-1.5 text-[var(--text-3)]">{coords[hover].p.t}</span>
+          <span className="ml-1.5 text-[var(--text-3)]">{coords[h].p.t}</span>
         </div>
       )}
     </div>
