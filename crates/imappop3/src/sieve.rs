@@ -30,7 +30,7 @@
 //! 脚本从 `<maildir>/.sieve` 读取（UTF-8，≤64 KiB）。
 
 use crate::error::{MailError, Result};
-use crate::maildir::{write_atomic, with_lock, FlagSet, MailStore, NewMessage, INBOX};
+use crate::maildir::{with_lock, write_atomic, FlagSet, MailStore, NewMessage, INBOX};
 use crate::mime;
 use crate::outbound::OutboundSink;
 
@@ -1621,7 +1621,10 @@ mod tests {
         for i in 0..MAX_SCRIPTS {
             put_script(&store, &format!("s{i:02}"), "keep;").expect("上限内必须能上传");
         }
-        assert!(put_script(&store, "overflow", "keep;").is_err(), "到上限后新脚本必须被拒");
+        assert!(
+            put_script(&store, "overflow", "keep;").is_err(),
+            "到上限后新脚本必须被拒"
+        );
         // 覆盖已有脚本：数量不增长，放行。
         put_script(&store, "s00", "keep;").expect("覆盖已有脚本不受数量限制");
         // 删掉一个，名额让出。
@@ -1633,7 +1636,10 @@ mod tests {
     fn deeply_nested_scripts_are_rejected_not_a_stack_overflow() {
         // 64 KiB 全是 `not not not…`（约 1.6 万层）以前会直接打爆解析栈 abort
         // 整个进程；现在按程序化构造的小输入验证同样的路径被干净拒绝。
-        let not_chain = format!("if {} true {{ keep; }}", "not ".repeat(MAX_PARSE_DEPTH + 10));
+        let not_chain = format!(
+            "if {} true {{ keep; }}",
+            "not ".repeat(MAX_PARSE_DEPTH + 10)
+        );
         assert!(compile(&not_chain).is_err());
 
         let nested_blocks = format!(

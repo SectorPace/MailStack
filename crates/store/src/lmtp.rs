@@ -187,6 +187,21 @@ impl LmtpClient {
                     .to_string(),
             ));
         }
+        // `LHLO <name>` 是**另一处**直接 `format!` 进协议行的地方（R2-010）。
+        // 原先只校验了信封地址：`helo_name` 在 `bin/mailstackd` 里取自
+        // `config.mail_host`，经 API 写入时已被 `validate_setup_identity` 约束，
+        // 但 `setup.json` 是 root 可手改的，且 `LmtpClient::new` 是 `pub` 构造器 ——
+        // 同一个入口统一拒绝，不信任任何上游生产者。
+        let helo = self.helo_name.trim();
+        if helo.is_empty()
+            || helo.contains(['\r', '\n', '\0'])
+            || helo.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(StoreError::Lmtp(
+                "LHLO name must be a non-empty host name without spaces, CR, LF or NUL (SMTP command injection)"
+                    .to_string(),
+            ));
+        }
 
         let stream = self.connect().await?;
         let mut io = BufReader::new(stream);
@@ -199,9 +214,7 @@ impl LmtpClient {
         }
 
         // LMTP 打招呼用 LHLO（不是 EHLO）。
-        let (lhlo_code, lhlo_text) = self
-            .command(&mut io, &format!("LHLO {}", self.helo_name))
-            .await?;
+        let (lhlo_code, lhlo_text) = self.command(&mut io, &format!("LHLO {helo}")).await?;
         if !is_positive(lhlo_code) {
             return Err(StoreError::Lmtp(format!(
                 "LHLO rejected: {lhlo_code} {lhlo_text}"
@@ -690,6 +703,43 @@ mod tests {
             error.to_string().contains("CR, LF or NUL"),
             "发件人注入必须在入口被拒绝：{error}"
         );
+    }
+
+    /// `LHLO` 的参数同样直接拼进协议行：CR/LF/NUL 必须在任何 I/O 之前被拒绝
+    /// （R2-010：原先只守了信封地址，`helo_name` 是唯一漏网的拼接点）。
+    #[tokio::test]
+    async fn helo_names_with_crlf_or_nul_are_rejected_before_any_io() {
+        // 同一条「连上必失败」的端点：若守卫未生效，错误会是连接错误而不是注入拒绝。
+        let client = LmtpClient::new(
+            LmtpEndpoint::Tcp("127.0.0.1".to_string(), 1),
+            "mail.example.org\r\nRCPT TO:<victim@x>",
+            Duration::from_millis(200),
+        );
+        let error = client
+            .deliver("s@example.org", &["r@example.org".to_string()], "body")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("CR, LF or NUL"),
+            "LHLO 注入必须在入口被拒绝：{error}"
+        );
+
+        // NUL 与空名字同样拒绝；带空白的参数不是合法主机名（会拼出额外参数）。
+        for bad in ["mail.example.org\0", "", "  ", "mail example.org"] {
+            let client = LmtpClient::new(
+                LmtpEndpoint::Tcp("127.0.0.1".to_string(), 1),
+                bad,
+                Duration::from_millis(200),
+            );
+            let error = client
+                .deliver("s@example.org", &["r@example.org".to_string()], "body")
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("LHLO name"),
+                "{bad:?} 必须在入口被拒绝：{error}"
+            );
+        }
     }
 
     /// 超长且不出换行的应答必须按协议错误断开，而不是无界吃内存

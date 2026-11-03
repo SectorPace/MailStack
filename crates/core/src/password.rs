@@ -254,10 +254,12 @@ pub fn verify_password(record: &PasswordRecord, password: &str) -> bool {
     if expected.len() != HASH_LEN || salt.len() != SALT_LEN {
         return false;
     }
+    // 夹在 [PBKDF2_ITERATIONS, MAX_PBKDF2_ITERATIONS] 之间。
+    // 用 `clamp` 而不是链式 max/min：两个常量在编译期就满足下界 < 上界，
+    // 不会触发 clamp 的 panic 分支，且把「两个界」放在一处，避免有人只改一半。
     let iterations = record
         .iterations
-        .max(PBKDF2_ITERATIONS)
-        .min(MAX_PBKDF2_ITERATIONS);
+        .clamp(PBKDF2_ITERATIONS, MAX_PBKDF2_ITERATIONS);
     let actual = pbkdf2_sha256(password.as_bytes(), &salt, iterations, expected.len());
     constant_time_eq(&actual, &expected)
 }

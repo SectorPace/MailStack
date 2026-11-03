@@ -163,6 +163,23 @@ pub enum Action {
     },
 }
 
+/// 会话所属监听的角色 —— 决定收下的邮件走哪一套语义。
+///
+/// ## 为什么必须由**会话**告诉 sink，而不是让 sink 自己猜
+///
+/// 同一个进程里三个端口共用一份队列写入逻辑，但 25 与 465/587 的信任模型完全
+/// 不同：25 的对端是任意外部 MTA（必须做 SPF/DKIM/DMARC 入站判定），465/587 的
+/// 对端是**本机自己的用户**（已认证的外发提交，不能按「陌生对端」判）。
+/// 把这个区分做成消息字段而不是让 sink 从端口/认证状态反推，是为了不再出现
+/// 「提交邮件被自家 DMARC 判死」这类跨端口语义串线（R3-001）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRole {
+    /// MX 收信口（25）：入站语义。
+    Mx,
+    /// 提交口（465/587）：用户外发语义。
+    Submission,
+}
+
 /// 一封被接受的邮件（交给投递方）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedMessage {
@@ -173,6 +190,12 @@ pub struct AcceptedMessage {
     pub data: Vec<u8>,
     /// 对端在 HELO/EHLO 里声明的名字（SPF 的 `%{h}` 与日志都需要）。
     pub helo: String,
+    /// 会话角色（见 [`SessionRole`]）。sink 依据它决定是否做入站认证判定。
+    pub role: SessionRole,
+    /// 会话是否已通过 SASL 认证（仅提交口可能为真）。
+    pub authenticated: bool,
+    /// 会话是否运行在 TLS 之上（决定 `Received:` 的 `with ESMTP`/`ESMTP(S)`）。
+    pub secured: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +228,12 @@ pub struct Session<'a> {
     /// 正在进行的 SASL 交换所等待的机制；`None` 表示没有交换在进行。
     pending_auth: Option<String>,
     tls_active: bool,
+    /// 本会话属于 MX 收信口还是提交口（见 [`SessionRole`]）。
+    ///
+    /// 由装配层给出的 `offer_auth` / `require_auth_for_submission` 推导：
+    /// 只有 465/587 会通告 AUTH 或强制提交认证，25 两者都不置位。
+    /// 推导放在构造期而不是每条命令里，保证整条会话的角色不会中途改变。
+    role: SessionRole,
 }
 
 impl<'a> Session<'a> {
@@ -219,6 +248,13 @@ impl<'a> Session<'a> {
         recipients: &'a dyn RecipientChecker,
     ) -> Self {
         let tls_active = config.tls_active;
+        // 角色由装配层的端口策略推导（见字段说明）。派生时**同时**看两个标志：
+        // 465 只通告 AUTH、587 两者都有；25 两者都不置位。
+        let role = if config.offer_auth || config.require_auth_for_submission {
+            SessionRole::Submission
+        } else {
+            SessionRole::Mx
+        };
         Self {
             config,
             relay,
@@ -232,6 +268,7 @@ impl<'a> Session<'a> {
             auth_user: None,
             pending_auth: None,
             tls_active,
+            role,
         }
     }
 
@@ -255,6 +292,11 @@ impl<'a> Session<'a> {
 
     pub fn is_tls_active(&self) -> bool {
         self.tls_active
+    }
+
+    /// 本会话所属监听的角色（MX 收信口 / 提交口）。
+    pub fn role(&self) -> SessionRole {
+        self.role
     }
 
     pub fn helo(&self) -> Option<&str> {
@@ -363,6 +405,26 @@ impl<'a> Session<'a> {
                 texts::SUBMISSION_AUTH_REQUIRED,
             ));
         }
+        // 提交口发件人归属（R3-003）：已认证会话只能以自己的身份发信。
+        //
+        // 在此之前，任意一个普通账号都能用 `MAIL FROM:<ceo@本域>` 提交，队列再按
+        // 头部 `From:` 域用本域 DKIM 私钥签名 —— 外部收件方看到的就是一封
+        // 「DKIM 通过且与 From 对齐」的、密码学上真实的伪造信。反中继只判断
+        // 「已认证 ⇒ 可外发」，它管不了**以谁的名义**外发。
+        //
+        // 判定放在 530 之后、写入状态之前：未认证的提交由 530 负责（策略开关），
+        // 这里只处理「有身份却用了别人的发件人」。
+        if self.role == SessionRole::Submission {
+            if let Some(user) = self.auth_user.as_deref() {
+                if !sender_owned_by(user, &from) {
+                    return Action::Reply(Reply::with_enhanced(
+                        550,
+                        "5.7.1",
+                        texts::SENDER_NOT_OWNED,
+                    ));
+                }
+            }
+        }
         self.mail_from = Some(from);
         self.recipients.clear();
         self.phase = Phase::Mail;
@@ -374,32 +436,44 @@ impl<'a> Session<'a> {
             return Action::Reply(Reply::with_enhanced(503, "5.5.1", texts::SEQUENCE));
         }
 
-        // `<postmaster>` 没有域，按 RFC 5321 §4.1.1.3 必须接受 —— 但补哪个域是
-        // **本机策略**，不是猜测。没有配置就明确拒绝。
+        // 重复收件人在**任何查名录/查策略之前**就短路（R3-008）：
+        // 去重此前发生在 `accept_recipient`，晚于 `directory.exists()` —— 于是
+        // 同一条连接连发 100 个相同 RCPT 就等于 100 次同步文件读 + JSON 解析。
+        // 这里提前返回 250 与最终应答完全一致（RFC 5321 允许重复收件人）。
+        if self.recipients.iter().any(|existing| existing == &to) {
+            return Action::Reply(Reply::with_enhanced(250, "2.1.5", texts::RCPT_OK));
+        }
+
+        // `postmaster`（无域）与 `postmaster@<任一纳管网域>` 都是 RFC 5321
+        // §4.1.1.3 要求必须接受的保留地址 —— 它们映射到 `SessionConfig::postmaster`
+        // 这条**运维策略值**，不保证是一个注册邮箱。让名录去判它会把
+        // 「按 RFC 必须接受的保留地址」变成 550（Abuse 报告、DSN 都往这里发）。
+        //
         // 大小写不敏感：RFC 规定 <POSTMASTER>（任意大小写）与 <postmaster> 等价，
         // 精确等值比较会把合规客户端的保留地址投递拒成 550。
-        let to = if to.eq_ignore_ascii_case("postmaster") {
-            match &self.config.postmaster {
+        //
+        // `postmaster@<外域>` **不**走这里：它要么是未认证会话的转发（反中继会拒），
+        // 要么是已认证会话的合法外发 —— 两种都不是本机的保留地址。
+        let reserved_postmaster = match to.rsplit_once('@') {
+            Some((local, domain)) => {
+                local.eq_ignore_ascii_case("postmaster") && self.relay.is_managed(domain)
+            }
+            None => to.eq_ignore_ascii_case("postmaster"),
+        };
+        if reserved_postmaster {
+            return match &self.config.postmaster {
+                // 显式接受，**不查收件人名录**：见上。
                 Some(address) => {
                     let address = address.clone();
-                    // 显式接受，**不查收件人名录**：这个地址是运维在
-                    // `SessionConfig::postmaster` 里配的策略值，不保证是一个
-                    // 注册邮箱。让名录去判它会把「按 RFC 必须接受的保留地址」
-                    // 变成 550 —— 而这条路径本来就是规范强制的兜底入口
-                    //（Abuse 报告、DSN 都往这里发）。
-                    return self.accept_recipient(address);
+                    self.accept_recipient(address)
                 }
-                None => {
-                    return Action::Reply(Reply::with_enhanced(
-                        550,
-                        "5.1.1",
-                        "postmaster address is not configured on this host",
-                    ))
-                }
-            }
-        } else {
-            to
-        };
+                None => Action::Reply(Reply::with_enhanced(
+                    550,
+                    "5.1.1",
+                    "postmaster address is not configured on this host",
+                )),
+            };
+        }
 
         if self.recipients.len() >= self.config.max_recipients {
             return Action::Reply(Reply::with_enhanced(
@@ -514,6 +588,9 @@ impl<'a> Session<'a> {
                 recipients,
                 data,
                 helo: helo.unwrap_or_default(),
+                role: self.role,
+                authenticated: self.authenticated,
+                secured: self.tls_active,
             }),
         )
     }
@@ -663,6 +740,41 @@ impl<'a> Session<'a> {
             self.phase = Phase::Greeted;
         }
     }
+}
+
+/// 提交口的信封发件人是否属于已认证身份（R3-003）。
+///
+/// 放行的形态只有三类：
+///
+/// 1. **null sender**（`<>`）：DSN/退信没有身份可冒用，且认证会话也可能是
+///    自动化投递的发起方；拦掉它只会让退信发不出去。
+/// 2. 与认证身份**完全相同**的地址（大小写不敏感 —— 账号名在本项目里一律小写）。
+/// 3. 认证身份是**裸账号名**（`alice`，unix 风格登录）时，允许 `alice@<任意域>`：
+///    口令库两种键都可能存在（`candidate_keys`），而「alice 用自己名字的信箱
+///    发信」是同一个主体，不是冒用。
+///
+/// 明确**不**放行：同名不同人（`alice@example.org` 认证后发
+/// `alice@other.example`）、别人的地址（`ceo@example.org`）、以及任何需要查外部
+/// 别名表的形态。别名归属需要读别名表的目标列，装配层目前没有把这份数据交给
+/// 会话；在拿到之前按**更严格**的一侧失败关闭 —— 宁可让运维给别名单独开账号，
+/// 也不能让一个普通账号以任意本域地址外发。
+fn sender_owned_by(authenticated_user: &str, mail_from: &str) -> bool {
+    if mail_from.is_empty() {
+        return true;
+    }
+    let user = authenticated_user.trim().to_ascii_lowercase();
+    if user.is_empty() {
+        return false;
+    }
+    let from = mail_from.trim().to_ascii_lowercase();
+    if from == user {
+        return true;
+    }
+    if !user.contains('@') {
+        let local = from.rsplit_once('@').map_or(from.as_str(), |(l, _)| l);
+        return local == user;
+    }
+    false
 }
 
 impl std::fmt::Debug for Session<'_> {
@@ -1332,10 +1444,7 @@ mod tests {
         assert_eq!(reply.code, 530, "未认证的提交必须被 530 拒绝");
         assert_eq!(reply.enhanced, Some("5.7.0"));
         assert!(reply.first_line().contains("Authentication required"));
-        assert!(
-            session.mail_from().is_none(),
-            "被拒的事务不得置位发件人"
-        );
+        assert!(session.mail_from().is_none(), "被拒的事务不得置位发件人");
         // 会话没有错位：认证之后同一状态机可以正常开事务（见下一用例）。
     }
 
@@ -1375,6 +1484,102 @@ mod tests {
         assert!(
             matches!(action, Action::Reply(ref reply) if reply.code == 250),
             "默认配置下未认证 MAIL 必须照旧接受：{action:?}"
+        );
+    }
+
+    // ───────────────── 提交口发件人归属（R3-003）─────────────────
+
+    /// 认证成 `user` 的提交会话。
+    fn authenticated_submission(user: &str) -> Session<'static> {
+        let mut session = submission_session();
+        let _ = session.handle(Command::Ehlo("c.test".into()));
+        let _ = session.handle(auth_plain(Some("AGJvYg==")));
+        let reply = session.complete_auth(AuthOutcome::Success {
+            user: user.to_string(),
+        });
+        assert_eq!(reply.code, 235);
+        session
+    }
+
+    /// 反例守卫：认证 alice 后用 `ceo@example.org` 作信封发件人必须 550。
+    ///
+    /// 修复前这条 MAIL 是 250：反中继只判断「已认证 ⇒ 可外发」，队列再按头部
+    /// `From:` 域用本域 DKIM 私钥签名，外部收件方看到的是「DKIM 通过且对齐」的
+    /// 伪造信 —— 一个普通账号就能冒充本域任何地址。
+    #[test]
+    fn an_authenticated_submission_may_not_use_another_senders_address() {
+        let mut session = authenticated_submission("alice@example.org");
+        let Action::Reply(reply) = session.handle(Command::Mail {
+            from: "ceo@example.org".into(),
+            params: MailParams::default(),
+        }) else {
+            panic!("应回应答");
+        };
+        assert_eq!(reply.code, 550, "冒用他人发件人必须被拒绝：{reply:?}");
+        assert_eq!(reply.enhanced, Some("5.7.1"));
+        assert!(session.mail_from().is_none(), "被拒的事务不得置位发件人");
+
+        // 用**自己**的地址则照常通过（反例与正例在同一条会话上）。
+        let action = session.handle(Command::Mail {
+            from: "alice@example.org".into(),
+            params: MailParams::default(),
+        });
+        assert!(
+            matches!(action, Action::Reply(ref reply) if reply.code == 250),
+            "认证身份自己的地址必须放行：{action:?}"
+        );
+    }
+
+    /// 裸账号名（unix 风格登录名）允许其对应的 `name@domain` 形式。
+    #[test]
+    fn a_bare_account_name_may_send_from_its_own_address() {
+        let mut session = authenticated_submission("alice");
+        let action = session.handle(Command::Mail {
+            from: "alice@example.org".into(),
+            params: MailParams::default(),
+        });
+        assert!(
+            matches!(action, Action::Reply(ref reply) if reply.code == 250),
+            "alice 用 alice@example.org 发信是同一主体：{action:?}"
+        );
+
+        let mut session = authenticated_submission("alice");
+        let Action::Reply(reply) = session.handle(Command::Mail {
+            from: "bob@example.org".into(),
+            params: MailParams::default(),
+        }) else {
+            panic!("应回应答");
+        };
+        assert_eq!(reply.code, 550, "裸账号名也不得冒用别人的地址");
+    }
+
+    /// null sender（`<>`）没有身份可冒用，认证会话的退信必须能发出。
+    #[test]
+    fn the_null_sender_is_allowed_from_an_authenticated_submission() {
+        let mut session = authenticated_submission("alice@example.org");
+        let action = session.handle(Command::Mail {
+            from: String::new(),
+            params: MailParams::default(),
+        });
+        assert!(
+            matches!(action, Action::Reply(ref reply) if reply.code == 250),
+            "null sender 不得被发件人归属校验拦下：{action:?}"
+        );
+    }
+
+    /// 回归守卫：MX 收信口（25）不做发件人归属校验 —— 对端是外部 MTA，
+    /// 信封发件人本来就可以是任意域。
+    #[test]
+    fn an_mx_session_is_not_subject_to_sender_ownership() {
+        let mut session = session(&["example.org"]);
+        let _ = session.handle(Command::Ehlo("c.test".into()));
+        let action = session.handle(Command::Mail {
+            from: "ceo@example.org".into(),
+            params: MailParams::default(),
+        });
+        assert!(
+            matches!(action, Action::Reply(ref reply) if reply.code == 250),
+            "25 端口不得出现提交口语义：{action:?}"
         );
     }
 
@@ -1486,6 +1691,35 @@ mod tests {
         };
         assert!(reply.is_positive_completion(), "{reply:?}");
         assert_eq!(session.recipients(), &["alice@example.org".to_string()]);
+    }
+
+    /// R3-008：重复收件人必须在**查名录之前**短路。
+    ///
+    /// 名录查询是同步文件读 + JSON 解析（每条 RCPT 两次）。未认证攻击者只要
+    /// `EHLO` + `MAIL` 后连发 100 个相同 `RCPT`，原实现就产生 200 次文件读；
+    /// 修复后同一地址只该查一次。
+    #[test]
+    fn repeated_recipients_are_deduplicated_before_any_directory_lookup() {
+        let directory = FakeDirectory::knowing(&["alice@example.org"]);
+        let mut session = session_with_directory(&["example.org"], &directory);
+        opened(&mut session, "a@remote.test");
+
+        for _ in 0..100 {
+            let action = session.handle(Command::Rcpt {
+                to: "alice@example.org".into(),
+            });
+            assert!(
+                matches!(action, Action::Reply(ref reply) if reply.is_positive_completion()),
+                "重复收件人应答必须与首次一致：{action:?}"
+            );
+        }
+        assert_eq!(session.recipients(), &["alice@example.org".to_string()]);
+        assert_eq!(
+            directory.queried().len(),
+            1,
+            "同一地址 100 次 RCPT 只应查一次名录，实际 {:?}",
+            directory.queried()
+        );
     }
 
     /// 反例守卫：**远程域不去查本地名录**，反中继规则照旧。
@@ -1699,5 +1933,54 @@ mod tests {
             "postmaster 不该查名录（实际查了 {:?}）",
             directory.queried()
         );
+    }
+
+    /// R3-012：`postmaster@<本机纳管网域>` 同样是不受名录约束的保留地址。
+    ///
+    /// 修复前只有裸 `postmaster` 被特判；`postmaster@example.org` 会走名录，
+    /// 而名录里通常没有这个地址（配置项只是「裸 postmaster 映射到的地址」）→ 550。
+    /// Abuse 报告与 DSN 惯用带域形式，被拒会直接影响滥用处置与退信可达性。
+    #[test]
+    fn postmaster_at_a_managed_domain_is_reserved_too() {
+        let directory = FakeDirectory::knowing(&["alice@example.org"]);
+        let mut session = session_with_directory(&["example.org"], &directory);
+        opened(&mut session, "a@remote.test");
+
+        // 大小写不敏感（RFC 5321 §4.5.1）。
+        let Action::Reply(reply) = session.handle(Command::Rcpt {
+            to: "PostMaster@Example.ORG".into(),
+        }) else {
+            panic!("应回应答");
+        };
+        assert!(
+            reply.is_positive_completion(),
+            "postmaster@纳管网域必须接受：{reply:?}"
+        );
+        assert_eq!(
+            session.recipients(),
+            &["postmaster@example.org".to_string()],
+            "必须映射到配置的 postmaster 地址"
+        );
+        assert!(
+            directory.queried().is_empty(),
+            "保留地址不得查名录（实际查了 {:?}）",
+            directory.queried()
+        );
+    }
+
+    /// `postmaster@<外域>` 不是本机保留地址：未认证会话照旧按反中继拒绝。
+    #[test]
+    fn postmaster_at_a_foreign_domain_is_not_reserved() {
+        let directory = FakeDirectory::knowing(&["alice@example.org"]);
+        let mut session = session_with_directory(&["example.org"], &directory);
+        opened(&mut session, "a@remote.test");
+
+        let Action::Reply(reply) = session.handle(Command::Rcpt {
+            to: "postmaster@evil.test".into(),
+        }) else {
+            panic!("应回应答");
+        };
+        assert_eq!(reply.code, 554, "外域 postmaster 必须按反中继拒");
+        assert!(session.recipients().is_empty());
     }
 }

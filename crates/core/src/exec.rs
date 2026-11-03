@@ -249,7 +249,15 @@ fn find_in_path(program: &str, path: &OsStr) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-fn resolve_program_for_execution(program: &str) -> CoreResult<String> {
+/// 解析**可执行**路径：只返回通过可信检查（属主 / 权限位 / 目录链）的程序。
+///
+/// 与 [`resolve_program`] 的区别：那个是「展示/兼容用」的宽松版本（找不到就原样
+/// 返回程序名）；本函数是**执行前**的唯一入口 —— 解析不出来就报错，绝不把裸名
+/// 交回给调用方（`Command::new("gpg")` 会让内核按 `PATH` 搜索，等于绕开全部检查）。
+///
+/// 公开它是因为特权路径上还有别的执行点（如 `backup::GpgCipher` 直接调 gpg），
+/// 它们必须复用同一条解析链，而不是各写一份。
+pub fn resolve_program_for_execution(program: &str) -> CoreResult<String> {
     let path = if program.contains('/') {
         PathBuf::from(program)
     } else {
@@ -336,6 +344,15 @@ pub enum ServiceVerb {
 }
 
 const SERVICE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 表文件同步序列（`postmap` / `postfix check`）的单步超时。
+///
+/// 这两步跑在 `store` 的 `locked()` 临界区内（flock 是**跨进程**的），而
+/// `postmap` 是外部二进制：它可能卡在 Berkeley DB 锁、网络文件系统、或一个挂死
+/// 的 `postfix` 上。没有超时的话，一次卡死会让此后所有 `domains.add/delete`
+/// 永久阻塞 —— 特权助手没有请求级超时，客户端超时只是让调用方看到失败，锁不会
+/// 释放。取 60s：正常表在毫秒级完成，再慢也远不到一分钟的量级。
+pub const POSTMAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl ServiceVerb {
     pub fn as_str(&self) -> &'static str {
@@ -614,11 +631,9 @@ pub fn is_service_active(env: &dyn ServiceEnv, runner: &dyn CommandRunner, unit:
         {
             return true;
         }
-        if let Ok(out) = runner.run_with_timeout(
-            "fail2ban-client",
-            &["ping"],
-            SERVICE_COMMAND_TIMEOUT,
-        ) {
+        if let Ok(out) =
+            runner.run_with_timeout("fail2ban-client", &["ping"], SERVICE_COMMAND_TIMEOUT)
+        {
             if out.success() && out.stdout.to_lowercase().contains("pong") {
                 return true;
             }
@@ -641,6 +656,13 @@ pub struct PostmapOutcome {
     pub check_ok: bool,
     /// 重载 Postfix 是否成功。
     pub reload_ok: bool,
+    /// 本机**没有安装 Postfix**（`postmap` 可执行文件不存在）。
+    ///
+    /// 这不是失败：MailStack 是 Postfix 的替代品，表文件由 MailStack 自己按文本读取，
+    /// 只有「Postfix 仍在跑、需要重新编译 hash 表」时这一步才有意义。
+    /// 把「没装 Postfix」判成失败，会让管理台在**纯 MailStack 主机**上加域名/加别名
+    /// 一律报错 —— 而那正是 v1.0.0 的目标部署形态。
+    pub postfix_absent: bool,
 }
 
 /// 把表文件编译成 Postfix 的 hash 数据库，并让 Postfix 重读配置
@@ -661,7 +683,33 @@ pub fn postmap_and_reload(
 ) -> PostmapOutcome {
     let table_str = table.to_string_lossy().to_string();
 
-    let postmap_ok = match runner.run("postmap", &[table_str.as_str()]) {
+    // 「找不到 postmap 可执行文件」= 本机没有 Postfix，而不是这一步失败。
+    //
+    // 必须与「postmap 存在但执行失败」严格区分：
+    //   * 不存在 → 没有 Postfix 在消费 hash 表，跳过整条同步序列是正确行为；
+    //   * 存在但失败/db 编译失败 → 调用方必须知道（Postfix 可能还在读旧表）。
+    // 只看 `CoreError::NotFound`，不看错误文案 —— 文案是给人看的，判定必须基于类型。
+    // 超时是必须的：这一整段跑在 `store` 的跨进程 `locked()` 临界区里，
+    // 卡住的 `postmap` 会把之后所有域表操作一起拖死（见 `POSTMAP_TIMEOUT`）。
+    let postmap_result = runner.run_with_timeout("postmap", &[table_str.as_str()], POSTMAP_TIMEOUT);
+    if matches!(postmap_result, Err(CoreError::NotFound(_))) {
+        crate::warn::warn_with_detail(
+            "postmap",
+            &format!(
+                "Postfix 未安装（找不到 postmap），跳过 {} 的 hash 表同步；\
+                 MailStack 直接读取文本表，无需 Postfix 侧动作",
+                table.display()
+            ),
+        );
+        return PostmapOutcome {
+            postmap_ok: true,
+            check_ok: true,
+            reload_ok: true,
+            postfix_absent: true,
+        };
+    }
+
+    let postmap_ok = match postmap_result {
         Ok(out) => {
             if !out.success() {
                 crate::warn::warn_with_detail("postmap", &out.diagnostic("postmap"));
@@ -674,7 +722,7 @@ pub fn postmap_and_reload(
         }
     };
 
-    let check_ok = match runner.run("postfix", &["check"]) {
+    let check_ok = match runner.run_with_timeout("postfix", &["check"], POSTMAP_TIMEOUT) {
         Ok(out) => {
             if !out.success() {
                 crate::warn::warn_with_detail("postfix check", &out.diagnostic("postfix check"));
@@ -698,6 +746,7 @@ pub fn postmap_and_reload(
         postmap_ok,
         check_ok,
         reload_ok: reload.success(),
+        postfix_absent: false,
     }
 }
 
@@ -944,9 +993,79 @@ mod tests {
             PostmapOutcome {
                 postmap_ok: true,
                 check_ok: true,
-                reload_ok: true
+                reload_ok: true,
+                postfix_absent: false
             }
         );
+    }
+
+    /// 反例守卫：`postmap` / `postfix check` 必须在**有界超时**下执行。
+    ///
+    /// 回归背景：这两步跑在 `store::tables` 的跨进程 `locked()` 临界区里，用的却是
+    /// 无超时的 `run()`。一个卡在 Berkeley DB 锁 / 网络文件系统 / 挂死的 `postfix`
+    /// 上的 `postmap` 会让之后所有 `domains.add/delete` **永久阻塞**（flock 不会因为
+    /// 调用方超时而释放）。这条测试断言两步都走 `run_with_timeout`，且超时值有界。
+    #[test]
+    fn the_postmap_sequence_is_bounded_by_a_timeout() {
+        let runner = RecordingRunner::new();
+        let env = FakeEnv::postfix_only();
+        let outcome =
+            postmap_and_reload(&env, &runner, Path::new("/etc/postfix/mailstack_domains"));
+
+        assert!(outcome.postmap_ok && outcome.check_ok);
+        let observed = runner.timeouts.lock().unwrap().clone();
+        assert!(
+            observed
+                .iter()
+                .any(|(program, timeout)| program == "postmap" && *timeout == POSTMAP_TIMEOUT),
+            "postmap 必须带超时执行，实际见过: {observed:?}"
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|(program, timeout)| program == "postfix" && *timeout == POSTMAP_TIMEOUT),
+            "postfix check 必须带超时执行，实际见过: {observed:?}"
+        );
+    }
+
+    /// 本机没有 Postfix（找不到 `postmap`）时，整条同步序列必须被视为「无需同步」，
+    /// 而不是「同步失败」。
+    ///
+    /// 回归背景：v1.0.0 的纯 MailStack 主机（Postfix 已移除）上，`domains.add` /
+    /// `aliases.add` 会把「没有 postmap 可执行文件」判成 Postfix 更新失败并让整个
+    /// 动作报错 —— 新装的服务器上第一次加域名就会失败。
+    #[test]
+    fn missing_postmap_means_postfix_is_absent_not_a_failure() {
+        struct NoPostfix;
+        impl CommandRunner for NoPostfix {
+            fn run(&self, program: &str, _args: &[&str]) -> CoreResult<CommandOutput> {
+                Err(CoreError::NotFound(PathBuf::from(program)))
+            }
+
+            // 同步序列现在走**带超时**的入口：替身必须把同一语义透传下去，
+            // 否则默认实现会返回 `Invalid`（"未实现超时"），
+            // 「找不到 postmap」就再也识别不出来（会被当成同步失败）。
+            fn run_with_timeout(
+                &self,
+                program: &str,
+                args: &[&str],
+                _timeout: std::time::Duration,
+            ) -> CoreResult<CommandOutput> {
+                self.run(program, args)
+            }
+        }
+
+        let env = FakeEnv::with(&[], &[]);
+        let outcome = postmap_and_reload(
+            &env,
+            &NoPostfix,
+            Path::new("/etc/postfix/mailstack_domains"),
+        );
+
+        assert!(outcome.postfix_absent, "必须识别出 Postfix 未安装");
+        assert!(outcome.postmap_ok, "没有 Postfix 时这不叫失败");
+        assert!(outcome.check_ok);
+        assert!(outcome.reload_ok);
     }
 
     #[test]

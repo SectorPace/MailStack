@@ -72,6 +72,35 @@ fn temp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.tmp.{}.{seq}.{nanos}", std::process::id()))
 }
 
+// 测试观测点：临时文件已创建、**第一字节尚未写入**时回调。
+//
+// 用 `thread_local` 而不是全局 `Mutex<Option<Box<dyn Fn>>>`：这样的闭包既不是
+// `Send` 也不是 `Sync`，全局静态放不进去；而测试天然是一线程一个用例，线程局部
+// 已经足够，还顺带避免了并行用例互相干扰（CI 的 `--test-threads` 默认 > 1）。
+#[cfg(test)]
+type TempCreatedHook = Option<Box<dyn Fn(&Path)>>;
+
+#[cfg(test)]
+thread_local! {
+    static ON_TEMP_CREATED: std::cell::RefCell<TempCreatedHook> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn notify_temp_created(path: &Path) {
+    ON_TEMP_CREATED.with(|hook| {
+        // 先取出引用再调用：回调里若再调 `atomic` 也只是读这个 thread_local，
+        // 不会与 `borrow` 冲突（回调只允许读元数据，不允许重入写）。
+        let borrowed = hook.borrow();
+        if let Some(callback) = borrowed.as_ref() {
+            callback(path);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn notify_temp_created(_path: &Path) {}
+
 /// 原子写入 `data` 到 `path`，权限 `mode` 在 **首字节落盘之前**就已确定（INV-33）。
 ///
 /// 步骤与 `core.py:621-662` 逐条对应：
@@ -143,6 +172,13 @@ pub fn atomic_as(path: &Path, data: &[u8], mode: u32, group: Option<&str>) -> Co
                 .open(&tmp)
                 .map_err(|e| CoreError::io(&tmp, e))?
         };
+        // INV-33 的观测点：`create(2)` 已返回、**还没写第一个字节**。
+        //
+        // 守卫测试 `atomic_applies_mode_before_the_first_byte_lands` 在这里读临时
+        // 文件的权限。若实现退回「`File::create`（0666 & ~umask）→ 写 → chmod」，
+        // 此处读到的是 0644（root 常见 umask 022）—— 测试随即变红。只断言
+        // 「rename 后的最终 mode」的旧测试对这类回退**完全没有**分辨力。
+        notify_temp_created(&tmp);
         f.write_all(data).map_err(|e| CoreError::io(&tmp, e))?;
         f.flush().map_err(|e| CoreError::io(&tmp, e))?;
         f.sync_all().map_err(|e| CoreError::io(&tmp, e))?;
@@ -264,26 +300,44 @@ fn chown_group_best_effort(path: &Path, group: &str) {
 fn chown_group_best_effort(_path: &Path, _group: &str) {}
 
 /// 通过 NSS 解析组名到 gid（等价 `grp.getgrnam`）。
+///
+/// `getgrnam_r` 在调用方缓冲区装不下成员列表时返回 `ERANGE`（POSIX 定义的行为）。
+/// 原实现把 `ERANGE` 与「组不存在」一样折成 `None`，于是
+/// `atomic_as(..., Some(ADMIN_GROUP))` **静默跳过 chown**：`admin.json` 落成
+/// `0640 root:root`，靠组权限读凭据的管理台从此读不到它 —— 表现是「口令/2FA 都
+/// 正确但控制台说未配置」，排障方向被完全带偏。方向是 fail-closed（不会放宽权限），
+/// 但契约被静默改变了。这里按 POSIX 的用法**倍增缓冲重试**（上限 1 MiB）；
+/// 只有真正的「没这个组」才返回 `None`。
 #[cfg(unix)]
 pub fn gid_by_name(name: &str) -> Option<u32> {
+    /// 组行里成员列表的合理上限（远超真实系统的 `/etc/group` 行长）。
+    const MAX_BUFFER: usize = 1024 * 1024;
+
     use std::ffi::CString;
     let cname = CString::new(name).ok()?;
-    let mut grp: libc::group = unsafe { std::mem::zeroed() };
-    let mut result: *mut libc::group = std::ptr::null_mut();
-    let mut buf = vec![0 as libc::c_char; 4096];
-    let rc = unsafe {
-        libc::getgrnam_r(
-            cname.as_ptr(),
-            &mut grp,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &mut result,
-        )
-    };
-    if rc == 0 && !result.is_null() {
-        Some(grp.gr_gid)
-    } else {
-        None
+    let mut size = 4096usize;
+    loop {
+        let mut grp: libc::group = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        let mut buf = vec![0 as libc::c_char; size];
+        let rc = unsafe {
+            libc::getgrnam_r(
+                cname.as_ptr(),
+                &mut grp,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == 0 {
+            return (!result.is_null()).then_some(grp.gr_gid);
+        }
+        if rc == libc::ERANGE && size < MAX_BUFFER {
+            // 缓冲区不够：翻倍重试，而不是假装「组不存在」。
+            size = (size * 2).min(MAX_BUFFER);
+            continue;
+        }
+        return None;
     }
 }
 
@@ -430,10 +484,125 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.ends_with(".tmp"))
+            // 临时文件名是 `<name>.tmp.<pid>.<seq>.<nanos>`，旧断言用的
+            // `ends_with(".tmp")` 永远匹配不上 —— 空断言，等于没测。
+            .filter(|n| n.contains(".tmp."))
             .collect();
         assert!(leftovers.is_empty(), "不得残留临时文件: {leftovers:?}");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 在一次 `atomic_as` 期间观察「临时文件已创建、首字节未写」的那一刻。
+    ///
+    /// 用 `Rc<RefCell<_>>` 而不是 channel：回调在调用线程上同步执行。
+    #[cfg(test)]
+    struct TempHookGuard;
+
+    #[cfg(test)]
+    impl Drop for TempHookGuard {
+        fn drop(&mut self) {
+            ON_TEMP_CREATED.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(test)]
+    fn observe_temp_creation<F: Fn(&Path) + 'static>(callback: F) -> TempHookGuard {
+        ON_TEMP_CREATED.with(|hook| *hook.borrow_mut() = Some(Box::new(callback)));
+        TempHookGuard
+    }
+
+    /// INV-33 的**真正**守卫：权限必须在**第一字节落盘之前**就生效。
+    ///
+    /// 旧测试 `atomic_applies_mode_before_rename` 只断言 rename 之后的最终 mode ——
+    /// 把实现退回「`File::create`（0666 & ~umask，root 常见 0644）→ 写完整机密 →
+    /// fsync → `set_mode(0600)`」，它**照样全绿**，而那正是 `admin.json`（口令哈希）、
+    /// `totp.key`（AES 主密钥）、TLS 私钥在全系统可读窗口里躺着的那段时间。
+    ///
+    /// 用 inotify 守着目录能稳定命中那个窗口；本测试把同一个观测点做成了
+    /// `#[cfg(test)]` 回调，在这个窗口里读临时文件的权限。
+    #[cfg(unix)]
+    #[test]
+    fn atomic_applies_mode_before_the_first_byte_lands() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::PermissionsExt;
+        use std::rc::Rc;
+
+        let dir = temp_dir("first-byte");
+        let target = dir.join("admin.json");
+        let observed: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+        let sink = Rc::clone(&observed);
+        let calls = Rc::new(RefCell::new(0usize));
+        let counter = Rc::clone(&calls);
+
+        let _hook = observe_temp_creation(move |tmp: &Path| {
+            *counter.borrow_mut() += 1;
+            let mode = fs::metadata(tmp)
+                .expect("回调触发时临时文件必须已经存在")
+                .permissions()
+                .mode()
+                & 0o777;
+            *sink.borrow_mut() = Some(mode);
+        });
+
+        atomic_as(&target, b"{\"password\":\"topsecret\"}", 0o600, None).unwrap();
+
+        assert_eq!(*calls.borrow(), 1, "每次写入必须恰好观察到一个临时文件");
+        assert_eq!(
+            *observed.borrow(),
+            Some(0o600),
+            "INV-33：mode 必须在首字节落盘之前就是 0600；\
+             读到 0644 说明实现退回了「先写后 chmod」"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 失败路径守卫：`rename` 失败时不得把机密临时文件留在盘上。
+    ///
+    /// 目标路径是一个**非空目录**，`rename(2)` 必然失败（EISDIR/ENOTDIR）。
+    /// 旧实现只在成功路径上 rename，失败时临时文件（内容完整、权限正确，
+    /// 但仍是明文机密）长期留在目录里。
+    #[test]
+    fn a_failed_rename_leaves_no_temp_file() {
+        let dir = temp_dir("failed-rename");
+        let target = dir.join("victim");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("blocker"), b"x").unwrap();
+
+        let error =
+            atomic_as(&target, b"topsecret", 0o600, None).expect_err("rename 到非空目录不可能成功");
+        assert!(matches!(error, CoreError::Io { .. }), "{error:?}");
+
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("victim.tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "失败的写入不得在盘上留一份机密副本: {leftovers:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 临时路径必须每次调用都不同，否则并发写者会互相覆盖出半写文件。
+    #[test]
+    fn temp_paths_are_unique_per_call() {
+        let target = PathBuf::from("/etc/mailstack/admin.json");
+        let first = temp_path(&target);
+        let second = temp_path(&target);
+
+        assert_ne!(first, second, "同一目标的两次写入不得共用临时文件");
+        assert_eq!(
+            first.parent(),
+            target.parent(),
+            "临时文件必须与目标同目录 —— 跨文件系统的 rename 不是原子操作"
+        );
+        let name = first.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            name.starts_with("admin.json.tmp."),
+            "临时文件名应带目标名与唯一后缀，实际 {name}"
+        );
     }
 
     #[cfg(unix)]
@@ -585,5 +754,19 @@ mod tests {
     #[test]
     fn rows_of_missing_file_is_empty_not_an_error() {
         assert!(rows(Path::new("/nonexistent/mailstack/table")).is_empty());
+    }
+
+    /// 组解析的两个基本事实：存在的组能解析，不存在的组返回 `None`（不是 panic）。
+    ///
+    /// `ERANGE`（缓冲区不够）那条路径无法在普通测试里造出真实的大组，代码已按
+    /// POSIX 的用法倍增重试；这里守住最容易回归的两端。
+    #[cfg(unix)]
+    #[test]
+    fn group_resolution_finds_existing_groups_and_reports_missing_ones() {
+        assert!(gid_by_name("root").is_some(), "root 组必须能解析");
+        assert!(
+            gid_by_name("mailstack-definitely-missing-group").is_none(),
+            "不存在的组必须返回 None"
+        );
     }
 }

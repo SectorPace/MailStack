@@ -394,9 +394,7 @@ impl SmtpRemoteTransport {
                 accepted: recipients.len(),
             }),
             MessageOutcome::Rejected {
-                response,
-                accepted,
-                ..
+                response, accepted, ..
             } => {
                 // 部分成功必须如实上报：拒绝发生之前已被对端接受的收件人要随失败
                 // 带回给队列（`DeliveryFailure::accepted`），否则整批按失败处理时

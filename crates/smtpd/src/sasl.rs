@@ -133,6 +133,21 @@ impl std::fmt::Debug for AuthBackend {
     }
 }
 
+/// 同时进行的 PBKDF2 校验数上限（R3-005）。
+///
+/// PBKDF2 是纯 CPU-bound（310k 轮 HMAC-SHA256，单次几十到上百毫秒）。即使搬到
+/// `spawn_blocking`，不加并发上限也只是把「饿死 tokio worker」换成
+/// 「饿死整台机器的 CPU」：攻击者可以在 blocking 池里同时堆几百次校验。
+/// 这里给出一个确定的上界，超出的请求排队超过 [`PBKDF2_QUEUE_TIMEOUT`] 后
+/// 回 454（临时失败），让客户端退避重试而不是继续加压。
+///
+/// 8 = 小内存 VPS（2–4 vCPU）上仍能提供交互式登录体验、同时让暴力破解的
+/// 有效速率被钉死的折中值。
+pub const MAX_CONCURRENT_PBKDF2: usize = 8;
+
+/// PBKDF2 校验的排队等待上限。超过即视为后端过载（454），而不是无限排队。
+pub const PBKDF2_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// 直接按 `mailbox-passwords.json`（INV-37）校验提交端口的 PLAIN 认证。
 ///
 /// 这是提交端口的**默认口令源**：与 IMAP/POP3/ManageSieve 共用同一份记录，改密不会
@@ -146,6 +161,8 @@ pub struct MailboxPasswordsAuthenticator {
     /// 多账号测试会因此饿死 runtime），`verify_password` 仍会跑满迭代再返回
     /// false，等时目标不变。
     dummy: PasswordRecord,
+    /// PBKDF2 并发闸（见 [`MAX_CONCURRENT_PBKDF2`]）。`Arc` 让克隆共享同一份额度。
+    verify_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl MailboxPasswordsAuthenticator {
@@ -153,7 +170,14 @@ impl MailboxPasswordsAuthenticator {
         Self {
             passwords,
             dummy: dummy_record(),
+            verify_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PBKDF2)),
         }
+    }
+
+    /// 覆盖 PBKDF2 并发上限（测试与特殊部署）。
+    pub fn with_max_concurrent(mut self, max: usize) -> Self {
+        self.verify_slots = Arc::new(tokio::sync::Semaphore::new(max.max(1)));
+        self
     }
 
     /// 生产构造：读 `<Paths::mailbox_passwords>`。
@@ -164,11 +188,49 @@ impl MailboxPasswordsAuthenticator {
     pub fn from_path(path: impl Into<std::path::PathBuf>) -> Self {
         Self::new(MailboxPasswords::new(path))
     }
+}
 
-    /// 未知用户/存储故障时也消耗一次 PBKDF2，抹平响应时间差异。
-    fn pay_dummy_cost(&self, password: &str) {
-        let _ = verify_password(&self.dummy, password);
+/// 在 blocking 线程池上跑一次完整的「读取记录 + PBKDF2 校验」，返回认证结论。
+///
+/// 抽成函数是为了让 `spawn_blocking` 的闭包只捕获 `Send` 数据（口令、记录库、
+/// 假记录），且**不**把 `&self` 带进阻塞线程 —— 借用的生命周期跨不了线程边界。
+fn verify_on_blocking_pool(
+    passwords: MailboxPasswords,
+    dummy: PasswordRecord,
+    user: String,
+    password: String,
+) -> AuthOutcome {
+    for candidate in mailstack_core::mailbox_passwords::candidate_keys(&user) {
+        match passwords.get(&candidate) {
+            Ok(Some(record)) => {
+                return if verify_password(&record, &password) {
+                    let confirmed = if record.username.is_empty() {
+                        user
+                    } else {
+                        record.username
+                    };
+                    AuthOutcome::Success { user: confirmed }
+                } else {
+                    AuthOutcome::InvalidCredentials
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // fail closed：存储坏了不能放行；但要把原因留在日志里，
+                // 否则排障会指向认证逻辑而不是口令库。
+                tracing::warn!(
+                    %error,
+                    path = %passwords.path().display(),
+                    "邮箱口令库不可读，拒绝本次认证"
+                );
+                // 等时：把未知用户的代价照付一遍再拒绝。
+                let _ = verify_password(&dummy, &password);
+                return AuthOutcome::InvalidCredentials;
+            }
+        }
     }
+    let _ = verify_password(&dummy, &password);
+    AuthOutcome::InvalidCredentials
 }
 
 impl Authenticator for MailboxPasswordsAuthenticator {
@@ -181,36 +243,52 @@ impl Authenticator for MailboxPasswordsAuthenticator {
                 // 会话层已保证是合法 base64；解不出 \0 分隔字段是客户端/实现问题。
                 return AuthOutcome::InvalidCredentials;
             };
-            for candidate in mailstack_core::mailbox_passwords::candidate_keys(&user) {
-                match self.passwords.get(&candidate) {
-                    Ok(Some(record)) => {
-                        return if verify_password(&record, &password) {
-                            let confirmed = if record.username.is_empty() {
-                                user
-                            } else {
-                                record.username
-                            };
-                            AuthOutcome::Success { user: confirmed }
-                        } else {
-                            AuthOutcome::InvalidCredentials
-                        };
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        // fail closed：存储坏了不能放行；但要把原因留在日志里，
-                        // 否则排障会指向认证逻辑而不是口令库。
-                        tracing::warn!(
-                            %error,
-                            path = %self.passwords.path().display(),
-                            "邮箱口令库不可读，拒绝本次认证"
-                        );
-                        self.pay_dummy_cost(&password);
-                        return AuthOutcome::InvalidCredentials;
-                    }
+
+            // 并发闸：先拿许可再进 blocking 池。排队也有上限 —— 无限排队会把
+            // 认证超时变成「客户端先放弃、校验还在后台跑」，白白烧 CPU。
+            let permit = match tokio::time::timeout(
+                PBKDF2_QUEUE_TIMEOUT,
+                Arc::clone(&self.verify_slots).acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_closed)) => {
+                    return AuthOutcome::TemporaryFailure(
+                        "password verification queue is closed".to_string(),
+                    )
                 }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = PBKDF2_QUEUE_TIMEOUT.as_secs(),
+                        "PBKDF2 校验队列已满，本次认证按临时失败处理"
+                    );
+                    return AuthOutcome::TemporaryFailure(
+                        "password verification queue is saturated".to_string(),
+                    );
+                }
+            };
+
+            // R3-005：PBKDF2 绝不能在 tokio worker 上同步跑。原实现把一个
+            // 50–150ms 的纯 CPU 计算放在 async 块里，少量连接即可让所有
+            // worker 阻塞（25 端口收信、队列、LMAP/RPC 一起停摆）。IMAP/POP3
+            // 与 web 登录早已改为 `spawn_blocking`，这里补齐同一条纪律。
+            let passwords = self.passwords.clone();
+            let dummy = self.dummy.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                // 许可在阻塞任务结束时才归还 —— 覆盖整个 PBKDF2 期间。
+                let _permit = permit;
+                verify_on_blocking_pool(passwords, dummy, user, password)
+            })
+            .await;
+
+            match joined {
+                Ok(outcome) => outcome,
+                // blocking 任务 panic/取消：临时故障，不是口令错。
+                Err(error) => AuthOutcome::TemporaryFailure(format!(
+                    "password verification task failed: {error}"
+                )),
             }
-            self.pay_dummy_cost(&password);
-            AuthOutcome::InvalidCredentials
         })
     }
 }
@@ -253,7 +331,7 @@ fn dummy_record() -> PasswordRecord {
 /// 之所以是**安全**检查而不是顺手做的格式检查：这个字符串会被拼进 Dovecot 的
 /// 制表符分隔协议行（见模块说明）。返回 `false` 时上层必须回 501 而不是转发。
 pub fn is_valid_base64(value: &str) -> bool {
-    if value.is_empty() || value.len() % 4 != 0 {
+    if value.is_empty() || !value.len().is_multiple_of(4) {
         return false;
     }
     let bytes = value.as_bytes();
@@ -759,6 +837,40 @@ mod tests {
             auth.authenticate(password_request("nobody@example.com", STRONG))
                 .await,
             AuthOutcome::InvalidCredentials
+        );
+    }
+
+    /// R3-005 回归守卫：PBKDF2 必须跑在 blocking 线程池上，不能占住 async worker。
+    ///
+    /// 用一个单线程 runtime + 一个同时运行的 ticker 任务来观测：若校验仍在
+    /// worker 上同步执行，ticker 在校验期间一次都跑不到（`ticks ≈ 0`）；
+    /// 搬到 `spawn_blocking` 后 worker 被让出，ticker 能正常推进。
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_verification_does_not_block_the_async_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        // 不存在的口令库 → 未知用户路径，但仍会完整跑一次 PBKDF2（等时设计）。
+        let auth = MailboxPasswordsAuthenticator::from_path(dir.path().join("missing.json"))
+            .with_max_concurrent(2);
+
+        let ticks = std::sync::Arc::new(AtomicUsize::new(0));
+        let ticker_ticks = std::sync::Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                ticker_ticks.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let outcome = auth
+            .authenticate(password_request("nobody@example.com", STRONG))
+            .await;
+        assert_eq!(outcome, AuthOutcome::InvalidCredentials);
+        ticker.abort();
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "PBKDF2 期间 async worker 必须能继续调度其他任务（当前被同步阻塞）"
         );
     }
 

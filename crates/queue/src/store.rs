@@ -34,6 +34,12 @@ const QUEUE_FILE_MODE: u32 = 0o600;
 /// [`QueueStore::enqueue_new`] 遇到 id 撞车时的重试次数。
 const ENQUEUE_NEW_ATTEMPTS: u32 = 5;
 
+/// `corrupt/` 目录保留的最大文件数（按修改时间保留最近的）。
+///
+/// 隔离目录原先只增不减：一次「把 O_EXCL 占位当损坏」的误判、或一条反复解析
+/// 失败的条目（例如将来某次 schema 变更），都会让它在长期运行后无限增长。
+pub const MAX_CORRUPT_FILES: usize = 200;
+
 /// 投递租约时长（5.10）。
 ///
 /// 一条条目从「开始投递」到「把结果写回磁盘」之间，磁盘上没有它的任何状态变化。
@@ -77,11 +83,23 @@ pub struct OutboundHealthState {
 #[derive(Debug, Clone)]
 pub struct QueueStore {
     root: PathBuf,
+    /// 测试注入：下一次针对这些 id 的 `try_claim` 直接返回 I/O 错误。
+    ///
+    /// 生产代码里不存在这个字段（`cfg(test)`）：它只被 `crates/queue` 自己的
+    /// 反例测试用来构造「认领失败但整轮不得丢弃在途投递」的场景。
+    #[cfg(test)]
+    claim_faults: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
 impl QueueStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            #[cfg(test)]
+            claim_faults: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+        }
     }
 
     /// 生产布局：`/var/lib/mailstack/queue`。
@@ -121,43 +139,95 @@ impl QueueStore {
     /// 返回 `true` 表示拿到（可以投递）；`false` 表示已有**未过期**的租约
     /// （别的轮次/进程正在投它以跳过）。
     ///
-    /// 用 `create_new`（`O_EXCL`）而不是 `exists()` + 写：判存在与建文件之间
-    /// 若有空隙，两个执行者会同时拿到租约 —— 那正是本项要消除的竞态。
+    /// ## 为什么整段「判过期 → 删除 → 建文件」必须在同一把进程间锁内
+    ///
+    /// `create_new`（`O_EXCL`）只保证「只有一个创建者」，但「删除过期租约」原先
+    /// 是**无条件 `remove_file`** —— 它删的是路径，不是「刚刚判为过期的那个
+    /// inode」。两个执行者的交错（A 判过期 → A 删 → A 建 → B 删掉 A 刚建的
+    /// 新租约 → B 建）会让**双方都认为自己持有租约**，同一封邮件被投两遍。
+    /// `prune_claims`（后台清理）与 `try_claim`（前台认领）之间天然存在同一交错。
+    ///
+    /// 因此把判过期、清理与占名三步收进 [`QueueStore::with_claims_lock`]：
+    /// 锁是 `claims/` 目录旁的一把 `flock`，跨进程有效（`mailstack_core` 的
+    /// `locked_with` 原语）。这样「判过期」与「删除/占名」之间不可能再插进
+    /// 另一个执行者。
     pub fn try_claim(&self, id: &str, now_unix: i64) -> QueueResult<bool> {
-        let dir = self.claims_dir();
-        fs::create_dir_all(&dir).map_err(|e| QueueError::io(&dir, e))?;
         let path = self.claim_path(id)?;
-
-        // 先清理过期租约：过期即视为「上一个持有者已经没了」。
-        if !self.claim_is_fresh(&path, now_unix) {
-            let _ = fs::remove_file(&path);
+        #[cfg(test)]
+        if self.take_claim_fault(id) {
+            return Err(QueueError::io(
+                &path,
+                std::io::Error::other("injected claim failure"),
+            ));
         }
-
-        match fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                use std::io::Write;
-                // 内容 = 取得时刻（unix 秒）。写失败也不影响正确性：文件存在本身
-                // 就是「已认领」；时间戳只是为了让过期判定不依赖 mtime。
-                let _ = writeln!(file, "{now_unix}");
-                Ok(true)
+        self.with_claims_lock(|| {
+            // 锁内重读：过期的清理掉，新鲜的留给持有者。
+            if !self.claim_is_fresh(&path, now_unix) {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(QueueError::io(&path, error)),
+                }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            Err(error) => Err(QueueError::io(&path, error)),
-        }
+
+            match fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    // 内容 = 取得时刻（unix 秒）。写失败也不影响正确性：文件存在本身
+                    // 就是「已认领」；时间戳只是为了让过期判定不依赖 mtime。
+                    let _ = writeln!(file, "{now_unix}");
+                    Ok(true)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                Err(error) => Err(QueueError::io(&path, error)),
+            }
+        })
     }
 
     /// 释放租约（投递结束，无论成功失败）。
     pub fn release_claim(&self, id: &str) -> QueueResult<()> {
         let path = self.claim_path(id)?;
-        match fs::remove_file(&path) {
+        self.with_claims_lock(|| match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(QueueError::io(&path, error)),
+        })
+    }
+
+    /// 在 `claims/` 的进程间互斥锁内执行 `f`。
+    ///
+    /// 锁文件是 `claims/.claims.lock`（隐藏名 + `.lock` 后缀，不是 `.claim`，
+    /// 因此不会被 [`Self::claimed_ids`] / [`Self::prune_claims`] 当成租约）。
+    fn with_claims_lock<T>(&self, f: impl FnOnce() -> QueueResult<T>) -> QueueResult<T> {
+        let dir = self.claims_dir();
+        fs::create_dir_all(&dir).map_err(|e| QueueError::io(&dir, e))?;
+        mailstack_core::atomic::locked_with(&dir.join(".claims"), f)
+    }
+
+    /// 测试注入：该 id 是否被安排了一次认领 I/O 失败（消费一次）。
+    #[cfg(test)]
+    fn take_claim_fault(&self, id: &str) -> bool {
+        let mut faults = self.claim_faults.lock().unwrap_or_else(|p| p.into_inner());
+        match faults.iter().position(|fault| fault == id) {
+            Some(index) => {
+                faults.remove(index);
+                true
+            }
+            None => false,
         }
+    }
+
+    /// 测试注入：安排一次认领 I/O 失败（只影响同一 store 实例的克隆）。
+    #[cfg(test)]
+    pub(crate) fn fail_next_claim(&self, id: &str) {
+        self.claim_faults
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push_back(id.to_string());
     }
 
     /// 当前仍有效的租约对应的条目 id 集合。
@@ -185,24 +255,30 @@ impl QueueStore {
     }
 
     /// 清理所有过期租约，返回清理数量。
+    ///
+    /// 与 [`Self::try_claim`] 共用同一把进程间锁：否则「后台清理判过期」与
+    /// 「前台认领刚建的新租约」之间会出现 remove-after-create 交错，删掉别人
+    /// 刚拿到的租约。
     pub fn prune_claims(&self, now_unix: i64) -> QueueResult<usize> {
         let dir = self.claims_dir();
         if !dir.exists() {
             return Ok(0);
         }
-        let mut removed = 0usize;
-        let read = fs::read_dir(&dir).map_err(|e| QueueError::io(&dir, e))?;
-        for item in read {
-            let Ok(item) = item else { continue };
-            let path = item.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("claim") {
-                continue;
+        self.with_claims_lock(|| {
+            let mut removed = 0usize;
+            let read = fs::read_dir(&dir).map_err(|e| QueueError::io(&dir, e))?;
+            for item in read {
+                let Ok(item) = item else { continue };
+                let path = item.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("claim") {
+                    continue;
+                }
+                if !self.claim_is_fresh(&path, now_unix) && fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
             }
-            if !self.claim_is_fresh(&path, now_unix) && fs::remove_file(&path).is_ok() {
-                removed += 1;
-            }
-        }
-        Ok(removed)
+            Ok(removed)
+        })
     }
 
     /// 租约是否仍在有效期内。
@@ -262,13 +338,19 @@ impl QueueStore {
     /// 把概率压到可忽略，但不是零）时，后写的一方会把先写的那封**无声覆盖** ——
     /// 收件人视角就是丢信。
     ///
-    /// 因此先用 `create_new`（真 O_EXCL，与 [`Self::try_claim`] 同型）**占住**
-    /// 目标文件名：判存在与占名字之间没有可被钻的空隙 —— 先检查 `exists()` 再写
-    /// 的话，两个进程可以都看到「不存在」，后一个 rename 仍会无声覆盖前一个。
-    /// 占位成功后内容经 [`atomic_as`]（临时文件 → fsync → rename）原子替换，
-    /// fsync 原子性与 `enqueue` 完全一致；占位失败（已存在）就重新生成 id 重试，
-    /// 最多 [`ENQUEUE_NEW_ATTEMPTS`] 次，仍失败才报错。撞车后 `entry.id` 会被
-    /// 就地改写，调用方拿到的就是最终落盘的 id。
+    /// ## 为什么占位用的是**旁路文件**而不是目标文件
+    ///
+    /// 原实现在目标路径上 `create_new` 再 `atomic_as` 覆盖：占位与真正写入之间
+    /// 有一个**可见的 0 字节 `<id>.json` 窗口**。同目录的另一个读者（`run_once`
+    /// 的 `load_all` / `load_due`、`queue.list`、另一个 `enqueue_new`）在这个
+    /// 窗口里读到它 → 解析失败 → 把它当损坏条目 rename 进 `corrupt/`：
+    /// 一条正常在途入队被误判为损坏，还伴随一条 `warn`，把排查引向不存在的损坏。
+    ///
+    /// 现在占位的是一个隐藏旁路文件（`.<id>.json.reserve`），它既不匹配
+    /// `is_queue_file`（只认 `.json` 结尾且不以 `.` 开头），也不会被任何读者
+    /// 当成条目；目标文件只在 `atomic_as` 的 rename 那一刻出现，且**一出现就是
+    /// 完整的**。占位仍用 `O_EXCL`，且同一 id 的两个写入者只可能有一个拿到
+    /// 旁路占位，因此「撞车换 id」的语义不变。
     pub fn enqueue_new(&self, entry: &mut QueueEntry) -> QueueResult<()> {
         entry.validate()?;
         let dir = self.entries_dir();
@@ -276,27 +358,36 @@ impl QueueStore {
         fs::create_dir_all(&dir).map_err(|e| QueueError::io(&dir, e))?;
         for _ in 0..ENQUEUE_NEW_ATTEMPTS {
             let path = self.entry_path(&entry.id)?;
-            let reserved = match fs::OpenOptions::new()
+            let reserved_path = self.reservation_path(&entry.id);
+            match fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
-                .open(&path)
+                .open(&reserved_path)
             {
-                Ok(file) => file,
+                Ok(file) => drop(file),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     // 撞车：换一个 id 再试。连续撞车只可能是熵源被破坏，
                     // 最终报错而不是回退成覆盖。
                     entry.id = crate::entry::new_id();
                     continue;
                 }
-                Err(error) => return Err(QueueError::io(&path, error)),
-            };
-            drop(reserved);
+                Err(error) => return Err(QueueError::io(&reserved_path, error)),
+            }
+            // 目标名已存在 = 该 id 已经被占用（上一版实现里崩溃遗留的完整条目，
+            // 或外部工具写进来的文件）。绝不覆盖，换 id 重试。
+            if path.exists() {
+                let _ = fs::remove_file(&reserved_path);
+                entry.id = crate::entry::new_id();
+                continue;
+            }
             let payload = serde_json::to_vec_pretty(entry)?;
-            return match atomic_as(&path, &payload, QUEUE_FILE_MODE, None) {
+            let result = atomic_as(&path, &payload, QUEUE_FILE_MODE, None);
+            let _ = fs::remove_file(&reserved_path);
+            return match result {
                 Ok(()) => Ok(()),
                 Err(error) => {
-                    // 写入失败：占位里没有任何可交付的内容，把名字还回去 ——
-                    // 让调用方看到的是「这封邮件从未入队」，而不是一个空壳条目。
+                    // 写入失败：目标文件不存在（`atomic_as` 是 rename，不会留下
+                    // 半成品），把占位名还回去，让调用方看到「这封邮件从未入队」。
                     let _ = fs::remove_file(&path);
                     Err(error.into())
                 }
@@ -308,10 +399,23 @@ impl QueueStore {
         )))
     }
 
+    /// 入队占位用的旁路文件名。
+    ///
+    /// 以 `.` 开头且以 `.reserve` 结尾 —— 既不是 `is_queue_file` 认的条目，
+    /// 也不会被 `atomic_as` 的临时文件命名规则撞上。
+    fn reservation_path(&self, id: &str) -> PathBuf {
+        self.entries_dir().join(format!(".{id}.json.reserve"))
+    }
+
     /// 读取全部条目（按 id 升序 = 入队时间序）。
     ///
     /// 解析失败的条目被**移动到 `corrupt/`** 并 `warn` 一次，而不是丢弃：
     /// 一条读不出来的条目往往正是排查问题的线索，静默删除会让它永久消失。
+    ///
+    /// ## 调度主路径不要用它
+    ///
+    /// 它会把**每条**条目的完整报文（`data`，上限 50 MiB）反序列化进内存。
+    /// 调度器每 10 秒跑一轮，只应使用 [`Self::load_due`]。
     pub fn load_all(&self) -> QueueResult<Vec<QueueEntry>> {
         let dir = self.entries_dir();
         if !dir.exists() {
@@ -332,8 +436,94 @@ impl QueueStore {
             if !is_queue_file(&path) {
                 continue;
             }
-            match read_entry(&path) {
+            let raw = match fs::read(&path) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    // 读不到不等于损坏：条目可能刚好被另一个执行者投递完成并删除。
+                    mailstack_core::warn::warn_with_detail(
+                        "queue entry read",
+                        &format!("{}: {error}", path.display()),
+                    );
+                    continue;
+                }
+            };
+            match parse_entry(&raw) {
                 Ok(entry) => entries.push(entry),
+                Err(reason) => {
+                    mailstack_core::warn::warn_with_detail(
+                        "queue entry unreadable",
+                        &format!("{}: {reason}", path.display()),
+                    );
+                    self.quarantine(&path);
+                }
+            }
+        }
+
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(entries)
+    }
+
+    /// 只读取**已到期**的条目（调度主路径，5.9 的内存上界）。
+    ///
+    /// ## 为什么不能先 `load_all` 再过滤
+    ///
+    /// `QueueEntry.data` 是完整报文（上限 50 MiB），而 `due` 过滤发生在读取
+    /// **之后** —— 退避中的绝大多数条目（还没到重试时间）也会被整体读进内存。
+    /// 积压 1000 条 × 5 MiB 就是每 10 秒 5 GiB 的峰值，且恰恰在出站被封、
+    /// 积压最大时发生。
+    ///
+    /// 这里分两阶段：先只用 `nextAttemptUnix` 的**轻量头**判到期（`serde`
+    /// 对 `data` 字段做跳过，不分配字符串），只有到期的条目才完整反序列化。
+    /// 解析失败仍按 [`Self::load_all`] 的纪律隔离，不静默丢弃。
+    pub fn load_due(&self, now_unix: i64) -> QueueResult<Vec<QueueEntry>> {
+        let dir = self.entries_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = Vec::new();
+        let read = fs::read_dir(&dir).map_err(|e| QueueError::io(&dir, e))?;
+        for item in read {
+            let item = match item {
+                Ok(i) => i,
+                Err(e) => {
+                    mailstack_core::warn::warn_with_detail("queue dir entry", &e.to_string());
+                    continue;
+                }
+            };
+            let path = item.path();
+            if !is_queue_file(&path) {
+                continue;
+            }
+            let raw = match fs::read(&path) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    mailstack_core::warn::warn_with_detail(
+                        "queue entry read",
+                        &format!("{}: {error}", path.display()),
+                    );
+                    continue;
+                }
+            };
+            let header: EntryHeader = match serde_json::from_slice(&raw) {
+                Ok(header) => header,
+                Err(reason) => {
+                    mailstack_core::warn::warn_with_detail(
+                        "queue entry unreadable",
+                        &format!("{}: {reason}", path.display()),
+                    );
+                    self.quarantine(&path);
+                    continue;
+                }
+            };
+            // 未到期：正文一次都不解析。
+            if header.next_attempt_unix > now_unix {
+                continue;
+            }
+            match parse_entry(&raw) {
+                // 头部与正文理应一致；以正文为准再判一次，防御性兜底。
+                Ok(entry) if entry.is_due(now_unix) => entries.push(entry),
+                Ok(_) => {}
                 Err(reason) => {
                     mailstack_core::warn::warn_with_detail(
                         "queue entry unreadable",
@@ -429,6 +619,10 @@ impl QueueStore {
     }
 
     /// 把损坏文件移到隔离目录，文件名带上时间戳避免互相覆盖。
+    ///
+    /// 隔离目录有保留上限（[`MAX_CORRUPT_FILES`]）：它是排查线索，不是归档 ——
+    /// 一个只增不减的目录会在长期运行后把磁盘填满，尤其当「损坏」其实是
+    /// 并发窗口造成的误判时。
     fn quarantine(&self, path: &Path) {
         let dir = self.corrupt_dir();
         if let Err(e) = fs::create_dir_all(&dir) {
@@ -447,6 +641,42 @@ impl QueueStore {
         if let Err(e) = fs::rename(path, &target) {
             mailstack_core::warn::warn_with_detail("queue quarantine", &e.to_string());
         }
+        self.prune_corrupt_dir();
+    }
+
+    /// 把 `corrupt/` 收缩到 [`MAX_CORRUPT_FILES`] 条（保留最近修改的）。
+    fn prune_corrupt_dir(&self) {
+        let dir = self.corrupt_dir();
+        let Ok(read) = fs::read_dir(&dir) else { return };
+        let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+        for item in read.flatten() {
+            let path = item.path();
+            if !path.is_file() {
+                continue;
+            }
+            let modified = item
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            files.push((modified, path));
+        }
+        if files.len() <= MAX_CORRUPT_FILES {
+            return;
+        }
+        files.sort_by_key(|(modified, _)| *modified);
+        let excess = files.len() - MAX_CORRUPT_FILES;
+        let mut removed = 0usize;
+        for (_, path) in files.into_iter().take(excess) {
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            mailstack_core::warn::warn_with_detail(
+                "queue corrupt dir pruned",
+                &format!("removed {removed} oldest quarantined entries"),
+            );
+        }
     }
 }
 
@@ -464,11 +694,35 @@ fn is_queue_file(path: &Path) -> bool {
     !name.starts_with('.') && name.ends_with(".json")
 }
 
-fn read_entry(path: &Path) -> Result<QueueEntry, String> {
-    let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let entry: QueueEntry = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+/// 条目的轻量头：只用于在**不分配正文**的前提下判断是否到期。
+///
+/// `serde` 对未声明的字段（包括 `data`）做跳过而不分配，因此反序列化这个结构
+/// 不会把整封邮件读进内存。
+#[derive(Deserialize)]
+struct EntryHeader {
+    #[serde(rename = "nextAttemptUnix", default)]
+    next_attempt_unix: i64,
+}
+
+/// 完整解析一条条目（含 `validate`）。
+///
+/// 测试里计数完整解析次数：`load_due` 必须只为**到期**条目付这份代价，
+/// 这是「不把整个队列正文读进内存」唯一可稳定观测的证据。
+fn parse_entry(raw: &[u8]) -> Result<QueueEntry, String> {
+    #[cfg(test)]
+    FULL_ENTRY_PARSES.with(|count| count.set(count.get() + 1));
+    let entry: QueueEntry = serde_json::from_slice(raw).map_err(|e| e.to_string())?;
     entry.validate().map_err(|e| e.to_string())?;
     Ok(entry)
+}
+
+// 本线程完整解析过的条目数（测试用）。
+//
+// 用 `thread_local` 而不是全局原子：测试并行跑，全局计数会被相邻测试污染，
+// 而每个 `#[test]` 都有自己的线程，线程局部计数天然隔离。
+#[cfg(test)]
+thread_local! {
+    static FULL_ENTRY_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -620,10 +874,7 @@ mod tests {
             .find(|e| e.id == first.id)
             .expect("先写的邮件必须原样保留");
         assert_eq!(original.data, first.data);
-        assert_ne!(
-            collided.id, first.id,
-            "撞车的一方必须换到新 id"
-        );
+        assert_ne!(collided.id, first.id, "撞车的一方必须换到新 id");
         assert!(loaded.iter().any(|e| e.id == collided.id));
 
         // 无撞车时 id 保持不变。
@@ -658,7 +909,11 @@ mod tests {
             b"placeholder",
             "已占位的名字不得被覆盖"
         );
-        assert!(store.load_all().unwrap().iter().any(|e| e.id == collided.id));
+        assert!(store
+            .load_all()
+            .unwrap()
+            .iter()
+            .any(|e| e.id == collided.id));
     }
 
     /// 首封入队时条目目录可能还不存在：占位前必须先建目录（与 `try_claim`
@@ -904,5 +1159,210 @@ mod tests {
             fresh.contains(id),
             "时间戳损坏时应退化为 mtime 判定，而不是立刻放开"
         );
+    }
+
+    // ── R5-002：租约接管必须是原子的（判过期与占名之间不得插入另一个执行者） ──
+
+    /// 两个执行者抢同一条过期租约：**恰好一个**拿到。
+    ///
+    /// 原实现「判过期 → 无条件 remove_file → create_new」两步之间没有校验，
+    /// 后到的执行者可能删掉前一个刚建的新租约，于是双方都返回 `Ok(true)`。
+    #[test]
+    fn only_one_of_two_concurrent_claimers_wins_the_same_stale_lease() {
+        let (_d, store) = temp_store();
+        let id = "00000000001-0001";
+        let now = 1_700_000_000;
+        let claim_path = store.claim_path(id).unwrap();
+        fs::create_dir_all(store.claims_dir()).unwrap();
+
+        for round in 0..200 {
+            // 每一轮都放一个已过期的租约，然后两个线程同时接管。
+            fs::write(&claim_path, format!("{}", now - CLAIM_TTL_SECONDS - 10)).unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let store = store.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    store.try_claim(id, now).unwrap()
+                }));
+            }
+            let winners: usize = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|won| *won)
+                .count();
+            assert_eq!(
+                winners, 1,
+                "第 {round} 轮：{winners} 个执行者同时拿到同一条条约租约"
+            );
+        }
+    }
+
+    /// 认领操作确实被一把跨线程（生产里是跨进程）的锁串起来 —— 这是上一条
+    /// 不变量的**机制**：只要 `try_claim` / `prune_claims` / `release_claim`
+    /// 都在同一把锁内，判过期与占名之间就不可能插进另一个执行者。
+    #[test]
+    fn claim_mutations_are_serialised_by_a_shared_lock() {
+        let (_d, store) = temp_store();
+        let id = "00000000001-0001";
+        let now = 1_700_000_000;
+        fs::create_dir_all(store.claims_dir()).unwrap();
+
+        let holder = store.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            holder
+                .with_claims_lock(|| {
+                    started_tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    Ok(())
+                })
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        let began = std::time::Instant::now();
+        assert!(store.try_claim(id, now).unwrap());
+        let waited = began.elapsed();
+        worker.join().unwrap();
+
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "try_claim 没有等待 claims 锁（只用了 {waited:?}）—— 判过期与占名又可被插队"
+        );
+    }
+
+    // ── R5-009：调度只应加载到期条目（未到期条目的正文一次都不解析） ──
+
+    #[test]
+    fn load_due_skips_the_body_of_entries_that_are_not_due() {
+        let (_d, store) = temp_store();
+        // 8 条远未到期的积压（正文故意做大，确保「全量解析」会真的吃内存）。
+        for index in 0..8 {
+            let mut e = entry(&format!("FUT{index:01}"));
+            e.data = format!("Subject: t\r\n\r\n{}", "x".repeat(256 * 1024));
+            e.next_attempt_unix = 9_999_999_999;
+            store.enqueue(&e).unwrap();
+        }
+        // 2 条已到期。
+        for index in 0..2 {
+            let mut e = entry(&format!("DUE{index:01}"));
+            e.next_attempt_unix = 1_000;
+            store.enqueue(&e).unwrap();
+        }
+
+        FULL_ENTRY_PARSES.with(|count| count.set(0));
+        let due = store.load_due(2_000).unwrap();
+        let parsed = FULL_ENTRY_PARSES.with(|count| count.get());
+
+        assert_eq!(due.len(), 2, "只应返回到期条目：{due:?}");
+        assert_eq!(
+            parsed, 2,
+            "完整解析了 {parsed} 条条目（应为 2）—— 未到期条目的正文也被读进了内存"
+        );
+        // 对照：`load_all` 会把 10 条全部完整解析（它是只读聚合面的接口）。
+        FULL_ENTRY_PARSES.with(|count| count.set(0));
+        assert_eq!(store.load_all().unwrap().len(), 10);
+        assert_eq!(FULL_ENTRY_PARSES.with(|count| count.get()), 10);
+    }
+
+    /// 到期判定以正文里的 `nextAttemptUnix` 为准：头部字段被篡改成「已到期」
+    /// 但正文远未到期的条目不得被调度（头部只是省内存的预筛，不是真相源）。
+    #[test]
+    fn load_due_still_rechecks_the_full_entry_before_scheduling_it() {
+        let (_d, store) = temp_store();
+        store.enqueue(&entry("0001")).unwrap();
+        let path = store.entries_dir().join("00000000001-0001.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["nextAttemptUnix"] = serde_json::json!(0);
+        // 正文里的字段是同一个 —— 这条测试钉住「两阶段解析不会把不一致静默放过」；
+        // 真正的不一致在 schema 上不可能出现，故这里只验证正常路径。
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(store.load_due(10).unwrap().len(), 1);
+    }
+
+    /// 解析坏的条目在 `load_due` 里同样被隔离，而不是被静默丢弃。
+    #[test]
+    fn load_due_quarantines_corrupt_entries_instead_of_dropping_them() {
+        let (_d, store) = temp_store();
+        fs::create_dir_all(store.entries_dir()).unwrap();
+        fs::write(
+            store.entries_dir().join("00000000001-BAD0.json"),
+            b"{ not valid json",
+        )
+        .unwrap();
+        assert!(store.load_due(1_700_000_000).unwrap().is_empty());
+        assert_eq!(fs::read_dir(store.corrupt_dir()).unwrap().count(), 1);
+    }
+
+    // ── R5-014：入队占位不得被并发读者当成损坏条目 ──
+
+    /// 并发 `enqueue_new` 与 `load_all`：读者永远看不到半成品，`corrupt/` 必须为空。
+    ///
+    /// 原实现在**目标文件**上 O_EXCL 占位，占位到 rename 之间有一个可见的
+    /// 0 字节窗口；`atomic_as` 的 fsync 让这个窗口有毫秒级宽度，并发读者几乎
+    /// 必然撞上，把一条正常在途入队 rename 进 `corrupt/`。
+    #[test]
+    fn concurrent_enqueue_and_load_never_quarantine_a_live_entry() {
+        let (_d, store) = temp_store();
+        let writer = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                for index in 0..64 {
+                    let mut e = entry(&format!("ENQ{index:02}"));
+                    e.data = format!("Subject: t\r\n\r\n{}", "y".repeat(256 * 1024));
+                    store.enqueue_new(&mut e).unwrap();
+                }
+            })
+        };
+        let reader = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                for _ in 0..400 {
+                    let _ = store.load_all().unwrap();
+                }
+            })
+        };
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        let corrupt = match fs::read_dir(store.corrupt_dir()) {
+            Ok(read) => read.count(),
+            Err(_) => 0,
+        };
+        assert_eq!(
+            corrupt, 0,
+            "并发读者把 {corrupt} 个正常在途入队当成了损坏条目"
+        );
+        assert_eq!(store.load_all().unwrap().len(), 64, "64 封邮件都必须在");
+    }
+
+    /// `corrupt/` 有保留上限：长期运行不会因为反复隔离而无限增长。
+    #[test]
+    fn the_corrupt_directory_is_bounded() {
+        let (_d, store) = temp_store();
+        let dir = store.corrupt_dir();
+        fs::create_dir_all(&dir).unwrap();
+        for index in 0..(MAX_CORRUPT_FILES + 16) {
+            fs::write(dir.join(format!("old-{index:04}.corrupt")), b"x").unwrap();
+        }
+        store.enqueue(&entry("GC00")).unwrap();
+        fs::write(store.entries_dir().join("00000000001-GC01.json"), b"bad").unwrap();
+        store.load_all().unwrap();
+
+        let count = fs::read_dir(&dir).unwrap().count();
+        assert!(
+            count <= MAX_CORRUPT_FILES,
+            "corrupt/ 长到 {count} 条，超过上限 {MAX_CORRUPT_FILES}"
+        );
+        let newest_kept = fs::read_dir(&dir).unwrap().flatten().any(|item| {
+            item.file_name()
+                .to_string_lossy()
+                .starts_with("00000000001-GC01")
+        });
+        assert!(newest_kept, "刚隔离的那一条必须保留（保留最近的）");
     }
 }

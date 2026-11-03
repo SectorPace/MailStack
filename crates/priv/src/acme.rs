@@ -283,27 +283,27 @@ impl Acme {
                 }
             }
 
-        // 校验全部通过，以下开始产生副作用。
-        std::fs::create_dir_all(&out_dir).map_err(|e| HandlerError::new(e.to_string()))?;
+            // 校验全部通过，以下开始产生副作用。
+            std::fs::create_dir_all(&out_dir).map_err(|e| HandlerError::new(e.to_string()))?;
 
-        let issue_outcome = self
-            .runner
-            .run_with_timeout(ACME_BIN, &issue_args, ISSUE_TIMEOUT);
-        match issue_outcome {
-            Ok(output) if output.success() => {}
-            // 签发失败：尽力把刚建的（此刻还是空的）目标目录清掉 —— 与
-            // 「校验先于建目录」的纪律同源，失败路径不在 /etc/mailstack/tls/
-            // 下留一个没人清理的空目录。`remove_dir` 只删空目录，acme.sh 若
-            // 已经写了别的文件进来则原样保留（best-effort）。
-            Ok(_) => {
-                self.remove_empty_dir_best_effort(&out_dir);
-                return Err(HandlerError::new("ACME certificate issue failed"));
+            let issue_outcome = self
+                .runner
+                .run_with_timeout(ACME_BIN, &issue_args, ISSUE_TIMEOUT);
+            match issue_outcome {
+                Ok(output) if output.success() => {}
+                // 签发失败：尽力把刚建的（此刻还是空的）目标目录清掉 —— 与
+                // 「校验先于建目录」的纪律同源，失败路径不在 /etc/mailstack/tls/
+                // 下留一个没人清理的空目录。`remove_dir` 只删空目录，acme.sh 若
+                // 已经写了别的文件进来则原样保留（best-effort）。
+                Ok(_) => {
+                    self.remove_empty_dir_best_effort(&out_dir);
+                    return Err(HandlerError::new("ACME certificate issue failed"));
+                }
+                Err(error) => {
+                    self.remove_empty_dir_best_effort(&out_dir);
+                    return Err(error.into());
+                }
             }
-            Err(error) => {
-                self.remove_empty_dir_best_effort(&out_dir);
-                return Err(error.into());
-            }
-        }
 
             self.probes.write_file(
                 Path::new(RELOAD_SCRIPT),

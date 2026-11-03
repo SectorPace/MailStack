@@ -283,6 +283,13 @@ export const DICT = {
   act_queue_processed: ["队列已处理", "Mail queue processed"],
   act_service_restarted: ["服务已重启", "Service restarted"],
   act_cert_renewed: ["证书已续期", "Certificate renewed"],
+  // Webmail 是独立进程 + 独立会话（默认 127.0.0.1:8444），从管理台以外部链接打开；
+  // 不在本 SPA 内做路由，避免把「邮箱用户会话」和「管理员会话」混在同一上下文。
+  nav_webmail: ["Webmail 邮箱", "Webmail"],
+  webmail_hint: [
+    "在新标签页打开 Webmail（独立进程/端口，默认 8444）",
+    "Open Webmail in a new tab (separate process/port, default 8444)",
+  ],
   queue_label: ["队列", "Queue"],
   database_label: ["数据库", "Database"],
   disk_label: ["磁盘空间", "Disk Space"],

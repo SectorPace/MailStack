@@ -57,6 +57,16 @@ impl BackoffPolicy {
     /// 第 `attempt` 次失败后的等待秒数（`attempt` 从 1 开始）。
     ///
     /// = 名义指数退避 + 抖动。抖动范围 ±10%，上界仍受 `max_secs` 约束。
+    ///
+    /// ## 为什么封顶之后改为「向下抖动」
+    ///
+    /// 原实现先算 `nominal ± spread` 再 `.min(max_secs)`。封顶之后
+    /// `nominal == max_secs`，于是区间上半部分（`delta > spread`，约一半概率）
+    /// 被剪成**同一个值** `max_secs` —— 模块头承诺的「不同条目则不共振」在
+    /// 封顶之后不成立，而封顶之后恰恰是积压最大、对端最脆弱的阶段。
+    ///
+    /// 现在封顶时只向下抖：区间是 `[max_secs - spread, max_secs]`，
+    /// 不再有被截断的质量点；未封顶时保持对称抖动（受 `max_secs` 兜底）。
     pub fn delay_secs(&self, attempt: u32, entry_id: &str) -> u64 {
         let nominal = self.nominal_delay_secs(attempt);
         if nominal == 0 {
@@ -64,13 +74,19 @@ impl BackoffPolicy {
         }
         let spread = (nominal / 10).max(1);
         let hash = stable_hash(entry_id);
-        // 落在 [nominal - spread, nominal + spread] 内，确定性且与 id 绑定。
-        let delta = hash % (2 * spread + 1);
-        nominal
-            .saturating_sub(spread)
-            .saturating_add(delta)
-            .min(self.max_secs)
-            .max(1)
+        // 抖动区间按「名义值是否已贴上限」分开构造，避免 `min` 把一半取值剪成同一点。
+        let (lower, upper) = if nominal >= self.max_secs {
+            // 封顶：只向下抖动，区间 [nominal - spread, nominal]。
+            (nominal.saturating_sub(spread).max(1), nominal)
+        } else {
+            // 未封顶：对称抖动，上界仍受 `max_secs` 约束。
+            (
+                nominal.saturating_sub(spread).max(1),
+                nominal.saturating_add(spread).min(self.max_secs.max(1)),
+            )
+        };
+        let span = upper.saturating_sub(lower);
+        lower.saturating_add(hash % (span + 1)).max(1)
     }
 
     /// 不含抖动的名义等待：`base * factor^(attempt-1)`，封顶 `max_secs`。
@@ -225,6 +241,40 @@ mod tests {
         );
     }
 
+    /// 封顶处不得把约一半条目的重试时刻剪成同一个值。
+    ///
+    /// 原实现先算 `nominal ± spread` 再 `.min(max_secs)`：`attempt >= 7` 时
+    /// `nominal == max_secs`，抖动区间上半部分被剪成恰好 `max_secs`。于是默认
+    /// 策略下第 7 次及以后的重试里约一半条目落在**同一秒** —— 退避模块承诺的
+    /// 「不同条目则不共振」在封顶之后失效，而封顶之后正是对端最脆弱的阶段。
+    #[test]
+    fn the_backoff_cap_does_not_collapse_half_of_the_entries_onto_one_instant() {
+        let p = BackoffPolicy::default();
+        let attempt = p.max_attempts; // 10：默认策略里早已封顶。
+        assert_eq!(p.nominal_delay_secs(attempt), p.max_secs, "前提：已封顶");
+
+        let delays: Vec<u64> = (0..64)
+            .map(|i| p.delay_secs(attempt, &format!("{i:04X}")))
+            .collect();
+        let distinct: std::collections::HashSet<u64> = delays.iter().copied().collect();
+        assert!(
+            distinct.len() >= 60,
+            "封顶处大量条目被剪到同一秒（{} / 64 个不同取值）：{delays:?}",
+            distinct.len()
+        );
+        for delay in delays {
+            assert!(
+                delay <= p.max_secs,
+                "抖动不得突破上限：{delay} > {}",
+                p.max_secs
+            );
+            assert!(
+                delay >= p.max_secs - p.max_secs / 10,
+                "封顶处只应向下抖动（不低于 max - 10%）：{delay}"
+            );
+        }
+    }
+
     #[test]
     fn on_failure_counts_attempts_and_schedules_next_try() {
         let p = policy();
@@ -270,7 +320,10 @@ mod tests {
             !stored.contains(['\r', '\n', '\0']),
             "控制字符必须被净化：{stored:?}"
         );
-        assert!(stored.contains("Bcc: attacker@evil"), "可读文本应保留（行内）");
+        assert!(
+            stored.contains("Bcc: attacker@evil"),
+            "可读文本应保留（行内）"
+        );
 
         // 超长截断到上限。
         let mut e2 = entry("QQ04");

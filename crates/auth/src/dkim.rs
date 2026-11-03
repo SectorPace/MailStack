@@ -121,17 +121,39 @@ pub(crate) fn verdicts_from(outputs: &[DkimOutput<'_>]) -> Vec<DkimVerdict> {
 ///
 /// 复用 mail-auth 的报文解析，而不是自己写一个取头正则 —— 头折叠、显示名里带
 /// `@`、地址被 `<>` 包住、注释，这些坑它都已经处理过了。
+///
+/// ## 多个不同 From 域时返回 `None`（不签）
+///
+/// 原实现只取 `parsed.from.first()`：认证用户提交
+/// `From: me@example.com, ceo@bank.com` 时，本机只对 `example.com` 签名，而接收方
+/// 会因「多 From 域」把 DMARC 判成 `none`（上游豁免）—— 等于本机主动参与了一次
+/// 针对第三个域的伪造报文。这里改成：**只要出现两个不同域就不签**，让上层按
+/// 「不在签名策略覆盖范围内」处理；签名器不负责决定这种报文该不该发出。
 pub fn from_domain(message: &[u8]) -> Option<String> {
     let parsed = AuthenticatedMessage::parse(message)?;
-    let address = parsed.from.first()?;
-    let (_, domain) = address.rsplit_once('@')?;
-    // addr-spec 可能被 `>`、空白或注释包着，只取合法的域名字符。
-    let domain: String = domain
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-        .collect();
-    let domain = domain.trim_matches('.').to_ascii_lowercase();
-    (!domain.is_empty()).then_some(domain)
+    let mut domains: Vec<String> = Vec::new();
+    for address in &parsed.from {
+        let Some((_, domain)) = address.rsplit_once('@') else {
+            continue;
+        };
+        // addr-spec 可能被 `>`、空白或注释包着，只取合法的域名字符。
+        let domain: String = domain
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+            .collect();
+        let domain = domain.trim_matches('.').to_ascii_lowercase();
+        if domain.is_empty() {
+            continue;
+        }
+        if !domains.iter().any(|seen| seen == &domain) {
+            domains.push(domain);
+        }
+    }
+    match domains.len() {
+        1 => domains.pop(),
+        // 0 个域 = 没有可背书的身份；>1 个域 = 无法确定该为谁背书。都不签。
+        _ => None,
+    }
 }
 
 /// 用 PKCS#1 DER 私钥签名，返回「`DKIM-Signature` 头 + 原报文」。
@@ -378,6 +400,33 @@ mod tests {
         assert_eq!(from_domain(b"Subject: t\r\n\r\nbody\r\n"), None);
         assert_eq!(from_domain(b"From: not-an-address\r\n\r\nbody\r\n"), None);
         assert_eq!(from_domain(b""), None);
+    }
+
+    /// 出站侧的多 From 域守卫：不能「只对第一个域签名」。
+    ///
+    /// 认证用户提交 `From: me@example.com, ceo@bank.com` 时，旧实现只取第一个
+    /// 地址 ⇒ 本机只为 `example.com` 背书，而报文里还挂着 `bank.com`；接收方又会
+    /// 因多 From 域把 DMARC 判成 none。签名器必须拒绝替这种报文选边。
+    #[test]
+    fn from_domain_refuses_messages_with_multiple_from_domains() {
+        for header in [
+            "From: me@example.com, ceo@bank.com\r\n",
+            "From: ceo@bank.com\r\nFrom: me@example.com\r\n",
+            "From: a@Example.COM, b@example.com, c@evil.test\r\n",
+        ] {
+            let message = format!("{header}Subject: t\r\n\r\nbody\r\n");
+            assert_eq!(
+                from_domain(message.as_bytes()),
+                None,
+                "多个不同 From 域时不得挑一个来签名：{header:?}"
+            );
+        }
+
+        // 同域多地址仍应正常返回该域（对照，防止误杀）。
+        assert_eq!(
+            from_domain(b"From: a@example.com, b@EXAMPLE.com\r\n\r\nbody\r\n").as_deref(),
+            Some("example.com")
+        );
     }
 
     #[test]

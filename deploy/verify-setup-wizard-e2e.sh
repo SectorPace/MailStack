@@ -78,10 +78,14 @@ else
 fi
 
 say "1. 生成夹具（fail-closed 启动所需）"
-# ROOT 可被环境变量覆盖；rm -rf 之前守住：空值与 / 一律拒绝执行。
+# ROOT 可被环境变量覆盖；rm -rf 之前守住：
+#   * 空值 / 根目录 / 常见系统目录一律拒绝（R7-011 实测：ROOT=/root 会 rm -rf /root）；
+#   * 必须看起来像本仓库根（有 Cargo.toml），否则拒绝。
 case "$ROOT" in
-  ""|"/") echo "  **ROOT 非法（'$ROOT'），拒绝 rm -rf**" >&2; exit 1 ;;
+  ""|"/"|"/root"|"/home"|"/usr"|"/etc"|"/var"|"/opt"|"/srv"|"/tmp"|"/mnt"|"/boot"|"/bin"|"/sbin"|"/lib"|"/lib64"|"/dev"|"/proc"|"/sys"|"/run")
+    echo "  **ROOT 非法（'$ROOT'），拒绝 rm -rf**" >&2; exit 1 ;;
 esac
+[ -f "$ROOT/Cargo.toml" ] || { echo "  **ROOT 不是 MailStack 仓库根（缺 Cargo.toml）：'$ROOT'，拒绝 rm -rf**" >&2; exit 1; }
 rm -rf "$ROOT"
 mkdir -p "$ROOT/etc/mailstack" "$ROOT/etc/postfix" "$ROOT/var/lib/mailstack/queue" "$ROOT/etc/mailstack/tls/$DOMAIN"
 printf '%s OK\n' "$DOMAIN" > "$ROOT/etc/postfix/mailstack_domains"

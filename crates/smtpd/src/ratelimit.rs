@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
 
+use crate::peer::PeerKey;
+
 /// 令牌桶参数。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RateLimitConfig {
@@ -64,10 +66,14 @@ struct Bucket {
 }
 
 /// 每 IP 令牌桶限速器。
+///
+/// 键是 [`PeerKey`]：IPv4 /32、IPv6 **/64**。同一个 /64 共享一个令牌桶 ——
+/// 否则拥有整段 /64 的攻击者每次连接换地址就能永远待在新桶的满额突发里，
+/// 限速对 IPv6 扫描等于不存在（R3-007）。
 #[derive(Debug)]
 pub struct RateLimiter {
     config: RateLimitConfig,
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    buckets: Mutex<HashMap<PeerKey, Bucket>>,
 }
 
 impl RateLimiter {
@@ -100,10 +106,11 @@ impl RateLimiter {
 
     /// 判定一次连接是否放行。
     pub fn check(&self, ip: IpAddr, now_millis: i64) -> RateDecision {
+        let key = PeerKey::from_ip(ip);
         let mut buckets = self.lock();
         let capacity = self.config.burst as f64;
 
-        if let Some(bucket) = buckets.get_mut(&ip) {
+        if let Some(bucket) = buckets.get_mut(&key) {
             refill(bucket, capacity, self.config.refill_per_second, now_millis);
             if bucket.tokens >= 1.0 {
                 bucket.tokens -= 1.0;
@@ -135,11 +142,11 @@ impl RateLimiter {
             now_millis,
         );
         bucket.tokens -= 1.0;
-        buckets.insert(ip, bucket);
+        buckets.insert(key, bucket);
         RateDecision::Allowed
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, Bucket>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PeerKey, Bucket>> {
         match self.buckets.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -166,7 +173,7 @@ fn retry_after(tokens: f64, rate: f64) -> u64 {
 /// 调用前提是 `buckets.len() >= max_entries`，因此本函数**保证**至少腾出一个位置，
 /// 否则新 IP 的插入会让表持续增长 —— 那正是限速表自身被撑爆的路径。
 fn evict(
-    buckets: &mut HashMap<IpAddr, Bucket>,
+    buckets: &mut HashMap<PeerKey, Bucket>,
     capacity: f64,
     rate: f64,
     now_millis: i64,
@@ -184,9 +191,9 @@ fn evict(
     }
 
     // 2) 仍然过多：按最后活跃时间淘汰最旧者，腾出至少 1 个位置。
-    let mut ages: Vec<(IpAddr, i64)> = buckets
+    let mut ages: Vec<(PeerKey, i64)> = buckets
         .iter()
-        .map(|(ip, bucket)| (*ip, bucket.last_millis))
+        .map(|(key, bucket)| (*key, bucket.last_millis))
         .collect();
     ages.sort_by_key(|(_, last)| *last);
     let target = max_entries.saturating_sub(1);
@@ -259,6 +266,30 @@ mod tests {
         assert!(!limiter.check(ip(1), 0).is_allowed());
         // 另一个 IP 有自己的桶，不受影响。
         assert!(limiter.check(ip(2), 0).is_allowed());
+    }
+
+    /// R3-007 反例：同一 IPv6 /64 内的不同地址共享一个桶，轮换地址拿不到新配额。
+    #[test]
+    fn one_ipv6_slash_64_shares_a_single_bucket() {
+        let limiter = limiter(2, 1.0, 100);
+        let base: std::net::Ipv6Addr = "2001:db8:aa:bb::".parse().unwrap();
+        let address = |index: u16| {
+            let mut octets = base.octets();
+            // 只改最后 2 字节：`octets[8..]` 是 8 字节，装不下 `u16::to_be_bytes()`。
+            octets[14..].copy_from_slice(&index.to_be_bytes());
+            IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        };
+
+        assert!(limiter.check(address(1), 0).is_allowed());
+        assert!(limiter.check(address(2), 0).is_allowed());
+        assert!(
+            !limiter.check(address(3), 0).is_allowed(),
+            "同 /64 第 3 次连接必须限速（不能靠换地址拿新桶）"
+        );
+
+        // 不同 /64 仍然是独立配额。
+        let other: IpAddr = "2001:db8:aa:bc::1".parse().unwrap();
+        assert!(limiter.check(other, 0).is_allowed());
     }
 
     #[test]

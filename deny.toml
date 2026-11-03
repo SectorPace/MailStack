@@ -97,8 +97,45 @@ multiple-versions = "warn"
 # `allow-wildcard-paths` 就是为这种情形提供的：路径依赖放行，其余通配仍然拒绝。
 allow-wildcard-paths = true
 wildcards = "deny"
-# 禁止把同一 crate 同时拉进两个不兼容的来源。
-deny = []
+# 纯 Rust 构建承诺（规格书 §3.4）：禁止 C 依赖链。
+#
+# 背景（R7-005）：此前这里是 `deny = []`，于是「禁止 C 依赖链」只靠
+# `deploy/verify-auth-clean-tree.sh` 一个手工脚本把关，而那个脚本命中时还
+# 不失败 —— 等于没有门禁。现在把项目承诺排除的 C 链 crate 直接写进
+# cargo-deny：CI 的 cargo-deny job 与本地脚本形成两道互相独立、都会红的门禁。
+#
+# 判定口径：凡构建期需要 C 编译器 / cmake / nasm / 系统库头文件才能产出的
+# crate 一律拒绝。本仓库已选定的纯 Rust 等价物：
+#   * 压缩：flate2 的 rust_backend（miniz_oxide），不链接 zlib；
+#   * TLS/加密：rustls + **ring**（ring 是已接受依赖：纯 Rust + asm，
+#     不走 libc 绑定；本清单**刻意不包含 ring**，否则会把现有 TLS 链拆掉）；
+#   * 不用 aws-lc-rs（需 cmake/nasm），不用 OpenSSL 系。
+# 每个条目都是「名 + 版本任意」：只要出现就是构建纪律被破坏，与版本无关。
+deny = [
+    # OpenSSL 系（链接 libssl/libcrypto，依赖系统头文件）
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "openssl-src" },
+    # AWS-LC 系（构建期需要 cmake + nasm + C 工具链）
+    { name = "aws-lc-rs" },
+    { name = "aws-lc-sys" },
+    # zstd 系（C 后端；rust 后端已由 flate2 承担）
+    { name = "zstd" },
+    { name = "zstd-safe" },
+    { name = "zstd-sys" },
+    # zlib 系（libz-sys 需要系统 zlib 头文件）
+    { name = "libz-sys" },
+    { name = "libz-ng-sys" },
+    # xz/lzma 系
+    { name = "xz2" },
+    { name = "liblzma-sys" },
+    # bzip2 系
+    { name = "bzip2" },
+    { name = "bzip2-sys" },
+    # 构建期外部工具链驱动：出现即说明有 C 链混入
+    { name = "cmake" },
+    { name = "nasm-rs" },
+]
 
 [sources]
 unknown-registry = "deny"

@@ -1,5 +1,26 @@
 # MailStack v0.8.1-beta1 测试报告（Rust 重写）
 
+> ## ⚠️ v1.0.0 最终门禁实测（2026-11-03，本节取代下方历史数字）
+>
+> 本文件正文是 **v0.8.1-beta1 检查点**的测试报告（历史存档）。v1.0.0 发布前的
+> 权威门禁实测如下（Ubuntu 26.04 / WSL2 + Rust 1.98.1）：
+>
+> | 指标 | 实测值 |
+> |---|---|
+> | `cargo test --workspace --all-targets` | **1701 passed / 0 failed** |
+> | 前端 `npm test`（vitest，`webui/`） | **187 passed / 0 failed** |
+> | `cargo fmt --all -- --check` | 通过 |
+> | `cargo clippy --workspace --all-targets -- -D warnings` | 通过 |
+> | `deploy/verify-invariant-gate.sh` | `INVARIANT_GATE_OK`（293 条不变量） |
+> | `deploy/verify-deliverables.sh` | `DELIVERABLES_OK` |
+> | 特权动作白名单 / HTTP 契约路由 | 59 条（RO 21 + RW 38）/ 73 条 |
+>
+> v1.0.0 新增 `crates/webmail` + `bin/mailstack-webmail`（Webmail 独立进程）、
+> `deploy/install.sh`（curl 一键 / 源码构建两种形态）、完整中英文 README 与
+> LICENSE/CHANGELOG/SECURITY。发布前完成 7 份独立审查（R1–R7，144 条发现），
+> critical/high 优先修复；本文件 §4/§5 的历史缺陷与未验证事项仍适用（但测试数、
+> 动作数已被 v1.0.0 覆盖）。
+
 - 版本：`0.8.1-beta1`
 - 规格书：`docs/REWRITE_TO_RUST.md` **v3**（本仓库外的源码包内）
 - 平台：WSL Ubuntu 24.04 / `x86_64-unknown-linux-gnu`（生产目标平台）

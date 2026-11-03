@@ -165,15 +165,14 @@ static KEY_CACHE: OnceLock<Mutex<Option<KeyCache>>> = OnceLock::new();
 fn cached_private_key(path: &Path) -> mailstack_auth::AuthResult<Arc<Vec<u8>>> {
     // stat 拿不到（文件缺失/不可读）记为 None：None 与 None 相等，
     // 但随之而来的读取也会失败，因此不会把「不存在」缓存成命中。
-    let fingerprint = std::fs::metadata(path).ok().map(|meta| {
-        (
-            meta.modified().ok(),
-            meta.len(),
-        )
-    });
+    let fingerprint = std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.modified().ok(), meta.len()));
 
     let cache = KEY_CACHE.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(cached) = guard.as_ref() {
         if let Some((mtime, len)) = &fingerprint {
             if cached.path == path && cached.mtime == *mtime && cached.len == Some(*len) {

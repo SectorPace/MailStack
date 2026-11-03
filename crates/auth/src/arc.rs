@@ -346,13 +346,15 @@ mod tests {
         // 只把 owned 的结果带出去。
         fn header_domain_for(from_line: &str, fallback: &str) -> String {
             let raw = format!("From: {from_line}\r\nTo: bob@example.net\r\n\r\nbody\r\n");
-            let message =
-                AuthenticatedMessage::parse(raw.as_bytes()).expect("报文应可解析");
+            let message = AuthenticatedMessage::parse(raw.as_bytes()).expect("报文应可解析");
             header_from(&message, fallback)
         }
 
         // 大写折叠为小写域。
-        assert_eq!(header_domain_for("Alice@Example.COM", "fallback.test"), "example.com");
+        assert_eq!(
+            header_domain_for("Alice@Example.COM", "fallback.test"),
+            "example.com"
+        );
 
         // 角括号形式同样取域（mail-auth 解析时已剥离，清洗不得破坏）。
         assert_eq!(
@@ -361,7 +363,10 @@ mod tests {
         );
 
         // 没有 @（解析不出地址或域为空）：退回 fallback。
-        assert_eq!(header_domain_for("no-at-sign", "fallback.test"), "fallback.test");
+        assert_eq!(
+            header_domain_for("no-at-sign", "fallback.test"),
+            "fallback.test"
+        );
     }
 
     // ─────────────────────────── 封印（RFC 8617 §5） ───────────────────────────

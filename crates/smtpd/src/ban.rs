@@ -24,6 +24,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
 
+use crate::peer::PeerKey;
+
 /// 封禁策略参数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BanConfig {
@@ -89,12 +91,18 @@ struct Entry {
     /// 见 [`Ban::manual`]。
     manual: bool,
     last_seen: i64,
+    /// 最近一次触达这个键的具体地址。
+    ///
+    /// IPv6 的键是 /64 前缀，一条记录可能对应整段里任意地址；记录最近触达的
+    /// 那个地址只是为了让 `banned()`/日志能给出一个可读的代表值（也用于
+    /// 手工封禁的对齐），不参与任何阈值判定。
+    last_ip: Option<IpAddr>,
 }
 
 impl Entry {
     fn to_ban(&self, ip: IpAddr) -> Ban {
         Ban {
-            ip,
+            ip: self.last_ip.unwrap_or(ip),
             until_unix: self.banned_until,
             permanent: self.permanent,
             strikes: self.strikes,
@@ -123,10 +131,14 @@ impl ManualBanDiff {
 }
 
 /// IP 封禁表。
+///
+/// 键是 [`PeerKey`]：IPv4 /32、IPv6 **/64**。同一个 /64 内的地址共享失败计数、
+/// 封禁与 strike —— 否则拥有一个 /64 的攻击者只要每次换地址，`max_failures`
+/// 就永远攒不满（R3-007）。
 #[derive(Debug)]
 pub struct BanList {
     config: BanConfig,
-    entries: Mutex<HashMap<IpAddr, Entry>>,
+    entries: Mutex<HashMap<PeerKey, Entry>>,
 }
 
 impl BanList {
@@ -158,31 +170,33 @@ impl BanList {
         self.lock().len()
     }
 
-    /// 查询某 IP 当前是否被封禁。
+    /// 查询某 IP 当前是否被封禁（IPv6 按 /64 聚合）。
     pub fn check(&self, ip: IpAddr, now: i64) -> Option<Ban> {
         let mut guard = self.lock();
-        let entry = guard.get_mut(&ip)?;
+        let entry = guard.get_mut(&PeerKey::from_ip(ip))?;
         Self::active_ban(entry, ip, now)
     }
 
     /// 记录一次失败；若本次失败触发了封禁则返回该封禁，否则返回 `None`。
     pub fn record_failure(&self, ip: IpAddr, now: i64) -> Option<Ban> {
         let config = self.config;
+        let key = PeerKey::from_ip(ip);
         let mut guard = self.lock();
 
-        if guard.len() >= config.max_entries && !guard.contains_key(&ip) {
+        if guard.len() >= config.max_entries && !guard.contains_key(&key) {
             let freed = evict(&mut guard, config.max_entries, now);
             // 淘汰不动（表被永久/手工/活跃封禁填满）时不再插入：条目数越过
             // `max_entries` 的无界增长正是内存保护要防的。此刻丢掉一次 strike
             // 是可接受的取舍 —— 表已饱和说明需要运维清理，而不是让守护进程
             // 无界吃内存。
-            if !freed && !guard.contains_key(&ip) {
+            if !freed && !guard.contains_key(&key) {
                 return None;
             }
         }
 
-        let entry = guard.entry(ip).or_default();
+        let entry = guard.entry(key).or_default();
         entry.last_seen = now;
+        entry.last_ip = Some(ip);
 
         // 已在封禁中：不重复计数（否则单次攻击会自我叠加成永久封禁）。
         if entry.permanent {
@@ -221,8 +235,10 @@ impl BanList {
     }
 
     /// 解除某 IP 的封禁（含永久封禁），并清空其计数。返回此前是否存在记录。
+    ///
+    /// IPv6 作用于该地址所在的 /64（与自动封禁的聚合口径一致）。
     pub fn unban(&self, ip: IpAddr) -> bool {
-        self.lock().remove(&ip).is_some()
+        self.lock().remove(&PeerKey::from_ip(ip)).is_some()
     }
 
     /// 当前生效的封禁列表。
@@ -243,24 +259,35 @@ impl BanList {
     /// 2. **手工封禁是永久的，且不受失败计数影响**。它只能由文件变更解除；
     ///    到期与 strike 升级都与它无关。
     pub fn apply_manual(&self, ips: &[IpAddr]) -> ManualBanDiff {
-        let wanted: std::collections::HashSet<IpAddr> = ips.iter().copied().collect();
+        // 键是聚合后的 PeerKey；值保留一个具体的代表地址（同 /64 出现多个时取列表
+        // 里最后一个），这样手工封禁的「新增/解除」diff 仍能给出可读的 IP。
+        let wanted: HashMap<PeerKey, IpAddr> =
+            ips.iter().map(|ip| (PeerKey::from_ip(*ip), *ip)).collect();
         let mut diff = ManualBanDiff::default();
         let mut guard = self.lock();
 
         // 先解除：文件里已不再列出的手工封禁。
-        let stale: Vec<IpAddr> = guard
+        let stale: Vec<(PeerKey, IpAddr)> = guard
             .iter()
-            .filter(|(ip, entry)| entry.manual && !wanted.contains(ip))
-            .map(|(ip, _)| *ip)
+            .filter(|(key, entry)| entry.manual && !wanted.contains_key(key))
+            .map(|(key, entry)| {
+                (
+                    *key,
+                    entry
+                        .last_ip
+                        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                )
+            })
             .collect();
-        for ip in stale {
-            guard.remove(&ip);
+        for (key, ip) in stale {
+            guard.remove(&key);
             diff.removed.push(ip);
         }
 
         // 再新增：文件里列出但尚未是手工封禁的地址。
-        for ip in &wanted {
-            let entry = guard.entry(*ip).or_default();
+        for (key, ip) in &wanted {
+            let entry = guard.entry(*key).or_default();
+            entry.last_ip = Some(*ip);
             if !entry.manual {
                 diff.added.push(*ip);
             }
@@ -279,8 +306,13 @@ impl BanList {
     fn entries(&self, now: i64) -> Vec<Ban> {
         let mut guard = self.lock();
         guard
-            .iter_mut()
-            .filter_map(|(ip, entry)| Self::active_ban(entry, *ip, now))
+            .values_mut()
+            .filter_map(|entry| {
+                let fallback = entry
+                    .last_ip
+                    .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                Self::active_ban(entry, fallback, now)
+            })
             .collect()
     }
 
@@ -299,7 +331,7 @@ impl BanList {
         None
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, Entry>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PeerKey, Entry>> {
         match self.entries.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -323,11 +355,11 @@ impl BanList {
 ///
 /// 返回本次是否真的腾出了位置；淘汰不动时调用方不得再插入新条目，
 /// 否则表会越过 `max_entries` 无界增长（内存保护本身失效）。
-fn evict(entries: &mut HashMap<IpAddr, Entry>, max_entries: usize, now: i64) -> bool {
+fn evict(entries: &mut HashMap<PeerKey, Entry>, max_entries: usize, now: i64) -> bool {
     entries.retain(|_, entry| {
         entry.permanent
             || entry.manual
-            || entry.banned_until.map_or(false, |until| until > now)
+            || entry.banned_until.is_some_and(|until| until > now)
             || !entry.failures.is_empty()
     });
 
@@ -338,17 +370,15 @@ fn evict(entries: &mut HashMap<IpAddr, Entry>, max_entries: usize, now: i64) -> 
     // 候选 = 永久/手工之外、且当前**未在封禁中**的条目。优先级：
     // 已过期封禁（strike 历史价值最低）排最前，其后是无失败历史的空壳
     //（第 1 步通常会清掉），最后按最久未活动淘汰窗口内的计数者。
-    let mut candidates: Vec<(IpAddr, i64, i64)> = entries
+    let mut candidates: Vec<(PeerKey, i64, i64)> = entries
         .iter()
         .filter(|(_, entry)| {
-            !entry.permanent
-                && !entry.manual
-                && entry.banned_until.map_or(true, |until| until <= now)
+            !entry.permanent && !entry.manual && entry.banned_until.is_none_or(|until| until <= now)
         })
-        .map(|(ip, entry)| {
-            let expired_ban = entry.banned_until.map_or(false, |until| until <= now);
+        .map(|(key, entry)| {
+            let expired_ban = entry.banned_until.is_some_and(|until| until <= now);
             let history_value = i64::from(!expired_ban && !entry.failures.is_empty());
-            (*ip, entry.last_seen, history_value)
+            (*key, entry.last_seen, history_value)
         })
         .collect();
     // 历史价值低者先走，同组内最旧者优先。
@@ -479,6 +509,49 @@ mod tests {
         }
         assert!(bans.check(ip(1), 5).is_some());
         assert!(bans.check(ip(2), 5).is_none(), "另一个 IP 不受影响");
+    }
+
+    /// R3-007 反例：IPv6 轮换地址不得绕过封禁 —— 同一 /64 共享失败计数。
+    ///
+    /// 修复前每个 /128 都是新条目，100 个地址各失败 1 次也不会触发阈值。
+    #[test]
+    fn one_ipv6_slash_64_cannot_rotate_addresses_to_dodge_the_ban() {
+        let bans = BanList::new(BanConfig {
+            max_failures: 8,
+            window_secs: 600,
+            temp_ban_secs: 300,
+            permanent_after: 0,
+            max_entries: 1_000,
+        });
+        let base: std::net::Ipv6Addr = "2001:db8:aa:bb::".parse().unwrap();
+        let segment = |index: u16| {
+            let mut octets = base.octets();
+            // 改写低 64 位，保持高 64 位（/64 前缀）不变。
+            // 注意：`octets[8..]` 是 8 字节，而 `u16::to_be_bytes` 只有 2 字节 ——
+            // 必须写到 16 字节地址的最后 2 字节（[14..]），否则 copy_from_slice 会 panic。
+            octets[14..].copy_from_slice(&index.to_be_bytes());
+            IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        };
+
+        for index in 0..7 {
+            assert!(
+                bans.record_failure(segment(index), 0).is_none(),
+                "第 {index} 次失败还不该封禁"
+            );
+        }
+        let ban = bans
+            .record_failure(segment(7), 0)
+            .expect("同一 /64 的第 8 次失败必须触发封禁");
+        assert!(!ban.permanent);
+
+        // 换一个同 /64 内从未出现过的地址：仍然被封。
+        assert!(
+            bans.check(segment(999), 1).is_some(),
+            "同一 /64 内的任意地址都必须在封禁中"
+        );
+        // 另一个 /64 不受影响。
+        let other: IpAddr = "2001:db8:aa:bc::1".parse().unwrap();
+        assert!(bans.check(other, 1).is_none(), "不同 /64 不得连坐");
     }
 
     #[test]

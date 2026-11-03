@@ -12,6 +12,12 @@ on:
 permissions:
   contents: read
 
+# 同一分支的新推送取消旧跑：避免「旧提交的 CI 还在占 runner，新提交排队」，
+# 也避免两个跑同时在 main 上做 cargo 缓存写。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # 可复现构建锚点（与 deploy/build.sh 一致）
@@ -22,6 +28,8 @@ jobs:
   quality:
     name: fmt + clippy + test
     runs-on: ubuntu-24.04
+    # 无上限的 job 会无限占 runner（尤其依赖下载卡住时）。
+    timeout-minutes: 45
     steps:
       # 6.3：pin 到 commit SHA（v4 = actions/checkout@v4 的 tag 解析结果）。
       # tag 可被上游重新指向，SHA 不能。
@@ -48,6 +56,37 @@ jobs:
 
       - name: test
         run: cargo test --locked --all-targets
+
+  # ── 前端（管理控制台 + Webmail）：类型检查 + 构建 + 单测 ──
+  #
+  # 为什么单独一个 job：`webui/` 的产物不进 Rust 门禁（cargo 既不构建也不校验它）。
+  # 在此之前仓库**没有任何 CI 在跑前端**，于是「改了前端没跑 npm run build」这类
+  # 错误只能在人工部署时发现。这里至少把 tsc --noEmit、vite build（双入口）与
+  # vitest 钉进 CI。
+  webui:
+    name: webui build + test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # 与本地开发一致的 Node 主版本；action 本身 pin 到 v4 tag 的当前 commit。
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - name: 依赖必须由 lockfile 重建
+        working-directory: webui
+        run: npm ci
+
+      - name: 类型检查 + 构建（index.html 管理台 + mail.html Webmail）
+        working-directory: webui
+        run: npm run build
+
+      - name: 单元测试
+        working-directory: webui
+        run: npm test
 
   # ── 供应链门禁（规格书 §7）：锁定构建 + 漏洞 + 许可 ──
   supply-chain:
@@ -117,8 +156,14 @@ jobs:
       - name: 不变量测试必须真正通过（不允许 ignore）
         run: |
           set -e
-          if grep -rn "#\[ignore\]" crates/ bin/ ; then
+          # R7-013：原判定只匹配 `#[ignore]` 这一种写法，`#[ignore = "..."]`
+          # 与 `#[cfg(any())]` 都能让测试「存在但永远不跑」而门禁照绿。
+          if grep -rnE '#\[ignore([[:space:]]*[=,][^]]*)?\]' crates/ bin/ ; then
             echo "::error::不变量测试不得标记为 ignore"
+            exit 1
+          fi
+          if grep -rnE '#\[cfg\(any\(\)\)\]' crates/ bin/ ; then
+            echo "::error::不变量测试不得用 #[cfg(any())] 编译期剔除"
             exit 1
           fi
           cargo test --locked --all-targets

@@ -61,6 +61,14 @@ const PAGE_SIZE_BYTES: u64 = 4096;
 /// 磁盘用量刷新间隔（与基线的 60 秒定时器一致）。
 const DISK_REFRESH_MS: i64 = 60_000;
 
+/// `postqueue -j` 的刷新间隔（R5-007）。
+///
+/// `postqueue -j` 会把整个队列（含已延迟条目）的元数据全量导出，条目上千时
+/// 单次是几十到几百毫秒 CPU + 磁盘；而原实现**每个采样周期**（2 秒）都跑一次，
+/// 每天 43 200 次，且整个调用都在采集器互斥锁内 —— 队列积压最大时（也正是
+/// 磁盘压力最大时）开销最大。队列积压不是秒级指标，60 秒与 `df` 同级足够。
+const QUEUE_REFRESH_MS: i64 = 60_000;
+
 /// `df` / `postqueue` 的最长等待时长。
 ///
 /// 子进程卡死时按「读不到」处理：宁可丢一个读数，不可让一次挂起的
@@ -198,6 +206,10 @@ struct Inner {
     disk: DiskInfo,
     /// 上次刷新磁盘用量的时刻；`None` 表示还没刷过。
     disk_updated_ms: Option<i64>,
+    /// 最近一次 `postqueue -j` 的读数（R5-007：60 秒缓存）。
+    queue: QueueMetrics,
+    /// 上次跑 `postqueue -j` 的时刻；`None` 表示还没跑过。
+    queue_updated_ms: Option<i64>,
 }
 
 /// 时序遥测采集器。
@@ -249,6 +261,8 @@ impl TelemetryCollector {
                     percent: 0.0,
                 },
                 disk_updated_ms: None,
+                queue: QueueMetrics::default(),
+                queue_updated_ms: None,
             }),
             proc_root,
             runner,
@@ -310,12 +324,27 @@ impl TelemetryCollector {
         let hostname = read_hostname(&self.proc_root);
 
         let (avg_cpu, max_cpu, avg_mem, max_mem, avg_sys_mem, max_sys_mem) = summarize(&points);
-        let loads = load.map(|l| [l.one, l.five, l.fifteen]).unwrap_or([0.0; 3]);
+        // R5-023：读不到的字段给 `null` 并登记进 `unavailable`，**不**拿 0 冒充
+        // 「刚启动 / 空闲 / 内存零占用」。0 是一个合法读数，与「没数据」混淆后，
+        // 运维看到的是一台「非常健康」的机器。
+        let loads = load.map(|l| [l.one, l.five, l.fifteen]);
+        let mem_available = self.proc_root.join("meminfo").is_file();
+        let mut unavailable: Vec<&str> = Vec::new();
+        if uptime.is_none() {
+            unavailable.push("uptime");
+        }
+        if loads.is_none() {
+            unavailable.push("loadavg");
+        }
+        if !mem_available {
+            unavailable.push("meminfo");
+        }
 
         json!({
             "timeframe": timeframe,
             "intervalMs": interval_ms,
             "samplingCount": points.len(),
+            "unavailable": unavailable,
             "current": {
                 "cpuPercent": latest.cpu_percent,
                 "totalDaemonMemoryMb": total_daemon_mb,
@@ -323,7 +352,7 @@ impl TelemetryCollector {
                 "systemMemoryTotalMb": mem.total_mb,
                 "systemMemoryPercent": mem.percent,
                 "loadAvg": loads,
-                "uptimeSec": uptime.unwrap_or(0),
+                "uptimeSec": uptime,
                 "daemons": daemons.iter().map(daemon_metric_json).collect::<Vec<_>>(),
                 "cores": cores,
                 "hostname": hostname,
@@ -354,7 +383,8 @@ impl TelemetryCollector {
         let cpu = self.sample_cpu_locked(inner);
         let mem = self.read_mem();
         let (total_daemon_mb, daemons) = self.daemons_locked(inner);
-        let queue = self.queue_metrics();
+        // R5-007：队列读数走 60 秒缓存，而不是每个采样周期跑一次 `postqueue`。
+        let queue = self.queue_locked(inner);
         let load = mailstack_core::sysinfo::read_loadavg(&self.proc_root);
         let loads = load.map(|l| [l.one, l.five, l.fifteen]).unwrap_or([0.0; 3]);
 
@@ -596,6 +626,21 @@ impl TelemetryCollector {
             let _ = tx.send(runner.run(&program, &arg_refs).ok());
         });
         rx.recv_timeout(SUBPROCESS_TIMEOUT).ok().flatten()
+    }
+
+    /// `postqueue -j`（每 60 秒刷新一次，其余时间返回缓存，R5-007）。
+    fn queue_locked(&self, inner: &mut Inner) -> QueueMetrics {
+        let now = (self.clock)();
+        let stale = inner
+            .queue_updated_ms
+            .map(|last| now - last >= QUEUE_REFRESH_MS)
+            .unwrap_or(true);
+        if stale {
+            inner.queue = self.queue_metrics();
+            // 读失败也要更新时间戳：否则每个上报周期都会重跑一次 `postqueue`。
+            inner.queue_updated_ms = Some(now);
+        }
+        inner.queue
     }
 
     /// `postqueue -j`：逐行 JSON 统计总数与延迟数。
@@ -885,6 +930,15 @@ mod tests {
                 .filter(|p| *p == "df")
                 .count()
         }
+
+        fn postqueue_calls(&self) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == "postqueue")
+                .count()
+        }
     }
 
     impl CommandRunner for FakeRunner {
@@ -1101,6 +1155,72 @@ mod tests {
             point.queue_deferred, 1,
             "只有带 delay_reason 的收件人算延迟"
         );
+    }
+
+    /// R5-007：`postqueue -j` 不得每个采样周期都跑（原实现每 2 秒一次全队列列举，
+    /// 且整段调用都在采集器互斥锁内）。队列积压是分钟级指标，缓存 60 秒足够。
+    #[test]
+    fn postqueue_is_not_run_on_every_sample() {
+        let f = Fixture::new("queuecache");
+        base_proc(&f);
+        let postqueue = "{\"queue_id\":\"A\",\"recipients\":[{\"address\":\"a@example.test\"}]}\n";
+        let (now, clock) = clock(0);
+        let runner = FakeRunner::new(DF_OK, postqueue);
+        let c = collector(&f, Arc::clone(&runner), clock);
+
+        // 30 个采样周期（2 秒一个 = 60 秒）。原实现会跑 30 次 `postqueue`。
+        for tick in 0..30 {
+            now.store(tick * 2_000, Ordering::SeqCst);
+            c.sample();
+        }
+        assert!(
+            runner.postqueue_calls() <= 2,
+            "60 秒内跑了 {} 次 postqueue（应 ≤ 2：首采一次 + 60 秒后一次）",
+            runner.postqueue_calls()
+        );
+        // 缓存期间读数仍然真实：队列计数取自上一次成功采样，而不是被清零。
+        let point = c.sample();
+        assert_eq!(point.queue_total, 1, "缓存期间队列读数不得退化成 0");
+
+        now.store(QUEUE_REFRESH_MS + 1, Ordering::SeqCst);
+        c.sample();
+        assert_eq!(runner.postqueue_calls(), 2, "60 秒后应刷新一次");
+    }
+
+    /// R5-023：`/proc` 读不到时必须如实标「不可用」，不能拿 0 冒充读数。
+    #[test]
+    fn unreadable_proc_entries_are_reported_as_unavailable_not_as_zero() {
+        // 一个空的 `/proc`：uptime / loadavg / meminfo 全都读不到。
+        let f = Fixture::new("unavailable");
+        let c = collector(&f, FakeRunner::new("", ""), clock(0).1);
+
+        let body = c.telemetry(None);
+        assert!(
+            body["current"]["uptimeSec"].is_null(),
+            "读不到 uptime 时必须回 null，而不是 0（前端会渲染成「刚启动」）：{}",
+            body["current"]["uptimeSec"]
+        );
+        assert!(
+            body["current"]["loadAvg"].is_null(),
+            "读不到 loadavg 时必须回 null，而不是 [0,0,0]（渲染成「空闲」）：{}",
+            body["current"]["loadAvg"]
+        );
+        let unavailable = body["unavailable"].as_array().unwrap();
+        for field in ["uptime", "loadavg", "meminfo"] {
+            assert!(
+                unavailable.iter().any(|item| item == field),
+                "`unavailable` 必须登记 {field}：{unavailable:?}"
+            );
+        }
+
+        // 对照：读得到时不得再标不可用。
+        let ok = Fixture::new("available");
+        base_proc(&ok);
+        let c = collector(&ok, FakeRunner::new(DF_OK, ""), clock(0).1);
+        let body = c.telemetry(None);
+        assert_eq!(body["current"]["uptimeSec"], 12345);
+        assert_eq!(body["current"]["loadAvg"][0], 0.52);
+        assert_eq!(body["unavailable"].as_array().unwrap().len(), 0);
     }
 
     #[test]

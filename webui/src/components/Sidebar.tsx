@@ -23,6 +23,7 @@ import {
   IconGlobe as IconDomains,
   IconKey as IconDKIM,
   IconLogs,
+  IconMail,
   IconQueue,
   IconRelay,
   IconServices,
@@ -31,6 +32,7 @@ import {
   IconUsers,
 } from "./icons";
 import { BrandLogo } from "./BrandLogo";
+import { webmailUrl } from "../lib/webmail";
 
 export const NAV: { key: RouteKey; icon: ComponentType<{ size?: number }> }[] = [
   { key: "dashboard", icon: IconDashboard },
@@ -99,6 +101,12 @@ export function Sidebar({
   const searchLabel = zh ? "搜索功能…" : "Search functions…";
   const collapseLabel = zh ? "折叠侧栏" : "Collapse sidebar";
   const expandLabel = zh ? "展开侧栏" : "Expand sidebar";
+  // Webmail 入口（独立进程/端口；URL 规则见 lib/webmail.ts）。
+  const webmailHref = webmailUrl();
+  const webmailLabel = zh ? "Webmail 邮箱" : "Webmail";
+  const webmailHint = zh
+    ? "在新标签页打开 Webmail（独立进程/端口，默认 8444）"
+    : "Open Webmail in a new tab (separate process/port, default 8444)";
 
   function toggleCollapsed() {
     setSidebarCollapsed(!collapsed);
@@ -272,6 +280,35 @@ export function Sidebar({
                 </div>
               ))}
         </nav>
+
+        {/* Webmail 入口：独立进程/端口（默认 :8444）的外部链接。
+            不放在路由表里 —— 它不是本 SPA 的页面；在 iframe/同源路由里嵌会把
+            管理员会话与邮箱用户会话混在同一个浏览上下文（见 lib/webmail.ts）。 */}
+        {webmailHref && (
+          <a
+            href={webmailHref}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={webmailHint}
+            className={`mt-1 flex shrink-0 items-center gap-2 rounded-[var(--radius-control)] border-t px-2.5 text-left outline-none transition-colors hover:opacity-80 ${iconRail ? "justify-center" : ""}`}
+            style={{
+              color: "var(--text-2)",
+              borderColor: "var(--hairline)",
+              height: "var(--control-h)",
+              paddingTop: 4,
+            }}
+          >
+            <IconMail size={16} />
+            {!iconRail && (
+              <span
+                className="nav-label min-w-0 flex-1 truncate font-medium"
+                style={{ fontSize: "var(--font-body)" }}
+              >
+                {webmailLabel}
+              </span>
+            )}
+          </a>
+        )}
 
         {/* 折叠开关（仅 fixed 桌面形态；rail/drawer 的宽度由断点决定） */}
         {variant === "fixed" && (

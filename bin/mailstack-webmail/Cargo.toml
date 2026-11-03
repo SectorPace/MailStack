@@ -1,0 +1,29 @@
+[package]
+name = "mailstack-webmail-bin"
+description = "MailStack Webmail 服务入口：/mail/api + 前端产物（mail.html）托管"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# 不发布到 crates.io（见 workspace [workspace.package] publish）。
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mailstack-webmail"
+path = "src/main.rs"
+
+[dependencies]
+mailstack-core.workspace = true
+mailstack-webmail.workspace = true
+axum.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"

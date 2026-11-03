@@ -290,24 +290,21 @@ impl QueueRunner {
         // 会整批重投。租约把这段窗口显式化：仍在租约内的条目**先跳过**，
         // 等租约过期再重试。
         //
-        // 租约清理、租约枚举与全量读取都是同步文件 I/O（`read_dir` + 逐条 JSON
-        // 解析**包括邮件正文**），不能占着 tokio worker 跑 —— 搬进
-        // `spawn_blocking`（与 `store.len()` 的既有先例一致）。三者共用一个
-        // 阻塞任务，少一次任务派生。
+        // 5.9（Fixer C）：租约清理、租约枚举与条目读取都是同步文件 I/O，不能占着
+        // tokio worker 跑 —— 搬进 `spawn_blocking`（与 `store.len()` 的既有先例
+        // 一致）。读取用 `load_due` 而**不是** `load_all`：后者会把整个队列（含
+        // 每条 50 MiB 的报文正文）反序列化进内存，而 `due` 过滤发生在读完之后。
         let store = self.store.clone();
-        let (entries, claimed) =
-            tokio::task::spawn_blocking(
-                move || -> QueueResult<(Vec<QueueEntry>, std::collections::HashSet<String>)> {
-                    store.prune_claims(now_unix)?;
-                    let claimed = store.claimed_ids(now_unix)?;
-                    let entries = store.load_all()?;
-                    Ok((entries, claimed))
-                },
-            )
-            .await
-            .map_err(|e| {
-                crate::error::QueueError::Storage(format!("queue load task failed: {e}"))
-            })??;
+        let (entries, claimed) = tokio::task::spawn_blocking(
+            move || -> QueueResult<(Vec<QueueEntry>, std::collections::HashSet<String>)> {
+                store.prune_claims(now_unix)?;
+                let claimed = store.claimed_ids(now_unix)?;
+                let entries = store.load_due(now_unix)?;
+                Ok((entries, claimed))
+            },
+        )
+        .await
+        .map_err(|e| crate::error::QueueError::Storage(format!("queue load task failed: {e}")))??;
         let due: Vec<QueueEntry> = entries
             .into_iter()
             .filter(|entry| entry.is_due(now_unix) && !claimed.contains(&entry.id))
@@ -317,23 +314,41 @@ impl QueueRunner {
         // 条目 —— 每条条目重建一遍纯属浪费（域名归一化 + 排序 + 去重）。
         let policy = RelayPolicy::new(self.config.managed_domains.iter().cloned());
 
+        let mut totals = EntryOutcome::default();
+        let mut considered = 0usize;
+        let mut failed = 0usize;
+        let mut join_error: Option<crate::error::QueueError> = None;
         let mut tasks = JoinSet::new();
         for entry in due.iter().cloned() {
             // 认领必须在**这里**（spawn 之前）完成，而不是在任务内部：
             // 任务一多，两个任务并发认领同一条时就都拿到了。
             // `try_claim` 用 O_EXCL，只有一方能成功。
-            if !self.store.try_claim(&entry.id, now_unix)? {
-                continue;
+            //
+            // 5.3（Fixer C）：认领失败**绝不能** `?` 提前返回。`?` 会让 `tasks`
+            // （`JoinSet`）在函数中途被 drop，而 drop `JoinSet` 会 **abort** 已经
+            // spawn 的任务 —— 那些任务可能正处在「对端已 250、本地还没落盘」的
+            // 窗口里，于是这一轮已投出的进度被丢掉，下一轮整批重投（与 5.18 的
+            // `select!` 丢弃 future 是同一类缺陷，只是触发点换成了目录 I/O 错误）。
+            // 认领是**逐条目**的前置条件，与整轮成败无关：记日志 + 计数 + 继续。
+            match self.store.try_claim(&entry.id, now_unix) {
+                Ok(true) => {
+                    let runner = Arc::clone(self);
+                    let policy = policy.clone();
+                    tasks.spawn(async move { runner.process(entry, now_unix, &policy).await });
+                }
+                Ok(false) => {
+                    // 别的执行者持有有效租约：本轮跳过是正常语义，不计数为失败。
+                }
+                Err(error) => {
+                    mailstack_core::warn::warn_with_detail(
+                        "queue claim",
+                        &format!("entry {}: {error}", entry.id),
+                    );
+                    failed += 1;
+                }
             }
-            let runner = Arc::clone(self);
-            let policy = policy.clone();
-            tasks.spawn(async move { runner.process(entry, now_unix, &policy).await });
         }
 
-        let mut totals = EntryOutcome::default();
-        let mut considered = 0usize;
-        let mut failed = 0usize;
-        let mut join_error: Option<crate::error::QueueError> = None;
         while let Some(joined) = tasks.join_next().await {
             match joined {
                 Ok(Ok(outcome)) => {
@@ -1928,5 +1943,98 @@ mod tests {
             "失败原因必须留在条目上，否则运维无从定位：{:?}",
             entries[0].last_error
         );
+    }
+
+    /// 5.3（Fixer C）：认领失败不得中止整轮 —— 已 spawn 的在途投递必须跑完并落盘。
+    ///
+    /// 原实现是 `try_claim(..)?`：任一条目认领出错（`claims/` 目录 ENOSPC /
+    /// EACCES / EMFILE —— 磁盘出问题时最可能同时出现的那几种）就会提前返回，
+    /// 而 `JoinSet` 被 drop 会 **abort** 已 spawn 的任务。那些任务可能正处在
+    /// 「对端已 250、本地还没落盘」的窗口里，于是本轮已投出的进度被丢掉，
+    /// 下一轮整批重投（收件人收到重复邮件）。
+    #[tokio::test]
+    async fn a_failed_claim_does_not_abort_the_entries_already_in_flight() {
+        let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
+        // 两条都已到期，id 升序决定认领顺序。
+        enqueue_outbound(&harness.store, "00000000001-0001", &["alice@example.net"]);
+        enqueue_outbound(&harness.store, "00000000002-0002", &["bob@example.net"]);
+        // 第 2 条的认领注入一次 I/O 失败。
+        harness.store.fail_next_claim("00000000002-0002");
+        let runner = harness.runner(config(), None);
+
+        let report = runner
+            .run_once(1_000)
+            .await
+            .expect("逐条目认领失败不是整轮失败");
+
+        assert_eq!(report.delivered, 1, "第 1 条必须照常投递完成");
+        assert_eq!(report.failed, 1, "认领失败必须计入 failed（可观测）");
+        let calls = harness.remote.calls();
+        assert_eq!(calls.len(), 1, "在途投递不得因为后续认领失败被取消");
+        assert_eq!(calls[0].0, "00000000001-0001");
+
+        // 第 1 条已投递并从队列移除；第 2 条原样保留（下一轮重试）。
+        let entries = harness.store.load_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "00000000002-0002");
+        assert_eq!(entries[0].recipients, vec!["bob@example.net".to_string()]);
+    }
+
+    /// 5.9（Fixer C）：调度只加载**到期**条目。未到期条目即使正文巨大也不进内存。
+    ///
+    /// 这里用可观测的替身：未到期条目带一个**非法**的 `data`（空正文），如果
+    /// 调度路径把它们完整解析（`load_all` + 之后过滤），`validate` 会失败并把
+    /// 它们隔离进 `corrupt/`；`load_due` 只看 `nextAttemptUnix` 头，永远不会
+    /// 碰到它们 —— 于是文件必须仍在 `entries/` 下。
+    #[tokio::test]
+    async fn run_once_does_not_load_entries_that_are_not_due() {
+        let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
+        enqueue_outbound(&harness.store, "00000000001-0001", &["bob@example.net"]);
+
+        // 未到期条目：正文为空（非法），只靠头部字段判断不应被解析。
+        fs_write_future_entry(&harness.store, "00000000002-0002", 9_999_999_999);
+        // 已到期条目：正常正文，应被投递。
+        enqueue_outbound(&harness.store, "00000000003-0003", &["carol@example.net"]);
+
+        let runner = harness.runner(config(), None);
+        let report = runner.run_once(1_000).await.unwrap();
+
+        assert_eq!(report.delivered, 2, "两条到期条目都应投递");
+        assert_eq!(report.backlog, 1, "未到期条目仍留在队列里");
+        assert!(
+            harness
+                .store
+                .entries_dir()
+                .join("00000000002-0002.json")
+                .exists(),
+            "未到期条目不得被调度路径完整解析（否则空正文会被 validate 判非法并隔离）"
+        );
+        let corrupt = match std::fs::read_dir(harness.store.corrupt_dir()) {
+            Ok(read) => read.count(),
+            Err(_) => 0,
+        };
+        assert_eq!(corrupt, 0, "调度不得把未到期条目当损坏隔离");
+    }
+
+    /// 写一条「正文非法、但头部表明未到期」的条目（绕过 `QueueEntry` 校验，
+    /// 直接落盘 —— 这正是 `load_due` 必须避免完整解析的那种文件）。
+    fn fs_write_future_entry(store: &QueueStore, id: &str, next_attempt_unix: i64) {
+        let entries = store.entries_dir();
+        std::fs::create_dir_all(&entries).unwrap();
+        let payload = serde_json::json!({
+            "id": id,
+            "kind": "outbound",
+            "mailFrom": "sender@example.org",
+            "recipients": ["dave@example.net"],
+            "data": "",
+            "createdAt": "2026-01-01T00:00:00+00:00",
+            "attempts": 0,
+            "nextAttemptUnix": next_attempt_unix,
+        });
+        std::fs::write(
+            entries.join(format!("{id}.json")),
+            serde_json::to_vec_pretty(&payload).unwrap(),
+        )
+        .unwrap();
     }
 }

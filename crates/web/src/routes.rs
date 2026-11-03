@@ -26,18 +26,28 @@ use crate::{AppState, AuthenticatedUser};
 ///
 /// **动作名在编译期绑定**，处理器只从请求体读 `data` 载荷 —— 请求体无法指定
 /// 要执行的特权动作，白名单因此不可被绕过。
+///
+/// 宏同时生成 [`ACTION_HANDLER_BINDINGS`]：一张「处理器名 → 动作名」的编译期
+/// 绑定表。R5-012 的守卫用它把「契约里的路径」与「处理器真正调用的动作」连起来
+/// （见 `lib.rs` 的 `the_rpc_bridge_and_rest_routes_share_one_action_finaliser`）。
 macro_rules! action_handlers {
     ($($name:ident => $action:literal),* $(,)?) => {
         $(
             pub async fn $name(
                 State(state): State<AppState>,
+                peer: Option<ConnectInfo<SocketAddr>>,
                 path_params: Option<Path<HashMap<String, String>>>,
                 headers: axum::http::HeaderMap,
                 body: Result<Json<serde_json::Value>, JsonRejection>,
             ) -> Response {
-                run_action(&state, $action, path_params, &headers, body).await
+                run_action(&state, $action, peer, path_params, &headers, body).await
             }
         )*
+
+        /// 处理器名 → 动作名的编译期绑定表（守卫数据源，R5-012）。
+        pub const ACTION_HANDLER_BINDINGS: &[(&str, &str)] = &[
+            $((stringify!($name), $action)),*
+        ];
     };
 }
 
@@ -52,6 +62,11 @@ action_handlers! {
     settings_get            => "settings.get",
     settings_set            => "settings.set",
     admin_get               => "admin.get",
+    // 改密 / 2FA 变更三条：成功后必须吊销全部会话，收尾逻辑见
+    // [`finalize_successful_action`]（REST 与 RPC 桥共用）。
+    admin_set               => "admin.set",
+    totp_enable             => "admin.totp.enable",
+    totp_disable            => "admin.totp.disable",
     aliases_add             => "aliases.add",
     aliases_delete          => "aliases.delete",
     dkim_rotate             => "dkim.rotate",
@@ -100,9 +115,25 @@ action_handlers! {
     activity_list           => "activity.list",
 }
 
+/// 特权动作的**统一调用 + 收尾**。
+///
+/// ## 为什么「收尾」必须与调用绑在同一个函数里（R5-001）
+///
+/// `admin.set` / `admin.totp.enable` / `admin.totp.disable` 成功之后必须让该
+/// 管理员的**全部旧会话失效** —— 改密 / 改 2FA 是事故响应的第一步，旧会话还能
+/// 用的话「把攻击者踢下线」这条链就不成立。
+///
+/// 但同一批动作还能从 `POST /api/rpc` 桥触达（桥是前端传输层的兜底路径，
+/// 不是只有手工 curl 才走得到的旁门）。桥原先只做「查白名单 + 转发」，**完全
+/// 不做**这段收尾：拿一枚被劫持的会话经桥改掉口令，攻击者的会话仍然有效，
+/// 而受害者下次登录用旧口令失败 —— 恰好是事故响应的反向操作。
+///
+/// 因此把「动作成功后要做什么」收敛到 [`finalize_successful_action`]，
+/// REST 处理器（[`run_action`]）与桥（[`rpc_bridge`]）都只能经过它。
 async fn run_action(
     state: &AppState,
     action: &'static str,
+    peer: Option<ConnectInfo<SocketAddr>>,
     path_params: Option<Path<HashMap<String, String>>>,
     headers: &axum::http::HeaderMap,
     body: Result<Json<serde_json::Value>, JsonRejection>,
@@ -121,19 +152,31 @@ async fn run_action(
         }
     }
 
-    match state.inner.client.call(action, &data).await {
-        Ok(value) => crate::error::ok_json(value),
+    match state.call_action(action, &data).await {
+        Ok(value) => match finalize_successful_action(state, action, value) {
+            Ok(value) => {
+                let mut response = crate::error::ok_json(value);
+                if crate::contract::revokes_sessions(action) {
+                    let peer_addr = peer.map(|ConnectInfo(addr)| addr);
+                    if let Some(error) = finish_after_revocation(
+                        &mut response,
+                        state,
+                        peer_addr.as_ref(),
+                        forwarded_proto(headers).as_deref(),
+                    ) {
+                        return error;
+                    }
+                }
+                response
+            }
+            Err(error) => error.into_response(),
+        },
         Err(e) => e.into_response(),
     }
 }
 
-/// `POST /api/admin` —— 改用户名 / 改口令（`admin.set`）。
-///
-/// ## 为什么这里必须吊销会话
-///
-/// 改密是事故响应的**第一步**，而在此之前 [`SessionStore::revoke_user`] 是死代码
-/// —— 没有任何非测试调用点。于是「我改密码了」与「攻击者的会话失效了」之间
-/// 毫无关系：攻击者那 7 天绝对上限内的会话仍然完全可用，第一步形同虚设。
+/// 动作成功之后的统一收尾：按 [`crate::contract::revokes_sessions`] 决定是否
+/// 吊销该管理员的全部会话，并把 `revokedSessions` / `reauthenticate` 注入响应体。
 ///
 /// ## 决策：**连当前会话一起吊销**，并要求重新登录
 ///
@@ -152,123 +195,40 @@ async fn run_action(
 ///
 /// 请求体的 `username` 可以是空串（「只改密码」是既有语义），也可能被篡改。
 /// 吊销是**按用户维度全量生效**的操作，一旦用户名取错就会「踢光别人、留下自己」
-/// —— 恰好与目的相反。以落盘配置为准才是真相源。
-pub async fn admin_set(
-    State(state): State<AppState>,
-    peer: Option<ConnectInfo<SocketAddr>>,
-    headers: axum::http::HeaderMap,
-    body: Result<Json<serde_json::Value>, JsonRejection>,
-) -> Response {
-    let payload = match json_payload(body, &headers) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let peer_addr = peer.map(|ConnectInfo(addr)| addr);
-
-    if let Err(e) = state.inner.client.call("admin.set", &payload).await {
-        // 失败**不吊销**：凭据没变，踢下线只会白白让用户重登，
-        // 还把「改密失败」这个真正需要看到的事实盖掉。
-        return e.into_response();
+/// —— 恰好与目的相反。以落盘配置为准才是真相源；读不到就显式失败（半完成状态
+/// 必须让调用方看见，而不是静默当作成功）。
+fn finalize_successful_action(
+    state: &AppState,
+    action: &str,
+    mut value: serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    if !crate::contract::revokes_sessions(action) {
+        return Ok(value);
     }
-
-    let Some(username) = admin_username(&state) else {
-        return e500_missing_admin_config();
+    let Some(username) = admin_username(state) else {
+        return Err(missing_admin_config_error());
     };
-    let mut response = revoke_sessions(&state, &username, serde_json::json!({ "ok": true }));
-    if let Some(error) = finish_after_revocation(
-        &mut response,
-        &state,
-        peer_addr.as_ref(),
-        forwarded_proto(&headers).as_deref(),
-    ) {
-        return error;
+    let revoked = state.inner.sessions.revoke_user(&username);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("revokedSessions".to_string(), revoked.into());
+        obj.insert("reauthenticate".to_string(), true.into());
     }
-    response
+    Ok(value)
 }
 
-/// `POST /api/admin/2fa/enable` —— 启用 2FA。
-///
-/// 理由与 [`admin_set`] 相同，但要更严：`enable` 之后 2FA 才真正生效，
-/// 而**在此之前建立的全部会话**都没有经过第二因子验证 —— 它们是在更弱的
-/// 信任边界下拿到的，全部不再可信。
-///
-/// 响应体必须原样带回助手的 `recoveryCodes`：那是**只此一次**的明文，
-/// 丢在这里就等于让用户永远拿不到恢复码（而没有恢复码的 2FA 等于没有）。
-///
-/// `begin` **不**走这里：它只是把 secret 交给用户，2FA 尚未生效，
-/// 若此时踢下线，用户会发现自己刚点「开始绑定」就被登出（基线对此有明确
-/// 注释：`wasEnabled` 为真时才清会话，否则每次 begin 都会把会话作废掉）。
-pub async fn totp_enable(
-    State(state): State<AppState>,
-    peer: Option<ConnectInfo<SocketAddr>>,
-    headers: axum::http::HeaderMap,
-    body: Result<Json<serde_json::Value>, JsonRejection>,
-) -> Response {
-    let payload = match json_payload(body, &headers) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let peer_addr = peer.map(|ConnectInfo(addr)| addr);
-    match state.inner.client.call("admin.totp.enable", &payload).await {
-        Ok(value) => {
-            let Some(username) = admin_username(&state) else {
-                return e500_missing_admin_config();
-            };
-            let mut response = revoke_sessions(&state, &username, value);
-            if let Some(error) = finish_after_revocation(
-                &mut response,
-                &state,
-                peer_addr.as_ref(),
-                forwarded_proto(&headers).as_deref(),
-            ) {
-                return error;
-            }
-            response
-        }
-        Err(e) => e.into_response(),
-    }
-}
-
-/// `POST /api/admin/2fa/disable` —— 关 2FA。
-///
-/// 与 [`totp_enable`] 同一套收尾：2FA 消失之后，旧会话不再受第二因子保护，
-/// 全部吊销并要求重新登录。**这里更不能「保留当前会话」** ——
-/// 能发起这个请求的会话正是劫持来的。
-pub async fn totp_disable(
-    State(state): State<AppState>,
-    peer: Option<ConnectInfo<SocketAddr>>,
-    headers: axum::http::HeaderMap,
-    body: Result<Json<serde_json::Value>, JsonRejection>,
-) -> Response {
-    let payload = match json_payload(body, &headers) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let peer_addr = peer.map(|ConnectInfo(addr)| addr);
-    match state
-        .inner
-        .client
-        .call("admin.totp.disable", &payload)
-        .await
-    {
-        Ok(value) => {
-            let Some(username) = admin_username(&state) else {
-                return e500_missing_admin_config();
-            };
-            let mut response = revoke_sessions(&state, &username, value);
-            if let Some(error) = finish_after_revocation(
-                &mut response,
-                &state,
-                peer_addr.as_ref(),
-                forwarded_proto(&headers).as_deref(),
-            ) {
-                return error;
-            }
-            response
-        }
-        Err(e) => e.into_response(),
-    }
-}
+// `POST /api/admin` —— 改用户名 / 改口令（`admin.set`）。
+//
+// 动作调用与收尾都已收敛到 [`run_action`] / [`finalize_successful_action`]：
+// 改密成功后该管理员的**全部会话**被吊销（连当前这一枚），响应带
+// `reauthenticate: true` 与一个 `Max-Age=0` 的作废 Cookie。
+//
+// `begin` **不**走吊销：它只是把 secret 交给用户，2FA 尚未生效，
+// 若此时踢下线，用户会发现自己刚点「开始绑定」就被登出（基线对此有明确
+// 注释：`wasEnabled` 为真时才清会话，否则每次 begin 都会把会话作废掉）。
+//
+// （上面这段是历史设计说明，不是某个条目的 rustdoc —— 用 `//` 而不是 `///`，
+//   否则 clippy new lint `empty_line_after_doc_comments` 会把后面的
+//   `json_payload` 当成它文档化的对象。）
 
 /// 请求体 → 载荷：`null` 归一化为空对象；提取失败按 [`request_has_body`]
 /// 区分处理。`Err(response)` 表示必须直接以该响应回复（400 错误外壳）。
@@ -277,6 +237,11 @@ pub async fn totp_disable(
 /// 提取失败（畸形 JSON、错误 Content-Type、超限）都塌缩成 `None` —— 动作
 /// 拿着 `{}` 跑完并回 200，客户端却以为提交的数据生效了。现在除「无主体的
 /// 请求」外一律显式拒绝。
+//
+// `Response` 的 Err 变体较大（~128B）。这里的错误路径是「直接回一个带状态码
+// 与 JSON 外壳的响应」，把 Err 装箱只会让 400 路径多一次分配；这是 axum 项目
+// 里常见的显式豁免，不是可优化点。
+#[allow(clippy::result_large_err)]
 fn json_payload(
     body: Result<Json<serde_json::Value>, JsonRejection>,
     headers: &axum::http::HeaderMap,
@@ -292,18 +257,15 @@ fn json_payload(
             // 里）本就无 JSON 可言：维持既有「空载荷继续」语义，否则所有无主体
             // 的删除/列表请求会全体 400。带主体但 Content-Type 不是 JSON、或
             // JSON 解析失败的，一律 400 错误外壳。
-            if matches!(
-                &rejection,
-                JsonRejection::MissingJsonContentType(_)
-            ) && !request_has_body(headers)
+            if matches!(&rejection, JsonRejection::MissingJsonContentType(_))
+                && !request_has_body(headers)
             {
                 return Ok(serde_json::json!({}));
             }
-            Err(ApiError::new(
-                crate::ratelimit::ERR_REQUEST_FAILED,
-                rejection.body_text(),
+            Err(
+                ApiError::new(crate::ratelimit::ERR_REQUEST_FAILED, rejection.body_text())
+                    .into_response(),
             )
-            .into_response())
         }
     }
 }
@@ -330,17 +292,16 @@ fn admin_username(state: &AppState) -> Option<String> {
     mailstack_core::config::read_admin_config(state.paths()).map(|c| c.username)
 }
 
-/// 按用户维度**全量**吊销会话，并把助手的返回值原样包进响应。
+/// `admin.json` 读不到时的错误。
 ///
-/// 返回值里额外带 `revokedSessions` 与 `reauthenticate`：前者让用户知道
-/// 「其它几个设备已登出」，后者告诉前端「请把会话作废并回登录页」。
-fn revoke_sessions(state: &AppState, username: &str, mut value: serde_json::Value) -> Response {
-    let revoked = state.inner.sessions.revoke_user(username);
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("revokedSessions".to_string(), revoked.into());
-        obj.insert("reauthenticate".to_string(), true.into());
-    }
-    crate::error::ok_json(value)
+/// 走到这里说明「凭据已改但吊销目标不明」，属于**半完成状态**：必须让调用方
+/// 看见，而不是静默当作成功。
+fn missing_admin_config_error() -> ApiError {
+    ApiError::new(
+        crate::ratelimit::ERR_INTERNAL_ERROR,
+        "administrator configuration is unreadable; sessions were not revoked",
+    )
+    .with_status(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// 下发一个「立即作废」的会话 Cookie。
@@ -373,7 +334,9 @@ pub(crate) fn clear_session_cookie(
     // 这类现象的成因之一：服务端会话已删，浏览器那枚 cookie 却还在。
     // 现在让它返回错误，由调用方改成显式失败。
     let value = HeaderValue::from_str(&cookie).map_err(|error| {
-        format!("session invalidation cookie is not serializable: {error} (cookie={cookie})")
+        // R5-018：文案里只保留错误类型，不带 cookie 串（也不带任何凭据）。
+        // 完整串写日志同样有风险，故只记录错误类型。
+        format!("session invalidation cookie is not serializable: {error}")
     })?;
     response.headers_mut().append(header::SET_COOKIE, value);
     Ok(())
@@ -421,19 +384,6 @@ fn cookie_context(
     )
 }
 
-/// `admin.json` 读不到时的 500。
-///
-/// 走到这里说明「凭据已改但吊销目标不明」，属于**半完成状态**：必须让调用方
-/// 看见，而不是静默当作成功。
-fn e500_missing_admin_config() -> Response {
-    ApiError::new(
-        crate::ratelimit::ERR_INTERNAL_ERROR,
-        "administrator configuration is unreadable; sessions were not revoked",
-    )
-    .with_status(StatusCode::INTERNAL_SERVER_ERROR)
-    .into_response()
-}
-
 /// `POST /api/rpc` —— 管理前端的 RPC 桥。
 ///
 /// 请求体形状：`{ "action": "<动作名>", "data": { ... } }`。
@@ -450,11 +400,31 @@ fn e500_missing_admin_config() -> Response {
 ///
 /// 响应形状与 REST 路由**相反**：这里必须带 `{ok, data}` 外壳，因为前端 `bridge()`
 /// 按 `body.ok` / `body.data` 拆包（见 [`crate::error::rpc_ok_json`]）。
+///
+/// ## 收尾（R5-001）
+///
+/// 桥与专用 REST 路由**共用** [`finalize_successful_action`]：经桥改密 / 改 2FA
+/// 成功后同样吊销该管理员的全部会话，并作废浏览器那枚 Cookie。原先桥只做
+/// 「查白名单 + 转发」，于是 `{"action":"admin.set"}` 能改掉口令却一个人都踢不掉
+/// —— 拿被劫持的会话经桥改密，攻击者的会话仍然有效，而受害者用旧口令登不进来。
 pub async fn rpc_bridge(
     State(state): State<AppState>,
     peer: Option<ConnectInfo<SocketAddr>>,
-    Json(body): Json<serde_json::Value>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
+    // R5-013：畸形 JSON / 错误 Content-Type 也必须回**桥的错误外壳**
+    // （`{ok:false,error:"..."}`），不能落到 axum 的纯文本拒绝 —— 前端 `bridge()`
+    // 按 `body.ok` / `body.error` 拆包，纯文本会让它报一句没有信息量的解析失败。
+    // 细节只进日志，响应是固定文案（错误模型不泄漏 serde 的行列与期望类型）。
+    let body = match body {
+        Ok(Json(value)) => value,
+        Err(rejection) => {
+            tracing::warn!(error = %rejection.body_text(), "rpc bridge rejected a malformed body");
+            return crate::error::rpc_err_json(StatusCode::BAD_REQUEST, "malformed request body");
+        }
+    };
+
     let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("");
     if !crate::contract::is_exposed_action(action) {
         // 不区分「动作不存在」与「动作未暴露」—— 否则内部动作名会成为可探测信息。
@@ -465,8 +435,8 @@ pub async fn rpc_bridge(
     // `ai.*` 动作都能从这里走 —— 只限流 `/api/ai/` 路径的话，改走桥就用一句
     // `{"action":"ai.chat"}` 绕开了出站付费调用的配额。429 的状态码、错误外壳
     // 与 `Retry-After` 语义与 `/api/ai/*` 的中间件完全一致（同一构造函数）。
+    let peer_addr = peer.map(|ConnectInfo(addr)| addr);
     if action.starts_with("ai.") {
-        let peer_addr = peer.map(|ConnectInfo(addr)| addr);
         if let Some(response) = crate::ai_limited_response(&state, peer_addr.as_ref()) {
             return response;
         }
@@ -479,8 +449,29 @@ pub async fn rpc_bridge(
         data
     };
 
-    match state.inner.client.call(action, &data).await {
-        Ok(value) => crate::error::rpc_ok_json(value),
+    match state.call_action(action, &data).await {
+        Ok(value) => {
+            // 与 REST 路由同一段收尾：改密 / 改 2FA 后吊销全部会话。
+            let value = match finalize_successful_action(&state, action, value) {
+                Ok(value) => value,
+                Err(error) => {
+                    // 动作成功了但收尾失败（admin.json 读不到）：绝不能回「成功」。
+                    return crate::error::rpc_err_json(error.status, error.message.clone());
+                }
+            };
+            let mut response = crate::error::rpc_ok_json(value);
+            if crate::contract::revokes_sessions(action) {
+                if let Some(error) = finish_after_revocation(
+                    &mut response,
+                    &state,
+                    peer_addr.as_ref(),
+                    forwarded_proto(&headers).as_deref(),
+                ) {
+                    return error;
+                }
+            }
+            response
+        }
         // 桥的错误是**字符串**：前端把它直接当消息展示。若沿用 REST 的嵌套形状，
         // 界面只会显示 "HTTP 5xx"，丢掉服务端给出的可读原因。
         Err(e) => crate::error::rpc_err_json(e.status, e.message.clone()),
@@ -533,7 +524,8 @@ fn normalize_ip(ip: IpAddr) -> String {
 /// `POST /api/auth/login`。
 ///
 /// 语义（规格书 §5.2、INV-23）：
-/// * 三档限流 + 5 次失败账号锁定
+/// * 三档限流 + 5 次失败锁定（R5-006：锁定的键是**来源 IP + 账号**，
+///   匿名攻击者只能锁住自己那个来源，不能把唯一管理员从另一个来源锁死）
 /// * `401 INVALID_CREDENTIALS` **不区分**失败原因（枚举防护）
 /// * **唯一例外**：密码正确但已启用 2FA → `401 TOTP_REQUIRED`
 ///
@@ -582,7 +574,10 @@ pub async fn login(
     // 主密钥 /etc/mailstack/totp.key 仅特权助手可读（INV-27、INV-28）。
     let Some(config) = mailstack_core::config::read_admin_config(state.paths()) else {
         // 尚未初始化：与原实现一样按凭证无效处理（不区分原因，防枚举）。
-        state.inner.login_limiter.record_failure(&username);
+        state
+            .inner
+            .login_limiter
+            .record_failure(&client_ip, &username);
         return ApiError::new(ERR_INVALID_CREDENTIALS, "invalid credentials")
             .with_status(StatusCode::UNAUTHORIZED)
             .into_response();
@@ -620,7 +615,12 @@ pub async fn login(
     let username_ok = config.username == username;
 
     if !(password_ok && username_ok) {
-        state.inner.login_limiter.record_failure(&username);
+        // 失败计数的键是 **(来源 IP, 账号)**：未认证的匿名者只能锁住自己那条，
+        // 不能把唯一管理员的登录从别的来源锁死（R5-006）。
+        state
+            .inner
+            .login_limiter
+            .record_failure(&client_ip, &username);
         return ApiError::new(ERR_INVALID_CREDENTIALS, "invalid credentials")
             .with_status(StatusCode::UNAUTHORIZED)
             .into_response();
@@ -652,7 +652,10 @@ pub async fn login(
                     .unwrap_or(false) => {}
             Ok(_) => {
                 // 验证码错误与口令错误返回同一响应体（不区分因子）。
-                state.inner.login_limiter.record_failure(&username);
+                state
+                    .inner
+                    .login_limiter
+                    .record_failure(&client_ip, &username);
                 return ApiError::new(ERR_INVALID_CREDENTIALS, "invalid credentials")
                     .with_status(StatusCode::UNAUTHORIZED)
                     .into_response();
@@ -670,7 +673,12 @@ pub async fn login(
         }
     }
 
-    state.inner.login_limiter.record_success(&username);
+    // 成功只清**本次来源**的失败计数（另一个来源的锁定必须保留，否则一次
+    // 合法登录就能把攻击者来源的惩罚一起清零 —— 清理语义变成绕过）。
+    state
+        .inner
+        .login_limiter
+        .record_success(&client_ip, &username);
     // 5.5：`touch().map(|s| s.csrf).unwrap_or_default()` 在 `touch` 返回 `None`
     // 时会交付一个**空串 CSRF**，而响应仍是 `200 {"ok":true}` —— 静默假成功。
     // `create_session` 一次返回 id 与 csrf，「拿不到」从此不再是一个分支。
@@ -743,15 +751,57 @@ pub async fn list_sessions(State(state): State<AppState>) -> Response {
 }
 
 /// `POST /api/auth/sessions/revoke` —— 体 `{ id }`（id 是**指纹**，不是会话 ID）。
+///
+/// ## 吊销自己的会话时必须一并作废 Cookie（R5-016）
+///
+/// 原先无论吊销谁，响应都是 `{ok:true}`。前端若把「吊销」按钮指向当前会话，
+/// 用户会在**浏览器仍持有那枚 Cookie** 的情况下被静默登出（下一次请求才发现），
+/// 或者更糟：界面仍显示已登录。带上自己的指纹时改为与改密同款收尾 ——
+/// 作废 Cookie + `reauthenticate: true`，让前端立刻回登录页。
 pub async fn revoke_session(
     State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: axum::http::HeaderMap,
+    axum::Extension(user): axum::Extension<AuthenticatedUser>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
+    let body = match body {
+        Ok(Json(value)) => value,
+        Err(_) => {
+            return ApiError::new(
+                crate::ratelimit::ERR_REQUEST_FAILED,
+                "malformed request body",
+            )
+            .into_response();
+        }
+    };
     let Some(fingerprint) = body.get("id").and_then(|v| v.as_str()) else {
         return ApiError::new("REQUEST_FAILED", "missing session fingerprint").into_response();
     };
     let revoked = state.inner.sessions.revoke_by_fingerprint(fingerprint);
-    Json(serde_json::json!({ "ok": revoked })).into_response()
+
+    // 吊销的是不是「当前这一枚」：是的话必须把浏览器那枚 Cookie 一起作废。
+    let own = crate::session::fingerprint_of(&user.session_id);
+    if !(revoked && fingerprint == own) {
+        return Json(serde_json::json!({ "ok": revoked })).into_response();
+    }
+
+    let peer_addr = peer.map(|ConnectInfo(addr)| addr);
+    let mut response = Json(serde_json::json!({
+        "ok": true,
+        "revoked": true,
+        "reauthenticate": true,
+    }))
+    .into_response();
+    if let Some(error) = finish_after_revocation(
+        &mut response,
+        &state,
+        peer_addr.as_ref(),
+        forwarded_proto(&headers).as_deref(),
+    ) {
+        return error;
+    }
+    response
 }
 
 /// `DELETE /api/auth/sessions` —— 吊销除当前外的全部会话。
@@ -791,11 +841,26 @@ pub async fn metrics_telemetry(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let range = params.get("range").cloned();
+    // R5-008：并发闸门。一次采样会持采集器互斥锁做 /proc 遍历并跑
+    // `df` / `postqueue` 子进程（毫秒到秒级）。没有闸门时，一个已认证会话并发
+    // 发 N 个遥测请求就能把 `spawn_blocking` 池（默认 512）全部排在那一把锁上 ——
+    // 阻塞池打满后**登录的 PBKDF2 也拿不到线程**，管理台无法登录。
+    // 拿不到闸门时立刻 429（带 `Retry-After`），绝不排队等锁。
+    let Ok(permit) = std::sync::Arc::clone(&state.inner.telemetry_gate).try_acquire_owned() else {
+        return ApiError::rate_limited(1).into_response();
+    };
     let collector = std::sync::Arc::clone(&state.inner.telemetry);
     // 采样会持锁做 /proc 遍历并跑 `df` / `postqueue` 子进程（毫秒到秒级的
     // 阻塞操作）—— 必须搬进阻塞线程池：直接跑在 async worker 上会把整个
     // worker 池占住（与登录的 PBKDF2 同一纪律，见 `login` 的注释）。
-    match tokio::task::spawn_blocking(move || collector.telemetry(range.as_deref())).await {
+    let result = tokio::task::spawn_blocking(move || {
+        let body = collector.telemetry(range.as_deref());
+        // 采样结束才释放闸门（drop 在阻塞线程里，许可立刻可用）。
+        drop(permit);
+        body
+    })
+    .await;
+    match result {
         Ok(value) => Json(value).into_response(),
         Err(error) => {
             // 采样任务崩了属基础设施故障：JoinError 原文只进日志，不回客户端。
@@ -1028,10 +1093,7 @@ mod tests {
         // 的配对关系由 `the_cookie_name_follows_the_secure_decision` 与
         // `issued_and_cleared_session_cookies_are_always_paired` 钉住。
         assert!(
-            cookie.starts_with(&format!(
-                "{}=",
-                crate::session::SESSION_COOKIE_PLAIN_NAME
-            )),
+            cookie.starts_with(&format!("{}=", crate::session::SESSION_COOKIE_PLAIN_NAME)),
             "cookie: {cookie}"
         );
         assert!(
@@ -1307,10 +1369,7 @@ mod tests {
                 .unwrap()
                 .to_string();
             assert!(
-                cookie.starts_with(&format!(
-                    "{}=",
-                    crate::session::SESSION_COOKIE_PLAIN_NAME
-                )),
+                cookie.starts_with(&format!("{}=", crate::session::SESSION_COOKIE_PLAIN_NAME)),
                 "第 {round} 轮：cookie 不可用"
             );
 
@@ -1374,10 +1433,7 @@ mod tests {
 
         for cookie in [&issued, &cleared] {
             assert!(
-                cookie.starts_with(&format!(
-                    "{}=",
-                    crate::session::SESSION_COOKIE_PLAIN_NAME
-                )),
+                cookie.starts_with(&format!("{}=", crate::session::SESSION_COOKIE_PLAIN_NAME)),
                 "HTTP 默认部署必须用无前缀名：{cookie}"
             );
             assert!(
@@ -1402,7 +1458,10 @@ mod tests {
                 cookie.starts_with(&format!("{}=", crate::SESSION_COOKIE)),
                 "HTTPS 部署必须用 `__Host-` 名：{cookie}"
             );
-            assert!(cookie.contains("Secure"), "HTTPS 部署必须带 Secure：{cookie}");
+            assert!(
+                cookie.contains("Secure"),
+                "HTTPS 部署必须带 Secure：{cookie}"
+            );
         }
         assert!(cleared.contains("Max-Age=0"), "作废必须立即过期：{cleared}");
 
@@ -1597,5 +1656,412 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    // ── R5-001：RPC 桥必须执行与 REST 路由相同的收尾 ──
+
+    /// 测试替身：记录动作并成功返回（真实助手在测试机上不可达，也不该被触发）。
+    fn recording_stub(calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> crate::ActionStub {
+        std::sync::Arc::new(move |action: &str, _data: &serde_json::Value| {
+            calls.lock().unwrap().push(action.to_string());
+            // 2FA enable 的响应必须带回恢复码（只此一次的明文）。
+            Ok(serde_json::json!({ "ok": true, "recoveryCodes": ["AAAA-BBBB"] }))
+        })
+    }
+
+    /// 经 `POST /api/rpc` 改密 / 改 2FA：**与专用路由一样**必须吊销全部会话。
+    ///
+    /// 原实现的桥只做「查白名单 + 转发」，于是拿一枚被劫持的会话经桥改掉口令，
+    /// 攻击者的会话仍然有效，而受害者下次登录用旧口令失败 —— 恰好是事故响应
+    /// 的反向操作。这里对三个动作逐个断言：会话清零 + 作废 Cookie + 前端标记。
+    #[tokio::test]
+    async fn the_rpc_bridge_revokes_sessions_exactly_like_the_dedicated_routes() {
+        for (action, body) in [
+            (
+                "admin.set",
+                serde_json::json!({"username": "admin", "password": "An0therGood1"}),
+            ),
+            ("admin.totp.enable", serde_json::json!({"code": "123456"})),
+            ("admin.totp.disable", serde_json::json!({"confirm": true})),
+        ] {
+            let (root, state) = test_state("bridge-revoke");
+            mailstack_core::config::admin_set(state.paths(), "admin", "Tr0ubadour9x").unwrap();
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let state = state.with_action_stub(recording_stub(std::sync::Arc::clone(&calls)));
+
+            // 两枚会话：被劫持的那一枚（发起请求）与另一台设备。
+            let (sid, csrf) = state.inner.sessions.create_session("admin");
+            let other = state.inner.sessions.create("admin");
+            assert_eq!(state.inner.sessions.len(), 2);
+
+            let response = post_rpc(
+                build_router(state.clone()),
+                &sid,
+                &csrf,
+                serde_json::json!({ "action": action, "data": body }),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK, "{action} 经桥应成功");
+            let set_cookie = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            assert!(
+                set_cookie.contains("Max-Age=0"),
+                "{action} 经桥成功后必须作废浏览器那枚 Cookie：{set_cookie:?}"
+            );
+            let payload = body_json(response).await;
+            assert_eq!(payload["ok"], true);
+            assert_eq!(payload["data"]["reauthenticate"], true, "{payload}");
+            assert_eq!(payload["data"]["revokedSessions"], 2, "{payload}");
+
+            assert!(
+                state.inner.sessions.touch(&sid).is_none(),
+                "{action} 经桥成功后旧会话（含发起者）必须失效"
+            );
+            assert!(state.inner.sessions.touch(&other).is_none());
+            assert_eq!(state.inner.sessions.len(), 0);
+            assert_eq!(calls.lock().unwrap().as_slice(), [action.to_string()]);
+
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// 对照：同一条收尾对 REST 专用路由同样生效（重构后不得只剩桥那一半）。
+    #[tokio::test]
+    async fn the_dedicated_admin_route_still_revokes_sessions() {
+        let (root, state) = test_state("rest-revoke");
+        mailstack_core::config::admin_set(state.paths(), "admin", "Tr0ubadour9x").unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = state.with_action_stub(recording_stub(std::sync::Arc::clone(&calls)));
+        let (sid, csrf) = state.inner.sessions.create_session("admin");
+
+        let response = build_router(state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/admin")
+                    .header(header::COOKIE, format!("{}={sid}", crate::SESSION_COOKIE))
+                    .header("x-csrf-token", csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"username": "admin", "password": "An0therGood1"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::SET_COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .contains("Max-Age=0"),
+            "改密成功后必须作废会话 Cookie"
+        );
+        let payload = body_json(response).await;
+        assert_eq!(payload["ok"], true, "REST 成功响应必须是裸对象");
+        assert_eq!(payload["reauthenticate"], true);
+        assert_eq!(payload["revokedSessions"], 1);
+        assert!(state.inner.sessions.touch(&sid).is_none());
+        assert_eq!(calls.lock().unwrap().as_slice(), ["admin.set".to_string()]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── R5-006：锁定按来源隔离，匿名者锁不死管理员的登录 ──
+
+    async fn post_login_from(
+        app: axum::Router,
+        peer: SocketAddr,
+        payload: serde_json::Value,
+    ) -> Response {
+        let mut request = HttpRequest::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        // 注入传输层对端：路由取的是真实来源，不读 X-Forwarded-For。
+        request.extensions_mut().insert(ConnectInfo(peer));
+        app.oneshot(request).await.unwrap()
+    }
+
+    /// 未认证的攻击者从自己的来源失败 5 次，只能锁住自己；管理员从另一个来源
+    /// （回环 / SSH 隧道）仍能正常登录 —— 这正是 R5-006 的修复目标。
+    #[tokio::test]
+    async fn an_attacker_cannot_lock_the_admin_out_from_another_source() {
+        let (root, state) = test_state("login-src");
+        mailstack_core::config::admin_set(state.paths(), "admin", "Tr0ubadour9x").unwrap();
+
+        let attacker: SocketAddr = "198.51.100.9:4444".parse().unwrap();
+        let operator: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let good = serde_json::json!({ "username": "admin", "password": "Tr0ubadour9x" });
+        let bad = serde_json::json!({ "username": "admin", "password": "Wr0ng1Password" });
+
+        for attempt in 0..crate::ratelimit::FAILURE_LOCKOUT_THRESHOLD {
+            let response =
+                post_login_from(build_router(state.clone()), attacker, bad.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "第 {attempt} 次失败应为 401"
+            );
+        }
+        assert!(
+            state.inner.login_limiter.is_locked_from(
+                "198.51.100.9",
+                "admin",
+                time::OffsetDateTime::now_utc()
+            ),
+            "攻击者自己的来源必须被锁定"
+        );
+
+        // 攻击者（即使口令正确）仍被自己的锁定挡住。
+        let blocked = post_login_from(build_router(state.clone()), attacker, good.clone()).await;
+        assert_eq!(
+            blocked.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "锁定中的来源必须被拒绝，实际 {}",
+            blocked.status()
+        );
+        assert!(blocked.headers().get("retry-after").is_some());
+
+        // 管理员从另一个来源登录：不受影响。
+        let allowed = post_login_from(build_router(state.clone()), operator, good).await;
+        assert_eq!(
+            allowed.status(),
+            StatusCode::OK,
+            "管理员从另一个来源必须仍能登录（否则匿名者可用 5 个请求锁死管理台）"
+        );
+        assert_eq!(state.inner.sessions.len(), 1);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 轮换来源 IP 不能无限续锁：每次换来源只会锁那个新来源，既不延长已有
+    /// 锁定，也不会波及管理员来源。
+    #[tokio::test]
+    async fn rotating_source_ips_cannot_renew_the_lockout() {
+        let (root, state) = test_state("login-rotate");
+        mailstack_core::config::admin_set(state.paths(), "admin", "Tr0ubadour9x").unwrap();
+        let bad = serde_json::json!({ "username": "admin", "password": "Wr0ng1Password" });
+
+        let first: SocketAddr = "203.0.113.5:1111".parse().unwrap();
+        for _ in 0..crate::ratelimit::FAILURE_LOCKOUT_THRESHOLD {
+            post_login_from(build_router(state.clone()), first, bad.clone()).await;
+        }
+        let remaining_before = match state.inner.login_limiter.check_at(
+            "203.0.113.5",
+            "admin",
+            time::OffsetDateTime::now_utc(),
+        ) {
+            crate::ratelimit::LimitVerdict::Limited { retry_after_secs } => retry_after_secs,
+            crate::ratelimit::LimitVerdict::Allow => panic!("首个来源应已锁定"),
+        };
+
+        // 攻击者轮换 IP 继续失败。
+        for index in 0..40u32 {
+            let ip: SocketAddr = format!("203.0.113.{}:2222", index % 200 + 1)
+                .parse()
+                .unwrap();
+            post_login_from(build_router(state.clone()), ip, bad.clone()).await;
+        }
+
+        let remaining_after = match state.inner.login_limiter.check_at(
+            "203.0.113.5",
+            "admin",
+            time::OffsetDateTime::now_utc(),
+        ) {
+            crate::ratelimit::LimitVerdict::Limited { retry_after_secs } => retry_after_secs,
+            crate::ratelimit::LimitVerdict::Allow => panic!("原有锁定被轮换来源清掉了"),
+        };
+        assert!(
+            remaining_after <= remaining_before,
+            "轮换来源延长了已有锁定：{remaining_before} → {remaining_after}"
+        );
+
+        // 管理员从回环登录：**升级锁定**只作用于攻击者自己的 (IP, 账号) 来源，
+        // 不会波及回环。但攻击者在这条测试里一分钟内打了 45 次，按账号的
+        // **每分钟**限流桶（ACCOUNT_LIMIT_PER_MINUTE）此刻仍在生效 —— 这是
+        // 刻意的短时抖动，不是永久锁死。用 reset 模拟「一分钟后重试」：
+        // 若实现退化成全局账号锁，reset 后仍会被判 429，测试会红。
+        state.inner.login_limiter.reset();
+        let operator: SocketAddr = "127.0.0.1:3333".parse().unwrap();
+        let allowed = post_login_from(
+            build_router(state.clone()),
+            operator,
+            serde_json::json!({ "username": "admin", "password": "Tr0ubadour9x" }),
+        )
+        .await;
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── R5-013：桥的畸形请求体必须回桥的错误外壳 ──
+
+    #[tokio::test]
+    async fn the_rpc_bridge_rejects_a_malformed_body_with_its_own_json_error_shape() {
+        let (root, state) = test_state("rpc-badjson");
+        let (sid, csrf) = state.inner.sessions.create_session("admin");
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/rpc")
+                    .header(header::COOKIE, format!("{}={sid}", crate::SESSION_COOKIE))
+                    .header("x-csrf-token", csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{\"action\": "))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .contains("application/json"),
+            "畸形请求体不得回 text/plain（前端 bridge() 按 JSON 拆包）"
+        );
+        let payload = body_json(response).await;
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["error"], "malformed request body");
+        assert!(
+            !payload.to_string().contains("column"),
+            "错误模型不得泄漏 serde 的行列细节：{payload}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── R5-016：吊销自己的会话必须同时作废 Cookie ──
+
+    #[tokio::test]
+    async fn revoking_the_current_session_also_expires_the_cookie() {
+        let (root, state) = test_state("revoke-self");
+        let (sid, csrf) = state.inner.sessions.create_session("admin");
+        let own = crate::session::fingerprint_of(&sid);
+        let app = build_router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/auth/sessions/revoke")
+                    .header(header::COOKIE, format!("{}={sid}", crate::SESSION_COOKIE))
+                    .header("x-csrf-token", csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::json!({ "id": own }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            set_cookie.contains("Max-Age=0"),
+            "吊销自己的会话必须作废 Cookie（否则界面仍显示已登录）：{set_cookie:?}"
+        );
+        let payload = body_json(response).await;
+        assert_eq!(payload["reauthenticate"], true, "{payload}");
+        assert!(state.inner.sessions.touch(&sid).is_none());
+
+        // 对照：吊销别人的会话照旧不碰当前 Cookie。
+        let (sid2, csrf2) = state.inner.sessions.create_session("admin");
+        let third = state.inner.sessions.create("admin");
+        let third_fp = crate::session::fingerprint_of(&third);
+        let response = build_router(state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/api/auth/sessions/revoke")
+                    .header(header::COOKIE, format!("{}={sid2}", crate::SESSION_COOKIE))
+                    .header("x-csrf-token", csrf2)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "id": third_fp }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "吊销别人的会话不应作废当前 Cookie"
+        );
+        assert!(state.inner.sessions.touch(&sid2).is_some());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── R5-008：遥测采样必须有并发闸门 ──
+
+    #[tokio::test]
+    async fn telemetry_sampling_is_gated_instead_of_filling_the_blocking_pool() {
+        let (root, state) = test_state("telemetry-gate");
+        let state = state.with_telemetry(std::sync::Arc::new(crate::telemetry::inert_collector(
+            root.join("proc"),
+        )));
+        let (sid, _csrf) = state.inner.sessions.create_session("admin");
+
+        // 模拟「另一次采样正在跑」：占住唯一的许可。
+        let permit = state.inner.telemetry_gate.try_acquire().unwrap();
+        let response = build_router(state.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/metrics/telemetry")
+                    .header(header::COOKIE, format!("{}={sid}", crate::SESSION_COOKIE))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "采样已满时必须立刻 429，绝不排进阻塞池等锁"
+        );
+        assert!(
+            response.headers().get("retry-after").is_some(),
+            "429 必须带 Retry-After"
+        );
+
+        // 许可释放后恢复。
+        drop(permit);
+        let response = build_router(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/metrics/telemetry")
+                    .header(header::COOKIE, format!("{}={sid}", crate::SESSION_COOKIE))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

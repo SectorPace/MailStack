@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="noindex,nofollow,noarchive" />
+    <meta name="referrer" content="no-referrer" />
+    <title>MailStack Webmail</title>
+    <meta name="description" content="MailStack self-hosted webmail — a fast mail client for your MailStack mailbox." />
+    <!--
+      首帧主题/平台引导：与 index.html 相同的 theme-init.js（读管理台偏好，避免白闪）。
+      Webmail 自己的主题/语言偏好由 src/webmail/main.tsx 首行 import 的 preboot.ts 覆盖；
+      两者都是外部脚本（后端 CSP script-src 'self' 禁止内联脚本）。
+    -->
+    <script src="/theme-init.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/webmail/main.tsx"></script>
+  </body>
+</html>

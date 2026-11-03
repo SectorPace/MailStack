@@ -315,7 +315,10 @@ where
             return self.no("PUTSCRIPT requires a name").await;
         };
         // 落盘（临时文件 + fsync + rename）在 blocking 线程里完成。
-        blocking::maildir(&store, move |store| sieve::put_script(store, &name, &source)).await?;
+        blocking::maildir(&store, move |store| {
+            sieve::put_script(store, &name, &source)
+        })
+        .await?;
         self.ok("PUTSCRIPT completed").await
     }
 
@@ -324,12 +327,11 @@ where
             return self.no("authenticate first").await;
         };
         let name = command.args.first().cloned().unwrap_or_default();
-        let active = if name.is_empty() {
-            None
-        } else {
-            Some(name)
-        };
-        blocking::maildir(&store, move |store| sieve::set_active(store, active.as_deref())).await?;
+        let active = if name.is_empty() { None } else { Some(name) };
+        blocking::maildir(&store, move |store| {
+            sieve::set_active(store, active.as_deref())
+        })
+        .await?;
         self.ok("SETACTIVE completed").await
     }
 
@@ -380,7 +382,7 @@ where
             return self.no("script exceeds 64 KiB").await;
         }
         // 目录扫描是同步 fs I/O，交给 blocking 线程池（与 LISTSCRIPTS 同一纪律）。
-        let scripts = blocking::maildir(&store, move |store| sieve::list_scripts(store)).await?;
+        let scripts = blocking::maildir(&store, sieve::list_scripts).await?;
         let name = command.args[0].as_str();
         let is_overwrite = scripts.iter().any(|(present, _)| present == name);
         if !is_overwrite && scripts.len() >= sieve::MAX_SCRIPTS {
@@ -1017,7 +1019,10 @@ mod tests {
         }
         client.send("HAVESPACE \"new\" 10").await;
         let reply = client.until_terminal().await;
-        assert!(reply[0].starts_with("NO"), "脚本数到上限后必须如实说没空间：{reply:?}");
+        assert!(
+            reply[0].starts_with("NO"),
+            "脚本数到上限后必须如实说没空间：{reply:?}"
+        );
         assert!(reply[0].contains("limit"), "{reply:?}");
         client.send("HAVESPACE \"s00\" 10").await;
         assert!(

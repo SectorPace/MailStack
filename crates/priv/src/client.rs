@@ -287,7 +287,7 @@ impl PrivilegedCaller {
                 // kill_on_drop(true) 负责在这里把 root 子进程杀掉。
                 return Err(CallError::mid_timeout(
                     "privileged helper timed out mid-flight",
-                ))
+                ));
             }
         };
 

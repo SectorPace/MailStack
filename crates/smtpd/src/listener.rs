@@ -44,6 +44,7 @@ use crate::ban::{BanConfig, BanList};
 use crate::connection::{
     serve, serve_after_upgrade, write_reply, MessageSink, ServeOutcome, ServerLimits,
 };
+use crate::peer::PeerKey;
 use crate::ratelimit::{RateDecision, RateLimitConfig, RateLimiter};
 use crate::reply::{texts, Reply};
 use crate::sasl::{AuthBackend, Authenticator, UnavailableAuthenticator};
@@ -70,6 +71,79 @@ pub trait Clock: Send + Sync + 'static {
     fn now_millis(&self) -> i64;
 }
 
+/// 每来源（IPv6 /64）的**并发连接**计数（R3-006）。
+///
+/// 与限速器（连接速率）和封禁表（失败次数）都不同：这里量的是「此刻同时占着
+/// 多少条连接」。一个 slowloris 客户端只需要**合法速率**就能慢慢攒满全局许可，
+/// 只有并发计数能把它挡在源头。
+///
+/// 表里只有「当前活跃连接」的条目：连接结束（guard Drop）即减少/删除，因此
+/// 条目数天然 ≤ `max_connections`，不需要另设淘汰逻辑。
+#[derive(Debug)]
+struct PeerConnections {
+    max_per_peer: usize,
+    active: std::sync::Mutex<std::collections::HashMap<PeerKey, usize>>,
+}
+
+impl PeerConnections {
+    fn new(max_per_peer: usize) -> Self {
+        Self {
+            max_per_peer: max_per_peer.max(1),
+            active: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>, ip: std::net::IpAddr) -> Option<PeerConnectionSlot> {
+        let key = PeerKey::from_ip(ip);
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = active.entry(key).or_insert(0);
+        if *count >= self.max_per_peer {
+            return None;
+        }
+        *count += 1;
+        Some(PeerConnectionSlot {
+            owner: Arc::clone(self),
+            key,
+        })
+    }
+
+    /// 当前某来源的活跃连接数（仅测试观测用）。
+    #[cfg(test)]
+    fn active_for(&self, ip: std::net::IpAddr) -> usize {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&PeerKey::from_ip(ip))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// 一条活跃连接的占位；Drop 时归还该来源的并发额度。
+struct PeerConnectionSlot {
+    owner: Arc<PeerConnections>,
+    key: PeerKey,
+}
+
+impl Drop for PeerConnectionSlot {
+    fn drop(&mut self) {
+        let mut active = self
+            .owner
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = active.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// 生产用时钟。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemClock;
@@ -94,6 +168,13 @@ pub struct ServerConfig {
     pub limits: ServerLimits,
     /// 同时在处理的连接数上限。
     pub max_connections: usize,
+    /// **单个来源**（IPv6 按 /64 聚合）可同时占用的连接数上限（R3-006）。
+    ///
+    /// 全局 `max_connections` 只约束总数：一个 IP 用合法速率慢慢连、每条连接
+    /// 每次都在超时前喂 1 字节，就能在约 9 分钟内占满全部全局许可，之后**所有
+    /// 端口**对所有人直接 `drop(stream)`。每来源上限把「占满」的成本抬到需要
+    /// 上千个地址（IPv6 还要跨 /64），而正常客户端不会同时开十几条连接。
+    pub max_connections_per_ip: usize,
     /// 连接限速参数。
     pub rate_limit: RateLimitConfig,
     /// 自动封禁参数。
@@ -118,6 +199,9 @@ impl Default for ServerConfig {
             relay: RelayPolicy::new(Vec::<String>::new()),
             limits: ServerLimits::default(),
             max_connections: 512,
+            // 16：正常 MTA/客户端同时开几条连接；16 已覆盖「多线程客户端 +
+            // 重试」的合法突发，同时让单 IP 最多占全局许可的 1/32。
+            max_connections_per_ip: 16,
             rate_limit: RateLimitConfig::default(),
             ban: BanConfig::default(),
             shutdown_grace: Duration::from_secs(10),
@@ -153,6 +237,8 @@ pub struct MailServer<S: MessageSink + ?Sized> {
     clock: Arc<dyn Clock>,
     rate: Arc<RateLimiter>,
     bans: Arc<BanList>,
+    /// 每来源并发连接计数（见 [`PeerConnections`]）。
+    peers: Arc<PeerConnections>,
     /// 与 `config.recipients` 同源，但单独持有一份以便在每条连接上借用。
     recipients: Option<Arc<dyn RecipientChecker>>,
     /// 会话级总时限。生产固定为 [`SESSION_TOTAL_TIMEOUT`]；可注入是为了让
@@ -196,6 +282,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
     ) -> Result<Self, ConfigError> {
         validate(&config, tls.as_ref(), tls_mode)?;
         let recipients = config.recipients.clone();
+        let peers = Arc::new(PeerConnections::new(config.max_connections_per_ip));
         Ok(Self {
             listener,
             config,
@@ -205,6 +292,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
             clock,
             rate,
             bans,
+            peers,
             recipients,
             session_timeout: SESSION_TOTAL_TIMEOUT,
         })
@@ -234,6 +322,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
             clock,
             rate,
             bans,
+            peers,
             recipients,
             session_timeout,
         } = self;
@@ -251,7 +340,25 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
                 }
                 accepted = listener.accept() => {
                     match accepted {
-                        Ok((stream, peer)) => {
+                        Ok((mut stream, peer)) => {
+                            // 每来源并发配额（R3-006）：在**全局许可之前**判定，
+                            // 一个 IP 打满自己的份额时不去挤占别人的全局名额。
+                            // 超限时回 421 而不是静默 drop —— 对端才知道是限流、
+                            // 而不是服务器坏了。
+                            let Some(peer_slot) = peers.try_acquire(peer.ip()) else {
+                                tracing::warn!(
+                                    peer = %peer,
+                                    max = config.max_connections_per_ip,
+                                    "每来源并发连接已达上限，拒绝新连接"
+                                );
+                                let reply = Reply::with_enhanced(
+                                    421,
+                                    "4.7.0",
+                                    texts::TOO_MANY_CONNECTIONS,
+                                );
+                                let _ = write_reply(&mut stream, &reply).await;
+                                continue;
+                            };
                             // 连接数配额：满了就**直接关掉**而不是排队。
                             // 排队会让内存随攻击者的连接数增长，而拒绝对端立刻可重试。
                             let permit = match semaphore.clone().try_acquire_owned() {
@@ -275,6 +382,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
                             };
                             tasks.spawn(async move {
                                 let _permit = permit;
+                                let _peer_slot = peer_slot;
                                 context.handle(stream, peer).await;
                             });
                         }
@@ -382,7 +490,11 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
                     Ok(Ok(encrypted)) => Box::new(encrypted),
                     Ok(Err(error)) => {
                         tracing::warn!(peer = %peer, error = %error, "隐式 TLS 握手失败");
-                        self.bans.record_failure(ip, self.clock.now_millis() / 1000);
+                        // 不记入封禁表（R3-009）：握手失败在真实互联网上大量来自
+                        // 非恶意原因（只支持 TLS 1.0/1.1、证书链过期、中间设备做
+                        // TLS 拦截、证书轮换期的短暂不匹配）。把它按「协议滥用」
+                        // 计数会让合法发信方被 421 封 1 小时、三次后升级为永久封禁。
+                        // 连接速率限制与每来源并发上限已经兜住握手洪泛。
                         return;
                     }
                     Err(_) => {
@@ -394,7 +506,8 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
                             timeout_secs = TLS_HANDSHAKE_TIMEOUT.as_secs(),
                             "TLS 握手超时"
                         );
-                        self.bans.record_failure(ip, self.clock.now_millis() / 1000);
+                        // 同上：超时同样可能来自网络/中间设备。可归因的协议失败
+                        // 才进封禁表；这里只断开。
                         return;
                     }
                 }
@@ -517,7 +630,7 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
                         Ok(Ok(Ok(encrypted))) => Box::new(encrypted),
                         Ok(Ok(Err(error))) => {
                             tracing::warn!(peer = %peer, error = %error, "STARTTLS 握手失败");
-                            self.bans.record_failure(ip, self.clock.now_millis() / 1000);
+                            // 不记入封禁表（R3-009），理由见隐式 TLS 分支。
                             return;
                         }
                         Ok(Err(_)) => {
@@ -527,7 +640,6 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
                                 timeout_secs = TLS_HANDSHAKE_TIMEOUT.as_secs(),
                                 "STARTTLS 握手超时"
                             );
-                            self.bans.record_failure(ip, self.clock.now_millis() / 1000);
                             return;
                         }
                         Err(_) => {
@@ -840,6 +952,50 @@ mod tests {
         assert!(
             out.contains("421 4.4.2 session timeout"),
             "滴水会话必须在总时限处收到 421，实际：{out}"
+        );
+    }
+
+    /// R3-006：单个来源的并发连接数必须封顶，且额度在连接结束时归还。
+    #[test]
+    fn a_single_peer_cannot_exceed_its_concurrent_connection_quota() {
+        let peers = Arc::new(PeerConnections::new(3));
+        let attacker: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let other: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+
+        let mut slots = Vec::new();
+        for _ in 0..3 {
+            slots.push(peers.try_acquire(attacker).expect("配额内应放行"));
+        }
+        assert!(
+            peers.try_acquire(attacker).is_none(),
+            "超过每 IP 并发上限必须拒绝"
+        );
+        // 另一个 IP 不受影响 —— 单点占满不能连坐所有人。
+        assert!(peers.try_acquire(other).is_some(), "另一个来源应仍可建连");
+        assert_eq!(peers.active_for(attacker), 3);
+
+        drop(slots);
+        assert_eq!(peers.active_for(attacker), 0, "连接结束后必须归还额度");
+        assert!(peers.try_acquire(attacker).is_some(), "额度应可复用");
+    }
+
+    /// R3-007 配套：IPv6 的并发计数按 /64 聚合，轮换地址拿不到新配额。
+    #[test]
+    fn ipv6_concurrency_is_aggregated_by_slash_64() {
+        let peers = Arc::new(PeerConnections::new(2));
+        let first: std::net::IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let second: std::net::IpAddr = "2001:db8:1:2::2".parse().unwrap();
+        let other_prefix: std::net::IpAddr = "2001:db8:1:3::1".parse().unwrap();
+
+        let _a = peers.try_acquire(first).expect("放行");
+        let _b = peers.try_acquire(second).expect("同一 /64 的第二条");
+        assert!(
+            peers.try_acquire(second).is_none(),
+            "同一 /64 的第 3 条必须被拒（即使换地址）"
+        );
+        assert!(
+            peers.try_acquire(other_prefix).is_some(),
+            "另一 /64 不受影响"
         );
     }
 }

@@ -330,15 +330,19 @@ where
                 }
             }
             Action::EnterData(reply) => {
-                // 全局收信并发预算：每条连接在 DATA 阶段可缓冲至多
-                // `max_message_size`（默认 25 MiB），而连接数上限（512）并不约束
-                // **字节** —— 512 × 25 MiB × 数份拷贝可以把进程推向 OOM。
-                // 用进程级计数把「同时收正文」封顶，给出确定的总内存上界；
+                // 全局收信并发预算：按**字节**而不是按条数封顶（R3-011）。
+                //
+                // 每条连接在 DATA 阶段最多缓冲 `max_message_size` 字节；生产默认
+                // 是 50 MiB（`settings.max_message_size_mb`），而连接数上限（512）
+                // 完全不约束**字节**。原实现用「48 条并发 × 每封至多 25 MiB」
+                // 估算上界，既与实际默认值不符，也漏掉了 sink 里整封复制一份的
+                // 峰值。现在改为从 `max_message_size` 动态预留字节额度：
+                // 所有并发 DATA 的**预留总量**不超过 [`DATA_MEMORY_BUDGET`]，
+                // 与实际配置无关地给出确定的内存上界。
                 // 到顶的新 DATA 按 451 临时拒绝（不开 354、事务状态不动），
                 // 客户端稍后重试即可。
-                let Some(_data_slot) = DataSlot::acquire() else {
-                    let backpressure =
-                        Reply::with_enhanced(451, "4.3.2", texts::DATA_BACKPRESSURE);
+                let Some(_data_slot) = DataSlot::acquire(session.config().max_message_size) else {
+                    let backpressure = Reply::with_enhanced(451, "4.3.2", texts::DATA_BACKPRESSURE);
                     write_reply(&mut stream, &backpressure).await?;
                     continue;
                 };
@@ -382,31 +386,53 @@ enum DataOutcome {
     Closed,
 }
 
-/// 同时处于「收正文」阶段的连接数上限（进程级）。见 `drive` 的 EnterData 分支：
-/// 它把并发 DATA 的总缓冲字节封在 `48 × max_message_size` 这个确定上界内。
-const MAX_CONCURRENT_DATA_COLLECTIONS: usize = 48;
-static ACTIVE_DATA_COLLECTIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+/// 同时处于「收正文」阶段的**缓冲字节**预算（进程级）。
+///
+/// 与「条数上限」相比，字节预算才是内存上界的正确口径：条目数上限要乘上
+/// `max_message_size` 才知道占多少内存，而后者来自 `settings.json`（生产默认
+/// 50 MiB），改一个配置就悄悄改变了上界。这里直接对字节记账：
+/// 每条进入 DATA 的连接按本次会话的 `max_message_size` 预留额度，预留总量
+/// 不超过本常量；sink 侧已改成就地插入头（不再整封复制），所以实际峰值
+/// ≈ 预留总量，没有隐藏的 2 倍系数。
+///
+/// 1 GiB 的取舍：默认 50 MiB × 20 条并发 DATA；在 512 连接的小内存 VPS 上
+/// 既留足并发收信能力，又让未认证攻击者无法仅靠 DATA 把进程推向 OOM。
+const DATA_MEMORY_BUDGET: usize = 1024 * 1024 * 1024;
+static ACTIVE_DATA_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// 收正文并发的占位。Drop 时归还计数，任何早退路径（断开、裸 LF、超限）
+/// 收正文的字节额度占位。Drop 时归还，任何早退路径（断开、裸 LF、超限）
 /// 都不会泄漏。
-struct DataSlot;
+struct DataSlot {
+    bytes: usize,
+}
 
 impl DataSlot {
-    fn acquire() -> Option<Self> {
-        let prev = ACTIVE_DATA_COLLECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if prev >= MAX_CONCURRENT_DATA_COLLECTIONS {
-            ACTIVE_DATA_COLLECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            None
-        } else {
-            Some(DataSlot)
+    fn acquire(message_size: usize) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        // 至少按 1 字节记账：`max_message_size = 0` 的畸形配置不能变成
+        // 「无限并发」（每条都 0 字节）。
+        let request = message_size.max(1);
+        let mut current = ACTIVE_DATA_BYTES.load(Ordering::Relaxed);
+        loop {
+            if current.saturating_add(request) > DATA_MEMORY_BUDGET {
+                return None;
+            }
+            match ACTIVE_DATA_BYTES.compare_exchange_weak(
+                current,
+                current + request,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(DataSlot { bytes: request }),
+                Err(actual) => current = actual,
+            }
         }
     }
 }
 
 impl Drop for DataSlot {
     fn drop(&mut self) {
-        ACTIVE_DATA_COLLECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        ACTIVE_DATA_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1330,6 +1356,31 @@ mod tests {
         assert!(
             !out.contains("550 5.1.1"),
             "外域收件人不得走本地名录判定：{out}"
+        );
+    }
+
+    /// R3-011：DATA 内存上界按**字节**记账，而不是「条数 × 一个假设的报文大小」。
+    ///
+    /// 这条测试刻意不依赖当前并发占用：请求一个超过整个预算的量，无论别的测试
+    /// 此刻占了多少都必须被拒绝；额度释放后同一个量又能拿到。
+    #[test]
+    fn the_data_memory_budget_is_byte_based_and_released_on_drop() {
+        // 超过预算的请求必须被拒（无论当前已占多少）。
+        assert!(
+            DataSlot::acquire(usize::MAX / 2).is_none(),
+            "超过总预算的 DATA 必须被 451 背压拒绝"
+        );
+
+        {
+            let first = DataSlot::acquire(1024).expect("预算内应放行");
+            let second = DataSlot::acquire(2048).expect("预算内应放行");
+            drop(first);
+            drop(second);
+        }
+        // 归还后额度可复用 —— 早退路径（Drop）不会泄漏记账。
+        assert!(
+            DataSlot::acquire(4096).is_some(),
+            "DATA 结束后必须归还字节额度"
         );
     }
 }

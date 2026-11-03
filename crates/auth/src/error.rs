@@ -5,6 +5,21 @@
 
 use std::path::PathBuf;
 
+/// 把 core 的原子写/锁错误折算成 auth 错误。
+///
+/// 只为一处存在：`keys::rotate` 必须复用 `mailstack_core::atomic::{locked_with,
+/// file_snapshot, ...}` 才能在跨进程锁内完成「快照 → 写 → 回滚」。`Io` 原样保留
+/// （路径与 io::Error 都有信息量），其余（锁打不开、序列化）折算成 `Signing`：
+/// 对调用方来说都是「这次轮换没有完成」。
+impl From<mailstack_core::CoreError> for AuthError {
+    fn from(error: mailstack_core::CoreError) -> Self {
+        match error {
+            mailstack_core::CoreError::Io { path, source } => AuthError::Io { path, source },
+            other => AuthError::Signing(other.to_string()),
+        }
+    }
+}
+
 /// 认证/签名子系统的错误。
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {

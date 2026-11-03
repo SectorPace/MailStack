@@ -31,16 +31,52 @@ use mailstack_smtpd::{BanList, ManualBanDiff};
 /// 更密的轮询只是在反复读一个小文件。
 pub const RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 
+/// 跨轮次记住「这个文件曾经有过内容」。
+///
+/// 只靠单次 `load()` 无法区分两种「文件不存在」：**首次运行**（合法的空状态）
+/// 与**文件被删掉**（异常）。前者按空集合处理是对的；后者若也按空集合处理，
+/// 一次误删 / 备份还原 / `backup.restore` 的清理步骤就会让在册手工封禁
+/// **全部静默解除**（`info` 日志里只有一行「已重载」）。区分它们只需要一个布尔。
+#[derive(Debug, Default)]
+pub struct ReloadState {
+    /// 上一次成功读取时文件里是否有内容。
+    had_entries: bool,
+}
+
 /// 执行一次重载。
 ///
 /// 返回 `Some(diff)` 表示已经把文件内容对齐进内存表（`diff` 可能为空 = 无变化）；
 /// 返回 `None` 表示**文件读不到或内容坏了，本次没有改动任何封禁** ——
 /// 调用方应当告警而不是继续。
 pub fn reload_once(store: &ManualBanStore, bans: &BanList) -> Option<ManualBanDiff> {
+    reload_once_with(store, bans, &mut ReloadState::default())
+}
+
+/// 同 [`reload_once`]，但跨轮次记住「文件曾有过内容」。
+///
+/// 生产的热重载循环必须用这个版本：文件**曾经存在且有内容**、下一轮却不见了，
+/// 是异常（误删 / 还原 / 清理脚本），必须保持现状并告警，绝不能当成「全部解封」。
+pub fn reload_once_with(
+    store: &ManualBanStore,
+    bans: &BanList,
+    state: &mut ReloadState,
+) -> Option<ManualBanDiff> {
     let ips = match store.load() {
-        // 文件不存在 = 还没有人手工封禁过任何地址，是一个正常的初始状态。
-        Ok(None) => Vec::new(),
-        Ok(Some(entries)) => entries.into_iter().map(|entry| entry.ip).collect(),
+        Ok(None) => {
+            if state.had_entries {
+                tracing::error!(
+                    path = %store.path().display(),
+                    "手工封禁文件在已知有内容的情况下消失，保持现有封禁不变（本次不解除任何封禁）"
+                );
+                return None;
+            }
+            // 首次运行：还没有人手工封禁过任何地址，是一个正常的初始状态。
+            Vec::new()
+        }
+        Ok(Some(entries)) => {
+            state.had_entries = !entries.is_empty();
+            entries.into_iter().map(|entry| entry.ip).collect()
+        }
         Err(_) => return None,
     };
     Some(bans.apply_manual(&ips))
@@ -58,6 +94,8 @@ pub async fn watch(
 
     // 读的是几十字节的小文件，同步读即可 —— 这里不值得为它引入一套异步文件 I/O。
     let store = ManualBanStore::from_paths(&paths);
+    // 跨轮次记住「文件曾有过内容」：文件被删掉 ≠ 全部解封。
+    let mut state = ReloadState::default();
 
     loop {
         tokio::select! {
@@ -66,7 +104,7 @@ pub async fn watch(
                 return;
             }
             _ = ticker.tick() => {
-                match reload_once(&store, &bans) {
+                match reload_once_with(&store, &bans, &mut state) {
                     Some(diff) if !diff.is_empty() => {
                         tracing::info!(
                             added = ?diff.added,
@@ -147,6 +185,51 @@ mod tests {
             "读失败必须如实返回 None"
         );
         assert!(bans.check(ip(7), 0).is_some(), "读失败绝不能解除任何封禁");
+    }
+
+    /// 文件被删掉不等于「全部解封」：它曾经有内容，现在的消失是异常。
+    ///
+    /// `rm manual-bans.json`（误删、备份还原、清理脚本）原先会被当成空集合，
+    /// 下一轮重载把在册手工封禁全部解除，只留一条 `info` 日志。
+    #[test]
+    fn a_deleted_ban_file_does_not_silently_lift_every_manual_ban() {
+        let (_dir, _paths, store, bans) = fixture();
+        store.add(ip(7), None, "2026-10-02T00:00:00Z").unwrap();
+        let mut state = ReloadState::default();
+        reload_once_with(&store, &bans, &mut state).unwrap();
+        assert!(bans.check(ip(7), 0).is_some());
+
+        std::fs::remove_file(store.path()).unwrap();
+        assert!(
+            reload_once_with(&store, &bans, &mut state).is_none(),
+            "文件曾有过内容却消失：必须报异常，而不是当作空集合"
+        );
+        assert!(
+            bans.check(ip(7), 0).is_some(),
+            "文件消失绝不能把在册手工封禁全部解除"
+        );
+
+        // 对照：首次运行（从未有过内容）时，文件不存在是合法空状态。
+        let (_dir2, _p2, store2, bans2) = fixture();
+        let mut fresh = ReloadState::default();
+        let diff = reload_once_with(&store2, &bans2, &mut fresh).expect("首次运行是正常状态");
+        assert!(diff.is_empty());
+    }
+
+    /// 正常的「解封最后一条」路径必须仍然解除封禁：`remove` 写的是 `[]`，
+    /// 文件仍在、内容合法，因此不能被上面的「文件消失」判定误伤。
+    #[test]
+    fn removing_the_last_ban_through_the_store_still_lifts_it() {
+        let (_dir, _paths, store, bans) = fixture();
+        store.add(ip(7), None, "2026-10-02T00:00:00Z").unwrap();
+        let mut state = ReloadState::default();
+        reload_once_with(&store, &bans, &mut state).unwrap();
+        assert!(bans.check(ip(7), 0).is_some());
+
+        store.remove(ip(7)).unwrap();
+        assert!(store.path().exists(), "remove 写空数组，不删除文件");
+        reload_once_with(&store, &bans, &mut state).unwrap();
+        assert!(bans.check(ip(7), 0).is_none(), "正常解封路径必须仍然生效");
     }
 
     #[test]

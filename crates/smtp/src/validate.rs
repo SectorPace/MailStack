@@ -109,6 +109,20 @@ pub fn validate_relay(
         }
     }
 
+    // 用户名里的 `:` 必须硬拒（R3-013）。
+    //
+    // `sasl_passwd` 的行格式是 `<relayhost> <user>:<password>`，读侧在**第一个**
+    // 冒号处切分。用户名 `svc:mail` + 口令 `pw` 写盘后读回成
+    // `username="svc"`、`password="mail:pw"` —— apply 回报成功、回读只看
+    // relayhost 也通过，但认证用的是错的凭据，表现为「配置好了却一直 535」。
+    // 口令里的冒号是安全的（切分发生在第一个冒号），只拒用户名。
+    if request.username.contains(':') {
+        return Err(SmtpError::InvalidEndpoint(
+            "SMTP username must not contain ':' (it is the sasl_passwd user/password separator)"
+                .to_string(),
+        ));
+    }
+
     // 凭证必须成对提供。
     let has_user = !request.username.is_empty();
     let has_pass = !request.password.is_empty();
@@ -134,8 +148,17 @@ pub fn validate_relay(
 ///
 /// 只有在请求显式要求私网**且**部署策略已开启时，才放宽到允许私网地址；
 /// 其余一律公网策略（不主动放宽）。
-pub fn address_policy_for(request: &RelayValidationRequest) -> crate::target::AddressPolicy {
-    if request.allow_private_network {
+///
+/// `private_network_enabled` 是**部署**策略（不是请求字段）。把它做成必需参数
+/// 而不是让调用方先 `validate_relay` 再记得传对策略，是 R3-015 的修复点：
+/// 这个函数原先只看 `request.allow_private_network`，签名里根本没有部署策略，
+/// 文档承诺的「且部署策略已开启」在实现上不可能成立 —— 任何未来调用者只要
+/// 忘了先 validate，就会得到一次 SSRF 放宽。
+pub fn address_policy_for(
+    request: &RelayValidationRequest,
+    private_network_enabled: bool,
+) -> crate::target::AddressPolicy {
+    if request.allow_private_network && private_network_enabled {
         crate::target::AddressPolicy::allow_private()
     } else {
         crate::target::AddressPolicy::public_only()
@@ -347,6 +370,58 @@ mod tests {
         req.password = String::new();
         let endpoint = validate_relay(&req, false).unwrap();
         assert!(!endpoint.has_credentials());
+    }
+
+    #[test]
+    fn rejects_colon_in_username_but_allows_it_in_password() {
+        // R3-013：`sasl_passwd` 在第一个冒号处切分。用户名含冒号会让
+        // 「写进去的 user」与「读回来的 user」不一致 —— apply 成功但认证永远 535。
+        let mut req = base_request();
+        req.username = "svc:mail".to_string();
+        req.password = "pw".to_string();
+        let err = validate_relay(&req, false).unwrap_err();
+        assert!(
+            matches!(err, SmtpError::InvalidEndpoint(_)),
+            "用户名含冒号必须被拒绝，实际: {err:?}"
+        );
+
+        // 口令里的冒号是安全的：读侧 split_once 只切第一个冒号。
+        let mut req = base_request();
+        req.username = "svc".to_string();
+        req.password = "pa:ss:word".to_string();
+        let endpoint = validate_relay(&req, false).unwrap();
+        assert_eq!(endpoint.password, "pa:ss:word");
+    }
+
+    #[test]
+    fn address_policy_requires_both_the_request_and_the_deployment_to_opt_in() {
+        // R3-015：文档承诺「请求要求私网**且**部署已开启」。原签名没有部署策略，
+        // 实现也只看请求字段 —— 这里把四种组合全部钉住。
+        let mut request = base_request();
+        request.allow_private_network = true;
+
+        assert_eq!(
+            address_policy_for(&request, false),
+            crate::target::AddressPolicy::public_only(),
+            "部署未开启时不得放宽（即使请求要求私网）"
+        );
+        assert_eq!(
+            address_policy_for(&request, true),
+            crate::target::AddressPolicy::allow_private(),
+            "两者都开启才放宽"
+        );
+
+        let mut public_request = base_request();
+        public_request.allow_private_network = false;
+        assert_eq!(
+            address_policy_for(&public_request, true),
+            crate::target::AddressPolicy::public_only(),
+            "请求没要求时不得主动放宽"
+        );
+        assert_eq!(
+            address_policy_for(&public_request, false),
+            crate::target::AddressPolicy::public_only()
+        );
     }
 
     #[test]

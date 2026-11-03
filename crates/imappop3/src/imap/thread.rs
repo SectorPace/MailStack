@@ -332,6 +332,9 @@ mod tests {
             .collect();
         let rendered = render(ThreadAlgorithm::References, &messages);
         assert!(rendered.contains("(514)"), "{rendered}");
-        assert!(!rendered.contains("(515)"), "超限的更深层不应输出: {rendered}");
+        assert!(
+            !rendered.contains("(515)"),
+            "超限的更深层不应输出: {rendered}"
+        );
     }
 }

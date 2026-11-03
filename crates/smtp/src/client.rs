@@ -11,10 +11,27 @@
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Instant;
 
 use crate::dial::{EstablishedStream, PinnedDialer, TlsMode};
 use crate::error::{SmtpError, SmtpResult};
 use crate::target::PinnedTarget;
+
+/// 单次 SMTP 会话（一次投递尝试）的总时限（R3-010）。
+///
+/// ## 为什么「单次读写超时」不够
+///
+/// 直投模式下对端是任意收件域的 MX（完全恶意）。原实现的超时全是**逐次**的：
+/// `read_response` 每读一行各领一份 `timeout`，正文每 32 KiB 块各领一份。
+/// 对端只要在每次超时前发 1 字节，一次投递就能占用 worker 数小时（单行上限
+/// 4096 字节 × 64 行 × 单行超时）；正文阶段同理按块无限延长。队列的
+/// `relay_concurrency` 有限，少数恶意收件域即可吃满出站并发，所有外发积压
+/// （连 DSN 告警都发不出去）。
+///
+/// 会话级 deadline 与入站侧的 `SESSION_TOTAL_TIMEOUT` 对称：每个 await 点都用
+/// 「剩余总预算」与单次超时中较小者兜住，整条 `MAIL → RCPT → DATA → 250`
+/// 有确定上界。
+pub const SESSION_BUDGET: Duration = Duration::from_secs(300);
 
 /// 出站单行长度上限。
 ///
@@ -224,6 +241,14 @@ impl LineIo {
 pub struct SmtpSession {
     io: LineIo,
     timeout: Duration,
+    /// 整条会话的绝对截止时刻（构造时 `now + budget`）。
+    ///
+    /// 与 `timeout`（单次读写上限）同时生效：每个 await 点用两者中**先到**者
+    /// 兜底，因此既防「一次读挂太久」，也防「每次都在超时前动一下」的滴水
+    /// 攻击（R3-010）。
+    deadline: Instant,
+    /// 构造时声明的整体预算（只用于错误文案与观测，判定用 `deadline`）。
+    budget: Duration,
     capabilities: Capabilities,
 }
 
@@ -237,14 +262,27 @@ impl SmtpSession {
     ) -> SmtpResult<(Self, Response)> {
         let stream = dialer.connect_with_mode(target, mode).await?;
         let mut session = Self::from_stream(stream, timeout);
+        // banner 读取也受同一个会话 deadline 约束（connect 的 TCP/TLS 阶段
+        // 各有自己的超时；从 banner 开始进入 SMTP 会话预算）。
         let banner = session.read_response().await?;
         Ok((session, banner))
     }
 
     pub fn from_stream(stream: EstablishedStream, timeout: Duration) -> Self {
+        Self::from_stream_with_budget(stream, timeout, SESSION_BUDGET)
+    }
+
+    /// 显式指定整体预算的构造（测试与需要更短预算的部署）。
+    pub fn from_stream_with_budget(
+        stream: EstablishedStream,
+        timeout: Duration,
+        budget: Duration,
+    ) -> Self {
         Self {
             io: LineIo::new(stream),
             timeout,
+            deadline: Instant::now() + budget,
+            budget,
             capabilities: Capabilities::default(),
         }
     }
@@ -257,15 +295,34 @@ impl SmtpSession {
         self.io.is_encrypted()
     }
 
+    /// 本次 await 可用的等待预算：单次超时与会话剩余预算中的较小者。
+    fn wait_budget(&self) -> Duration {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        self.timeout.min(remaining)
+    }
+
+    /// 超时后的错误：区分「单次超时」与「会话总预算耗尽」，便于排障定位。
+    fn timeout_error(&self, what: &str) -> SmtpError {
+        if Instant::now() >= self.deadline {
+            SmtpError::Protocol(format!(
+                "SMTP session deadline ({}ms) exceeded while {what}",
+                self.budget.as_millis()
+            ))
+        } else {
+            SmtpError::Protocol(format!("timed out {what}"))
+        }
+    }
+
     /// 读取一条（可能多行的）响应。
     pub async fn read_response(&mut self) -> SmtpResult<Response> {
         let mut lines = Vec::new();
         let mut code: Option<u16> = None;
 
         loop {
-            let line = tokio::time::timeout(self.timeout, self.io.read_line())
+            let wait = self.wait_budget();
+            let line = tokio::time::timeout(wait, self.io.read_line())
                 .await
-                .map_err(|_| SmtpError::Protocol("timed out waiting for server response".into()))?
+                .map_err(|_| self.timeout_error("waiting for server response"))?
                 .map_err(SmtpError::Io)?;
 
             let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
@@ -305,9 +362,10 @@ impl SmtpSession {
 
     /// 发送一行命令并读取响应。
     pub async fn command(&mut self, line: &str) -> SmtpResult<Response> {
-        tokio::time::timeout(self.timeout, self.io.write_line(line))
+        let wait = self.wait_budget();
+        tokio::time::timeout(wait, self.io.write_line(line))
             .await
-            .map_err(|_| SmtpError::Protocol("timed out writing command".into()))?
+            .map_err(|_| self.timeout_error("writing command"))?
             .map_err(SmtpError::Io)?;
         self.read_response().await
     }
@@ -337,10 +395,16 @@ impl SmtpSession {
         }
 
         let timeout = self.timeout;
+        let deadline = self.deadline;
+        let budget = self.budget;
         // 明文读缓冲在此被丢弃 —— 这是必须的：TLS 之后任何明文残留字节
         // 都属于协议违规输入，绝不能进入解密后的读路径。
         let upgraded = self.io.into_inner().upgrade(dialer, target).await?;
-        Ok((Self::from_stream(upgraded, timeout), response))
+        let mut next = Self::from_stream_with_budget(upgraded, timeout, budget);
+        // 升级不能重置会话预算：否则一个「先 STARTTLS 再滴水」的对端可以靠
+        // 重入拿到一份全新的预算（与入站侧 STARTTLS 重入的处理同一立场）。
+        next.deadline = deadline;
+        Ok((next, response))
     }
 
     /// AUTH PLAIN / LOGIN。
@@ -495,14 +559,16 @@ impl SmtpSession {
         // 整体耗时随载荷伸缩，但每一块都被超时兜住，连接健康时不再误判超时。
         let terminated = terminate_data(data);
         for chunk in terminated.as_bytes().chunks(DATA_WRITE_CHUNK_BYTES) {
-            tokio::time::timeout(self.timeout, self.io.write_chunk_raw(chunk))
+            let wait = self.wait_budget();
+            tokio::time::timeout(wait, self.io.write_chunk_raw(chunk))
                 .await
-                .map_err(|_| SmtpError::Protocol("timed out writing message body".into()))?
+                .map_err(|_| self.timeout_error("writing message body"))?
                 .map_err(SmtpError::Io)?;
         }
-        tokio::time::timeout(self.timeout, self.io.flush_raw())
+        let wait = self.wait_budget();
+        tokio::time::timeout(wait, self.io.flush_raw())
             .await
-            .map_err(|_| SmtpError::Protocol("timed out flushing message body".into()))?
+            .map_err(|_| self.timeout_error("flushing message body"))?
             .map_err(SmtpError::Io)?;
 
         let response = self.read_response().await?;
@@ -1053,5 +1119,54 @@ mod tests {
             .send_message_detailed("a@example.com", &["b@example.net".to_string()], "body")
             .await;
         assert!(result.is_err(), "未知结果不得伪装成已判定的拒绝");
+    }
+
+    /// R3-010 反例：只按「单次读」限时的恶意对端会把投递挂到单行上限 × 单次超时。
+    ///
+    /// 服务端每 50ms 只吐一个字符、永不换行 —— 每次 `read` 都在单次超时前被喂活，
+    /// 单次超时永远不会到点。修复前这条投递要等到 4096 字节（约 200 秒）才因
+    /// 行长超限失败；会话级 deadline 必须在 300ms 左右把它掐断。
+    #[tokio::test]
+    async fn a_trickling_server_is_stopped_by_the_session_deadline() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        tokio::spawn(async move {
+            if server.write_all(b"220 ready\r\n").await.is_err() {
+                return;
+            }
+            loop {
+                if server.write_all(b"2").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+
+        let mut session = SmtpSession::from_stream_with_budget(
+            crate::dial::EstablishedStream::Plain(client),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(300),
+        );
+        let banner = session.read_response().await.expect("banner 应可读");
+        assert_eq!(banner.code, 220);
+
+        let started = tokio::time::Instant::now();
+        let error = session
+            .command("EHLO client.test")
+            .await
+            .expect_err("滴水对端必须在会话 deadline 处失败");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "会话级 deadline 未生效：耗时 {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.to_string().contains("session deadline"),
+            "错误应指明是会话总预算耗尽：{error}"
+        );
     }
 }

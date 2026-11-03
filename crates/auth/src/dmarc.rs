@@ -7,22 +7,37 @@
 //! 把编排放在这里而不是调用方，是为了避免出现「调用方自己拼 SPF 结果传给 DMARC」
 //! 这种各拼一份、迟早走样的局面。
 //!
-//! ## `pct=` 抽样（RFC 7489 §6.6.4，已接线）
+//! ## `pct=` 抽样（RFC 7489 §6.6.4）—— **仅注入路径生效，生产路径不生效（已知偏离）**
 //!
 //! [`parse_pct`]（从原始记录文本解析）→ [`policy_sample_draw`]（每条消息的抽签）
 //! → [`effective_policy`]（抽样折算，只弱化不强化），由 [`evaluate`] 在判定为
 //! fail 且已公布策略有处置动作（reject / quarantine）时执行，并把**本条消息实际
-//! 执行**的策略写进 [`DmarcCheck::policy_value`] —— 所有消费方（SMTP 收信的 550
-//! 判定等）经 [`DmarcCheck::policy_is_reject`] 自动带上 pct 语义，不必各自重算。
-//! 方向 fail-closed：`pct` 只可能**概率性地弱化**处置；记录损坏（`pct` 取不到）
-//! 或抽签熵异常集中时，最坏等价于「未实现 pct」（全量执行已公布策略）。
+//! 执行**的策略写进 [`DmarcCheck::policy_value`]。
 //!
-//! 已知边界（诚实披露）：原始记录文本只有 [`crate::cache::TxtCache::add_dmarc`]
-//! 注入路径才拿得到 —— mail-auth 0.13 联网解析 DMARC 时在解析器内部就把原始
-//! 字节消费掉了，[`crate::cache::TxtCache`] 的回调里只有解析后的结构（`pct`
-//! 已被丢弃）。联网解析路径上 `raw_dmarc_record` 因此返回 `None`，pct 按
-//! 「未公布」处理（全量执行已公布策略）—— 正是 fail-closed 方向的退化，
-//! 不会更严。
+//! **但这条链只在测试/离线注入路径上拿得到原始记录文本**：mail-auth 0.13 联网
+//! 解析 DMARC 时在解析器内部就把原始字节消费掉了，[`crate::cache::TxtCache`] 的
+//! `ResolverCache::insert` 回调里只有**解析后的结构**，而 `mail_auth::dmarc::Dmarc`
+//! 结构里根本没有 `pct` 字段。生产的 `TxtCache` 实例因此永远拿不到原始文本，
+//! `raw_dmarc_record()` 恒为 `None` ⇒ **`p=reject; pct=10` 在本机按 100% 执行**。
+//!
+//! 方向是「比已公布策略更严」（fail-closed，不会放行本该拒收的邮件），但它是
+//! **与 RFC 7489 §6.6.4 的偏离**，会拒收域主在 rollout 期间本来希望放行的合法
+//! 流量。修复需要换掉 TXT 查询层（自己发 DNS 拿原始 TXT 再 `Dmarc::parse`）或
+//! 上游给 mail-auth 加 `pct` 字段——两者都要改依赖面（本仓库禁止新增 C 依赖
+//! 链），因此本轮**明确记为已知限制**，不假装已接线：
+//!
+//! * [`effective_policy`] / [`parse_pct`] 保留（离线注入路径可测、可复用）；
+//! * 测试 `pct_is_not_available_on_the_network_parse_path` 把「生产写法的缓存
+//!   拿不到 pct」**钉成断言** —— 将来真的修好时它会变红，提醒同步改文档；
+//! * 后续方案见 `docs/TEST_REPORT.md` 的已知偏离清单（由 Lead 登记）。
+//!
+//! ## 多 RFC5322.From 域（RFC 7489 §6.6.1）
+//!
+//! mail-auth 遇到「多个不同 From 域」时在**查任何 DNS 之前**就返回
+//! `DmarcOutput::default()`（上游注释说是「MUST be exempt」）。本模块**不能**把这
+//! 个默认值当成「该域无策略」放行：那等于任何外部发件人只要在 `From` 里加一个
+//! 第二地址，就能伪造任意 `p=reject` 域。见 [`MULTI_FROM_REASON`] 与
+//! [`evaluate`] 里的 fail-closed 分支。
 
 use std::net::IpAddr;
 
@@ -33,6 +48,13 @@ use crate::cache::TxtCache;
 use crate::dkim::{DkimStatus, DkimVerdict};
 use crate::error::{AuthError, AuthResult};
 use crate::spf::{SpfCheck, SpfStatus};
+
+/// 多 RFC5322.From 域时的判定文案。
+///
+/// 单独抽成常量是为了让消费方与测试能**识别**这个状态，而不是去嗅探一句人话
+/// （文案会随排障需要调整）。判据仍然是 [`DmarcStatus::Fail`]，因此既有的
+/// 「fail + policy_is_reject ⇒ 拒收」链路不需要改动就自动覆盖它。
+pub const MULTI_FROM_REASON: &str = "multiple RFC5322.From domains";
 
 /// DMARC 判定结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +81,15 @@ impl DmarcStatus {
             DmarcStatus::PermissionError(_) => "permerror",
             DmarcStatus::None => "none",
         }
+    }
+
+    /// 是否因「多个不同 RFC5322.From 域」被判 fail（RFC 7489 §6.6.1）。
+    ///
+    /// 上游遇到这种报文会在查 DNS 之前就返回 `None`；本模块把它改判为 fail 并
+    /// 按 fail-closed 处理。用 [`MULTI_FROM_REASON`] 比对，而不是让调用方去嗅探
+    /// 任意 `Fail` 文案 —— 文案可能变，这条常量不会。
+    pub fn is_multi_from(&self) -> bool {
+        matches!(self, DmarcStatus::Fail(reason) if reason.starts_with(MULTI_FROM_REASON))
     }
 }
 
@@ -191,6 +222,43 @@ pub async fn evaluate(
         .verify_dkim(Parameters::new(&parsed).with_txt_cache(cache))
         .await;
     let dkim = crate::dkim::verdicts_from(&dkim_outputs);
+
+    // ── 多个不同 RFC5322.From 域：fail-closed（RFC 7489 §6.6.1）─────────────
+    //
+    // RFC 7489 §6.6.1 要求对每个 From 域各做一次 DMARC 检查，并在失败时执行
+    // 「最严的那条策略」；同节还指出多 From 头的报文「typically rejected」。
+    // mail-auth 0.13 的实现是在**查任何 DNS 之前**直接返回 `DmarcOutput::default()`
+    // （上游注释：「MUST be exempt from DMARC checking」）。如果照搬那个默认值，
+    // 本仓库会把它映射成 `DmarcStatus::None`（「该域没有策略」），而 sink 只在
+    // `Fail && reject` 时拒收 ⇒ **任何外部发件人只要在 From 里加一个第二地址，
+    // 就能伪造任意 `p=reject` 域**（银行/GitHub/Gmail…），DMARC 完全失效。
+    //
+    // 这里不做「逐域查策略再取最严」：上游在返回前没发过任何查询，缓存里也不会有
+    // 这些域的策略记录；自己用缓存做树走查要么拿不到（生产常态），要么得复刻上游
+    // 的 p/sp/np/t=y/psd 选择逻辑 —— 那是一条会与上游悄悄分叉、且分叉方向可能是
+    // **弱化**的路径。按任务约定的「无法确定策略时按严格模式」：多 From 域一律
+    // fail，且实际执行策略取 [`DmarcPolicy::Reject`]。
+    //
+    // 结果：既有的 `matches!(status, Fail(_)) && policy_is_reject()` 直接拒收，
+    // 不需要消费方为这条新规则单独改判定（sink 无需 patch 即可闭环）。
+    let from_domains = from_domains(&parsed);
+    if from_domains.len() > 1 {
+        let domains = from_domains.join(", ");
+        return Ok(DmarcCheck {
+            status: DmarcStatus::Fail(format!(
+                "{MULTI_FROM_REASON} ({domains}); RFC 7489 §6.6.1 requires the most strict \
+                 policy, and the strictest available reading is fail-closed"
+            )),
+            domain: domains,
+            // `policy=` 是「对方公布了什么」。多 From 时不存在唯一作者域，
+            // 也没有可引用的已公布策略 —— 留空（A-R 不输出 policy=）比编一个
+            // `reject` 更诚实；实际执行的严格策略在 `policy_value` 里。
+            policy: String::new(),
+            policy_value: DmarcPolicy::Reject,
+            spf,
+            dkim,
+        });
+    }
 
     // 6.15：裸 `rsplit_once('@')` 不做任何清洗。上游传进来的 `sender` 可能是
     // `MAIL FROM:<User@Example.COM>` 这类带尖括号/空白/大写的形态，
@@ -377,6 +445,30 @@ fn policy_sample_draw_from(domain: &str, message_id: &[u8], nanos: u128) -> u8 {
     (hasher.finish() % 100) as u8
 }
 
+/// 报文里所有 `RFC5322.From` 地址的**去重域集合**（小写，按首次出现排序）。
+///
+/// 与上游 `verify_dmarc` 一样遍历**每一个** `From` 头里的**每一个**地址；区别是
+/// 这里只回答「有几个不同的域」，不复制上游那条「多个域 ⇒ 豁免」的处理。
+/// 上游的写法也只比较域、不比较大小写差异（`to_a_label` 折小写），所以
+/// `a@Example.COM` 与 `b@example.com` 算同一个域 —— 这条口径必须一致，否则
+/// 合法邮件会被误判成多域。
+pub fn from_domains(parsed: &AuthenticatedMessage<'_>) -> Vec<String> {
+    let mut domains: Vec<String> = Vec::new();
+    for address in &parsed.from {
+        let Some((_, domain)) = address.rsplit_once('@') else {
+            continue;
+        };
+        let domain = sanitize_domain_part(domain);
+        if domain.is_empty() {
+            continue;
+        }
+        if !domains.iter().any(|seen| seen == &domain) {
+            domains.push(domain);
+        }
+    }
+    domains
+}
+
 /// 清洗一个**已经是域名**的字符串（域半段）：去尖括号残留与空白、折叠小写。
 ///
 /// [`sanitized_domain`]（整地址 → 域）与 `arc::header_from`（已解析地址的域半段）
@@ -514,6 +606,218 @@ mod tests {
         assert_eq!(check.policy_value, DmarcPolicy::Reject);
         assert!(check.policy_is_reject());
         assert_eq!(check.policy, "reject", "展示字符串仍是已公布策略");
+    }
+
+    // ─────────────── 多 RFC5322.From 域（R1-001 / RFC 7489 §6.6.1）───────────────
+
+    /// 单个 `From` 头里两个不同域 —— 上游解析器会把两个地址都收进 `message.from`。
+    const MULTI_FROM_ONE_HEADER: &str = concat!(
+        "From: ceo@bank.com, x@evil.test\r\n",
+        "To: bob@example.net\r\n",
+        "Subject: multi\r\n",
+        "Date: Wed, 01 Oct 2026 10:00:00 +0800\r\n",
+        "\r\n",
+        "body\r\n"
+    );
+
+    /// 两个 `From` 头（RFC 5322 禁止，但解析器照收）。
+    const MULTI_FROM_TWO_HEADERS: &str = concat!(
+        "From: ceo@bank.com\r\n",
+        "From: x@evil.test\r\n",
+        "To: bob@example.net\r\n",
+        "Subject: multi\r\n",
+        "Date: Wed, 01 Oct 2026 10:00:00 +0800\r\n",
+        "\r\n",
+        "body\r\n"
+    );
+
+    fn cache_with_names_absent(names: &[&str]) -> TxtCache {
+        let cache = TxtCache::new();
+        for name in names {
+            cache.pin_absent(name);
+        }
+        cache
+    }
+
+    /// **R1-001 的反例守卫**：`From` 含两个不同域时，上游返回的
+    /// `DmarcOutput::default()` 会被映射成 `DmarcStatus::None` —— 与「该域没有
+    /// DMARC 记录」同一个变体。消费方只在 `Fail && reject` 时拒收，于是这种报文
+    /// 直接入队投递：任何外部发件人加一个第二地址就能伪造任意 `p=reject` 域。
+    #[tokio::test]
+    async fn a_single_from_header_with_two_domains_is_failed_instead_of_exempted() {
+        let cache =
+            cache_with_names_absent(&["mail.example.com", "bank.com", "evil.test", "example.com"]);
+
+        let check = evaluate(
+            &resolver(),
+            &cache,
+            MULTI_FROM_ONE_HEADER.as_bytes(),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+            "mail.example.com",
+            "mx.mailstack.test",
+            "ceo@bank.com",
+        )
+        .await
+        .expect("评估");
+
+        assert!(
+            check.status.is_multi_from(),
+            "多 From 域必须被显式识别并判 fail：{check:?}"
+        );
+        assert!(
+            !matches!(check.status, DmarcStatus::None),
+            "多 From 域不得被当成「该域没有策略」放行"
+        );
+        assert_eq!(check.status.keyword(), "fail");
+        assert!(
+            check.policy_is_reject(),
+            "无法确定唯一作者域/策略时必须按最严策略处理（fail-closed）"
+        );
+        assert_eq!(check.domain, "bank.com, evil.test", "判定要带上全部作者域");
+        assert_eq!(
+            check.policy, "",
+            "没有唯一可引用的已公布策略，不得编一个出来"
+        );
+    }
+
+    /// 两个 `From` 头同样命中（RFC 5322 禁止，但解析器照收）。
+    #[tokio::test]
+    async fn two_from_headers_with_different_domains_are_failed_too() {
+        let cache =
+            cache_with_names_absent(&["mail.example.com", "bank.com", "evil.test", "example.com"]);
+        let check = evaluate(
+            &resolver(),
+            &cache,
+            MULTI_FROM_TWO_HEADERS.as_bytes(),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+            "mail.example.com",
+            "mx.mailstack.test",
+            "ceo@bank.com",
+        )
+        .await
+        .expect("评估");
+
+        assert!(check.status.is_multi_from(), "{check:?}");
+        assert!(check.policy_is_reject());
+    }
+
+    /// 对照守卫（防误杀）：**同一个域**的多个 From 地址必须照常评估。
+    ///
+    /// 这条是 R1-001 修复的边界：只有「不同域」才是伪造信号；同域多地址在
+    /// RFC 5322 里合法，上游也会照常做 DMARC 检查。
+    #[tokio::test]
+    async fn same_domain_multiple_from_addresses_still_evaluate_normally() {
+        let cache = TxtCache::new();
+        cache.pin_dmarc_walk("example.com");
+        cache.pin_absent("mail.example.com");
+        cache
+            .add_spf("example.com", b"v=spf1 ip4:203.0.113.10 -all")
+            .expect("装载 SPF 记录");
+        cache
+            .add_dmarc("_dmarc.example.com", b"v=DMARC1; p=reject")
+            .expect("装载 DMARC 记录");
+
+        let message = concat!(
+            "From: alice@example.com, bob@EXAMPLE.com\r\n",
+            "To: carol@example.net\r\n",
+            "Subject: same domain\r\n",
+            "Date: Wed, 01 Oct 2026 10:00:00 +0800\r\n",
+            "\r\n",
+            "body\r\n"
+        );
+        let check = evaluate(
+            &resolver(),
+            &cache,
+            message.as_bytes(),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+            "mail.example.com",
+            "mx.mailstack.test",
+            "alice@example.com",
+        )
+        .await
+        .expect("评估");
+
+        assert!(
+            !check.status.is_multi_from(),
+            "同域多地址不得被当成多 From 域：{check:?}"
+        );
+        assert_eq!(check.status, DmarcStatus::Pass, "对齐的 SPF 仍应 pass");
+        assert!(check.policy_is_reject());
+    }
+
+    /// `from_domains` 是上述判定的唯一依据：去重、折小写、跳过无域地址。
+    #[test]
+    fn from_domains_dedups_and_normalises_before_the_multi_from_check() {
+        let parsed = AuthenticatedMessage::parse(
+            b"From: \"A\" <a@Example.COM>, b@example.com\r\nFrom: c@other.test\r\n\r\nbody",
+        )
+        .expect("解析报文");
+        assert_eq!(
+            from_domains(&parsed),
+            vec!["example.com".to_string(), "other.test".to_string()]
+        );
+
+        let parsed =
+            AuthenticatedMessage::parse(b"From: not-an-address\r\n\r\nbody").expect("解析");
+        assert!(
+            from_domains(&parsed).is_empty(),
+            "没有合法域时不得凭空造出一个域（否则会误判为多域）"
+        );
+    }
+
+    /// **R1-004 的诚实基线**：生产装配的缓存写入形态（`ResolverCache::insert`，
+    /// 只有解析后的结构）拿不到原始 DMARC 文本 ⇒ `pct=` 不生效，`pct=0` 仍按
+    /// 100% 执行。这是**已知偏离**（fail-closed 方向，不会放行本该拒收的邮件），
+    /// 不是修复；将来真的接上原始 TXT 时这条测试会变红，提醒同步更新文档。
+    #[tokio::test]
+    async fn pct_is_not_available_on_the_network_parse_path() {
+        use mail_auth::common::parse::TxtRecordParser;
+        use mail_auth::dmarc::Dmarc;
+        use mail_auth::ResolverCache;
+        use std::time::{Duration, Instant};
+
+        let cache = TxtCache::new();
+        cache.pin_dmarc_walk("example.com");
+        cache.pin_absent("mail.example.com");
+        cache
+            .add_spf("example.com", b"v=spf1 ip4:203.0.113.10 -all")
+            .expect("装载 SPF 记录");
+        // 生产路径的形态：mail-auth 联网解析完，回调 `insert` 只给解析结构。
+        let parsed = Dmarc::parse(b"v=DMARC1; p=reject; pct=0").expect("解析记录");
+        let value: mail_auth::Txt = parsed.into();
+        cache.insert(
+            "_dmarc.example.com.".into(),
+            value,
+            Instant::now() + Duration::from_secs(60),
+        );
+
+        assert!(
+            cache.raw_dmarc_record("example.com").is_none(),
+            "联网解析路径拿不到原始文本（pct 已被上游丢弃）"
+        );
+
+        let check = evaluate(
+            &resolver(),
+            &cache,
+            MESSAGE.as_bytes(),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+            "mail.example.com",
+            "mx.mailstack.test",
+            "alice@example.com",
+        )
+        .await
+        .expect("评估");
+
+        assert_eq!(
+            check.status,
+            DmarcStatus::Fail("Policy not aligned".to_string())
+        );
+        assert_eq!(
+            check.policy_value,
+            DmarcPolicy::Reject,
+            "pct=0 在生产路径不生效：按 100% 执行（已知偏离）"
+        );
+        assert!(check.policy_is_reject());
     }
 
     #[test]
@@ -667,7 +971,10 @@ mod tests {
                 other => panic!("p=reject 的弱化只可能到 quarantine，实际 {other:?}"),
             }
         }
-        assert!(rejected > 0, "抽样必须命中一部分（期望 ~10%）：{rejected}/60");
+        assert!(
+            rejected > 0,
+            "抽样必须命中一部分（期望 ~10%）：{rejected}/60"
+        );
         assert!(
             quarantined >= 30,
             "落选必须占绝大多数（期望 ~90%）：rejected={rejected} quarantined={quarantined}"

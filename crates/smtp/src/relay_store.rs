@@ -519,10 +519,13 @@ mod tests {
         assert_eq!(doc[KEY_TLS_SECURITY_LEVEL], "encrypt");
         assert_eq!(doc[KEY_SASL_SECURITY_OPTIONS], "noanonymous");
         assert!(doc[CREDENTIALS_KEY].contains("apikey:"));
-        assert!(
-            !doc.contains_key(KEY_TLS_WRAPPERMODE),
-            "587 + STARTTLS 不应写 wrappermode"
+        // R3-004：这个键**恒写**，587 + STARTTLS 时显式落 `no`。
+        // 原实现「需要才写」，导致 465 → 587 切换后旧的 `yes` 留在盘上。
+        assert_eq!(
+            doc[KEY_TLS_WRAPPERMODE], "no",
+            "587 + STARTTLS 必须显式写 no（而不是留空/不写）"
         );
+        assert!(!result.wrappermode, "回读值必须为 false");
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1,0 +1,34 @@
+[package]
+name = "mailstack-webmail"
+description = "MailStack Webmail：邮箱用户 Web 客户端（认证、会话、Maildir 读写、MIME 与 HTML 消毒、发信入队）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# 不发布到 crates.io（见 workspace [workspace.package] publish）。
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+mailstack-core.workspace = true
+mailstack-imappop3.workspace = true
+mailstack-queue.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+time.workspace = true
+base64.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+# 邮件正文的 charset 转换（GBK/ISO-8859-1/Shift_JIS …）。它已在 Cargo.lock 的
+# 传递依赖里，提升为直接依赖不引入新的供应链面。
+encoding_rs = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"

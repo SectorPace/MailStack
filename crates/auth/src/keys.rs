@@ -359,10 +359,28 @@ pub fn load_private_key_der(path: &Path) -> AuthResult<Vec<u8>> {
 
 /// `dkim.rotate`：生成并落盘一套 `<selector>.private` / `<selector>.txt`。
 ///
-/// 落盘顺序对齐基线（`certs.py:194-197`）：先由生成器写出私钥，**再**加固权限。
-/// 这里把「写出」拆成两步以保证中间态永远不比目标更宽松：先以 `0600` 原子落盘，
-/// 再 chmod 到 `0640` + chown 到 `root:opendkim`。这样即使加固失败，密钥也停在
-/// `0600`（更严），而不是 `0640 root:root`（更松）。
+/// ## 为什么不能「先写私钥、再写 .txt」
+///
+/// 原实现是两次独立的原子写，中间没有任何事务：
+///
+/// * 第二步失败（ENOSPC / EACCES / 进程死亡）⇒ 磁盘上是**新私钥 + 旧 `.txt`**。
+///   出站签名器立刻用新私钥签名，而 DNS 上仍是旧公钥 ⇒ **所有外发邮件的 DKIM
+///   验签失败**，且旧私钥已经被毁掉、没有回滚点；
+/// * 没有跨进程锁 ⇒ 两个并发的 `dkim.rotate` 各自生成一套密钥交错写，最后写赢；
+///   先返回的调用里那个 `public_key_spki_b64` 可能与磁盘私钥根本不是一对，
+///   运维照着它发布 DNS 记录 ⇒ 同上静默失败。
+///
+/// 现在的顺序（全部在 [`mailstack_core::atomic::locked_with`] 的跨进程锁内）：
+///
+/// 1. 快照旧 pair（回滚点）；
+/// 2. 生成新密钥，在**同文件系统的 0700 staging 目录**里写好两份文件；
+/// 3. 把 staging 私钥读回并解析（写坏了就不发布）；
+/// 4. 先 `rename` `.txt`、再 `rename` `.private`，最后 fsync 目录；
+/// 5. 任何一步失败 ⇒ 用快照恢复 `.txt`；旧私钥**从未被触碰**，仍然可用。
+///
+/// 为什么 `.txt` 在前：崩溃窗口里「旧私钥 + 新 `.txt`」比「新私钥 + 旧 `.txt`」
+/// 安全 —— 前者签名仍与**已经发布**的 DNS 一致（运维还没看到新 `.txt`），后者
+/// 会让外发签名立刻全量失效（正是要修的缺陷）。
 pub fn rotate(paths: &Paths, domain: &str, selector: Option<&str>) -> AuthResult<DkimRotation> {
     let domain = validate_domain(domain)?;
     let selector = validate_selector(selector)?;
@@ -370,29 +388,161 @@ pub fn rotate(paths: &Paths, domain: &str, selector: Option<&str>) -> AuthResult
     let dir = dkim_key_dir(paths, &domain);
     fs::create_dir_all(&dir).map_err(|error| AuthError::io(&dir, error))?;
 
-    let material = generate_key_material(&domain, &selector, DKIM_KEY_BITS)?;
-
     let private_path = private_key_path(paths, &domain, &selector);
+    let txt_path = txt_record_path(paths, &domain, &selector);
+
+    // 锁的 sidecar 是 `<selector>.private.lock`，与 `atomic_as` 的
+    // `.<name>.lock` 不同名 —— 持锁期间再调 atomic 不会自死锁（INV-31）。
+    mailstack_core::atomic::locked_with(&private_path, || {
+        rotate_locked(&dir, &domain, &selector, &private_path, &txt_path)
+    })
+}
+
+/// [`rotate`] 的临界区（调用方必须已持有 `private_path` 的跨进程锁）。
+fn rotate_locked(
+    dir: &Path,
+    domain: &str,
+    selector: &str,
+    private_path: &Path,
+    txt_path: &Path,
+) -> AuthResult<DkimRotation> {
+    // 回滚点：两部文件当前的样子（不存在也记录成「不存在」）。
+    let old_txt = mailstack_core::atomic::file_snapshot(txt_path)?;
+
+    let material = generate_key_material(domain, selector, DKIM_KEY_BITS)?;
+
+    let staging = RotationStaging::create(dir)?;
+    let staged_private = staging.path().join("dkim.private");
+    let staged_txt = staging.path().join("dkim.txt");
+
+    // 先在 staging 里把两份文件都写好（0600 私钥 / 0644 记录）。
     mailstack_core::atomic::atomic_as(
-        &private_path,
+        &staged_private,
         material.private_key_pem.as_bytes(),
         0o600,
         None,
-    )
-    .map_err(|error| AuthError::Signing(error.to_string()))?;
-    apply_key_permissions(&private_path);
+    )?;
+    // 自检：把**已经落盘的**私钥读回来解析。生成器/写入任何一环出错都在这里
+    // 暴露，而不是等出站签名器在下一封邮件上才发现。
+    load_private_key_der(&staged_private)?;
+    // 加固（0600 → 0640 + root:opendkim）在 staging 里完成，发布即最终形态。
+    apply_key_permissions(&staged_private);
+    mailstack_core::atomic::atomic_as(&staged_txt, material.txt_record.as_bytes(), 0o644, None)?;
 
-    let txt_path = txt_record_path(paths, &domain, &selector);
-    mailstack_core::atomic::atomic_as(&txt_path, material.txt_record.as_bytes(), 0o644, None)
-        .map_err(|error| AuthError::Signing(error.to_string()))?;
+    // ── 发布（先 .txt 后 .private）─────────────────────────────────────
+    let rollback_txt = || -> String {
+        match mailstack_core::atomic::file_restore(txt_path, &old_txt, None) {
+            Ok(()) => "已回滚 .txt".to_string(),
+            Err(error) => format!("回滚 .txt 也失败（{error}）"),
+        }
+    };
+
+    if let Err(error) = fs::rename(&staged_txt, txt_path) {
+        // .txt 没发布成功：私钥还没动，直接报错即可。
+        return Err(AuthError::Signing(format!(
+            "DKIM 轮换失败：无法发布 DNS 记录（{error}）；私钥未改动"
+        )));
+    }
+
+    // 测试注入点：模拟「.txt 已发布、私钥 rename 之前失败」（ENOSPC / 进程被杀）。
+    // 只影响当前线程，避免并行用例互相干扰。
+    #[cfg(test)]
+    let injected_failure = FAIL_BEFORE_PRIVATE_RENAME.with(|flag| flag.replace(false));
+    #[cfg(not(test))]
+    let injected_failure = false;
+
+    let publish_error = if injected_failure {
+        Some("注入的失败点（.txt 已发布、私钥 rename 之前）".to_string())
+    } else {
+        fs::rename(&staged_private, private_path)
+            .err()
+            .map(|error| error.to_string())
+    };
+    if let Some(detail) = publish_error {
+        let rollback = rollback_txt();
+        return Err(AuthError::Signing(format!(
+            "DKIM 轮换失败：无法发布私钥（{detail}）；旧私钥保持不变，{rollback}"
+        )));
+    }
+
+    // rename 只保证「本次挂起内可见」，fsync 目录才把这次替换固化。
+    fsync_dir(dir);
 
     Ok(DkimRotation {
         status: "ok",
-        domain,
-        selector,
+        domain: domain.to_string(),
+        selector: selector.to_string(),
         record: material.txt_record,
         public_key_spki_b64: material.public_key_spki_b64,
     })
+}
+
+// 测试注入：在当前线程的下一次轮换里，让「发布私钥」这一步失败。
+#[cfg(test)]
+thread_local! {
+    static FAIL_BEFORE_PRIVATE_RENAME: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// 同文件系统的 staging 目录：0700 创建，析构即清理。
+///
+/// 用的不是 `std::env::temp_dir()`：`rename` 必须与目标同文件系统才是原子的，
+/// 而 `/tmp` 经常是另一个挂载点（tmpfs）。
+struct RotationStaging {
+    path: PathBuf,
+}
+
+impl RotationStaging {
+    fn create(parent: &Path) -> AuthResult<Self> {
+        let path = parent.join(format!(".rotate-{}", unique_tag()));
+        #[cfg(unix)]
+        {
+            // `DirBuilder::mode` 让 create(2) 那一刻就是 0700（umask 只会更严）。
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .map_err(|error| AuthError::io(&path, error))?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir(&path).map_err(|error| AuthError::io(&path, error))?;
+        }
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RotationStaging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// 进程内唯一的临时名标签：`<pid>.<序号>.<纳秒>`（与 `atomic.rs` 同一模式）。
+fn unique_tag() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}.{}.{}", std::process::id(), seq, nanos)
+}
+
+/// fsync 目录（`rename` 的掉电持久化保证）；失败只 warn。
+fn fsync_dir(dir: &Path) {
+    match fs::File::open(dir) {
+        Ok(handle) => {
+            if let Err(error) = handle.sync_all() {
+                warn_with_error(&format!("fsync {}", dir.display()), &error);
+            }
+        }
+        Err(error) => warn_with_error(&format!("open dir {}", dir.display()), &error),
+    }
 }
 
 #[cfg(test)]
@@ -613,5 +763,144 @@ mod tests {
         let mode = fs::metadata(&private).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode & 0o007, 0, "私钥不得对其他人可读（实际 {mode:o}）");
         assert_eq!(mode, DKIM_KEY_MODE, "加固后应为 0640（实际 {mode:o}）");
+    }
+
+    // ───────────────── 轮换的成对原子性 / 并发（R1-002）─────────────────
+
+    /// 从 `.txt` 的 zone 片段里取出 `p=` 的 base64（去引号去空白后按 `p=` 切）。
+    fn spki_from_zone_record(record: &str) -> String {
+        let flattened: String = record
+            .chars()
+            .filter(|c| *c != '"' && !c.is_whitespace())
+            .collect();
+        let tail = flattened
+            .split("p=")
+            .nth(1)
+            .expect("DKIM zone 片段里必须有 p=");
+        tail.chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+            .collect()
+    }
+
+    /// 用磁盘上的私钥签一条报文，再用 `.txt` 里 `p=` 的公钥验签。
+    ///
+    /// 这就是「私钥与已发布公钥是一对」的**可执行判据**；返回结论而不是直接断言，
+    /// 便于并发用例把失败信息与当时的 record 一起打出来。
+    fn private_key_matches_record(private: &Path, record: &str) -> Result<(), String> {
+        let der = load_private_key_der(private).map_err(|e| e.to_string())?;
+        let message = b"From: alice@example.com\r\nSubject: pair check\r\n\r\nbody\r\n";
+        let signed = crate::dkim::sign_with_default_headers(
+            &der,
+            "example.com",
+            DEFAULT_DKIM_SELECTOR,
+            message,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let cache = crate::cache::TxtCache::new();
+        let public = spki_from_zone_record(record);
+        cache
+            .add_domain_key(
+                &format!("{DEFAULT_DKIM_SELECTOR}._domainkey.example.com"),
+                dkim_txt_value(&public).as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let verdicts = runtime
+            .block_on(async {
+                let resolver = crate::cache::system_resolver().map_err(|e| e.to_string())?;
+                crate::dkim::verify_with(&resolver, &cache, &signed)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|e| e.to_string())?;
+        match verdicts.as_slice() {
+            [verdict] if verdict.status.is_pass() => Ok(()),
+            other => Err(format!("私钥与 .txt 不是一对：{other:?}")),
+        }
+    }
+
+    /// **R1-002 的失败注入反例**：`.txt` 已发布、私钥 rename 之前失败时，
+    /// 旧私钥必须**原样可用**，`.txt` 必须回滚成旧记录。
+    ///
+    /// 旧实现里两次写之间没有事务：第二步失败会留下「新私钥 + 旧 .txt」，
+    /// 出站签名立刻全量失效，而旧私钥已经没了。
+    #[test]
+    fn a_failed_rotation_keeps_the_old_private_key_and_the_old_record() {
+        let (_dir, paths) = fixture();
+        // 第一次轮换成功 —— 这对就是「旧 pair」。
+        let first = rotate(&paths, "example.com", None).expect("首次轮换");
+        let private = private_key_path(&paths, "example.com", DEFAULT_DKIM_SELECTOR);
+        let txt = txt_record_path(&paths, "example.com", DEFAULT_DKIM_SELECTOR);
+        let old_private = std::fs::read(&private).expect("旧私钥");
+        let old_record = std::fs::read_to_string(&txt).expect("旧 DNS 记录");
+        assert_eq!(old_record, first.record);
+        private_key_matches_record(&private, &old_record).expect("旧 pair 必须自洽");
+
+        // 注入失败：.txt rename 成功之后、.private rename 之前。
+        FAIL_BEFORE_PRIVATE_RENAME.with(|flag| flag.set(true));
+        let error = rotate(&paths, "example.com", None).expect_err("注入点必须让轮换失败");
+        assert!(
+            error.to_string().contains("注入的失败点"),
+            "错误必须如实说明失败阶段：{error}"
+        );
+
+        assert_eq!(
+            std::fs::read(&private).expect("旧私钥必须仍在"),
+            old_private,
+            "轮换失败不得改动旧私钥"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&txt).expect("旧记录必须仍在"),
+            old_record,
+            ".txt 必须回滚成旧记录，否则运维会发布一把没有私钥的公钥"
+        );
+        // 出站签名仍然可用：旧私钥 + 旧 .txt 是一对。
+        private_key_matches_record(&private, &old_record).expect("失败后旧 pair 必须仍可用");
+
+        // staging 目录必须被清理（半成品不得留在盘上）。
+        let leftovers: Vec<String> = fs::read_dir(dkim_key_dir(&paths, "example.com"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".rotate-"))
+            .collect();
+        assert!(leftovers.is_empty(), "不得残留 staging 目录: {leftovers:?}");
+    }
+
+    /// **R1-002 的并发反例**：多个线程同时轮换，最终磁盘上必须是一对**自洽**的
+    /// 私钥/公钥；调用返回的 record 也必须是某一次真正落盘的那份。
+    #[test]
+    fn concurrent_rotations_serialise_into_a_consistent_key_pair() {
+        let (_dir, paths) = fixture();
+        // 先有一对旧密钥，让并发轮换是在「覆盖」而不是「首次创建」上竞争。
+        rotate(&paths, "example.com", None).expect("首次轮换");
+
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let paths = paths.clone();
+            handles.push(std::thread::spawn(move || {
+                rotate(&paths, "example.com", None).expect("并发轮换应串行化后成功")
+            }));
+        }
+        let rotations: Vec<DkimRotation> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("轮换线程不得 panic"))
+            .collect();
+
+        let private = private_key_path(&paths, "example.com", DEFAULT_DKIM_SELECTOR);
+        let txt = txt_record_path(&paths, "example.com", DEFAULT_DKIM_SELECTOR);
+        let on_disk = std::fs::read_to_string(&txt).expect("读回 DNS 记录");
+        assert!(
+            rotations.iter().any(|rotation| rotation.record == on_disk),
+            "磁盘上的记录必须来自某一次真实轮换（说明有人拿到了与磁盘不符的 record）"
+        );
+        // 关键断言：磁盘上的私钥与磁盘上的公钥必须是一对。交错写会在这里失败。
+        private_key_matches_record(&private, &on_disk)
+            .unwrap_or_else(|error| panic!("并发轮换产生了不一致的 key pair：{error}"));
     }
 }

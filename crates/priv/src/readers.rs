@@ -314,11 +314,12 @@ pub struct BackupEnv {
     pub restore_root: PathBuf,
     /// 加密 / 解密后端。生产是 `gpg`。
     pub cipher: Arc<dyn mailstack_core::backup::BackupCipher>,
-    /// 允许被恢复写入家目录的账号集合。
+    /// 允许被恢复写入家目录的账号集合（**额外**注入项）。
     ///
-    /// 用户模型（`users.*`）尚未移植，因此生产是**空集合** —— 任何
-    /// `home/<user>/...` 成员都会被拒绝。这是 fail-closed：无法证明某个家目录
-    /// 归 MailStack 管，就不该往里面写东西。
+    /// 权威来源是 `managed-users.json` / `managed-mailboxes.json`：生产在
+    /// `backup.restore` 时用 [`crate::users::Users::managed_accounts`] 动态解析
+    /// （读失败上抛，不静默成空集合）。这个字段保留给测试与"额外允许某个账号"
+    /// 的场景，与动态解析结果取并集。
     pub home_allowlist: BTreeSet<String>,
 }
 
@@ -732,8 +733,10 @@ impl Readers {
     /// `snapshot`：把各只读子项拼成一个响应。
     ///
     /// `status` 与 `snapshot` 是同一个动作（契约里两条路由都映射到 `snapshot`），
-    /// 因此这里不能有「轻量版」。**`unavailable` 是响应的一部分**：用户模块
-    /// （vmail 用户表）尚未移植，界面必须能区分「没有用户」与「读不到用户」。
+    /// 因此这里不能有「轻量版」。**`unavailable` 是响应的一部分**：某个子项确实
+    /// 读不到时，界面必须能区分「没有数据」与「读不到数据」。用户注册表已经移植
+    /// （`users.list` 在 RO 白名单里），因此这里**不得**再谎报 `users` 不可用
+    /// （R2-007）；真正读失败的子项由各自的读取路径动态上报。
     pub fn snapshot(&self, _data: &Value) -> Result<Value, HandlerError> {
         let tables = self.tables();
         // 5.13：读不出来就报错，不要伪装成「没有域名」。
@@ -775,9 +778,9 @@ impl Readers {
                 .map(certificate_to_json)
                 .collect::<Vec<_>>(),
             "services": self.service_items(),
-            // 尚未移植的只读子项。写成数组而不是省略，是为了让界面能显示
-            // 「该部分尚未提供」，而不是把它渲染成「零」。
-            "unavailable": ["users"],
+            // 空数组 = 全部读到。`users.*` 已实现，因此不再把 `users` 写死在这里
+            // （那会让人去查不存在的移植缺口）；真正读失败的子项在各自路径上报。
+            "unavailable": Vec::<String>::new(),
         }))
     }
 
@@ -930,7 +933,8 @@ impl Readers {
                     "domain_table",
                     !names.is_empty(),
                     if names.is_empty() {
-                        "domain table is empty: every recipient will be refused (INV-17)".to_string()
+                        "domain table is empty: every recipient will be refused (INV-17)"
+                            .to_string()
                     } else {
                         format!("{} domain(s)", names.len())
                     },
@@ -1146,7 +1150,9 @@ impl Readers {
     /// DKIM 私钥按**纳管域**枚举，因此域名表读失败必须上抛（与
     /// [`Self::managed_domains`] 的口径一致）：静默成空集合会让扫描器
     /// 「恰好扫不到任何 DKIM 私钥」，把一次读故障伪装成一次干净的体检。
-    fn security_inventory(&self) -> Result<Vec<mailstack_core::security::SensitivePath>, HandlerError> {
+    fn security_inventory(
+        &self,
+    ) -> Result<Vec<mailstack_core::security::SensitivePath>, HandlerError> {
         use mailstack_core::security::SensitivePath;
 
         let p = &self.paths;
@@ -1274,6 +1280,8 @@ impl Readers {
     /// * **加密失败时连明文一起删**（在 `encrypt_in_place` 里）：运维要求了加密，
     ///   留下明文就是静默降级。
     /// * 打包失败时**删掉半成品**，不给运维留一个「看起来有备份」的残档。
+    /// * **请求了邮件却没有一个邮件来源就失败**（R2-013）：`includeMails: true`
+    ///   而归档里一封邮件都没有，比直接失败更危险 —— 运维会按这份响应去做灾难恢复。
     pub fn backup_create(&self, data: &Value) -> Result<Value, HandlerError> {
         let include_mails = flag(data, "includeMails");
         let include_secrets = flag(data, "includeSecrets");
@@ -1288,7 +1296,27 @@ impl Readers {
             ));
         }
 
-        let sources = mailstack_core::backup::default_sources(&self.backups.root, include_mails);
+        // 邮件来源按**权威布局**枚举：受管账号的 `~/Maildir`（家目录经 passwd 解析，
+        // 与 `crates/imapd/src/resolver.rs` 同一口径）。注册表读失败上抛 —— 读不出来
+        // 就无从证明「没有邮件」，静默成空列表正是 R2-013 的成因。
+        let (mail_dirs, mail_warnings) = if include_mails {
+            self.users.managed_maildirs()?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        if include_mails && mail_dirs.is_empty() {
+            return Err(HandlerError::new(format!(
+                "backup.create was asked to include mail, but no managed mailbox Maildir was found ({})",
+                if mail_warnings.is_empty() {
+                    "no managed mailboxes are registered".to_string()
+                } else {
+                    mail_warnings.join("; ")
+                }
+            )));
+        }
+
+        let sources =
+            mailstack_core::backup::default_sources(&self.backups.root, include_mails, &mail_dirs);
         if sources.is_empty() {
             return Err(HandlerError::new(
                 "No configuration sources were found for backup",
@@ -1328,6 +1356,9 @@ impl Readers {
                 return Err(HandlerError::new(error.to_string()));
             }
         };
+        // 有受管邮箱解析不到 Maildir 时，这次归档**确实**不完整 —— 必须标出来
+        // （`partial` 会让 restore 要求 `allowPartialRestore=true`，这是有意的摩擦）。
+        let partial = partial || !mail_warnings.is_empty();
 
         let encrypted = if passphrase.is_empty() {
             false
@@ -1355,7 +1386,12 @@ impl Readers {
             metadata_missing: false,
         };
         store.write_metadata(&metadata)?;
-        Ok(json!({ "created": true, "backup": metadata }))
+        Ok(json!({
+            "created": true,
+            "backup": metadata,
+            // 邮件来源不完整时把具体账号说出来，而不是只给一个 partial 布尔值。
+            "warnings": mail_warnings,
+        }))
     }
 
     /// `backup.restore`：校验并恢复一份归档。
@@ -1392,12 +1428,17 @@ impl Readers {
             allow_partial_restore: flag(data, "allowPartialRestore"),
             dry_run,
         };
+        // 恢复允许写入的家目录账号：注册表是权威来源（R2-013）。读失败上抛 ——
+        // 退化成空集合会让整份归档因为 `home/*` 成员被拒，而错误会指向归档而不是
+        // 真正坏掉的注册表；更糟的是若哪个调用方把它放宽成「空集合 = 全放行」，
+        // 那就是一次往任意家目录写文件。
+        let home_allowlist = self.home_allowlist()?;
         let outcome = mailstack_core::backup::restore_archive(
             &store,
             &target,
             &self.backups.restore_root,
             &options,
-            &self.backups.home_allowlist,
+            &home_allowlist,
             self.backups.cipher.as_ref(),
         )?;
 
@@ -1413,7 +1454,7 @@ impl Readers {
             }));
         }
 
-        let snapshot = self.pre_restore_snapshot(&store, &passphrase);
+        let snapshot = self.pre_restore_snapshot(&store, &passphrase, &home_allowlist);
         self.reload_after_restore();
         Ok(json!({
             "restored": true,
@@ -1446,6 +1487,13 @@ impl Readers {
         Ok(json!({ "deleted": true, "filename": name }))
     }
 
+    /// 恢复允许写入的家目录账号：注入项 ∪ 当前受管账号。
+    fn home_allowlist(&self) -> Result<BTreeSet<String>, HandlerError> {
+        let mut allow = self.backups.home_allowlist.clone();
+        allow.extend(self.users.managed_accounts()?);
+        Ok(allow)
+    }
+
     /// 恢复前打一个回滚点。
     ///
     /// 返回 `(快照路径, 告警)`。快照本身**必须可读**才登记：一个截断的快照当成
@@ -1454,8 +1502,9 @@ impl Readers {
         &self,
         store: &mailstack_core::backup::BackupStore,
         passphrase: &str,
+        home_allowlist: &BTreeSet<String>,
     ) -> (Option<String>, Option<String>) {
-        let sources = mailstack_core::backup::default_sources(&self.backups.root, false);
+        let sources = mailstack_core::backup::default_sources(&self.backups.root, false, &[]);
         if sources.is_empty() {
             return (
                 None,
@@ -1480,8 +1529,7 @@ impl Readers {
             Err(error) => Some(format!("pre-restore snapshot failed: {error}")),
         };
         if warning.is_none() {
-            if let Err(error) =
-                mailstack_core::backup::validate_archive(&snapshot, &self.backups.home_allowlist)
+            if let Err(error) = mailstack_core::backup::validate_archive(&snapshot, home_allowlist)
             {
                 warning = Some(format!(
                     "pre-restore snapshot failed the readability check: {error}"
@@ -1854,10 +1902,7 @@ impl Readers {
         // MX：期望主机与某条 MX 记录的**目标主机精确相等**（去优先级前缀、
         // 去结尾点、忽略大小写）。子串匹配会把 `evilemail.example.com`、
         // `mail.example.com.attacker.net` 一并判成匹配，不设防。
-        checks.insert(
-            "mx".to_string(),
-            json!(mx_records_contain(&mx, &mail_host)),
-        );
+        checks.insert("mx".to_string(), json!(mx_records_contain(&mx, &mail_host)));
         // 恰好一条 SPF：两条 `v=spf1` 会让收信方按 RFC 7208 直接判 permerror。
         checks.insert("spfSingle".to_string(), json!(spf_records.len() == 1));
         // 期望值缺省时不能恒报 false —— 那会把「SPF 实际正确」说成「期望校验
@@ -2838,10 +2883,7 @@ fn read_activity(log_path: &Path) -> Result<Vec<Value>, HandlerError> {
 /// 审计日志还没写过是合法状态。文件大于窗口时 `seek` 到 `len - max_bytes`
 /// 再读，**绝不**把整个文件读进内存：`activity.list` 是前端轮询的动作，
 /// 全量读等于把每次轮询变成一次 IO 放大。
-fn read_log_tail(
-    log_path: &Path,
-    max_bytes: u64,
-) -> Result<Option<(String, bool)>, HandlerError> {
+fn read_log_tail(log_path: &Path, max_bytes: u64) -> Result<Option<(String, bool)>, HandlerError> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = match std::fs::File::open(log_path) {
@@ -2857,10 +2899,7 @@ fn read_log_tail(
     let read_error = |e: std::io::Error| {
         HandlerError::new(format!("read audit log {}: {e}", log_path.display()))
     };
-    let len = file
-        .metadata()
-        .map_err(|e| read_error(e))?
-        .len();
+    let len = file.metadata().map_err(&read_error)?.len();
     if len <= max_bytes {
         let mut text = String::new();
         file.read_to_string(&mut text).map_err(read_error)?;
@@ -2869,12 +2908,11 @@ fn read_log_tail(
     file.seek(SeekFrom::Start(len - max_bytes))
         .map_err(read_error)?;
     let mut bytes = Vec::with_capacity(max_bytes as usize);
-    file.take(max_bytes).read_to_end(&mut bytes).map_err(read_error)?;
+    file.take(max_bytes)
+        .read_to_end(&mut bytes)
+        .map_err(read_error)?;
     // 日志可能含非 UTF-8 的尾巴；有损解码与展示面的口径一致。
-    Ok(Some((
-        String::from_utf8_lossy(&bytes).into_owned(),
-        true,
-    )))
+    Ok(Some((String::from_utf8_lossy(&bytes).into_owned(), true)))
 }
 
 /// `YYYY-MM-DD HH:MM:SS`（UTC）。
@@ -3575,6 +3613,57 @@ mod tests {
             })
         }
 
+        /// 带一个**受管邮箱**的备份装置：权威布局 `~/Maildir` + 两份注册表 + passwd。
+        ///
+        /// 家目录从注入的 `<passwd_root>/passwd` 解析（与 `imapd::resolver` 同一口径）。
+        fn backup_readers_with_a_managed_mailbox(&self, runner: Arc<dyn CommandRunner>) -> Readers {
+            let home = self.backup_root.join("home/alice");
+            fs::create_dir_all(home.join("Maildir/new")).unwrap();
+            fs::write(
+                home.join("Maildir/new/1712000000.M1P1.mx.eml"),
+                "Subject: hi\r\n\r\nbody",
+            )
+            .unwrap();
+            fs::create_dir_all(self.paths.managed_users.parent().unwrap()).unwrap();
+            fs::write(&self.paths.managed_users, "[\"alice\"]\n").unwrap();
+            fs::create_dir_all(self.paths.managed_mailboxes.parent().unwrap()).unwrap();
+            fs::write(
+                &self.paths.managed_mailboxes,
+                r#"[{"email":"alice@example.com","unixUser":"alice","displayName":""}]"#,
+            )
+            .unwrap();
+            let passwd_root = self.root.join("etcfs");
+            fs::create_dir_all(&passwd_root).unwrap();
+            fs::write(
+                passwd_root.join("passwd"),
+                format!("alice:x:1001:1001::{}:/usr/sbin/nologin\n", home.display()),
+            )
+            .unwrap();
+            self.readers(runner)
+                .with_users_env(UsersEnv {
+                    passwd_root,
+                    session_epoch_owner: None,
+                    ..UsersEnv::default()
+                })
+                .with_backup_env(BackupEnv {
+                    root: self.backup_root.clone(),
+                    restore_root: self.restore_root.clone(),
+                    cipher: Arc::new(TestCipher),
+                    home_allowlist: BTreeSet::new(),
+                })
+        }
+
+        /// 归档里的成员名（按归档内顺序）。
+        fn archive_members(&self, filename: &str) -> Vec<String> {
+            let archive = self.paths.backups_dir.join(filename);
+            let file = fs::File::open(&archive).unwrap();
+            let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+            tar.entries()
+                .unwrap()
+                .map(|entry| entry.unwrap().path().unwrap().to_string_lossy().to_string())
+                .collect()
+        }
+
         fn readers(&self, runner: Arc<dyn CommandRunner>) -> Readers {
             self.readers_with_env(runner, Arc::new(NoServices))
         }
@@ -3685,8 +3774,8 @@ mod tests {
         assert_eq!(out["ok"], true);
         assert_eq!(out["identity"]["domain"], "example.com");
         assert_eq!(out["version"], mailstack_core::VERSION);
-        // 用户模块尚未移植 —— 必须显式说出来，否则界面会把「读不到」画成「0 个用户」。
-        assert_eq!(out["unavailable"], json!(["users"]));
+        // `users.list` 已经实现，因此不得再谎报用户模块不可用（R2-007）。
+        assert_eq!(out["unavailable"], json!([]));
     }
 
     #[test]
@@ -5044,6 +5133,149 @@ mod tests {
         assert!(!metadata_path.exists(), "元数据必须一并删除");
     }
 
+    // ─────────── R2-013：includeMails 必须归档权威布局（~/Maildir） ───────────
+
+    /// 反例：`includeMails: true` 的归档里必须真的有受管邮箱的邮件。
+    ///
+    /// 修复前 `default_sources` 把邮件来源写死成 `var/vmail`（本栈从不创建），
+    /// 于是归档只有 `etc/*` 与 `var/lib/*`，而响应仍回 `includeMails: true`、
+    /// `partial: false` —— 一份"完整备份"里一封邮件都没有。
+    #[test]
+    fn backup_create_includes_the_managed_maildir() {
+        let f = Fixture::new("bmail");
+        let readers = f.backup_readers_with_a_managed_mailbox(always_ok_runner());
+
+        let out = readers
+            .backup_create(&json!({ "includeMails": true, "includeSecrets": true }))
+            .unwrap();
+        assert_eq!(out["backup"]["includeMails"], true);
+        assert_eq!(
+            out["backup"]["partial"], false,
+            "邮件来源齐全时不该标 partial"
+        );
+        assert_eq!(out["warnings"], json!([]));
+
+        let filename = out["backup"]["filename"].as_str().unwrap().to_string();
+        let members = f.archive_members(&filename);
+        assert!(
+            members.contains(&"home/alice/Maildir/new/1712000000.M1P1.mx.eml".to_string()),
+            "归档必须包含受管邮箱的邮件（权威布局 home/<user>/Maildir）：{members:?}"
+        );
+    }
+
+    /// 反向：同一份归档必须能被 `backup.restore` 还原到临时根。
+    #[test]
+    fn backup_restore_puts_a_managed_maildir_back_into_the_target_root() {
+        let f = Fixture::new("bmailrestore");
+        let readers = f.backup_readers_with_a_managed_mailbox(always_ok_runner());
+        let created = readers
+            .backup_create(&json!({ "includeMails": true }))
+            .unwrap();
+        let filename = created["backup"]["filename"].as_str().unwrap().to_string();
+
+        // 破坏现场：还原之后必须把邮件放回去。
+        fs::remove_file(
+            f.backup_root
+                .join("home/alice/Maildir/new/1712000000.M1P1.mx.eml"),
+        )
+        .unwrap();
+        let out = readers
+            .backup_restore(&json!({ "filename": filename, "confirm": true }))
+            .unwrap();
+        assert_eq!(out["restored"], true);
+
+        let restored = f
+            .restore_root
+            .join("home/alice/Maildir/new/1712000000.M1P1.mx.eml");
+        assert_eq!(
+            fs::read_to_string(&restored).unwrap(),
+            "Subject: hi\r\n\r\nbody",
+            "受管邮箱的邮件必须被还原到 {}",
+            restored.display()
+        );
+    }
+
+    /// 反例：请求了邮件却一个来源都没有 → 必须报错，绝不产出"空邮件备份"。
+    #[test]
+    fn backup_create_refuses_include_mails_when_no_maildir_is_resolvable() {
+        let f = Fixture::new("bmailnone");
+        let err = f
+            .backup_readers(always_ok_runner())
+            .backup_create(&json!({ "includeMails": true }))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no managed mailbox Maildir"),
+            "必须显式说明没有邮件来源：{err}"
+        );
+    }
+
+    /// 反例：注册表读不出来时必须报错，不能当成"没有受管邮箱"继续打一个空备份。
+    #[test]
+    fn backup_create_fails_closed_when_the_managed_registry_is_corrupt() {
+        let f = Fixture::new("bmailcorrupt");
+        fs::create_dir_all(f.paths.managed_users.parent().unwrap()).unwrap();
+        fs::write(&f.paths.managed_users, "{not a json array").unwrap();
+        let err = f
+            .backup_readers(always_ok_runner())
+            .backup_create(&json!({ "includeMails": true }))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("managed user registry is corrupt"),
+            "{err}"
+        );
+    }
+
+    /// 反例：非受管账号的家目录成员仍然被拒（白名单语义没有放宽）。
+    #[test]
+    fn backup_restore_still_rejects_an_unmanaged_home_member() {
+        let f = Fixture::new("bmailunmanaged");
+        // 手工造一份含 home/bob/** 的归档（bob 不在任何注册表里）。
+        let bob_maildir = f.backup_root.join("home/bob/Maildir/new");
+        fs::create_dir_all(&bob_maildir).unwrap();
+        fs::write(bob_maildir.join("1.eml"), "Subject: bob\r\n\r\nx").unwrap();
+        fs::create_dir_all(&f.paths.backups_dir).unwrap();
+        let filename = "mailstack-backup-20261002-120000.tar.gz";
+        let target = f.paths.backups_dir.join(filename);
+        mailstack_core::backup::create_archive(
+            &f.backup_root,
+            &[f.backup_root.join("home/bob/Maildir")],
+            &target,
+            &[],
+            false,
+        )
+        .unwrap();
+        let store = mailstack_core::backup::BackupStore::from_paths(&f.paths);
+        store
+            .write_metadata(&mailstack_core::backup::BackupMetadata {
+                name: filename.to_string(),
+                filename: filename.to_string(),
+                path: target.display().to_string(),
+                size: fs::metadata(&target).unwrap().len(),
+                sha256: Some(mailstack_core::backup::file_sha256(&target).unwrap()),
+                created_at: "2026-10-02T12:00:00Z".to_string(),
+                include_mails: true,
+                include_secrets: false,
+                partial: false,
+                encrypted: false,
+                version: mailstack_core::VERSION.to_string(),
+                metadata_missing: false,
+            })
+            .unwrap();
+
+        let readers = f.backup_readers_with_a_managed_mailbox(always_ok_runner());
+        let err = readers
+            .backup_restore(&json!({ "filename": filename, "confirm": true }))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not manage"),
+            "非受管家目录必须被拒：{err}"
+        );
+        assert!(
+            walk(&f.restore_root).is_empty(),
+            "被拒的恢复不得落地任何文件"
+        );
+    }
+
     /// 递归列出一个目录下的全部文件（相对路径）。
     fn walk(root: &std::path::Path) -> Vec<String> {
         let mut out = Vec::new();
@@ -5462,10 +5694,7 @@ mod tests {
         // `v=spf1 mx -all`）应如实报告为通过 —— 与 dns.records 的缺省口径一致。
         let f = Fixture::new("spfdefault");
         let mut payload = identity_payload();
-        payload
-            .as_object_mut()
-            .unwrap()
-            .remove("expectedSpf");
+        payload.as_object_mut().unwrap().remove("expectedSpf");
         let readers =
             readers_with_networks(&f, Arc::new(published_dns()), ScriptedRelayProbe::passing());
 
@@ -5667,13 +5896,19 @@ mod tests {
         // 先落一份「与生产 apply 同形」的配置（直接经同一载体写入）。
         let mut store = NativeRelayStore::production(&f.paths);
         store
-            .write_key(mailstack_smtp::relay_apply::KEY_RELAYHOST, "[smtp.sendgrid.net]:587")
+            .write_key(
+                mailstack_smtp::relay_apply::KEY_RELAYHOST,
+                "[smtp.sendgrid.net]:587",
+            )
             .unwrap();
         store
             .write_key(mailstack_smtp::relay_apply::KEY_SASL_AUTH_ENABLE, "yes")
             .unwrap();
         store
-            .write_key(mailstack_smtp::relay_apply::KEY_TLS_SECURITY_LEVEL, "encrypt")
+            .write_key(
+                mailstack_smtp::relay_apply::KEY_TLS_SECURITY_LEVEL,
+                "encrypt",
+            )
             .unwrap();
         store
             .write_credentials("[smtp.sendgrid.net]:587 apikey:SG.secret\n")
@@ -5701,10 +5936,7 @@ mod tests {
             "smtp_tls_wrappermode",
             "saslPasswd",
         ] {
-            assert!(
-                doc.get(key).is_none(),
-                "{key} 必须被清除，实际: {doc}"
-            );
+            assert!(doc.get(key).is_none(), "{key} 必须被清除，实际: {doc}");
         }
 
         // 幂等：再 clear 一次仍是成功。

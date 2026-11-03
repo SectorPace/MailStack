@@ -1,0 +1,49 @@
+[Unit]
+Description=MailStack daemon (inbound SMTP 25/465/587 + outbound queue + privileged RPC)
+Documentation=https://github.com/SectorPace/MailStack
+After=network-online.target
+Wants=network-online.target
+# fail-closed：缺 setup.json 说明身份向导尚未完成，此时启动必然失败（这是设计的
+# fail-closed，不是 bug）。用 ConditionPathExists 表达「还没到该启动的时候」，
+# 完成向导后 `systemctl restart mailstackd` 即可；避免无限重启刷日志。
+ConditionPathExists=@ETC_DIR@/setup.json
+# 真实故障（证书缺失 / 端口被占）时不要无限重启：5 次 / 5 分钟后停住等人工介入。
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=@BIN_DIR@/mailstackd --port 25 --port 465 --port 587 --log info@CONFIG_ARG@
+# /run/mailstack 由 systemd 创建并托管生命周期；helper-ro.sock（0660
+# root:mailstack-admin）与 helper.sock（0600 root:root）都落在该目录。
+RuntimeDirectory=mailstack
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+LimitNOFILE=65536
+
+# ── 沙箱 ──
+# daemon 必须以 root 运行（25/465/587 是特权端口，且要 chown 两个 RPC socket）。
+# 但「root」不等于「整台机器可写」：除下面列出的路径外，文件系统按只读挂载。
+#
+# 为什么 ReadWritePaths 看起来偏宽：变更动作（设置 / 建号 / 改密 / DKIM / ACME /
+# 备份恢复）是在**本进程内**经特权派发执行的 —— useradd/chpasswd 要写
+# /etc/passwd、/etc/shadow、/home/<u>；DKIM 私钥写 /etc/opendkim；证书写
+# /etc/mailstack/tls；acme.sh 在 /root。把它们改成只读不会「更安全」，
+# 只会让 RW 动作在运行期失败（而且失败点远离配置改动，很难排障）。
+ProtectSystem=strict
+ReadWritePaths=/etc /home /var /run /root
+ProtectHome=no
+PrivateTmp=yes
+# daemon 已以 root 运行，不需要「获得」任何新权限；NoNewPrivileges 不影响
+# useradd/chpasswd 这类普通二进制（它们本身不是 setuid）。
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+
+[Install]
+WantedBy=multi-user.target

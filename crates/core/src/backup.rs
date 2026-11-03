@@ -105,8 +105,17 @@ pub const DEFAULT_SOURCE_DIRS: &[&str] = &[
     "var/lib/mailstack",
 ];
 
-/// 默认纳入的邮件存储目录（`includeMails = true` 且存在时，相对 root）。
-pub const MAIL_SOURCE_DIR: &str = "var/vmail";
+/// 权威邮件布局：每个受管系统账号的 `~/Maildir`（`cur`/`new`/`tmp`）。
+///
+/// 与 `crates/store/src/lib.rs` 和 `crates/imapd/src/resolver.rs` 是**同一个**结论：
+/// 本栈不用 `/var/vmail` 布局，账号就是系统账号，Maildir 在家目录下。
+pub const MAIL_DIR_NAME: &str = "Maildir";
+
+/// 历史部署的 Dovecot vmail 布局（相对 root）。
+///
+/// 本栈从不创建它（基线用系统账号 + `~/Maildir`）。保留**只**为兼容旧部署里
+/// 遗留的数据目录：存在就一并纳入，不存在也不算错误。
+pub const LEGACY_MAIL_SOURCE_DIR: &str = "var/vmail";
 
 static FILENAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     // `mailstack-backup-YYYYMMDD-HHMMSS[-suffix].tar.gz`。
@@ -405,10 +414,12 @@ pub fn is_backup_filename(name: &str) -> bool {
 
 /// 归档成员名是否合规：返回规范化后的相对路径。
 ///
-/// `managed_home_users` 是**允许被恢复写入家目录**的账号集合。当前用户模型
-/// （`users.*`）尚未移植，因此生产调用传的是空集合 —— 任何 `home/<user>/...`
-/// 成员都会被拒绝。这是刻意的 fail-closed：我们无法证明某个家目录归 MailStack 管，
-/// 就不该往里面写东西。等用户模型落地后把真实账号集合传进来即可。
+/// `managed_home_users` 是**允许被恢复写入家目录**的账号集合。它必须来自
+/// `managed-users.json` / `managed-mailboxes.json` 这份注册表（由 `crates/priv`
+/// 解析后传入），调用方读失败时**不得**退化成空集合再调用本函数来「试试看」：
+/// 空集合的语义是「没有任何家目录归 MailStack 管」，任何 `home/<user>/...`
+/// 成员都会被拒 —— 这是刻意的 fail-closed，我们无法证明某个家目录归 MailStack
+/// 管，就不该往里面写东西。
 pub fn normalize_member(
     raw: &str,
     managed_home_users: &BTreeSet<String>,
@@ -674,15 +685,11 @@ fn land_one(
 /// 落地失败时的尽力回滚：已覆盖的文件从备份还原，新建的文件删除。
 ///
 /// 回滚自身也可能失败 —— 逐项 warn，但不掩盖最初让落地失败的那个错误。
-fn rollback_landing(
-    overwritten: &[(PathBuf, PathBuf, Option<u32>)],
-    created: &[PathBuf],
-) {
+fn rollback_landing(overwritten: &[(PathBuf, PathBuf, Option<u32>)], created: &[PathBuf]) {
     for (target, backup, mode_before) in overwritten {
         let result = (|| -> Result<(), BackupError> {
             let mut output = open_no_follow(target, RESTORED_FILE_MODE)?;
-            let mut input =
-                std::fs::File::open(backup).map_err(|e| BackupError::io(backup, e))?;
+            let mut input = std::fs::File::open(backup).map_err(|e| BackupError::io(backup, e))?;
             std::io::copy(&mut input, &mut output).map_err(|e| BackupError::io(target, e))?;
             output.flush().map_err(|e| BackupError::io(target, e))?;
             output.sync_all().map_err(|e| BackupError::io(target, e))?;
@@ -929,21 +936,42 @@ fn archive_name(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
+/// 邮件来源目录（`includeMails = true` 时纳入）。
+///
+/// `mail_dirs` 是**受管账号的 `~/Maildir` 绝对路径**（`<家目录>/Maildir`），由
+/// 调用方从 `managed-*.json` + `/etc/passwd` 解析后传入 —— 这个 crate 不碰注册表，
+/// 也不猜 `<vmail>/<domain>/<user>` 那种早已废弃的布局。
+///
+/// 只纳入**真实存在**的目录；`var/vmail` 仅作为旧部署兼容项（存在才纳入）。
+/// 一个都没解析出来是**空列表**，调用方必须据此决定「这次备份不含邮件」该如何
+/// 如实上报，绝不能静默成功。
+pub fn mail_sources(root: &Path, mail_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut sources: Vec<PathBuf> = mail_dirs
+        .iter()
+        .filter(|maildir| maildir.is_dir())
+        .cloned()
+        .collect();
+    let legacy = root.join(LEGACY_MAIL_SOURCE_DIR);
+    if legacy.is_dir() {
+        sources.push(legacy);
+    }
+    sources
+}
+
 /// 默认的待备份来源（**存在的**才纳入）。
 ///
 /// `root` 是成员名的基准（生产是 `/`）。带上它，测试就能在一棵临时树上跑完整的
 /// 创建流程，而不是去读生产主机的 `/etc`。
-pub fn default_sources(root: &Path, include_mails: bool) -> Vec<PathBuf> {
+///
+/// `mail_dirs` 见 [`mail_sources`]：`include_mails = false` 时忽略。
+pub fn default_sources(root: &Path, include_mails: bool, mail_dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut sources: Vec<PathBuf> = DEFAULT_SOURCE_DIRS
         .iter()
         .map(|suffix| root.join(suffix))
         .filter(|path| path.exists())
         .collect();
     if include_mails {
-        let mail = root.join(MAIL_SOURCE_DIR);
-        if mail.is_dir() {
-            sources.push(mail);
-        }
+        sources.extend(mail_sources(root, mail_dirs));
     }
     sources
 }
@@ -961,24 +989,94 @@ pub trait BackupCipher: Send + Sync {
 }
 
 /// 真实实现：调用系统 `gpg`，口令经 stdin 传入。
+///
+/// ## 为什么不能直接 `Command::new("gpg")`
+///
+/// 裸名会让内核按 `PATH` 搜索，等于**绕开**本 crate 为特权执行点准备的整条
+/// 可信解析链（[`crate::exec::resolve_program_for_execution`]：canonicalize、
+/// 属主必须是 root/自身、自身不可被组/其他用户改写、**逐级检查父目录链**）。
+/// `backup.create` / `backup.restore` 是 root 助手动作，且 gpg 会从 stdin 收到
+/// **备份口令**、从 argv 拿到明文归档路径：只要助手进程的 `PATH` 里混进一个
+/// 可写目录（sudo 未设 `secure_path`、systemd unit 自定义 `Environment=PATH=`、
+/// 或运维从 shell 以 root 手跑 `mailstackctl`），本机任意用户放一个同名脚本就能
+/// 拿到 root 执行 + 全部备份明文。
 #[derive(Debug, Default)]
 pub struct GpgCipher;
 
+/// gpg 单次调用的超时。
+///
+/// 没有超时意味着一个卡住的 gpg（等待熵、坏掉的 pinentry、卡死的文件系统）会
+/// 永久占住 root 助手的请求线程。取 10 分钟：`MAX_ARCHIVE_BYTES` 上限是 5 GiB，
+/// gpg 的 AES-256 吞吐远高于此，正常备份/恢复都在秒级到分钟级。
+pub const GPG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 impl GpgCipher {
+    /// 解析并校验 gpg 可执行文件。解析失败（找不到 / 不可信）就是拒绝执行。
+    fn resolve_program() -> Result<PathBuf, BackupError> {
+        crate::exec::resolve_program_for_execution("gpg")
+            .map(PathBuf::from)
+            .map_err(|error| {
+                BackupError::Archive(format!(
+                    "拒绝执行不可信的 gpg（{error}）；备份口令不能交给未通过可信解析的程序"
+                ))
+            })
+    }
+
     fn spawn(&self, args: &[&str], passphrase: &str, context: &str) -> Result<(), BackupError> {
         use std::process::{Command, Stdio};
-        let mut child = Command::new("gpg")
+        use std::time::Instant;
+
+        let program = Self::resolve_program()?;
+        let mut child = Command::new(&program)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| BackupError::Archive(format!("{context}: 无法启动 gpg：{e}")))?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin
+
+        // 口令写完**必须关闭 stdin**（gpg 读到 EOF 才开始工作）。这里直接 take
+        // 句柄再 drop；写失败时先 kill + wait 回收，而不是带着僵尸进程早退。
+        let write_result = match child.stdin.take() {
+            Some(mut stdin) => stdin
                 .write_all(passphrase.as_bytes())
-                .map_err(|e| BackupError::Archive(format!("{context}: 写入口令失败：{e}")))?;
+                .map_err(|e| format!("{e}")),
+            None => Ok(()),
+        };
+        if let Err(detail) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(BackupError::Archive(format!(
+                "{context}: 写入口令失败：{detail}"
+            )));
         }
+
+        // 轮询 + 超时终止（与 `exec::SystemCommandRunner::run_with_timeout` 同一模式）：
+        // `wait_with_output` 没有超时，一个挂住的 gpg 会永久占住调用方。
+        let deadline = Instant::now() + GPG_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(BackupError::Archive(format!(
+                        "{context}: 等待 gpg 失败：{e}"
+                    )));
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BackupError::Archive(format!(
+                    "{context}: gpg 超过 {GPG_TIMEOUT:?} 未返回，已终止"
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // 子进程已退出；`wait_with_output` 会把 stdout/stderr 管道读干净并回收。
         let output = child
             .wait_with_output()
             .map_err(|e| BackupError::Archive(format!("{context}: 等待 gpg 失败：{e}")))?;
@@ -994,8 +1092,10 @@ impl GpgCipher {
 
 impl BackupCipher for GpgCipher {
     fn available(&self) -> bool {
-        std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("gpg").is_file()))
+        // 复用**执行时同一条**解析链：`PATH` 里那个 `gpg` 不可信时，
+        // 「可用」必须是 false —— 先宣称可用、执行时再拒绝，会让调用方
+        // 走进「加密到一半才失败」的分支。
+        Self::resolve_program().is_ok()
     }
 
     fn encrypt(&self, input: &Path, output: &Path, passphrase: &str) -> Result<(), BackupError> {
@@ -1096,6 +1196,11 @@ pub fn restore_archive(
     // 加密与否**只看元数据标志**：未标加密而 gzip 头不对是损坏，不是加密 ——
     // 让运维拿着口令去解一个只是丢了头部的文件，会把人引到完全错误的方向。
     let passphrase = options.passphrase.clone().unwrap_or_default();
+    // 解密产物落在 **0700 的 staging 目录**里（见 `StagingDir`），而不是备份目录。
+    // 这段窗口里的文件是完整明文归档（admin.json / sasl_passwd / DKIM 私钥全在
+    // 里面），权限只由 gpg 的 umask 决定；备份目录若是 0750/0755，组/其他人就能
+    // 在「解密完 → 校验/解压」之间读到全部机密。
+    let mut staging: Option<StagingDir> = None;
     let decrypted = if metadata.encrypted {
         if passphrase.is_empty() {
             return Err(BackupError::invalid(
@@ -1104,16 +1209,13 @@ pub fn restore_archive(
         }
         if !cipher.available() {
             return Err(BackupError::invalid(
-                "gpg is not installed; encrypted backups cannot be restored",
+                "gpg is not installed (or does not resolve to a trusted executable); encrypted backups cannot be restored",
             ));
         }
-        // 唯一后缀（pid + 序号 + 纳秒，与 `atomic.rs` 的 temp_path 同一模式）：
-        // 原先只有 PID，同一进程里两个并发恢复会撞名 —— 各自把解密结果写进
-        // 同一个 `.tar`，互相覆盖出半写文件，再被对方拿去恢复。
-        let staged = store
-            .dir()
-            .join(format!(".mailstack-restore-{}.tar", unique_temp_tag()));
+        let dir = StagingDir::create()?;
+        let staged = dir.path().join("restore.tar");
         cipher.decrypt(names_archive, &staged, &passphrase)?;
+        staging = Some(dir);
         Some(staged)
     } else {
         if !is_gzip_file(names_archive) {
@@ -1124,20 +1226,10 @@ pub fn restore_archive(
         None
     };
     let source = decrypted.as_deref().unwrap_or(names_archive);
-    let members = match validate_archive(source, managed_home_users) {
-        Ok(members) => members,
-        Err(error) => {
-            if let Some(staged) = &decrypted {
-                let _ = std::fs::remove_file(staged);
-            }
-            return Err(error);
-        }
-    };
+    // `staging` 必须活到 `extract_archive` 之后：提前 drop 会把还没读的明文删掉。
+    let members = validate_archive(source, managed_home_users)?;
 
     if options.dry_run {
-        if let Some(staged) = &decrypted {
-            let _ = std::fs::remove_file(staged);
-        }
         return Ok(RestoreOutcome {
             dry_run: true,
             files_count: members.len(),
@@ -1148,9 +1240,8 @@ pub fn restore_archive(
     }
 
     let restored = extract_archive(source, dest_root, managed_home_users);
-    if let Some(staged) = &decrypted {
-        let _ = std::fs::remove_file(staged);
-    }
+    // 备注：staging 由 `Drop` 清理（成功/失败都一样，不需要逐个 remove_file）。
+    drop(staging);
     let restored = restored?;
     Ok(RestoreOutcome {
         dry_run: false,
@@ -1176,13 +1267,18 @@ pub fn encrypt_in_place(
     if !cipher.available() {
         let _ = std::fs::remove_file(archive);
         return Err(BackupError::invalid(
-            "gpg is not installed; encrypted backups are unavailable (refusing to fall back to plaintext)",
+            "gpg is not installed (or does not resolve to a trusted executable); encrypted backups are unavailable (refusing to fall back to plaintext)",
         ));
     }
-    let staged = archive.with_file_name(format!(
-        "{}.enc",
-        archive.file_name().unwrap_or_default().to_string_lossy()
-    ));
+    // 暂存名**不可预测**且以 `O_CREAT|O_EXCL` + 0600 预创建：
+    //
+    // * 原先固定 `<archive>.enc`：备份目录若能被非 root 写（部署错误/组写权限），
+    //   可预置同名符号链接让 root 的 gpg 把密文写到任意路径；
+    // * 预创建让我们确定文件属主与权限，`gpg --yes` 只会截断它（权限保持 0600），
+    //   而不是由 gpg 按自己的 umask 决定。
+    let staged = unique_sibling_path(archive);
+    let staged_file = create_mode_file(&staged, ARCHIVE_MODE)?;
+    drop(staged_file);
     match cipher.encrypt(archive, &staged, passphrase) {
         Ok(()) => match (|| -> Result<(), BackupError> {
             set_mode_path(&staged, ARCHIVE_MODE)?;
@@ -1986,7 +2082,10 @@ mod tests {
         );
 
         let dest = root.join("dest");
-        write(&dest.join("etc/mailstack/settings.json"), b"original-settings");
+        write(
+            &dest.join("etc/mailstack/settings.json"),
+            b"original-settings",
+        );
         std::os::unix::fs::symlink(
             dest.join("etc/mailstack/nowhere").as_path(),
             dest.join("etc/mailstack/evil.json").as_path(),
@@ -2107,6 +2206,230 @@ mod tests {
             std::fs::read_to_string(dest.join("etc/mailstack/settings.json")).unwrap(),
             "{}"
         );
+    }
+
+    /// 反例守卫：`PATH` 里不可信目录中的同名 `gpg` 绝不能被 root 助手执行。
+    ///
+    /// `exec.rs` 的可信解析链（属主 / 权限位 / 父目录链）本来就是为这类场景准备的，
+    /// 而 `GpgCipher` 原先用裸名 `Command::new("gpg")` 完全绕开了它：`PATH` 一旦
+    /// 含可写目录，本机任意用户放一个 `gpg` 脚本就能拿到 root 执行、备份口令
+    /// 与全部备份明文。
+    #[cfg(unix)]
+    #[test]
+    fn gpg_is_never_executed_from_an_untrusted_path_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // PATH 是进程全局状态：改它的测试必须串行（本文件只有这一条会改）。
+        static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = PATH_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let dir = temp_root("gpg-path");
+        let marker = dir.join("executed");
+        // 目录 0777 = 任何本地用户都能往里写 → 解析链必须拒绝它下面的程序。
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let fake = dir.join("gpg");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let input = dir.join("archive.tar.gz");
+        std::fs::write(&input, b"plain").unwrap();
+        let output = dir.join("archive.enc");
+
+        let previous = std::env::var_os("PATH");
+        std::env::set_var("PATH", &dir);
+        let resolved = crate::exec::resolve_program_for_execution("gpg");
+        let available = GpgCipher.available();
+        let attempt = GpgCipher.encrypt(&input, &output, "hunter2");
+        match previous {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+
+        match resolved {
+            // 某些发行版会把 gpg 装在解析链的 sbin 兜底目录里；那时只要求
+            // **不是**恶意目录里的那个。
+            Ok(path) => assert_ne!(
+                std::path::Path::new(&path),
+                fake.as_path(),
+                "不可信目录里的 gpg 不得被解析为可执行"
+            ),
+            Err(_) => {
+                assert!(!available, "不可信的 gpg 不得被报告为可用");
+                assert!(attempt.is_err(), "必须拒绝执行，而不是把口令交给它");
+            }
+        }
+        assert!(
+            !marker.exists(),
+            "不可信目录里的 gpg 被实际执行了：root 助手可被本地用户劫持"
+        );
+    }
+
+    /// 反例守卫：加密暂存文件必须**预创建为 0600** 且名字不可预测。
+    ///
+    /// 原先固定 `<archive>.enc` 且不预创建：备份目录若可被非 root 写，可预置同名
+    /// 符号链接让 root 的 gpg 把密文写到任意路径；文件权限也由 gpg 的 umask 决定。
+    #[cfg(unix)]
+    #[test]
+    fn the_encryption_stage_file_is_private_and_not_predictable() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Mutex;
+
+        struct CheckingCipher {
+            observed: Mutex<Option<(PathBuf, u32, bool)>>,
+        }
+
+        impl BackupCipher for CheckingCipher {
+            fn available(&self) -> bool {
+                true
+            }
+            fn encrypt(
+                &self,
+                input: &Path,
+                output: &Path,
+                passphrase: &str,
+            ) -> Result<(), BackupError> {
+                let metadata = std::fs::metadata(output)
+                    .expect("暂存文件必须由 encrypt_in_place 预创建（O_EXCL + 0600）");
+                let mode = metadata.permissions().mode() & 0o777;
+                let predictable = output
+                    .file_name()
+                    .map(|name| name.to_string_lossy().ends_with(".enc"))
+                    .unwrap_or(true);
+                *self.observed.lock().unwrap() = Some((output.to_path_buf(), mode, predictable));
+
+                let body = std::fs::read(input).map_err(|e| BackupError::io(input, e))?;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(output)
+                    .map_err(|e| BackupError::io(output, e))?;
+                file.write_all(passphrase.as_bytes()).unwrap();
+                file.write_all(&body).unwrap();
+                Ok(())
+            }
+            fn decrypt(&self, _i: &Path, _o: &Path, _p: &str) -> Result<(), BackupError> {
+                Err(BackupError::invalid("unavailable"))
+            }
+        }
+
+        let dir = temp_root("enc-staging");
+        let archive = dir.join("mailstack-backup-20261002-120000.tar.gz");
+        std::fs::write(&archive, b"plaintext").unwrap();
+        let cipher = CheckingCipher {
+            observed: Mutex::new(None),
+        };
+
+        encrypt_in_place(&archive, "hunter2", &cipher).unwrap();
+
+        let (staged, mode, predictable) = cipher
+            .observed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("加密后端必须被调用");
+        assert_eq!(mode, 0o600, "暂存密文必须从创建那一刻就是 0600");
+        assert!(!predictable, "暂存名不得可预测（旧实现是 <archive>.enc）");
+        assert_eq!(
+            staged.parent(),
+            archive.parent(),
+            "必须同目录才能原子 rename"
+        );
+        assert!(!staged.exists(), "暂存文件应已 rename 为最终归档");
+        assert_eq!(
+            std::fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
+            ARCHIVE_MODE,
+            "最终归档权限"
+        );
+    }
+
+    /// 反例守卫：解密后的**完整明文归档**不得落在备份目录里。
+    ///
+    /// 它包含 admin.json / sasl_passwd / DKIM 私钥；备份目录常见权限是 0750/0755，
+    /// 组内或其他用户能在「解密完 → 校验/解压」之间读到全部机密。必须落进 0700
+    /// 的 staging 目录。
+    #[cfg(unix)]
+    #[test]
+    fn the_decrypted_archive_is_staged_in_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Mutex;
+
+        struct ObservingCipher {
+            observed: Mutex<Option<(PathBuf, u32)>>,
+        }
+
+        impl BackupCipher for ObservingCipher {
+            fn available(&self) -> bool {
+                true
+            }
+            fn encrypt(
+                &self,
+                input: &Path,
+                output: &Path,
+                passphrase: &str,
+            ) -> Result<(), BackupError> {
+                FakeCipher.encrypt(input, output, passphrase)
+            }
+            fn decrypt(
+                &self,
+                input: &Path,
+                output: &Path,
+                passphrase: &str,
+            ) -> Result<(), BackupError> {
+                let parent = output.parent().expect("解密产物应有父目录").to_path_buf();
+                let mode = std::fs::metadata(&parent)
+                    .expect("staging 目录必须已存在")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                *self.observed.lock().unwrap() = Some((parent, mode));
+                FakeCipher.decrypt(input, output, passphrase)
+            }
+        }
+
+        let root = temp_root("decrypt-staging");
+        let store = BackupStore::new(root.join("backups"));
+        let cipher = ObservingCipher {
+            observed: Mutex::new(None),
+        };
+        let target = build_backup(
+            &store,
+            "mailstack-backup-20261002-120000.tar.gz",
+            &[("etc/mailstack/settings.json", b"{}")],
+            true,
+            &cipher,
+        );
+
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let outcome = restore_archive(
+            &store,
+            &target,
+            &dest,
+            &RestoreOptions {
+                passphrase: Some("hunter2".into()),
+                ..Default::default()
+            },
+            &BTreeSet::new(),
+            &cipher,
+        )
+        .unwrap();
+        assert_eq!(outcome.files_count, 1);
+
+        let (parent, mode) = cipher
+            .observed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("解密后端必须被调用");
+        assert_eq!(mode, 0o700, "明文归档的 staging 目录必须是 0700");
+        assert_ne!(parent.as_path(), store.dir(), "明文归档不得落在备份目录里");
+        assert!(!parent.exists(), "staging 目录应在恢复完成后被清理");
     }
 
     #[test]
@@ -2264,15 +2587,125 @@ mod tests {
         // 带上 root 之后这条断言与主机上到底装了什么无关：建一棵临时树即可。
         let root = temp_root("sources");
         assert!(
-            default_sources(&root, true).is_empty(),
+            default_sources(&root, true, &[]).is_empty(),
             "空树里不该有任何来源"
         );
         std::fs::create_dir_all(root.join("etc/mailstack")).unwrap();
-        std::fs::create_dir_all(root.join("var/vmail")).unwrap();
-        let sources = default_sources(&root, true);
-        assert_eq!(sources.len(), 2);
+        let sources = default_sources(&root, true, &[]);
+        assert_eq!(sources.len(), 1, "只有配置目录；var/vmail 本栈不创建");
         assert!(sources.iter().all(|path| path.exists()));
         // 不含邮件时只剩配置目录。
-        assert_eq!(default_sources(&root, false).len(), 1);
+        assert_eq!(default_sources(&root, false, &[]).len(), 1);
+
+        // 权威布局：受管账号的 `~/Maildir` 必须被纳入。
+        std::fs::create_dir_all(root.join("home/alice/Maildir/new")).unwrap();
+        let maildir = root.join("home/alice/Maildir");
+        let with_mail = default_sources(&root, true, std::slice::from_ref(&maildir));
+        assert!(
+            with_mail.contains(&maildir),
+            "受管账号的 Maildir 必须成为邮件来源：{with_mail:?}"
+        );
+        // 家目录存在但 Maildir 还没建：不算来源，也不伪造一个。
+        let bob_maildir = root.join("home/bob/Maildir");
+        std::fs::create_dir_all(root.join("home/bob")).unwrap();
+        let only_alice = default_sources(&root, true, std::slice::from_ref(&bob_maildir));
+        assert!(
+            !only_alice.contains(&bob_maildir),
+            "不存在的 Maildir 不该被纳入：{only_alice:?}"
+        );
+
+        // 旧部署遗留的 var/vmail 仍然兼容纳入（存在才纳入）。
+        std::fs::create_dir_all(root.join(LEGACY_MAIL_SOURCE_DIR)).unwrap();
+        let with_legacy = default_sources(&root, true, &[]);
+        assert!(with_legacy.contains(&root.join(LEGACY_MAIL_SOURCE_DIR)));
+    }
+
+    /// R2-013 反例：`includeMails` 归档的必须是**权威布局**（`~/Maildir`）里的邮件。
+    ///
+    /// 修复前 `MAIL_SOURCE_DIR` 写死 `var/vmail`，本栈从不创建它，于是
+    /// `includeMails: true` 产出的归档里一封邮件都没有 —— 谎报成功。
+    #[test]
+    fn include_mails_archives_and_restores_the_authoritative_home_maildir() {
+        let root = temp_root("homemaildir");
+        write(&root.join("etc/mailstack/settings.json"), b"{}");
+        let maildir = root.join("home/alice/Maildir");
+        write(
+            &maildir.join("new/1712000000.M1P1.test"),
+            b"Subject: hi\r\n\r\nbody",
+        );
+        let homes = vec![root.join("home/alice/Maildir")];
+
+        let store = BackupStore::new(root.join("backups"));
+        let target = store.dir().join("mailstack-backup-20261002-120000.tar.gz");
+        let sources = default_sources(&root, true, &homes);
+        create_archive(&root, &sources, &target, &[], false).unwrap();
+
+        // 1) 归档里必须真的有这封邮件（而不是只有 etc/*）。
+        let file = std::fs::File::open(&target).unwrap();
+        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        let names: Vec<String> = tar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "home/alice/Maildir/new/1712000000.M1P1.test"),
+            "归档必须包含受管邮箱的邮件：{names:?}"
+        );
+
+        // 2) 恢复侧：把受管账号传进允许清单后，必须能落到临时根。
+        store
+            .write_metadata(&BackupMetadata {
+                name: "mailstack-backup-20261002-120000.tar.gz".into(),
+                filename: "mailstack-backup-20261002-120000.tar.gz".into(),
+                path: target.display().to_string(),
+                size: std::fs::metadata(&target).unwrap().len(),
+                sha256: Some(file_sha256(&target).unwrap()),
+                created_at: "2026-10-02T12:00:00Z".into(),
+                include_mails: true,
+                include_secrets: false,
+                partial: false,
+                encrypted: false,
+                version: crate::VERSION.to_string(),
+                metadata_missing: false,
+            })
+            .unwrap();
+
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let mut allowed = BTreeSet::new();
+        allowed.insert("alice".to_string());
+        let outcome = restore_archive(
+            &store,
+            &target,
+            &dest,
+            &RestoreOptions::default(),
+            &allowed,
+            &NoCipher,
+        )
+        .unwrap();
+        assert!(outcome.files_count >= 2, "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("home/alice/Maildir/new/1712000000.M1P1.test"))
+                .unwrap(),
+            "Subject: hi\r\n\r\nbody",
+            "受管邮箱的邮件必须被还原"
+        );
+
+        // 3) 非受管账号仍然被拒（同一份归档、空允许清单）。
+        let other = root.join("dest-other");
+        std::fs::create_dir_all(&other).unwrap();
+        let error = restore_archive(
+            &store,
+            &target,
+            &other,
+            &RestoreOptions::default(),
+            &BTreeSet::new(),
+            &NoCipher,
+        )
+        .expect_err("非受管家目录必须被拒");
+        assert!(error.to_string().contains("does not manage"), "{error}");
     }
 }

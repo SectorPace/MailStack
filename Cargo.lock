@@ -1484,6 +1484,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "mailstack-webmail"
+version = "1.0.0"
+dependencies = [
+ "axum",
+ "base64",
+ "encoding_rs",
+ "hex",
+ "http-body-util",
+ "mailstack-core",
+ "mailstack-imappop3",
+ "mailstack-queue",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tower 0.4.13",
+ "tracing",
+]
+
+[[package]]
+name = "mailstack-webmail-bin"
+version = "1.0.0"
+dependencies = [
+ "axum",
+ "clap",
+ "http-body-util",
+ "mailstack-core",
+ "mailstack-webmail",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower 0.4.13",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mailstackctl"
 version = "1.0.0"
 dependencies = [
@@ -1491,6 +1532,7 @@ dependencies = [
  "mailstack-core",
  "mailstack-priv",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
 ]

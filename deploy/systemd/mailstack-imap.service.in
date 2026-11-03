@@ -1,0 +1,39 @@
+[Unit]
+Description=MailStack IMAP/POP3/ManageSieve (replaces Dovecot imap/pop3)
+Documentation=https://github.com/SectorPace/MailStack
+After=network-online.target
+Wants=network-online.target
+# 证书缺失时不启动：本进程要求「有 TLS 材料」才开放口令认证（fail-closed）。
+# 没有证书时隐式 TLS 口（993/995）会变成无法完成握手的死端口 —— 那比不启动
+# 更难排查。证书就绪后 `systemctl start mailstack-imap`。
+@IMAP_CONDITION_LINE@
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+# 口令来源是 /etc/mailstack/mailbox-passwords.json（0600 root:root），
+# 邮箱来自 /etc/passwd + ~/Maildir；因此需要 root 读这些属主文件。
+# 993/995 是隐式 TLS；143/110 上只允许在 STARTTLS/STLS 之后提交口令。
+ExecStart=@BIN_DIR@/mailstack-imap --imap 0.0.0.0:143 --imaps 0.0.0.0:993 --pop3 0.0.0.0:110 --pop3s 0.0.0.0:995 --managesieve 0.0.0.0:4190 --metrics 127.0.0.1:9100@IMAP_CERT_ARGS@ --server-name @MAIL_HOST@ --log info@CONFIG_ARG@
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+LimitNOFILE=65536
+
+# ── 沙箱 ──
+# 会写 Maildir（~/Maildir 下 cur/new/tmp 与 sieve/），因此 /home 必须可写；
+# 其余路径（/etc/passwd、/etc/mailstack、证书）只读即可。
+ProtectSystem=strict
+ReadWritePaths=/home
+ProtectHome=no
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+
+[Install]
+WantedBy=multi-user.target

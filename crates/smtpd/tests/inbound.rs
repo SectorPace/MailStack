@@ -439,11 +439,18 @@ async fn repeated_rate_limit_triggers_ban_the_address() {
 }
 
 #[tokio::test]
-async fn tls_handshake_failures_accumulate_into_a_ban() {
+async fn tls_handshake_failures_do_not_get_the_peer_banned() {
+    // R3-009：握手失败在真实互联网上大量来自非恶意原因（对端只支持 TLS 1.0/1.1、
+    // 证书链过期、中间设备做 TLS 拦截、证书轮换期的短暂不匹配）。把它们按
+    // 「协议滥用」计入失败，会让一个合法发信方被 421 封 1 小时、三次后升级为
+    // 永久封禁 —— 邮件全部延迟且需要人工解封。
+    //
+    // 本测试把封禁阈值压到 2 次，先制造 4 次握手失败，再用正常 TLS 客户端连接：
+    // 必须照常收到 220，而不是 421 blocked。
     let pki = TestPki::generate();
     let sink = Arc::new(RecordingSink::default());
     let mut config = base_config();
-    // 限速放宽，确保封禁来自「连接失败」而不是限速。
+    // 限速放宽，确保结果只反映「握手失败是否进封禁表」。
     config.rate_limit.burst = 100;
     config.rate_limit.refill_per_second = 100.0;
     config.ban.max_failures = 2;
@@ -458,21 +465,30 @@ async fn tls_handshake_failures_accumulate_into_a_ban() {
     )
     .await;
 
-    // 两条「连上就发垃圾再断开」的连接：隐式 TLS 握手必定失败。
-    for _ in 0..2 {
+    // 四条「连上就发垃圾再断开」的连接：隐式 TLS 握手必定失败。
+    for _ in 0..4 {
         let mut stream = TcpStream::connect(harness.addr).await.unwrap();
         let _ = stream
             .write_all(b"this is not a TLS ClientHello\r\n\r\n")
             .await;
         let _ = stream.shutdown().await;
         drop(stream);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let mut client = harness.connect().await;
+    // 正常客户端仍然可用：TLS 1.2+ 握手成功、收到 220。
+    let stream = TcpStream::connect(harness.addr).await.unwrap();
+    let tls = pki
+        .connector(pki.client_config())
+        .connect(pki.server_name(), stream)
+        .await
+        .expect("握手失败不得连坐正常客户端");
+    let mut client = Client::new(tls);
     let reply = client.read_reply().await;
-    assert!(reply.starts_with("421 "), "{reply}");
-    assert!(reply.contains("blocked"), "多次握手失败后必须封禁：{reply}");
+    assert!(
+        reply.starts_with("220 "),
+        "TLS 握手失败不得触发封禁（实际应答：{reply}）"
+    );
     harness.stop();
 }
 
@@ -748,12 +764,23 @@ async fn a_verified_message_enters_the_queue_end_to_end() {
 
     let entries = QueueStore::new(dir.path()).load_all().expect("读取队列");
     assert_eq!(entries.len(), 1, "通过认证的邮件必须入队");
+    // R3-002：第一跳 trace 头必须由本机补上（先于 Authentication-Results）。
+    assert!(
+        entries[0].data.starts_with("Received: from client.test"),
+        "入站必须写 Received 头：{}",
+        &entries[0].data[..entries[0].data.len().min(160)]
+    );
+    assert!(
+        entries[0].data.contains("Return-Path: <alice@example.com>"),
+        "入站必须写 Return-Path：{}",
+        entries[0].data
+    );
     assert!(
         entries[0]
             .data
-            .starts_with("Authentication-Results: mx.mailstack.test;"),
-        "认证结论必须前置：{}",
-        &entries[0].data[..entries[0].data.len().min(120)]
+            .contains("Authentication-Results: mx.mailstack.test;"),
+        "认证结论必须存在：{}",
+        &entries[0].data[..entries[0].data.len().min(200)]
     );
     assert!(
         entries[0].data.contains("dmarc=pass"),

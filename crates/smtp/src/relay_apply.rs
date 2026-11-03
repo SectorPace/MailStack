@@ -6,11 +6,13 @@
 //! 2. 拼装 `relayhost` 形式为 `[<host>]:<port>`（方括号语法表示不做 MX 解析）
 //! 3. 原子写入凭证文件（`atomic()` + `0600`）：`<relayhost> <user>:<password>\n`
 //! 4. 回滚保障：执行前保存快照；异常时恢复
-//! 5. 写入各配置键、重载服务
-//! 6. **回读校验**：读回 `relayhost`，与期望不符则报错
-//! 7. 返回 `{ applied, relayhost: <observed>, test }`
+//! 5. 写入各配置键（**全集恒写**，含 `smtp_tls_wrappermode=yes|no`）、重载服务
+//! 6. **回读校验**：读回 `relayhost` 与 `wrappermode`，与期望不符则报错
+//! 7. 返回 `{ applied, relayhost: <observed>, wrappermode: <observed>, test }`
 //!
 //! 第 6 步不可省略：规格书明确要求「不得写完即认为成功」。
+//! `wrappermode` 必须回到**本次计划的值**，不能只看计划本身 —— 这一步正是
+//! 465 → 587 切换后残留 `=yes`（R3-004）的唯一发现点。
 //!
 //! ## 关于配置载体
 //!
@@ -86,7 +88,7 @@ pub fn plan_relay_apply(endpoint: &RelayEndpoint) -> RelayPlan {
     let wrappermode = endpoint.requires_wrappermode();
     let has_credentials = endpoint.has_credentials();
 
-    let mut keys = vec![
+    let keys = vec![
         (KEY_RELAYHOST.to_string(), relayhost.clone()),
         (
             KEY_SASL_AUTH_ENABLE.to_string(),
@@ -105,13 +107,18 @@ pub fn plan_relay_apply(endpoint: &RelayEndpoint) -> RelayPlan {
             "noanonymous".to_string(),
         ),
         (KEY_TLS_SECURITY_LEVEL.to_string(), "encrypt".to_string()),
+        // INV-20 + R3-004：这个键**恒写**，`yes`/`no` 显式二选一。
+        //
+        // 原实现只在需要时 push，`write_all` 又只写「本次计划里有的键」：从
+        // 465/SSL-TLS 改成 587/STARTTLS 时，旧的 `=yes` 会**留在盘上**，
+        // `load_relay` 于是把 587 当成隐式 TLS，全部外发卡在队列里。
+        // 键集合恒定还让快照/回滚自动覆盖这个键：原本不存在时回滚会 remove，
+        // 不会把一个陈旧的 `=yes` 写回去。
+        (
+            KEY_TLS_WRAPPERMODE.to_string(),
+            if wrappermode { "yes" } else { "no" }.to_string(),
+        ),
     ];
-
-    // INV-20：465 或 SSL/TLS 时必须写入 wrappermode。
-    // 现状缺陷正是「测试通过但从未写这个键」，且无从界面看出。
-    if wrappermode {
-        keys.push((KEY_TLS_WRAPPERMODE.to_string(), "yes".to_string()));
-    }
 
     let credentials = if has_credentials {
         // 格式契约：`<relayhost> <user>:<password>`，读侧在**第一个**冒号处切分
@@ -299,18 +306,44 @@ pub fn apply_relay(
         });
     }
 
+    // ── 6b) 回读 `wrappermode`：它决定连接是隐式 TLS 还是 STARTTLS ──
+    //
+    // 只回读 relayhost 不够（R3-004）：残留的 `=yes` 会让 `load_relay` 把 587
+    // 当成隐式 TLS，测试能通过、实际投递全部卡住 —— 与 INV-20 同形的故障。
+    // 现在计划里恒写该键，回读也恒校验；不一致就回滚并把差异报出来。
+    let observed_wrappermode = match store.read_key(KEY_TLS_WRAPPERMODE) {
+        Ok(value) => value
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| value.eq_ignore_ascii_case("yes")),
+        Err(error) => {
+            let rolled_back = rollback(store, &snapshot);
+            return Err(RelayApplyFailure { error, rolled_back });
+        }
+    };
+    if observed_wrappermode != plan.wrappermode {
+        let rolled_back = rollback(store, &snapshot);
+        return Err(RelayApplyFailure {
+            error: SmtpError::Rejected(format!(
+                "{ERR_RELAYHOST_VERIFY_FAILED}: wrappermode expected {} but observed {}",
+                plan.wrappermode, observed_wrappermode
+            )),
+            rolled_back,
+        });
+    }
+
     Ok(RelayApplyResult {
         applied: true,
         relayhost: observed.trim().to_string(),
-        wrappermode: plan.wrappermode,
+        wrappermode: observed_wrappermode,
     })
 }
 
 /// `apply_relay` 可能写入的全部键 —— 清除（direct 模式）的逆向范围以这份列表为准。
 ///
-/// 与 [`plan_relay_apply`] 保持同源：`plan` 依端点动态增减 `wrappermode`，
-/// 清除时无从知道「上次 apply 用的是哪种端点」，因此对全集逐键移除 ——
-/// `remove_key` 对从未设置的键是幂等空操作。
+/// 与 [`plan_relay_apply`] 保持同源：`plan` 现在恒写全部 6 个键（含
+/// `smtp_tls_wrappermode=yes|no`），因此快照与回滚天然覆盖这个键。
+/// 清除时仍对全集逐键移除 —— `remove_key` 对从未设置的键是幂等空操作。
 const APPLY_WRITTEN_KEYS: &[&str] = &[
     KEY_RELAYHOST,
     KEY_SASL_AUTH_ENABLE,
@@ -616,9 +649,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_omits_wrappermode_for_587_starttls() {
+    fn plan_writes_wrappermode_explicitly_for_587_starttls() {
+        // R3-004：这个键**恒写**，STARTTLS 时显式 `no`。原实现「需要才写」，
+        // 于是 465 → 587 切换后旧的 `=yes` 留在盘上，587 被当成隐式 TLS。
         let plan = plan_relay_apply(&endpoint(587, "STARTTLS", "apikey", "secret"));
-        assert_eq!(plan.key(KEY_TLS_WRAPPERMODE), None);
+        assert_eq!(plan.key(KEY_TLS_WRAPPERMODE), Some("no"));
         assert!(!plan.wrappermode);
     }
 
@@ -888,6 +923,34 @@ mod tests {
         );
     }
 
+    /// R3-004 反例：465 → 587 切换后**不得**残留 `wrappermode=yes`。
+    ///
+    /// 修复前：计划里没有该键 ⇒ `write_all` 不碰它 ⇒ 旧值留在盘上 ⇒
+    /// `load_relay` 把 587 判成 SSL/TLS ⇒ 全部外发卡在队列里。
+    #[test]
+    fn switching_from_465_to_587_removes_the_stale_wrappermode() {
+        let mut store = InMemoryRelayStore::new();
+        apply_relay(
+            &mut store,
+            &endpoint(465, "SSL/TLS", "apikey", "secret"),
+            &passed_test(),
+        )
+        .unwrap();
+        assert_eq!(store.keys[KEY_TLS_WRAPPERMODE], "yes");
+
+        let result = apply_relay(
+            &mut store,
+            &endpoint(587, "STARTTLS", "apikey", "secret"),
+            &passed_test(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.keys[KEY_TLS_WRAPPERMODE], "no",
+            "切到 STARTTLS 后必须显式写 no，不得残留 yes"
+        );
+        assert!(!result.wrappermode, "落地结果应反映回读值");
+    }
+
     #[test]
     fn apply_result_serialises_the_documented_shape() {
         let mut store = InMemoryRelayStore::new();
@@ -936,7 +999,11 @@ mod tests {
             &passed_test(),
         )
         .unwrap();
-        assert_eq!(store.keys.len(), 6, "apply 应已写入 6 个键（含 wrappermode）");
+        assert_eq!(
+            store.keys.len(),
+            6,
+            "apply 应已写入 6 个键（含 wrappermode）"
+        );
         assert!(store.credentials.is_some());
 
         let reloads_before = store.reloads;
@@ -946,10 +1013,7 @@ mod tests {
             "全部键必须被清除，实际: {:?}",
             store.keys
         );
-        assert!(
-            store.credentials.is_none(),
-            "凭证文件必须随 clear 一并删除"
-        );
+        assert!(store.credentials.is_none(), "凭证文件必须随 clear 一并删除");
         assert!(
             store.reloads > reloads_before,
             "清除后应重载（Postfix 载体靠它生效）"

@@ -2951,7 +2951,10 @@ mod tests {
             store.copy_many("INBOX", &[first, missing], "Archive"),
             Err(MailError::NotFound(_))
         ));
-        assert_eq!(store.open_folder("Archive", false).unwrap().messages.len(), 0);
+        assert_eq!(
+            store.open_folder("Archive", false).unwrap().messages.len(),
+            0
+        );
     }
 
     #[test]
@@ -3041,7 +3044,12 @@ mod tests {
         let victim = std::fs::read_dir(&new_dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(&second_base))
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&second_base)
+            })
             .unwrap();
         std::fs::remove_file(victim).unwrap();
 

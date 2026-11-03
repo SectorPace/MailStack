@@ -178,7 +178,12 @@ impl TxtCache {
                 .iter()
                 .filter(|(key, (_, until))| Some(key.as_ref()) != keep && until.is_some())
                 .min_by_key(|(_, (_, until))| *until)
-                .or_else(|| guard.entries.iter().find(|(key, _)| Some(key.as_ref()) != keep))
+                .or_else(|| {
+                    guard
+                        .entries
+                        .iter()
+                        .find(|(key, _)| Some(key.as_ref()) != keep)
+                })
                 .map(|(k, _)| k.clone());
             match victim {
                 Some(victim) => {
@@ -583,9 +588,7 @@ mod tests {
             guard.entries.len()
         );
         assert!(
-            guard
-                .entries
-                .contains_key("pinned._domainkey.example.com."),
+            guard.entries.contains_key("pinned._domainkey.example.com."),
             "注入条目被带 TTL 的条目挤掉了：淘汰顺序反了"
         );
     }
@@ -596,10 +599,7 @@ mod tests {
     fn raw_dmarc_text_is_retained_and_reachable_up_the_tree() {
         let cache = TxtCache::new();
         cache
-            .add_dmarc(
-                "_dmarc.example.com",
-                b"v=DMARC1; p=reject; pct=10",
-            )
+            .add_dmarc("_dmarc.example.com", b"v=DMARC1; p=reject; pct=10")
             .expect("装载 DMARC 记录");
 
         assert_eq!(

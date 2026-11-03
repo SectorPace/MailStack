@@ -96,9 +96,7 @@ impl Registry {
         });
 
         let p = paths.clone();
-        registry.register("setup.status", move |_data| {
-            setup_status_json(&p)
-        });
+        registry.register("setup.status", move |_data| setup_status_json(&p));
 
         // 向导收尾：置位 `setup.json` 的 `wizardCompleted` 并回同一份状态形状。
         // 幂等（重复调用是成功的空操作）；身份未配置时由 core 侧拒绝 ——
@@ -853,7 +851,7 @@ mod tests {
         assert_eq!(out["algorithm"], "SHA1");
         let secret = out["secret"].as_str().unwrap();
         assert!(
-            !secret.is_empty() && secret.len() % 8 == 0,
+            !secret.is_empty() && secret.len().is_multiple_of(8),
             "base32: {secret}"
         );
         assert!(out["otpauthUrl"]

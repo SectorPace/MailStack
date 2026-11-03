@@ -1,0 +1,39 @@
+[Unit]
+Description=MailStack admin console (management API + frontend bundle)
+Documentation=https://github.com/SectorPace/MailStack
+After=network-online.target mailstackd.service
+Wants=network-online.target mailstackd.service
+# ⚠️ 刻意用 Wants 而不是 Requires：mailstackd 的 ConditionPathExists（setup.json）
+# 在向导完成前为 false，Requires 会把管理台一起跳过 —— 而向导恰恰要靠管理台完成。
+# daemon 不在时，管理台对只读动作如实返回 503（INV-8：fail-closed，绝不降级执行），
+# 向导用的变更动作走 sudo 包装器，不依赖 daemon。
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# 管理台以 mailstack-admin 身份运行：它需要读 /run/mailstack/helper-ro.sock
+# （0660 root:mailstack-admin）与 /etc/mailstack（0750 root:mailstack-admin）。
+User=mailstack-admin
+Group=mailstack-admin
+ExecStart=@BIN_DIR@/mailstack-web --bind 127.0.0.1:@ADMIN_PORT@ --dist @DIST_DIR@ --sample-interval 2 --log info@CONFIG_ARG@
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+LimitNOFILE=16384
+
+# ── 沙箱 ──
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mailstack -/run/sudo -/var/lib/sudo
+ProtectHome=yes
+PrivateTmp=yes
+# ⚠️ 这里**绝不能**加 NoNewPrivileges=yes：变更动作要执行
+# `sudo /usr/local/libexec/mailstack-privileged`，sudo 是 setuid root 程序；
+# NoNewPrivileges 会让 sudo 直接失败 —— 等于把整个 RW 通道关死（且症状是
+# 「所有写操作超时/失败」，很难指向这条配置）。
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+
+[Install]
+WantedBy=multi-user.target

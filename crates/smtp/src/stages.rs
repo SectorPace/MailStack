@@ -202,7 +202,7 @@ pub async fn run_relay_test(
     };
 
     // ── 阶段 dns：解析 + IP 固定 ──
-    let policy = address_policy_for(request);
+    let policy = address_policy_for(request, private_network_enabled);
     let target = match crate::resolve_pinned(&endpoint.host, endpoint.port, policy).await {
         Ok(t) => t,
         Err(e) => return Err(rec.fail(e)),

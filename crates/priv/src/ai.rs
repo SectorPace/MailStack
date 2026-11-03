@@ -152,7 +152,8 @@ pub trait HostResolver: Send + Sync {
 /// 生产解析器。
 ///
 /// `resolve` 是**同步阻塞**调用（getaddrinfo）：不得钉在 tokio worker 上。
-/// 出站路径（`models_list` / `request_custom`）统一经
+/// **所有**调用点（`models_list` / `request_custom` 的预检，以及
+/// [`SystemAiTransport::perform`] 里每次重定向的重新解析）都必须经
 /// `tokio::task::spawn_blocking` 挪进 blocking 线程池；同步入口 `config_set`
 /// 则由 `Registry::dispatch` 对同步处理器的 spawn_blocking 兜底。
 #[derive(Debug, Default)]
@@ -690,6 +691,9 @@ fn resolve_location(base: &str, location: &str) -> String {
 pub struct SystemAiTransport {
     dialer: Option<PinnedDialer>,
     reason: Option<String>,
+    /// 端点校验用的解析器。生产是 [`SystemResolver`]；测试注入替身以断言
+    /// 「解析没有钉在 async worker 上」。
+    resolver: Arc<dyn HostResolver>,
 }
 
 impl Default for SystemAiTransport {
@@ -704,6 +708,7 @@ impl SystemAiTransport {
             Ok(dialer) => Self {
                 dialer: Some(dialer),
                 reason: None,
+                resolver: Arc::new(SystemResolver),
             },
             Err(error) => {
                 mailstack_core::warn::warn_with_detail(
@@ -713,9 +718,16 @@ impl SystemAiTransport {
                 Self {
                     dialer: None,
                     reason: Some(error.to_string()),
+                    resolver: Arc::new(SystemResolver),
                 }
             }
         }
+    }
+
+    /// 覆盖 DNS 解析器（测试用）。
+    pub fn with_resolver(mut self, resolver: Arc<dyn HostResolver>) -> Self {
+        self.resolver = resolver;
+        self
     }
 
     async fn perform(&self, request: AiHttpRequest) -> Result<AiHttpResponse, String> {
@@ -731,7 +743,20 @@ impl SystemAiTransport {
         let mut body = request.body.clone();
         let mut redirects = 0usize;
         loop {
-            let endpoint = validate_endpoint(&url, request.allow_private, &SystemResolver)?;
+            // 端点校验内含同步 DNS 解析（getaddrinfo）：这里是 async 上下文，
+            // 直接在 worker 上解析会钉住 `mailstackd` 的 tokio worker
+            // （上游 DNS 超时通常 5–30s），而该进程同时承载 25/465/587 入站、
+            // 出站队列与两个 RPC 面。每次重定向都要重新解析，所以这一步在循环内。
+            let endpoint = {
+                let resolver = Arc::clone(&self.resolver);
+                let url = url.clone();
+                let allow_private = request.allow_private;
+                tokio::task::spawn_blocking(move || {
+                    validate_endpoint(&url, allow_private, resolver.as_ref())
+                })
+                .await
+                .map_err(|error| format!("AI endpoint validation task failed: {error}"))??
+            };
             let target = pinned_from_addresses(
                 &endpoint.host,
                 endpoint.port,
@@ -1051,8 +1076,7 @@ impl Ai {
             base_url: cfg_str(&cfg, "baseUrl")
                 .map(|url| url.trim().to_string())
                 .unwrap_or_else(|| preset.base_url.to_string()),
-            api_key: cfg_str(&cfg, "apiKey")
-                .unwrap_or_else(|| preset.default_key.to_string()),
+            api_key: cfg_str(&cfg, "apiKey").unwrap_or_else(|| preset.default_key.to_string()),
             model: first_truthy([
                 Some(str_field(data, "model").trim().to_string()),
                 cfg_str(&cfg, "model"),
@@ -1175,8 +1199,7 @@ impl Ai {
             base_url: cfg_str(&cfg, "baseUrl")
                 .map(|url| url.trim().to_string())
                 .unwrap_or_else(|| preset.base_url.to_string()),
-            api_key: cfg_str(&cfg, "apiKey")
-                .unwrap_or_else(|| preset.default_key.to_string()),
+            api_key: cfg_str(&cfg, "apiKey").unwrap_or_else(|| preset.default_key.to_string()),
             model: first_truthy([
                 Some(str_field(data, "model").trim().to_string()),
                 cfg_str(&cfg, "model"),
@@ -2295,8 +2318,7 @@ mod tests {
         let f = Fixture::new("chatbigerr");
         f.write_config(chat_config());
         let long_body = "x".repeat(4000);
-        let transport =
-            FakeTransport::with(vec![Ok(json_response(500, "Err", json!(long_body)))]);
+        let transport = FakeTransport::with(vec![Ok(json_response(500, "Err", json!(long_body)))]);
         let ai = f.ai(
             Arc::new(FakeResolver::with("api.openai.com", &["8.8.8.8"])),
             transport,
@@ -2738,5 +2760,49 @@ mod tests {
             !err.to_string().contains("sk-chat-key-12345"),
             "错误文案不得含密钥"
         );
+    }
+
+    // ── 11. 出站 DNS 不得钉在 async worker 上（R2-009） ──
+
+    /// 反例：`SystemAiTransport::perform` 的 DNS 解析必须在 blocking 线程池里跑。
+    ///
+    /// 注入一个「每次解析睡 300ms」的替身解析器。若解析仍在 async 上下文里同步
+    /// 执行，同一个 `current_thread` runtime 上的 20ms 定时器只能等它返回
+    /// （`elapsed >= 300ms`）；走 `spawn_blocking` 后，定时器必须在解析**进行中**
+    /// 就到期。每次重定向都会重新解析，所以这条断言也覆盖重定向路径。
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_transport_never_runs_dns_on_the_async_worker() {
+        struct SlowResolver;
+        impl HostResolver for SlowResolver {
+            fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<IpAddr>, String> {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(vec!["127.0.0.1".parse().unwrap()])
+            }
+        }
+
+        let transport = Arc::new(
+            SystemAiTransport::new().with_resolver(Arc::new(SlowResolver) as Arc<dyn HostResolver>),
+        );
+        let request = AiHttpRequest {
+            url: "https://ai.example.com/v1/chat".to_string(),
+            method: "POST".to_string(),
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: Some(b"{}".to_vec()),
+            timeout_secs: 1,
+            // 允许私网，让解析出的 127.0.0.1 通过端点策略（否则会先被拒），
+            // 连接 127.0.0.1:443 会立刻被拒 —— 测试不依赖外部网络。
+            allow_private: true,
+        };
+
+        let started = std::time::Instant::now();
+        let sending = tokio::spawn(async move { transport.send(request).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "DNS 解析期间 async worker 被顶住 {elapsed:?}（解析必须走 spawn_blocking）"
+        );
+        let outcome = sending.await.unwrap();
+        assert!(outcome.is_err(), "127.0.0.1:443 不应成功：{outcome:?}");
     }
 }

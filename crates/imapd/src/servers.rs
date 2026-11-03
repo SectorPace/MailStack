@@ -317,24 +317,57 @@ pub async fn run(
     // 等第一个「停机信号 / 监听器自己结束 / 监听器出错」，三者都是终止条件，
     // 因此这里是 select 而不是 loop（每个分支都会离开）。
     let mut shutdown = shutdown;
+    let mut failure: Option<ImapdError> = None;
     tokio::select! {
         _ = shutdown.changed() => {
             tracing::info!("shutdown signal received; IMAP/POP3 listeners are draining");
         }
         completed = tasks.join_next() => {
-            match completed {
-                Some(Ok(Ok(()))) => {}
-                Some(Ok(Err(error))) => return Err(ImapdError::Io(error)),
-                Some(Err(error)) => {
-                    return Err(ImapdError::Config(format!("监听任务异常退出：{error}")));
-                }
-                None => {}
-            }
+            failure = classify_listener_exit(completed);
         }
     }
-    // 让各监听器在自己的 grace 内收尾。
-    while tasks.join_next().await.is_some() {}
+    // 让各监听器在自己的 grace 内收尾，但**必须有界**：任一监听器的收尾被一条
+    // 长连接卡住时，无限等待会让整个进程停在停机阶段，最终由 systemd
+    // `TimeoutStopSec` 强杀 —— 强杀会把在写的 Maildir 打断。
+    let drained = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if drained.is_err() {
+        return Err(ImapdError::Config(format!(
+            "监听器在 {DRAIN_TIMEOUT:?} 内未完成收尾；进程退出以触发 systemd 重启"
+        )));
+    }
     Ok(())
+}
+
+/// 收尾等待的上限（`mailstackd` 的 `ROUND_TIMEOUT` 是分钟级，这里只需覆盖
+/// 单条连接的正常收尾）。
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 解释一个监听任务的结束。
+///
+/// ## 为什么「正常返回」也是异常（R5-020）
+///
+/// `serve` 的 accept 循环只应在收到停机信号时返回 `Ok(())`。任一监听器若因
+/// 其它原因**正常返回**，整个 `run()` 原先会走进 drain 并最终返回 `Ok(())` ——
+/// `mailstack-imap` 的 main 于是给出 `ExitCode::SUCCESS`，systemd 不重启，
+/// 表现为「进程退了但退出码是 0」。这与 5.19 在 `mailstackd` 修掉的是同一类
+/// 「退出码撒谎」。因此这里把 `Some(Ok(Ok(())))` 也翻译成错误。
+pub(crate) fn classify_listener_exit(
+    completed: Option<Result<std::io::Result<()>, tokio::task::JoinError>>,
+) -> Option<ImapdError> {
+    match completed {
+        Some(Ok(Ok(()))) => Some(ImapdError::Config(
+            "监听器在未收到停机信号时自行退出（退出码必须非零，否则 systemd 不会重启）".into(),
+        )),
+        Some(Ok(Err(error))) => Some(ImapdError::Io(error)),
+        Some(Err(error)) => Some(ImapdError::Config(format!("监听任务异常退出：{error}"))),
+        None => None,
+    }
 }
 
 /// 对一个 Dovecot Maildir 跑离线 UID/关键字迁移（切换前的一次性操作）。
@@ -363,6 +396,26 @@ pub fn cert_pair_from_le(letsencrypt: &Path, domain: &str) -> Option<CertPair> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R5-020：监听器「正常返回」也是异常（退出码必须非零，否则 systemd 不重启）。
+    #[test]
+    fn a_listener_that_returns_ok_without_a_shutdown_signal_is_an_error() {
+        let error = classify_listener_exit(Some(Ok(Ok(()))))
+            .expect("未停机就正常返回必须翻译成错误，而不能让 run() 回 Ok(())");
+        assert!(
+            format!("{error}").contains("未收到停机信号"),
+            "错误原因必须可诊断：{error}"
+        );
+
+        let io = classify_listener_exit(Some(Ok(Err(std::io::Error::other("accept failed")))))
+            .expect("监听器出错必须上抛");
+        assert!(matches!(io, ImapdError::Io(_)), "应保留 IO 错误：{io:?}");
+
+        assert!(
+            classify_listener_exit(None).is_none(),
+            "没有完成的任务（空 JoinSet）不是失败"
+        );
+    }
 
     #[test]
     fn require_tls_without_a_certificate_is_refused_before_binding() {

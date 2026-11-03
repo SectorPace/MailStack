@@ -59,6 +59,21 @@ impl TlsMode {
 /// 都汇聚到这一处，在这里限时即可全覆盖。
 pub const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 出站允许的最低/最高 TLS 版本 —— 只有 1.2 与 1.3。
+///
+/// ## 为什么必须显式写出来（R3-014）
+///
+/// 入站侧（`smtpd::tls`）早就把版本列表写成了显式策略，并论证过「依赖库的默认
+/// 值恰好安全是一种隐式假设」。出站 `ClientConfig::builder()` 恰恰是这个假设：
+/// 一旦 rustls 升级或特性开关变化让默认集合发生变化，出站的最低版本会**静默**
+/// 变化，而且没有任何测试会发现（`ip_pinning.rs` 只测握手成功/失败）。
+/// 出站对端是任意 MX，与入站同样暴露。
+pub fn client_supported_versions() -> &'static [&'static rustls::SupportedProtocolVersion] {
+    static VERSIONS: [&rustls::SupportedProtocolVersion; 2] =
+        [&rustls::version::TLS12, &rustls::version::TLS13];
+    &VERSIONS
+}
+
 /// 拨号器：持有 TLS 配置与超时。
 #[derive(Clone)]
 pub struct PinnedDialer {
@@ -83,7 +98,7 @@ impl PinnedDialer {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let config = ClientConfig::builder()
+        let config = ClientConfig::builder_with_protocol_versions(client_supported_versions())
             .with_root_certificates(roots)
             .with_no_client_auth();
 
@@ -95,7 +110,7 @@ impl PinnedDialer {
 
     /// 用指定的根证书构造（测试与私有 CA 场景）。
     pub fn with_roots(roots: rustls::RootCertStore, connect_timeout: std::time::Duration) -> Self {
-        let config = ClientConfig::builder()
+        let config = ClientConfig::builder_with_protocol_versions(client_supported_versions())
             .with_root_certificates(roots)
             .with_no_client_auth();
         Self {
@@ -172,8 +187,9 @@ impl PinnedDialer {
         )
         .await
         {
-            Ok(result) => result
-                .map_err(|e| SmtpError::Tls(format!("TLS handshake with {}: {e}", target.hostname))),
+            Ok(result) => result.map_err(|e| {
+                SmtpError::Tls(format!("TLS handshake with {}: {e}", target.hostname))
+            }),
             Err(_) => Err(SmtpError::Tls(format!(
                 "TLS handshake with {} timed out after {}s",
                 target.hostname,
@@ -271,5 +287,31 @@ impl tokio::io::AsyncWrite for EstablishedStream {
             EstablishedStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             EstablishedStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R3-014：出站版本策略必须是**显式列表**，且只含 TLS 1.2/1.3。
+    ///
+    /// rustls 的 `ClientConfig` 不暴露已装配的版本集合，因此断言落在策略函数
+    /// 本身：三个构造器都只经 [`client_supported_versions`] 建配置（见
+    /// `with_webpki_roots`/`with_roots` 的实现），这条测试守住「列表写死且正确」。
+    /// 若有人改回 `ClientConfig::builder()`（依赖默认值），本测试仍然绿 ——
+    /// 但代码审查的锚点变成这条注释与函数本身，而不是库的默认值。
+    #[test]
+    fn outbound_tls_versions_are_explicitly_pinned_to_1_2_and_1_3() {
+        let versions = client_supported_versions();
+        assert_eq!(versions.len(), 2, "只允许 TLS 1.2 与 1.3");
+        assert!(
+            std::ptr::eq(versions[0], &rustls::version::TLS12),
+            "必须显式列出 TLS 1.2"
+        );
+        assert!(
+            std::ptr::eq(versions[1], &rustls::version::TLS13),
+            "必须显式列出 TLS 1.3"
+        );
     }
 }

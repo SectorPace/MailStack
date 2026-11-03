@@ -167,6 +167,9 @@ pub mod texts {
     // ── 连接准入（限速 / 封禁）──
     /// 连接频率超限；具体重试秒数由调用方拼接。
     pub const RATE_LIMITED: &str = "Too many connections from your address";
+    /// 421 4.7.0：同一来源（IPv6 按 /64）的并发连接数超过上限（R3-006）。
+    pub const TOO_MANY_CONNECTIONS: &str =
+        "Too many concurrent connections from your address, try again later";
     pub const BANNED_TEMPORARILY: &str = "Your address is temporarily blocked";
     pub const BANNED_PERMANENTLY: &str = "Your address is permanently blocked";
 
@@ -177,6 +180,11 @@ pub mod texts {
     // ── 提交口策略（587，RFC 8314 submission 语义）──
     /// 530 5.7.0：提交口要求先认证（`AUTH`）才能开事务。
     pub const SUBMISSION_AUTH_REQUIRED: &str = "Authentication required";
+    /// 550 5.7.1：提交口的信封发件人不属于当前认证身份（R3-003）。
+    ///
+    /// 文案刻意**不回显**被拒地址：地址是主人可控输入，回显只是把它反射回去。
+    pub const SENDER_NOT_OWNED: &str =
+        "Sender address rejected: not owned by the authenticated user";
 
     // ── 入站认证与入队 ──
     /// 认证评估本身失败（无法判定），按临时错误处理而不是放行。
@@ -184,6 +192,8 @@ pub mod texts {
     pub const DMARC_REJECTED: &str = "Message rejected by the sender domain DMARC policy";
     pub const MESSAGE_NOT_UTF8: &str = "Message body is not valid UTF-8";
     pub const QUEUE_WRITE_FAILED: &str = "Cannot write message to the local queue";
+    /// 554 5.4.6：`Received:` 跳数超限或检测到环（RFC 5321 §6.3/§7.5）。
+    pub const TOO_MANY_HOPS: &str = "Too many hops / mail loop detected";
 }
 
 #[cfg(test)]

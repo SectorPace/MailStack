@@ -21,10 +21,23 @@ pub const GLOBAL_LIMIT_PER_MINUTE: u32 = 600;
 pub const IP_LIMIT_PER_MINUTE: u32 = 20;
 /// 单账号桶：每分钟允许的尝试数。
 pub const ACCOUNT_LIMIT_PER_MINUTE: u32 = 10;
-/// 连续失败达到该次数即锁定账号。
+/// 单来源（IP + 账号）连续失败达到该次数即锁定。
+///
+/// **为什么不是「账号级」**：锁定键若只有账号名（或只有 IP），一个未认证的
+/// 匿名者只要拼对管理员用户名，发 5 个请求就能把唯一的管理控制台锁死；锁定
+/// 到期后再发 5 个即可无限续期 —— 成本约 5 请求 / 15 分钟，且不需要任何凭据
+/// （R5-006）。锁定按**来源**隔离后，攻击者只能锁住自己那个 IP，管理员的
+/// 来源（本机回环 / SSH 隧道 / 自己的出口）不受影响。
 pub const FAILURE_LOCKOUT_THRESHOLD: u32 = 5;
-/// 锁定时长。
+/// 首次锁定时长。
 pub const LOCKOUT_SECONDS: i64 = 900;
+/// 同一来源在惩罚窗口内**重复**触发锁定时依次升级的时长（封顶取最后一项）。
+///
+/// 目的是让持续爆破的来源付出越来越高的代价；因为锁定按来源生效，升级只会
+/// 惩罚攻击者自己，不会延长对管理员的拒绝服务。
+pub const LOCKOUT_ESCALATION_SECONDS: &[i64] = &[900, 3_600, 21_600];
+/// 升级记忆窗口：超过该窗口没有再次触发锁定，就回到第一档。
+pub const LOCKOUT_ESCALATION_WINDOW_SECONDS: i64 = 24 * 3_600;
 /// 单个键（IP 或账号名）的最大长度。
 ///
 /// ## 为什么需要它
@@ -91,8 +104,39 @@ struct LimiterState {
     global: Option<Counter>,
     by_ip: HashMap<String, Counter>,
     by_account: HashMap<String, Counter>,
-    /// 连续失败计数与锁定截止时刻。
-    failures: HashMap<String, (u32, Option<OffsetDateTime>)>,
+    /// 连续失败计数与锁定截止时刻，键是 **(来源 IP, 账号)**。
+    failures: HashMap<(String, String), FailureRecord>,
+}
+
+/// 一个来源（IP + 账号）的失败与锁定状态。
+#[derive(Debug, Clone)]
+struct FailureRecord {
+    /// 本轮（上次锁定之后）的连续失败次数。
+    failures: u32,
+    /// 锁定截止时刻；`None` 表示还在计数、尚未锁定。
+    locked_until: Option<OffsetDateTime>,
+    /// 本轮惩罚窗口内已触发过的锁定次数（决定升级档位）。
+    lockouts: u32,
+    /// 升级窗口起点。
+    window_start: OffsetDateTime,
+}
+
+impl FailureRecord {
+    fn new(now: OffsetDateTime) -> Self {
+        Self {
+            failures: 0,
+            locked_until: None,
+            lockouts: 0,
+            window_start: now,
+        }
+    }
+
+    /// 本轮的锁定时长：按已触发次数升级。
+    fn lock_seconds(&self) -> i64 {
+        let index =
+            (self.lockouts.saturating_sub(1) as usize).min(LOCKOUT_ESCALATION_SECONDS.len() - 1);
+        LOCKOUT_ESCALATION_SECONDS[index]
+    }
 }
 
 impl LoginLimiter {
@@ -112,16 +156,29 @@ impl LoginLimiter {
 
         let ip_key = sanitized(ip);
         let account_key = sanitized(account);
+        let source_key = (ip_key.to_string(), account_key.to_string());
 
-        // 账号锁定优先于桶限流。
-        if let Some((_, Some(until))) = state.failures.get(account_key.as_ref()) {
-            if *until > now {
-                return LimitVerdict::Limited {
-                    retry_after_secs: (*until - now).whole_seconds().max(1),
-                };
+        // 来源锁定优先于桶限流。
+        //
+        // 键是 **(IP, 账号)**：攻击者从自己的来源失败 5 次只会锁住自己那条，
+        // 不会波及管理员从另一个来源的登录（R5-006 的永久锁死正是全局账号锁
+        // 带来的）。锁定期满后清空计数，但保留升级档位（在窗口内）。
+        if let Some(record) = state.failures.get_mut(&source_key) {
+            if let Some(until) = record.locked_until {
+                if until > now {
+                    return LimitVerdict::Limited {
+                        retry_after_secs: (until - now).whole_seconds().max(1),
+                    };
+                }
+                // 锁定期已过：恢复计数，进入下一轮。
+                record.locked_until = None;
+                record.failures = 0;
+                if now - record.window_start >= Duration::seconds(LOCKOUT_ESCALATION_WINDOW_SECONDS)
+                {
+                    record.lockouts = 0;
+                    record.window_start = now;
+                }
             }
-            // 锁定期已过，清除。
-            state.failures.remove(account_key.as_ref());
         }
 
         // 先只读判决：不存在的桶不新建。这样「判决」不会产生副作用。
@@ -175,19 +232,29 @@ impl LoginLimiter {
         LimitVerdict::Allow
     }
 
-    /// 记录一次失败。达到阈值即锁定账号。
-    pub fn record_failure(&self, account: &str) {
-        self.record_failure_at(account, OffsetDateTime::now_utc());
+    /// 记录一次失败（键 = 来源 IP + 账号）。达到阈值即锁定**该来源**。
+    pub fn record_failure(&self, ip: &str, account: &str) {
+        self.record_failure_at(ip, account, OffsetDateTime::now_utc());
     }
 
-    pub fn record_failure_at(&self, account: &str, now: OffsetDateTime) {
+    pub fn record_failure_at(&self, ip: &str, account: &str, now: OffsetDateTime) {
         let mut state = self.lock();
-        // 键与 `check_at` 用同一个规范化函数，否则两者会记到不同桶上。
-        let key = sanitized(account);
-        let entry = state.failures.entry(key.into_owned()).or_insert((0, None));
-        entry.0 += 1;
-        if entry.0 >= FAILURE_LOCKOUT_THRESHOLD {
-            entry.1 = Some(now + Duration::seconds(LOCKOUT_SECONDS));
+        // 键与 `check_at` 用同一套规范化，否则两者会记到不同桶上。
+        let source_key = (sanitized(ip).into_owned(), sanitized(account).into_owned());
+        let record = state
+            .failures
+            .entry(source_key)
+            .or_insert_with(|| FailureRecord::new(now));
+        // 升级窗口过期：回到第一档，避免「一年前锁过一次」永远背着重罚。
+        if now - record.window_start >= Duration::seconds(LOCKOUT_ESCALATION_WINDOW_SECONDS) {
+            record.lockouts = 0;
+            record.window_start = now;
+        }
+        record.failures = record.failures.saturating_add(1);
+        if record.failures >= FAILURE_LOCKOUT_THRESHOLD {
+            record.lockouts = record.lockouts.saturating_add(1);
+            record.locked_until = Some(now + Duration::seconds(record.lock_seconds()));
+            record.failures = 0;
         }
         // 淘汰同样只在插入路径、表顶到上界时才跑（与 `check_at` 同一纪律）。
         if state.failures.len() > MAX_TRACKED_KEYS {
@@ -195,25 +262,49 @@ impl LoginLimiter {
         }
     }
 
-    /// 记录一次成功：清除失败计数与锁定。
+    /// 记录一次成功：清除**该来源**的失败计数与锁定。
     ///
-    /// 键与 [`Self::record_failure_at`] / [`Self::is_locked_at`] 必须走**同一个**
-    /// 规范化函数 —— 原先这里直接删原始键，超长键记在 sanitized 键上却永远
-    /// 清不掉（`is_locked` 同样用原始键查，锁定状态对长键整体失灵）。
-    pub fn record_success(&self, account: &str) {
-        let key = sanitized(account);
-        self.lock().failures.remove(key.as_ref());
+    /// 只清成功登录所用的那个 (IP, 账号)：把别的来源的计数也一起清掉，等于让
+    /// 攻击者用一次合法登录（或诱导管理员登录一次）重置自己来源之外的惩罚，
+    /// 那是「成功清理」变成绕过。账号桶由 `check_at` 的固定窗口自然滚动，不需要清。
+    pub fn record_success(&self, ip: &str, account: &str) {
+        let key = (sanitized(ip).into_owned(), sanitized(account).into_owned());
+        self.lock().failures.remove(&key);
     }
 
-    /// 该账号当前是否处于锁定期。
+    /// 该账号当前是否有**任何来源**处于锁定期。
     pub fn is_locked(&self, account: &str) -> bool {
         self.is_locked_at(account, OffsetDateTime::now_utc())
     }
 
     pub fn is_locked_at(&self, account: &str, now: OffsetDateTime) -> bool {
         let state = self.lock();
-        let key = sanitized(account);
-        matches!(state.failures.get(key.as_ref()), Some((_, Some(until))) if *until > now)
+        let account_key = sanitized(account);
+        state.failures.iter().any(|((_, stored_account), record)| {
+            stored_account.as_str() == account_key.as_ref()
+                && matches!(record.locked_until, Some(until) if until > now)
+        })
+    }
+
+    /// 指定来源是否处于锁定期。
+    pub fn is_locked_from(&self, ip: &str, account: &str, now: OffsetDateTime) -> bool {
+        let state = self.lock();
+        let key = (sanitized(ip).into_owned(), sanitized(account).into_owned());
+        matches!(
+            state.failures.get(&key).and_then(|record| record.locked_until),
+            Some(until) if until > now
+        )
+    }
+
+    /// 指定来源本轮已经触发过几次锁定（测试与审计用）。
+    pub fn lockouts_from(&self, ip: &str, account: &str) -> u32 {
+        let state = self.lock();
+        let key = (sanitized(ip).into_owned(), sanitized(account).into_owned());
+        state
+            .failures
+            .get(&key)
+            .map(|record| record.lockouts)
+            .unwrap_or(0)
     }
 
     /// 清除全部状态（仅供测试）。
@@ -244,12 +335,13 @@ impl LimiterState {
         let window = Duration::minutes(1);
         self.by_ip.retain(|_, c| now - c.window_start < window);
         self.by_account.retain(|_, c| now - c.window_start < window);
-        // `failures` 的过期判定与桶不同：**已过锁定期**的条目没有价值，直接删。
-        // 但 `until == None` 表示「失败次数还没攒到阈值」—— 那是正在计数的条目，
-        // 必须留下（早先写成「只留 `until > now`」会把第一次失败就抹掉，
-        // 于是账号永远锁不上：计数在 1 处被清空，永远到不了 5）。
-        self.failures
-            .retain(|_, (_, until)| until.is_none_or(|until| until > now));
+        // `failures` 的过期判定与桶不同：按**来源**记的记录没有固定窗口 ——
+        // 已过锁定期且计数为 0 的条目没有价值，直接删；仍在计数的（还没锁上）
+        // 与仍在锁定期内的必须留下。早先写成「只留 until > now」会把第一次失败
+        // 就抹掉，于是来源永远锁不上（计数在 1 处被清空，永远到不了 5）。
+        self.failures.retain(|_, record| {
+            matches!(record.locked_until, Some(until) if until > now) || record.failures > 0
+        });
 
         // 仍超上界（攻击者在**同一个窗口内**制造高基数）：按窗口起点最旧者淘汰。
         // 排序键是 `window_start`，取最旧 = 留最热。
@@ -266,13 +358,13 @@ impl LimiterState {
             }
         }
         while self.failures.len() > MAX_TRACKED_KEYS {
-            // 失败计数没有窗口起点，用「是否锁定」+ 插入序不可得，故直接清掉
-            // 一个已过锁定期的条目；全都在锁定期时按任意一个删，内存上界优先。
+            // 失败记录没有单调整理顺序，用「是否还锁着」区分：先清未锁定的
+            // （正在计数的），全都在锁定期时按任意一个删，内存上界优先。
             let Some(victim) = self
                 .failures
                 .iter()
-                .find(|(_, (_, until))| until.is_none())
-                .map(|(k, _)| k.clone())
+                .find(|(_, record)| record.locked_until.is_none())
+                .map(|(key, _)| key.clone())
             else {
                 break;
             };
@@ -609,42 +701,124 @@ mod tests {
     }
 
     #[test]
-    fn five_failures_lock_the_account() {
+    fn five_failures_lock_the_source() {
         let limiter = LoginLimiter::new();
         let t0 = OffsetDateTime::now_utc();
         for _ in 0..(FAILURE_LOCKOUT_THRESHOLD - 1) {
-            limiter.record_failure_at("admin", t0);
+            limiter.record_failure_at("203.0.113.7", "admin", t0);
         }
         assert!(!limiter.is_locked_at("admin", t0), "未达阈值不应锁定");
+        assert!(!limiter.is_locked_from("203.0.113.7", "admin", t0));
 
-        limiter.record_failure_at("admin", t0);
+        limiter.record_failure_at("203.0.113.7", "admin", t0);
         assert!(limiter.is_locked_at("admin", t0), "达阈值必须锁定");
+        assert!(
+            limiter.is_locked_from("203.0.113.7", "admin", t0),
+            "锁定必须记在触发它的那个来源上"
+        );
     }
 
+    /// R5-006 的核心反例：**轮换来源 IP 不能锁死/续锁别人的来源**。
+    ///
+    /// 原实现以请求体用户名为键，任意匿名来源 5 次失败就把唯一管理员账号全局
+    /// 锁死，到期后再发 5 次即可无限续期 —— 这是未认证、远程、可无限续期的
+    /// 管理控制台拒绝服务。改成按来源（IP + 账号）锁定后：
+    ///
+    /// * 攻击者从 `198.51.100.9` 失败 5 次只锁住它自己那条；
+    /// * 管理员从另一个来源（回环 / SSH 隧道 / 自己的出口）登录**完全不受影响**；
+    /// * 攻击者换 IP 继续失败，也不会延长已有锁定的剩余时间。
     #[test]
-    fn locked_account_is_rejected_even_with_capacity() {
+    fn rotating_source_ips_cannot_lock_out_or_extend_another_source() {
+        let limiter = LoginLimiter::new();
+        let t0 = OffsetDateTime::now_utc();
+
+        for _ in 0..FAILURE_LOCKOUT_THRESHOLD {
+            limiter.record_failure_at("198.51.100.9", "admin", t0);
+        }
+        assert!(limiter.is_locked_from("198.51.100.9", "admin", t0));
+        let blocked = limiter.check_at("198.51.100.9", "admin", t0);
+        assert!(!blocked.is_allowed(), "攻击者自己的来源必须被挡住");
+        let locked_until_secs = match blocked {
+            LimitVerdict::Limited { retry_after_secs } => retry_after_secs,
+            LimitVerdict::Allow => unreachable!(),
+        };
+
+        // 管理员从另一个来源登录：桶与锁定都不受影响。
+        assert!(
+            limiter.check_at("127.0.0.1", "admin", t0).is_allowed(),
+            "攻击者的锁定不得波及另一个来源"
+        );
+        assert!(!limiter.is_locked_from("127.0.0.1", "admin", t0));
+
+        // 攻击者轮换来源继续失败：不得延长它自己（或任何人）的锁定。
+        for index in 0..50u32 {
+            let ip = format!("198.51.100.{}", index % 250 + 1);
+            limiter.record_failure_at(&ip, "admin", t0 + Duration::seconds(index as i64));
+        }
+        let still = match limiter.check_at("198.51.100.9", "admin", t0) {
+            LimitVerdict::Limited { retry_after_secs } => retry_after_secs,
+            LimitVerdict::Allow => panic!("原锁定的剩余时间不该被轮换来源重置"),
+        };
+        assert_eq!(
+            still, locked_until_secs,
+            "轮换来源的失败不得延长已有锁定的剩余时间"
+        );
+        assert!(
+            limiter.check_at("127.0.0.1", "admin", t0).is_allowed(),
+            "轮换来源的失败也不得波及管理员自己的来源"
+        );
+    }
+
+    /// 正常用户（单一来源）失败 5 次仍应被锁定，且到期后可恢复。
+    #[test]
+    fn a_single_source_is_still_locked_and_recovers_after_the_lock_expires() {
         let limiter = LoginLimiter::new();
         let t0 = OffsetDateTime::now_utc();
         for _ in 0..FAILURE_LOCKOUT_THRESHOLD {
-            limiter.record_failure_at("admin", t0);
+            limiter.record_failure_at("127.0.0.1", "admin", t0);
         }
-        // 新 IP、新时间窗，但账号仍锁定 → 必须拒绝。
-        let verdict = limiter.check_at("5.5.5.5", "admin", t0);
-        assert!(!verdict.is_allowed(), "锁定中的账号必须被拒绝");
-    }
-
-    #[test]
-    fn lockout_expires_after_its_window() {
-        let limiter = LoginLimiter::new();
-        let t0 = OffsetDateTime::now_utc();
-        for _ in 0..FAILURE_LOCKOUT_THRESHOLD {
-            limiter.record_failure_at("admin", t0);
-        }
-        assert!(limiter.is_locked_at("admin", t0));
+        assert!(limiter.is_locked_from("127.0.0.1", "admin", t0));
+        assert!(
+            !limiter.check_at("127.0.0.1", "admin", t0).is_allowed(),
+            "锁定中的来源即使口令正确也必须拒绝"
+        );
 
         let after = t0 + Duration::seconds(LOCKOUT_SECONDS + 1);
-        assert!(!limiter.is_locked_at("admin", after), "锁定期满应自动解除");
-        assert!(limiter.check_at("5.5.5.5", "admin", after).is_allowed());
+        assert!(
+            !limiter.is_locked_from("127.0.0.1", "admin", after),
+            "锁定期满应自动解除"
+        );
+        assert!(limiter.check_at("127.0.0.1", "admin", after).is_allowed());
+    }
+
+    /// 同一来源反复触发锁定 → 时长升级（900 → 3600 → 21600）。
+    #[test]
+    fn repeated_lockouts_from_one_source_escalate() {
+        let limiter = LoginLimiter::new();
+        let mut t = OffsetDateTime::now_utc();
+        let mut observed = Vec::new();
+        for _ in 0..LOCKOUT_ESCALATION_SECONDS.len() {
+            for _ in 0..FAILURE_LOCKOUT_THRESHOLD {
+                limiter.record_failure_at("198.51.100.9", "admin", t);
+            }
+            let verdict = limiter.check_at("198.51.100.9", "admin", t);
+            match verdict {
+                LimitVerdict::Limited { retry_after_secs } => observed.push(retry_after_secs),
+                LimitVerdict::Allow => panic!("第 {} 次锁定没有生效", observed.len() + 1),
+            }
+            // 跳到锁定期满之后，继续下一轮。
+            t += Duration::seconds(observed.last().copied().unwrap_or(0) + 1);
+        }
+        assert_eq!(
+            observed,
+            LOCKOUT_ESCALATION_SECONDS.to_vec(),
+            "同一来源重复锁定必须按 900s → 1h → 6h 升级"
+        );
+        assert!(
+            *observed.last().unwrap() <= *LOCKOUT_ESCALATION_SECONDS.last().unwrap(),
+            "升级必须封顶"
+        );
+        assert_eq!(observed[0], LOCKOUT_SECONDS, "首次锁定时长不得改变");
     }
 
     #[test]
@@ -652,18 +826,37 @@ mod tests {
         let limiter = LoginLimiter::new();
         let t0 = OffsetDateTime::now_utc();
         for _ in 0..FAILURE_LOCKOUT_THRESHOLD {
-            limiter.record_failure_at("admin", t0);
+            limiter.record_failure_at("127.0.0.1", "admin", t0);
         }
         assert!(limiter.is_locked("admin"));
 
-        limiter.record_success("admin");
+        limiter.record_success("127.0.0.1", "admin");
         assert!(!limiter.is_locked("admin"), "成功登录必须清除锁定");
 
         // 失败计数也确实归零：再失败 4 次仍不应锁定。
         for _ in 0..(FAILURE_LOCKOUT_THRESHOLD - 1) {
-            limiter.record_failure_at("admin", t0);
+            limiter.record_failure_at("127.0.0.1", "admin", t0);
         }
         assert!(!limiter.is_locked_at("admin", t0));
+    }
+
+    /// 成功清理只作用于**成功登录的那个来源**：否则攻击者只要让管理员在任意
+    /// 时刻登录一次（或自己撞对一次口令），就能把别的来源的惩罚一起清零 ——
+    /// 「成功清理」变成绕过。
+    #[test]
+    fn success_only_clears_the_source_that_succeeded() {
+        let limiter = LoginLimiter::new();
+        let t0 = OffsetDateTime::now_utc();
+        for _ in 0..FAILURE_LOCKOUT_THRESHOLD {
+            limiter.record_failure_at("198.51.100.9", "admin", t0);
+        }
+        assert!(limiter.is_locked_from("198.51.100.9", "admin", t0));
+
+        limiter.record_success("127.0.0.1", "admin");
+        assert!(
+            limiter.is_locked_from("198.51.100.9", "admin", t0),
+            "另一个来源的成功登录不得清掉攻击者来源的锁定"
+        );
     }
 
     #[test]
@@ -671,10 +864,11 @@ mod tests {
         let limiter = LoginLimiter::new();
         let t0 = OffsetDateTime::now_utc();
         for _ in 0..FAILURE_LOCKOUT_THRESHOLD {
-            limiter.record_failure_at("admin", t0);
+            limiter.record_failure_at("127.0.0.1", "admin", t0);
         }
         assert!(limiter.is_locked_at("admin", t0));
         assert!(!limiter.is_locked_at("other", t0), "锁定不得影响其它账号");
+        assert!(!limiter.is_locked_from("127.0.0.1", "other", t0));
     }
 
     /// 键规范化必须在 `record_failure_at` / `record_success` / `is_locked_at`
@@ -688,14 +882,15 @@ mod tests {
         let long_account = format!("admin-{}", "x".repeat(MAX_KEY_LEN + 64));
 
         for _ in 0..FAILURE_LOCKOUT_THRESHOLD {
-            limiter.record_failure_at(&long_account, t0);
+            limiter.record_failure_at("127.0.0.1", &long_account, t0);
         }
         assert!(
             limiter.is_locked_at(&long_account, t0),
             "长账号键必须能上锁"
         );
+        assert!(limiter.is_locked_from("127.0.0.1", &long_account, t0));
 
-        limiter.record_success(&long_account);
+        limiter.record_success("127.0.0.1", &long_account);
         assert!(
             !limiter.is_locked_at(&long_account, t0),
             "成功登录必须能清掉长账号键的锁定"
@@ -703,7 +898,7 @@ mod tests {
 
         // 清掉之后再次失败仍能重新计数上锁（计数确实归零，不是删错键）。
         for _ in 0..FAILURE_LOCKOUT_THRESHOLD {
-            limiter.record_failure_at(&long_account, t0);
+            limiter.record_failure_at("127.0.0.1", &long_account, t0);
         }
         assert!(limiter.is_locked_at(&long_account, t0));
     }

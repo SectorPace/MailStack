@@ -102,13 +102,29 @@ pub async fn probe_outbound_port(port: u16) -> PortProbeResult {
 
 /// 指定目标清单的探测（便于测试与显式调用）。
 pub async fn probe_outbound_port_with(port: u16, targets: Vec<String>) -> PortProbeResult {
+    // 探测目标是公网 SMTP 服务，一律走公网地址策略。
+    probe_outbound_port_with_policy(port, targets, AddressPolicy::public_only()).await
+}
+
+/// 指定目标清单**与地址策略**的探测。
+///
+/// 策略参数化是 R3-016 的修复点：测试要构造「第一个目标真实可达」的场景，
+/// 而环回地址会被公网策略拒掉 —— 原先的测试因此只能测到「全部不可达」，
+/// 名字承诺的「命中即停止」一个字节都没覆盖到（删掉 `break` 仍然全绿）。
+///
+/// 生产调用方只应经 [`probe_outbound_port_with`] / [`probe_outbound_port`]；
+/// 这个入口存在是为了让「提前停止」可被**真实可达目标**验证。
+pub async fn probe_outbound_port_with_policy(
+    port: u16,
+    targets: Vec<String>,
+    policy: AddressPolicy,
+) -> PortProbeResult {
     let timeout = Duration::from_secs(PORT_PROBE_TIMEOUT_SECS);
     let mut details: Vec<ProbeTargetOutcome> = Vec::new();
     let mut hit: Option<(String, u64)> = None;
 
     for target in &targets {
-        // 探测目标是公网 SMTP 服务，一律走公网地址策略。
-        let resolved = match resolve_pinned(target, port, AddressPolicy::public_only()).await {
+        let resolved = match resolve_pinned(target, port, policy).await {
             Ok(t) => t,
             Err(e) => {
                 details.push(ProbeTargetOutcome {
@@ -347,22 +363,31 @@ mod tests {
 
     #[tokio::test]
     async fn probe_stops_at_the_first_reachable_target() {
-        // 第一个目标用环回（策略拒 → 失败），第二个用本地监听端口（可达）。
-        // 这里直接验证「命中即停止」的行为：details 不应包含第三个目标。
+        // R3-016：用**真实可达**的本地监听构造命中场景，断言 details 只含第一条。
+        // 删掉循环里的 `break` 时，第二条（不可解析的域名）会被追加，
+        // `details.len() == 1` 立刻变红 —— 这正是原测试缺失的性质。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        // 注意：探测走公网地址策略，环回会被拒绝，因此这里改用显式构造的
-        // 目标列表验证「提前 break」逻辑本身。
-        let result = probe_outbound_port_with(
+        let result = probe_outbound_port_with_policy(
             addr.port(),
             vec![
+                "127.0.0.1".to_string(),
                 "nonexistent.invalid.example.test".to_string(),
-                "another.invalid.example.test".to_string(),
             ],
+            AddressPolicy::allow_private(),
         )
         .await;
-        assert!(!result.open);
-        assert_eq!(result.details.len(), 2);
+
+        assert!(result.open, "第一个目标应可达");
+        assert_eq!(
+            result.details.len(),
+            1,
+            "命中首个可达目标后必须停止，实际尝试了 {:?}",
+            result.details.iter().map(|d| &d.target).collect::<Vec<_>>()
+        );
+        assert_eq!(result.details[0].target, "127.0.0.1");
+        assert!(result.details[0].reachable);
+        assert_eq!(result.target, "127.0.0.1");
     }
 
     #[tokio::test]

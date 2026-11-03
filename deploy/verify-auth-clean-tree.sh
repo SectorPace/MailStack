@@ -63,3 +63,11 @@ cargo tree -p mailstack-auth --prefix none 2>/dev/null | sort -u | wc -l
 echo
 echo "=== 磁盘 ==="
 df -h / | tail -1
+
+# R7-005：此前命中 C 依赖链只打 `[!!]` 就 exit 0 —— 门禁看得见红字但结果永远是绿的。
+# 这是门禁，必须 fail-closed：命中任何一条即非零退出。
+if [ "$FOUND" -ne 0 ]; then
+  echo "C_DEPENDENCY_GATE_FAIL: 发现 C 依赖链，违反了「纯 Rust 构建」约束" >&2
+  exit 1
+fi
+echo "C_DEPENDENCY_GATE_OK"

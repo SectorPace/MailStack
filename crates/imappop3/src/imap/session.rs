@@ -602,11 +602,12 @@ where
                                 .await
                         }
                     },
-                    None => match decode_base64_text(&self.read_continuation("VXNlcm5hbWU6").await?)
-                    {
-                        Ok(text) => text,
-                        Err(error) => return self.malformed_auth(&tag, &error).await,
-                    },
+                    None => {
+                        match decode_base64_text(&self.read_continuation("VXNlcm5hbWU6").await?) {
+                            Ok(text) => text,
+                            Err(error) => return self.malformed_auth(&tag, &error).await,
+                        }
+                    }
                 };
                 let password =
                     match decode_base64_text(&self.read_continuation("UGFzc3dvcmQ6").await?) {
@@ -3327,11 +3328,7 @@ where
 
     /// 当前用户对目标邮箱的有效权限：本人/所有者全权；共享邮箱取 ACL 授予集。
     /// `acl` 由调用方通过 blocking 池读取（见 [`blocking::maildir`]）。
-    fn my_rights(
-        &self,
-        resolved: &ResolvedMailbox,
-        acl: &BTreeMap<String, String>,
-    ) -> String {
+    fn my_rights(&self, resolved: &ResolvedMailbox, acl: &BTreeMap<String, String>) -> String {
         let Some(owner) = &resolved.owner else {
             return crate::acl::ALL_RIGHTS.to_string();
         };
@@ -3423,7 +3420,11 @@ where
         Ok(out)
     }
 
-    async fn require_shared_rights(&self, resolved: &ResolvedMailbox, required: &str) -> Result<()> {
+    async fn require_shared_rights(
+        &self,
+        resolved: &ResolvedMailbox,
+        required: &str,
+    ) -> Result<()> {
         check_shared_rights(
             &resolved.store,
             &resolved.folder,
@@ -3696,7 +3697,11 @@ fn resolve_pattern(reference: &str, pattern: &str) -> String {
 /// 模式把 UID 映射成当前视图里的序号。结果已排序去重（`SequenceSet::
 /// from_values` 会做区间压缩）。已保存的 UID 在当前邮箱里一封都对不上时
 /// 明确报错，绝不静默当作空集。
-fn saved_result_numbers(saved: &[u32], uid_mode: bool, messages: &[MessageMeta]) -> Result<Vec<u32>> {
+fn saved_result_numbers(
+    saved: &[u32],
+    uid_mode: bool,
+    messages: &[MessageMeta],
+) -> Result<Vec<u32>> {
     if uid_mode {
         let mut uids = saved.to_vec();
         uids.sort_unstable();
@@ -3980,17 +3985,17 @@ mod tests {
 
     #[test]
     fn dollar_placeholder_expands_to_every_saved_uid() {
-        let messages: Vec<MessageMeta> = [3u32, 7, 9]
-            .into_iter()
-            .map(meta_with_uid)
-            .collect();
+        let messages: Vec<MessageMeta> = [3u32, 7, 9].into_iter().map(meta_with_uid).collect();
         // uid 模式：展开为全部已保存 UID（排序去重），不只是最大值。
         assert_eq!(
             saved_result_numbers(&[9, 3, 7], true, &messages).unwrap(),
             vec![3, 7, 9]
         );
         // 序号模式：UID 映射成当前视图里的序号（uid 7 → 序号 2）。
-        assert_eq!(saved_result_numbers(&[7], false, &messages).unwrap(), vec![2]);
+        assert_eq!(
+            saved_result_numbers(&[7], false, &messages).unwrap(),
+            vec![2]
+        );
         assert_eq!(
             saved_result_numbers(&[3, 9], false, &messages).unwrap(),
             vec![1, 3]

@@ -844,10 +844,7 @@ mod tests {
         let log = dir.join("audit.log");
         fs::write(&log, "hello world\nnot json\n").unwrap();
         let error = read_last_audit_hash_strict(&log).expect_err("垃圾尾部必须报错");
-        assert!(
-            error.to_string().contains("no parseable record"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("no parseable record"), "{error}");
         fs::remove_dir_all(&dir).ok();
     }
 }

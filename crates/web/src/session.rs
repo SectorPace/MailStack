@@ -32,11 +32,17 @@ pub const SESSION_COOKIE_SECURE_NAME: &str = "__Host-mailstack_session";
 /// 等于让登录开箱即坏（「密码输对了却提示未登录」）。
 pub const SESSION_COOKIE_PLAIN_NAME: &str = "mailstack_session";
 
-/// 全部条件性名字。Cookie 的**下发/作废**从 [`session_cookie_context`] 按
-/// `Secure` 判定取其一；**解析**侧（`crate::session_cookie`）则两个都认 ——
-/// 只认其一，另一种部署的浏览器会被全体判成未认证。
-pub const SESSION_COOKIE_NAMES: &[&str] =
-    &[SESSION_COOKIE_SECURE_NAME, SESSION_COOKIE_PLAIN_NAME];
+/// 全部条件性名字，**按解析优先级排列**（`__Host-` 名在前）。
+///
+/// Cookie 的**下发/作废**从 [`session_cookie_context`] 按 `Secure` 判定取其一；
+/// **解析**侧（`crate::session_cookie`）两个都认 —— 只认其一，另一种部署的
+/// 浏览器会被全体判成未认证。
+///
+/// 但「两个都认」必须配合**固定优先级**：无前缀名可以被同站子域（`Domain=...`）
+/// 写入，若解析按 `Cookie` 头里的出现顺序取值，攻击者那枚（创建更早、通常排在
+/// 前面）就能顶掉受害者自己的 `__Host-` 会话 —— 前缀保护在读取侧被抵消。
+/// 因此顺序在这里钉死：先 `__Host-`，找不到才退到无前缀名。
+pub const SESSION_COOKIE_NAMES: &[&str] = &[SESSION_COOKIE_SECURE_NAME, SESSION_COOKIE_PLAIN_NAME];
 
 /// 兼容别名：保留既有导出名（HTTPS 部署下的名字）。
 ///

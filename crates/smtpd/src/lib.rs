@@ -39,6 +39,7 @@ pub mod command;
 pub mod connection;
 pub mod data;
 pub mod listener;
+mod peer;
 pub mod ratelimit;
 pub mod reply;
 pub mod sasl;
@@ -62,7 +63,7 @@ pub use sasl::{
 };
 pub use session::{
     AcceptedMessage, Action, AnyRecipient, DirectoryRecipients, RecipientChecker, Session,
-    SessionConfig,
+    SessionConfig, SessionRole,
 };
 pub use sink::QueueSink;
 pub use tls::{acceptor as tls_acceptor, CertPaths, TlsError, TlsMode};

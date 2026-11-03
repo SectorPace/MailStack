@@ -46,6 +46,13 @@ pub use session::{SessionStore, SESSION_COOKIE};
 /// API JSON 请求体上限：256 KB（INV-12）。
 pub const API_BODY_LIMIT_BYTES: usize = 256 * 1024;
 
+/// 遥测采样允许的最大并发数（R5-008）。
+///
+/// 采样会持采集器互斥锁做 `/proc` 遍历、`df` 与 `postqueue` 子进程（毫秒到
+/// 秒级）。并发上限取 1：第二个请求立刻得到 429，而不是再占一个阻塞线程排队
+/// 等锁 —— 阻塞池（默认 512）一旦被遥测请求排满，登录的 PBKDF2 也拿不到线程。
+pub const TELEMETRY_MAX_CONCURRENT_SAMPLES: usize = 1;
+
 /// 应用共享状态。
 #[derive(Clone)]
 pub struct AppState {
@@ -59,6 +66,13 @@ pub struct AppInner {
     /// AI 路由独立限流（20 次/分/IP）。
     pub ai_limiter: AiRateLimiter,
     pub client: PrivilegedClient,
+    /// 测试注入的特权调用替身（生产构建里不存在这个字段）。
+    ///
+    /// 存在的理由：R5-001 的反例测试必须让「经 RPC 桥改密」**成功**，才能断言
+    /// 旧会话真的被吊销；而真实助手在测试机上不可达（也不该被测试触发真实副作用）。
+    /// 它只在 `cfg(test)` 构建里存在，HTTP 面没有任何路径能设置它。
+    #[cfg(test)]
+    test_action_stub: Option<ActionStub>,
     /// 公网模式（影响注册窗口与 RO fallback）。
     pub public_mode: bool,
     /// 构建标识（INV-22：`/api/health` 的 `node` 字段不可缺）。
@@ -66,7 +80,20 @@ pub struct AppInner {
     /// 时序遥测采集器。契约里 `/api/metrics/telemetry` 的 `action` 是 `None`，
     /// 采样只能在本进程内做（动作白名单已冻结，不能为它新增动作）。
     pub telemetry: Arc<telemetry::TelemetryCollector>,
+    /// 遥测采样的并发闸门（R5-008）：同时最多一个采样在跑。
+    ///
+    /// `spawn_blocking` 池默认上限 512。一个已认证会话并发发 512 个遥测请求，
+    /// 就会让 512 个阻塞线程全部排在采集器的互斥锁上（每个可能持锁到子进程
+    /// 超时）；阻塞池被打满后**登录的 PBKDF2 也拿不到线程** —— 管理台无法登录。
+    /// 拿不到闸门时直接返回 429（带 `Retry-After`），绝不排队等锁。
+    pub telemetry_gate: Arc<tokio::sync::Semaphore>,
 }
+
+/// 测试用特权调用替身：签名与 [`PrivilegedClient::call`] 一致。
+#[cfg(test)]
+#[doc(hidden)]
+pub type ActionStub =
+    Arc<dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, ApiError> + Send + Sync>;
 
 impl AppState {
     pub fn new(paths: Paths) -> Self {
@@ -77,9 +104,14 @@ impl AppState {
                 login_limiter: LoginLimiter::new(),
                 ai_limiter: AiRateLimiter::new(),
                 client: PrivilegedClient::new(public_mode),
+                #[cfg(test)]
+                test_action_stub: None,
                 public_mode,
                 runtime_id: format!("mailstackd/{} (rust)", mailstack_core::VERSION),
                 telemetry: Arc::new(telemetry::TelemetryCollector::system()),
+                telemetry_gate: Arc::new(tokio::sync::Semaphore::new(
+                    TELEMETRY_MAX_CONCURRENT_SAMPLES,
+                )),
                 paths,
             }),
         }
@@ -97,6 +129,31 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner).expect("AppState 尚未克隆");
         inner.runtime_id = runtime_id.into();
         self
+    }
+
+    /// 注入特权调用替身（**测试专用**）。
+    #[cfg(test)]
+    pub fn with_action_stub(mut self, stub: ActionStub) -> Self {
+        let inner = Arc::get_mut(&mut self.inner).expect("AppState 尚未克隆");
+        inner.test_action_stub = Some(stub);
+        self
+    }
+
+    /// 调用一个特权动作 —— 全仓**唯一**的调用入口。
+    ///
+    /// 统一入口的价值不只是「少写几行」：动作成功后的安全收尾（会话吊销）
+    /// 必须与调用点绑定在同一个地方，否则每新增一条调用路径就会漏一次收尾
+    /// （R5-001 的 `POST /api/rpc` 正是这么漏的）。
+    pub(crate) async fn call_action(
+        &self,
+        action: &str,
+        data: &serde_json::Value,
+    ) -> Result<serde_json::Value, ApiError> {
+        #[cfg(test)]
+        if let Some(stub) = &self.inner.test_action_stub {
+            return stub(action, data);
+        }
+        self.inner.client.call(action, data).await
     }
 
     pub fn paths(&self) -> &Paths {
@@ -158,11 +215,28 @@ async fn no_store_api(request: Request, next: Next) -> Response {
 /// 会话 Cookie 的名字是**条件性**的（加 `Secure` 的部署带 `__Host-` 前缀、
 /// 默认 HTTP 部署不带，见 [`crate::session::session_cookie_context`]），解析侧
 /// 必须两个名字都认 —— 只认其一，另一种部署的浏览器会被全体判成未认证。
+///
+/// ## 取值顺序**不是**「头里谁先出现就取谁」
+///
+/// 原实现按 `Cookie` 头里的出现顺序取第一个匹配。而 `__Host-` 前缀的意义正是
+/// 让**同站子域**无法写入会话 cookie；同时接受无前缀名、又按出现顺序取值，等于
+/// 把这份保护在读取侧抵消掉：
+///
+/// 1. 攻击者先自己登录拿到 `S`，再从 `evil.example.com` 写
+///    `mailstack_session=S; Domain=example.com; Path=/`；
+/// 2. 受害者的浏览器此后同时携带两枚 cookie，而 RFC 6265 §5.4 在同 Path 长度时
+///    **按创建时间升序**排列 —— 攻击者那枚通常排在前面；
+/// 3. 于是受害者的每个管理操作都落在**攻击者的会话**里（会话固定）。
+///
+/// 现在固定为两遍扫描：先找 `__Host-` 那一枚，找不到才退到无前缀名。攻击者能写
+/// 的只有无前缀名，它永远压不过受害者浏览器里那枚带前缀的。
 pub fn session_cookie(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
-    for part in raw.split(';') {
-        let part = part.trim();
-        for name in crate::session::SESSION_COOKIE_NAMES {
+    // 名字列表本身按「前缀名优先」排列（见 `session::SESSION_COOKIE_NAMES`）：
+    // 外层循环名字、内层循环片段，取值顺序就与 Cookie 头里的排列无关。
+    for name in crate::session::SESSION_COOKIE_NAMES {
+        for part in raw.split(';') {
+            let part = part.trim();
             if let Some(value) = part.strip_prefix(&format!("{name}=")) {
                 if !value.is_empty() {
                     return Some(value.to_string());
@@ -1122,6 +1196,106 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// R5-012：契约里的「路径 → 动作」必须与处理器真正调用的动作逐条一致。
+    ///
+    /// 原守卫只断言「路由存在且未认证时回 401」，把 `ROUTES[].action` 当注释用：
+    /// `action_handlers!` 里任何一次复制粘贴错位（例如把 `totp_disable` 写成
+    /// `admin.totp.begin`、把 `domains_add` 写成 `domains.list`）都能全绿通过。
+    /// 这里用注入的调用替身记录**实际到达助手层**的动作名，逐条比对。
+    #[tokio::test]
+    async fn every_route_reaches_exactly_the_action_the_contract_declares() {
+        for spec in ROUTES {
+            let (root, state) = test_state("actionbinding");
+            let state = state.with_telemetry(std::sync::Arc::new(
+                crate::telemetry::inert_collector(root.join("proc")),
+            ));
+            let calls: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let state = state.with_action_stub({
+                let calls = std::sync::Arc::clone(&calls);
+                std::sync::Arc::new(move |action: &str, _data: &serde_json::Value| {
+                    calls.lock().unwrap().push(action.to_string());
+                    Ok(serde_json::json!({ "ok": true }))
+                })
+            });
+            let (sid, csrf) = state.inner.sessions.create_session("admin");
+            let app = build_router(state);
+
+            let uri = spec
+                .path
+                .split('/')
+                .map(|seg| if seg.starts_with(':') { "sample" } else { seg })
+                .collect::<Vec<_>>()
+                .join("/");
+            let response = app
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(spec.method)
+                        .uri(&uri)
+                        .header(header::COOKIE, format!("{}={sid}", SESSION_COOKIE))
+                        .header("x-csrf-token", &csrf)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // 受保护路由必须先通过认证层，否则测到的是 401 而不是动作绑定。
+            if spec.auth == crate::contract::Auth::Required {
+                assert_ne!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{} {} 在带会话时仍回 401（认证层先于业务执行）",
+                    spec.method,
+                    spec.path
+                );
+            }
+
+            let recorded = calls.lock().unwrap().clone();
+            let expected: Vec<String> = spec
+                .action
+                .map(|action| vec![action.to_string()])
+                .unwrap_or_default();
+            assert_eq!(
+                recorded, expected,
+                "{} {} 实际调用了 {recorded:?}，契约声明的是 {:?} —— 动作绑定漂移",
+                spec.method, spec.path, spec.action
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// 编译期绑定表必须与契约表的动作集合完全一致（双向）。
+    ///
+    /// 单向检查（「路由的动作都有处理器」）会漏掉「处理器存在但没有路由」；
+    /// 反过来也会漏掉「路由的动作没有处理器」。两个方向都查一遍。
+    #[test]
+    fn the_action_handler_table_covers_the_contract_exactly() {
+        use std::collections::HashSet;
+
+        let route_actions: HashSet<&str> = ROUTES.iter().filter_map(|spec| spec.action).collect();
+        let handler_actions: HashSet<&str> = crate::routes::ACTION_HANDLER_BINDINGS
+            .iter()
+            .map(|(_, action)| *action)
+            .collect();
+        assert_eq!(
+            route_actions, handler_actions,
+            "契约表的动作集合与处理器绑定表的动作集合不一致"
+        );
+
+        // 处理器名不得重复（重复会让绑定表本身失去意义）。
+        let names: HashSet<&str> = crate::routes::ACTION_HANDLER_BINDINGS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            names.len(),
+            crate::routes::ACTION_HANDLER_BINDINGS.len(),
+            "处理器绑定表里有重复的处理器名"
+        );
+    }
+
     #[tokio::test]
     async fn telemetry_is_served_in_process_and_returns_the_raw_object() {
         // 遥测的 `action` 是 `None`，因此不在「动作×路由」守卫的覆盖范围里，
@@ -1164,6 +1338,54 @@ mod tests {
         assert!(body.get("points").is_some(), "必须是遥测对象本身");
         assert!(body.get("ok").is_none(), "不得套 {{ok,data}} 外壳");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// R5-005：无前缀 Cookie 不得**顶掉** `__Host-` 那枚。
+    ///
+    /// 攻击者可以从子域写 `mailstack_session=<攻击者自己的 sid>; Domain=example.com`；
+    /// 原实现按 `Cookie` 头里的出现顺序取第一个匹配，受害者的浏览器在同 Path 长度
+    /// 下按创建时间升序排列，攻击者那枚通常排在前面 —— 于是受害者的管理操作全部
+    /// 落在攻击者的会话里（会话固定）。现在固定优先 `__Host-`，与头内顺序无关。
+    #[test]
+    fn a_plain_cookie_cannot_shadow_the_host_prefixed_one() {
+        let name = crate::session::SESSION_COOKIE_SECURE_NAME;
+        let plain = crate::session::SESSION_COOKIE_PLAIN_NAME;
+        for cookie in [
+            format!("{plain}=attacker; {name}=victim"),
+            format!("{name}=victim; {plain}=attacker"),
+            format!("theme=dark; {plain}=attacker; {name}=victim; lang=zh"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, HeaderValue::from_str(&cookie).unwrap());
+            assert_eq!(
+                session_cookie(&headers).as_deref(),
+                Some("victim"),
+                "无前缀 Cookie 顶掉了 __Host- 会话：{cookie}"
+            );
+        }
+
+        // 默认 HTTP 部署只下发无前缀名 —— 仍然必须能解析（否则登录开箱即坏）。
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{plain}=only-plain")).unwrap(),
+        );
+        assert_eq!(session_cookie(&headers).as_deref(), Some("only-plain"));
+
+        // 两种部署各自的 cookie 名都由同一判定产生。
+        assert_eq!(
+            crate::session::session_cookie_context(None, false, None, &HeaderMap::new()),
+            (plain, false),
+            "默认部署应下发无前缀名"
+        );
+        let peer: std::net::SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(
+            crate::session::session_cookie_context(None, false, Some(&peer), &headers),
+            (name, true),
+            "HTTPS 部署应下发 __Host- 名"
+        );
     }
 
     #[test]

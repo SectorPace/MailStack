@@ -312,6 +312,29 @@ pub fn is_exposed_action(action: &str) -> bool {
     ROUTES.iter().any(|spec| spec.action == Some(action))
 }
 
+/// 成功后**必须吊销会话**的动作（改密 / 2FA 绑定与解绑）。
+///
+/// ## 为什么它是契约的一部分，而不是埋在三个处理器里
+///
+/// `POST /api/admin`、`/api/admin/2fa/enable`、`/api/admin/2fa/disable` 成功之后
+/// 必须让**全部旧会话失效** —— 改密/改 2FA 是事故响应的第一步，如果旧会话还能用，
+/// 「 attacker 被踢下线」这条链就不成立。
+///
+/// 但同一个动作还能从 `POST /api/rpc` 桥触达（桥是前端传输层的兜底路径，不是
+/// 只有手工 curl 才走得到的旁门），而桥原先只做「查白名单 + 转发」，**完全不做**
+/// 这段收尾。把「动作 → 收尾」抽到这里，REST 处理器与桥共用同一份判定，
+/// 才不会再出现「专用路由记得踢人、桥忘了踢」这种绕过。
+///
+/// 守卫见 [`tests::the_session_revoking_set_covers_every_credential_changing_route`]：
+/// 三个动作必须各自有路由，且不允许出现「路由在、集合里没写」的动作。
+pub const SESSION_REVOKING_ACTIONS: &[&str] =
+    &["admin.set", "admin.totp.enable", "admin.totp.disable"];
+
+/// 该动作成功后是否需要吊销该管理员的全部会话。
+pub fn revokes_sessions(action: &str) -> bool {
+    SESSION_REVOKING_ACTIONS.contains(&action)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +526,56 @@ mod tests {
                 assert!(is_exposed_action(action), "{action} 应可过桥");
             }
         }
+    }
+
+    /// `admin.set` / `admin.totp.enable` / `admin.totp.disable` 成功后必须吊销
+    /// 会话 —— 这份集合是 REST 路由与 RPC 桥**共用**的收尾判定。
+    ///
+    /// 守卫是双向的：集合里写了的动作必须有路由（否则永远没人能触发它）；
+    /// 反过来，这三个动作**只能**通过这三条路由出现，且必须在集合里。
+    #[test]
+    fn the_session_revoking_set_covers_every_credential_changing_route() {
+        // 集合里的每个动作都必须有对外路由。
+        for action in SESSION_REVOKING_ACTIONS {
+            assert!(
+                is_exposed_action(action),
+                "{action} 声明了「成功后吊销会话」，却没有对外路由：这段收尾永远不会执行"
+            );
+            assert!(
+                mailstack_core::actions::is_allowed(action),
+                "{action} 必须在助手动作白名单内"
+            );
+            assert!(revokes_sessions(action));
+        }
+
+        // 反向：任何映射到这三个动作的路由，动作名必须与集合一致（不允许改名漂移）。
+        // 必须带 method 一起匹配：`/api/admin` 同时有 GET（admin.get）与 POST
+        // （admin.set），只按 path 找到的是第一条（GET），会把正确实现判红。
+        for (method, path, action) in [
+            ("POST", "/api/admin", "admin.set"),
+            ("POST", "/api/admin/2fa/enable", "admin.totp.enable"),
+            ("POST", "/api/admin/2fa/disable", "admin.totp.disable"),
+        ] {
+            let spec = ROUTES
+                .iter()
+                .find(|spec| spec.path == path && spec.method == method)
+                .unwrap_or_else(|| panic!("{method} {path} 必须在契约表里"));
+            assert_eq!(spec.action, Some(action), "{path} 的动作名被改动了");
+            assert!(
+                revokes_sessions(action),
+                "{path} 的动作 {action} 必须触发会话吊销"
+            );
+        }
+
+        // 集合里不允许混进无需吊销的动作（否则会误踢全部会话）。
+        for action in SESSION_REVOKING_ACTIONS {
+            assert!(
+                !matches!(*action, "admin.get" | "admin.totp.begin"),
+                "{action} 不该吊销会话（begin 只是把 secret 交给用户，2FA 尚未生效）"
+            );
+        }
+        assert!(!revokes_sessions("users.password"));
+        assert!(!revokes_sessions("admin.get"));
+        assert!(!revokes_sessions(""));
     }
 }

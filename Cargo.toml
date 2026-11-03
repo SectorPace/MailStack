@@ -19,23 +19,26 @@ members = [
     "bin/mailstack-web",
     # IMAP/POP3 守护进程：替代 Dovecot 的协议面入口。
     "bin/mailstack-imap",
+    # Webmail：邮箱用户的 Web 客户端（独立进程、独立会话，与管理台隔离）。
+    "crates/webmail",
+    "bin/mailstack-webmail",
 ]
-# 后续加入（按规格书 §6 迁移路线逐 Phase 解锁）：
-#   "crates/webmail"
 
 [workspace.package]
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.85"
-license = "SEE LICENSE IN LICENSE"
+# 依赖链的 MSRV 上界：time 0.3.55 / hickory-resolver 0.26.3 要求 1.88。
+# 写 1.85 会让 `cargo build` 在旧工具链上以「依赖要求更高版本」失败，
+# 而 CI 只测 1.98.1 又发现不了 —— 下限必须按真实依赖链标，不是按我们的偏好。
+rust-version = "1.88"
+license = "MIT"
 repository = "https://github.com/SectorPace/MailStack"
 authors = ["SectorPace"]
 # 6.1 配套：本项目的 crate **不发布到 crates.io**（自托管应用，不是库）。
 # 声明 `publish = false` 有两个实际作用：
 #   1. 语义上如实说明「这些包不对外分发」；
 #   2. 让 `cargo-deny` 的 `[licenses.private] ignore = true` 能正确跳过它们 ——
-#      否则 `license = "SEE LICENSE IN LICENSE"` 这种**Cargo 合法但非 SPDX** 的写法
-#      会被判成 unlicensed，11 个自有 crate 一起把许可门禁刷红。
+#      自有一组 crate 由内部发布流程分发，不参与 crates.io 的许可白名单判定。
 publish = false
 
 [workspace.dependencies]
@@ -49,10 +52,14 @@ mailstack-auth = { path = "crates/auth" }
 mailstack-smtpd = { path = "crates/smtpd" }
 mailstack-imappop3 = { path = "crates/imappop3" }
 mailstack-imapd = { path = "crates/imapd" }
+mailstack-webmail = { path = "crates/webmail" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
+# 邮件正文 charset 转换（GBK / ISO-8859-1 / Shift_JIS …）。已在 Cargo.lock 的
+# 传递依赖里，直接依赖不新增供应链面；webmail 的 MIME 渲染是唯一消费者。
+encoding_rs = "0.8"
 base64 = "0.22"
 regex = "1"
 sha2 = "0.10"

@@ -29,6 +29,16 @@ const MAX_REQUEST_HEAD: usize = 8 * 1024;
 /// 避免连接任务无限挂着；与其它监听器绑定握手/读超时的思路一致。
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 同时处理的连接上限（R5-019）。
+///
+/// 端点不做任何认证，每条连接最多占用 [`REQUEST_READ_TIMEOUT`]（10 秒）+ 1KB
+/// 缓冲。没有上限时，一个只连不发的慢速连接洪水就能堆出任意多任务 —— 部署时
+/// `--metrics 0.0.0.0:9100` 是一个很容易被写进脚本的形态。
+///
+/// 超过上限时**立刻关闭**新连接：抓取器会把连接重置当作「端点不可用」，
+/// 与回 503 的语义一致，且不额外消耗任何任务/内存。
+const MAX_CONCURRENT_CONNECTIONS: usize = 32;
+
 /// 渲染全部注册表为 Prometheus 文本。
 pub fn render(registries: &[Arc<Metrics>]) -> Vec<u8> {
     let mut body = Vec::new();
@@ -58,6 +68,8 @@ pub async fn serve_on(
     // 注册表以 Arc<[..]> 共享给每条连接；响应体**每请求渲染一次** ——
     // 指标是持续增长的，启动时渲染一份冻结快照会让每次抓取都拿到旧值。
     let registries: Arc<[Arc<Metrics>]> = Arc::from(registries);
+    // 并发闸门：许可随连接任务存活，任务结束（含被取消）自动归还。
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     let mut shutdown = shutdown;
     loop {
         tokio::select! {
@@ -70,8 +82,17 @@ pub async fn serve_on(
                         continue;
                     }
                 };
+                let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+                    // 超出上限：直接断开。不 spawn 任务，不占任何资源。
+                    tracing::warn!(
+                        limit = MAX_CONCURRENT_CONNECTIONS,
+                        "metrics 并发连接超过上限，拒绝新连接"
+                    );
+                    drop(stream);
+                    continue;
+                };
                 let registries = Arc::clone(&registries);
-                tokio::spawn(async move { respond(stream, registries).await });
+                tokio::spawn(async move { respond(stream, registries, permit).await });
             }
         }
     }
@@ -79,12 +100,16 @@ pub async fn serve_on(
 
 /// 读掉请求头（有界），回 200 + 正文。任何方法/路径都按 /metrics 处理：
 /// 抓取器只认响应体，探活也用同一个端点。
-async fn respond(mut stream: tokio::net::TcpStream, registries: Arc<[Arc<Metrics>]>) {
+async fn respond(
+    mut stream: tokio::net::TcpStream,
+    registries: Arc<[Arc<Metrics>]>,
+    // 只用于持有并发许可：连接任务结束（函数返回）时自动释放。
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) {
     let mut head = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
-        let read = match tokio::time::timeout(REQUEST_READ_TIMEOUT, stream.read(&mut chunk)).await
-        {
+        let read = match tokio::time::timeout(REQUEST_READ_TIMEOUT, stream.read(&mut chunk)).await {
             Ok(Ok(read)) => read,
             Ok(Err(_)) | Err(_) => return,
         };
@@ -165,6 +190,41 @@ mod tests {
         // 通知停机，服务端应正常退出。
         tx.send(true).unwrap();
         handle.await.unwrap().unwrap();
+    }
+
+    /// R5-019：只连不发的连接洪水不得无限堆任务；超过上限的新连接被立刻关闭。
+    #[tokio::test]
+    async fn a_slow_connection_flood_is_capped() {
+        let metrics = Arc::new(Metrics::new("imap"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { serve_on(listener, vec![metrics], rx).await });
+
+        // 占满全部许可：连上之后一句话都不发（模拟慢速连接洪水）。
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            held.push(tokio::net::TcpStream::connect(address).await.unwrap());
+        }
+        // 给 accept 循环一点时间把许可全部取走。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // 超限的新连接必须在**很短**的时间内被关闭（而不是排成一个任务等 10 秒）。
+        let mut closed = 0;
+        for _ in 0..8 {
+            let mut overflow = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut buffer = [0u8; 1];
+            match tokio::time::timeout(Duration::from_secs(1), overflow.read(&mut buffer)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => closed += 1,
+                Ok(Ok(_)) => panic!("超限连接居然收到了响应字节"),
+                Err(_) => {}
+            }
+        }
+        assert!(closed > 0, "并发上限没有生效：{} 条超限连接全部被挂住", 8);
+
+        tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        drop(held);
     }
 
     #[test]

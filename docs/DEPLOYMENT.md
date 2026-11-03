@@ -1,19 +1,21 @@
 # MailStack v1.0.0 部署文档（Rust 重写）
 
-> 对应规格书 `docs/REWRITE_TO_RUST.md`（v2）。v1.0.0 已完成全部协议面与 Web 管理台（详见 README），
+> 对应规格书 `docs/REWRITE_TO_RUST.md`（v2）。v1.0.0 已完成全部协议面、Web 管理台与 Webmail（详见 README），
 > 见文末「当前进度」。
 
 ## 1. 产物
 
 | 产物 | 说明 |
 |---|---|
-| `mailstackd` | 主服务二进制：**入站 SMTP（25/465/587）+ 出站队列调度 + 特权 RPC 的两个 Unix socket**。尚未承载 webmail |
-| `mailstackctl` | CLI：`mailstackctl <action> [JSON] [--confirm]`。只读动作直连 RO socket，变更动作经 `sudo` 包装器（见 §3.5） |
+| `mailstackd` | 主服务二进制：**入站 SMTP（25/465/587）+ 出站队列调度 + LMTP 本地投递 + 特权 RPC 的两个 Unix socket**。Webmail 由独立进程 `mailstack-webmail` 承载（见 §3.9） |
+| `mailstackctl` | CLI：`mailstackctl <action> [JSON] [--confirm]`。只读动作直连 RO socket，变更动作经 `sudo` 包装器（见 §3.5）。`--privileged-stdin` 是包装器协议模式（无 argv + stdin JSON） |
 | `mailstack-web` | 管理控制台服务：管理 API 的全部路由 + 前端产物托管 + 遥测后台采样（见 §3.7）。**可选**：不给 `--dist` 就只提供 API |
-| `mailstack-imap` | IMAP4rev1 / POP3 守护进程（143/993/110/995），替代 **Dovecot 的 imap/pop3**。口令来自 `mailbox-passwords.json`，邮箱来自 `/etc/passwd` + `~/Maildir`（见 §3.8） |
-| `dist/SHA256SUMS` | 全部产物校验和 |
+| `mailstack-imap` | IMAP4rev1 / POP3 / ManageSieve 守护进程（143/993/110/995/4190）+ metrics，替代 **Dovecot 的 imap/pop3**。口令来自 `mailbox-passwords.json`，邮箱来自 `/etc/passwd` + `~/Maildir`（见 §3.8） |
+| `mailstack-webmail` | Webmail 服务：`/mail/api/*` + `webui/dist`（入口 `mail.html`）托管，默认 `127.0.0.1:8444`，与管理台进程/端口/会话隔离（见 §3.9） |
+| `dist/SHA256SUMS` | 全部产物校验和（含发布 tarball 本身那一行） |
 | `dist/sbom.spdx.json` | SBOM（依赖清单）。`cargo-sbom` 未安装时退化为 `dist/dependency-inventory.txt`（外部依赖逐条 `name version license`） |
-| `dist/*-musl` | **可选**：`deploy/build.sh --musl` 产出的全静态二进制。用于 glibc 过旧或 musl 的目标平台，见 §6 |
+| `dist/*-musl` | **可选**：`deploy/build.sh --musl` 产出的全静态二进制。用于 glibc 过旧或 musl 的目标平台，见 §6。**本期一键安装不下载 musl 变体**，需自行构建后以 `--binary-dir dist` 安装 |
+| `dist/mailstack-v1.0.0-x86_64-unknown-linux-gnu.tar.gz` | 发布 tarball，供 `deploy/install.sh` 默认下载/`--archive` 使用；内含 5 个二进制、`deploy/install.sh`、`deploy/uninstall.sh`、systemd unit 模板、`webui-dist/`、README/README_EN/LICENSE/CHANGELOG |
 
 > ⚠️ **libc 兼容性（2026-10-30 实测，见 §6）**：默认产物是动态链接 glibc，
 > **下限 glibc 2.39**。本项目声明的安装矩阵里有 Rocky Linux 9 / Oracle Linux 9（glibc 2.34）
@@ -42,9 +44,13 @@
 # 前置：Linux（WSL Ubuntu 24.04）/ Rust 1.98.1 / C 编译器
 # 开发机（Windows）请先执行 deploy/wsl-install-rust.sh 装配 WSL 工具链
 
-deploy/build.sh             # release 构建 + SHA256SUMS + SBOM
+deploy/build.sh             # release 构建（5 个二进制）+ SHA256SUMS + SBOM
 deploy/build.sh --offline   # 使用已 vendor 的依赖离线构建
 deploy/build.sh --vendor    # 先 vendor 再离线构建
+deploy/build.sh --musl      # 额外产出 *-musl 全静态二进制
+
+# 前端产物（管理台 index.html + Webmail mail.html，同一次构建）
+cd webui && npm ci && npm run build && cd ..
 ```
 
 质量门禁（与 CI 一致）：
@@ -55,15 +61,59 @@ deploy/wsl-quality-gate.sh   # rustfmt --check + clippy -D warnings + cargo test
 
 ## 3. 部署
 
-> ⚠️ 本版本仍处于**与旧 Node/Python 实现双跑**的迁移期（规格书 §6）。
-> 部署必须保留原 mailstack-web 服务与原 Postfix。
->
-> **迁移期必须显式指定旁路端口**：`mailstackd` 的缺省端口是 25/465/587，那是
-> **完全接管**时才该用的值，现在用它会和 Postfix 抢端口。双跑阶段请用
-> `--port 2525`（已在 `ALLOWED_RELAY_PORTS` 白名单内的非特权端口），
-> 由上游按需转发。真正的端口接管属于 Phase 5。
+v1.0.0 有两条部署路径：
 
-### 3.1 systemd unit（草稿，安装脚本随 Phase 推进落地）
+1. **全新部署（推荐）**：用 `deploy/install.sh` 一次装好用户/组、目录与权限、二进制、
+   特权包装器与 sudoers、systemd unit、前端产物，并初始化管理员凭据。
+   一键脚本与源码构建两种形态见 [`docs/INSTALL.md`](INSTALL.md)。
+2. **迁移期与旧栈双跑**：保留原 Postfix 与旧 `mailstack-web`，先以旁路端口验证，
+   再切换端口与包装器。同一对 RPC socket、同一个 Maildir 都只能有一个实现占用。
+
+> **迁移期双跑必须显式指定旁路端口**：`mailstackd` 的缺省端口是 25/465/587，那是
+> **完全接管**时才该用的值，双跑时会和 Postfix 抢端口。双跑阶段请用
+> `--port 2525`（`ALLOWED_RELAY_PORTS` 白名单内的非特权端口），由上游按需转发。
+> 组件下线（停用 Postfix/OpenDKIM/fail2ban/Dovecot）是**迁移期的可选收尾步骤**，
+> 不是安装器自动完成项；纯 MailStack 主机（未安装 Postfix）可完整工作。
+>
+> 注意：MailStack 仍会写出 Postfix 格式的表文件以兼容双跑；找不到 `postmap`（本机没装
+> Postfix）时按「无需同步」处理，**不会**把域名/别名写入判为失败。
+
+### 3.0 安装脚本（`deploy/install.sh`）
+
+v1.0.0 起不再需要手工铺 systemd unit / 建用户 / 写包装器：安装器一次完成
+（`deploy/uninstall.sh` 负责卸载）。两种形态：
+
+```bash
+# ① curl 一键（默认从 GitHub Release 下载并校验 SHA256；管道模式不能同时传口令）
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh \
+  | sudo bash -s -- --domain mail.example.com
+
+# ② 先落盘再执行（带口令的无人值守安装走这条）
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh -o /tmp/mailstack-install.sh
+printf '%s\n' "$MAILSTACK_ADMIN_PASSWORD" | sudo bash /tmp/mailstack-install.sh \
+  --non-interactive --domain mail.example.com --admin-password-stdin
+
+# ③ 源码构建后安装
+git clone https://github.com/SectorPace/MailStack.git && cd MailStack
+deploy/build.sh
+sudo deploy/install.sh --binary-dir dist
+```
+
+要点（完整参数与流程见 [`docs/INSTALL.md`](INSTALL.md)）：
+
+* 默认安装 release 产物并**校验 `SHA256SUMS`**；`--from-source` / `--archive FILE|URL` /
+  `--binary-dir DIR` 覆盖来源；`--prefix DIR` 用于 staging/测试（自动不操作宿主 systemd）；
+  `--no-systemd` 用于容器；
+* `--access-mode local|caddy|direct` 写入 `/etc/mailstack/install-args.conf` 的 `ACCESS_MODE`
+  （`crates/core/src/mode.rs` 据此判公网档：Cookie `Secure`、public 模式备份必须加密等）；
+  `--imap yes|no` 控制 IMAP/POP3 服务（默认 `yes`）；
+* 自动创建 `mailstack-admin`、`mailstack-webmail` 等系统用户/组与目录权限（§3.4），
+  写入 `/usr/local/bin/` 下 5 个二进制、**正确的特权包装器**（§3.1.1）、sudoers 与 4 个 unit；
+* 管理员凭据经特权通道写入（`admin.json` 已存在则跳过）；身份（域名/DKIM/DNS）留给管理台 setup 向导；
+* `--uninstall` / `--purge`（或独立 `deploy/uninstall.sh`）提供卸载路径；
+* 重复执行是幂等的，不覆盖既有配置（运维改动保留）。
+
+### 3.1 systemd unit（安装器生成；以下为模板）
 
 ```ini
 # /etc/systemd/system/mailstackd.service
@@ -73,8 +123,9 @@ After=network.target
 
 [Service]
 Type=simple
-# 迁移期用非特权旁路端口；Phase 5 接管时改为 --port 25 --port 465 --port 587
-ExecStart=/usr/local/bin/mailstackd --port 2525
+# 全新部署直接接管 25/465/587；与 Postfix 双跑迁移期改用旁路端口，例如
+#   ExecStart=/usr/local/bin/mailstackd --port 2525
+ExecStart=/usr/local/bin/mailstackd --port 25 --port 465 --port 587
 RuntimeDirectory=mailstack
 User=root
 Restart=on-failure
@@ -111,6 +162,19 @@ WantedBy=multi-user.target
 > `helper-ro.sock`，而 **RW 面恒经 `sudo /usr/local/libexec/mailstack-privileged`** ——
 > `helper.sock` 是 `0600 root:root`，Web 进程（非 root）连不上，这是设计而不是缺陷。
 >
+> **包装器协议是「无 argv + stdin JSON」**：客户端（`PrivilegedCaller::call_via_sudo`）以
+> `sudo <wrapper>` 启动包装器，把 `{"action","data"}` 写进 stdin、从 stdout 读 `{"ok",...}`。
+> 因此包装器**必须转成 `--privileged-stdin` 模式**；转发 `"$@"` 是错的
+> （`mailstackctl` 会把空 argv 当成缺动作名，全部 38 个变更动作都无法执行）。
+> 这也是 R2-001/R7-002 记录的缺陷，安装器会写入正确内容：
+>
+> ```bash
+> #!/usr/bin/env bash
+> set -Eeuo pipefail
+> export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+> exec /usr/local/bin/mailstackctl --privileged-stdin
+> ```
+>
 > 迁移期主机上可能已经存在**重写之前**留下的同名包装器，它 exec 的是旧的 Python 助手：
 >
 > ```bash
@@ -119,22 +183,22 @@ WantedBy=multi-user.target
 > ```
 >
 > 那个文件**可能仍然存在**，于是包装器会**正常执行**——但它不认识本项目的任何动作名，
-> 对任何 RW 动作都以 `exit 1` 结束，客户端只看到 `PRIVILEGED_OPERATION_FAILED`，
-> 界面报出来的是笼统的「操作失败」。排查时容易误以为是权限或代码问题。
+> 对任何 RW 动作都以 `exit 1` 结束；若包装器改成了转发 `"$@"`，客户端则直接拿到用法错误。
+> 两种情况客户端都只看到 `PRIVILEGED_OPERATION_FAILED`，界面报出来的是笼统的「操作失败」，
+> 排查时容易误以为是权限或代码问题。
 >
-> 部署时必须确认包装器指向**本仓库**的助手：
+> 部署时必须确认包装器是上面那段正确内容（安装器已自动写入；手工部署时执行）：
 >
 > ```bash
-> # 1) 看包装器现在指向什么（出现 .py 即为旧助手）
+> # 1) 看包装器现在指向什么（出现 .py 或 "$@" 即为错误）
 > grep -E 'exec|mailstackctl' /usr/local/libexec/mailstack-privileged
 >
-> # 2) 让它转发到本仓库的 mailstackctl（路径按实际安装位置调整）
-> #    注意 --config-dir 必须由调用方给出，包装器不应自带生产路径
+> # 2) 写入正确包装器
 > cat > /usr/local/libexec/mailstack-privileged <<'WRAPPER'
 > #!/usr/bin/env bash
 > set -Eeuo pipefail
 > export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-> exec /usr/local/bin/mailstackctl "$@"
+> exec /usr/local/bin/mailstackctl --privileged-stdin
 > WRAPPER
 > chmod 0750 /usr/local/libexec/mailstack-privileged
 >
@@ -146,7 +210,7 @@ WantedBy=multi-user.target
 > `deploy/verify-setup-wizard-e2e.sh` 会先检查这一点：包装器不可用时它**跳过**
 > RW 步骤并如实说明，而不是把「包装器不对」报成「链路不通」。
 
-### 3.2 提交端口 SASL（Dovecot auth socket，§3.5）
+### 3.2 提交端口 SASL（口令库 `mailbox-passwords.json`）
 
 25/465/587 三个端口的认证能力**不同**，这是刻意的：
 
@@ -196,15 +260,21 @@ WantedBy=multi-user.target
 
 | 路径 | 用途 | 权限 |
 |---|---|---|
-| `/etc/mailstack/` | 应用配置 | — |
+| `/etc/mailstack/` | 应用配置 | `0750` root:mailstack-admin |
 | `/etc/mailstack/admin.json` | 管理员凭证 + 2FA 信封 | `0640` root:mailstack-admin |
 | `/etc/mailstack/setup.json` | 身份（域名 / 邮件主机 / 服务器 IP / DKIM selector） | `0600` |
 | `/etc/mailstack/relay.json` | 中继端点 + 明文凭证（`mailstackd` 读它决定出站路径） | `0600` root:root |
+| `/etc/mailstack/install-args.conf` | 安装元数据（`ACCESS_MODE` / `MAILSTACK_VERSION` / `MAIL_HOST`） | `0600` root:root |
 | `/etc/opendkim/keys/<domain>/<selector>.private` | DKIM 私钥 | `0640` root:opendkim |
 | `/etc/mailstack/totp.key` | TOTP 主密钥 | `0600` root:root（仅特权进程可读） |
+| `/var/lib/mailstack/` | 队列、注册表、Maildir 索引、会话纪元 | `0750` root:mailstack-webmail |
 | `/var/lib/mailstack/manual-bans.json` | 管理台手工封禁（唯一真相源） | `0600` root:root |
+| `/var/backups/mailstack/` | 备份归档 | `0700` root:root |
 | `/var/log/mailstack-rpc-audit.log` | 审计哈希链 | `0600` |
 | `/var/log/mailstack-rpc-audit.log.head` | 审计链锚文件 | `0600` |
+| `/usr/share/mailstack/admin/` | 前端产物（管理台 `index.html` + Webmail `mail.html`） | `0755` root:root |
+| `/usr/local/libexec/mailstack-privileged` | sudo 包装器（RW 通道唯一入口） | `0750` root:root |
+| `/etc/sudoers.d/mailstack-admin` | 仅授权执行该包装器 | `0440` root:root |
 | `/run/mailstack/helper-ro.sock` | 只读面 socket | `0660` root:mailstack-admin |
 | `/run/mailstack/helper.sock` | 变更面 socket | `0600` root:root |
 
@@ -248,7 +318,7 @@ CLI **没有**「强制走某个通道」的开关：通道由动作唯一判定
 
 ### 3.6 初始化向导（`setup.*`）
 
-管理台初始化向导的后端是四个变更面动作（`setup.*` 全部归 RW，因为即使 `dns.verify`
+管理台初始化向导的后端是一组变更面动作（`setup.*` 全部归 RW，因为即使 `dns.verify`
 以出站查询为主，它仍属向导流程且不在只读白名单内）：
 
 | 动作 | 做什么 | 落点 |
@@ -259,6 +329,7 @@ CLI **没有**「强制走某个通道」的开关：通道由动作唯一判定
 | `setup.relay.apply` | **先测后写**，测试通过才落中继配置 | `/etc/mailstack/relay.json` |
 | `setup.mail.test` | 向本机提交端点 `127.0.0.1:25` 投一封测试信 | 只读（本机 MTA 收下即入队） |
 | `mail.test_loopback` | 投一封带一次性 token 的环路自检信，并在 Maildir 里找回它 | 只读（写入由本机 MTA/MDA 负责） |
+| `setup.wizard.complete` | 向导收尾：置位 `setup.json` 的 `wizardCompleted`（幂等、非破坏性） | `/etc/mailstack/setup.json` |
 
 三点运维语义：
 
@@ -270,7 +341,8 @@ CLI **没有**「强制走某个通道」的开关：通道由动作唯一判定
   界面据 `connected` / `stages` 显示卡在哪一步。
 * **两个自检动作都走本机提交端点**（`sendmail` 已随 Postfix 一起移除）。因此它们要求
   `mailstackd` 正在监听 25；提交被 `250` 接受即表示环路通了。`maildirDelivered: false`
-  只说明没在 Maildir 里找到那封信（权威布局尚未定死），**不是**投递失败。
+  只说明没在 Maildir 里找到那封信（权威布局是 `<系统用户家目录>/Maildir`），
+  **不是**投递失败。
 `setup.mail.test` 恢复基线的**四步校验**（域名/发件人格式 → 口令格式回放 → 发件人必须对应一个受管邮箱 → 邮箱未锁定），
 不再有 `mailboxChecksSkipped` 这类「跳过检查」的标记 —— 检查全部真实执行。
 
@@ -330,19 +402,39 @@ After=network.target
 [Service]
 Type=simple
 # 993/995 隐式 TLS；143/110 配 STARTTLS/STLS；4190 ManageSieve 配 STARTTLS。
-# /metrics 只绑回环，供 Prometheus 或 mailstack-web 抓取。
+# /metrics 只绑回环，供 Prometheus 抓取。
 ExecStart=/usr/local/bin/mailstack-imap \
     --imap 0.0.0.0:143 --imaps 0.0.0.0:993 \
     --pop3 0.0.0.0:110 --pop3s 0.0.0.0:995 \
     --managesieve 0.0.0.0:4190 \
     --metrics 127.0.0.1:9100 \
-    --cert-domain mail.example.com \
+    --cert /etc/mailstack/tls/mail.example.com/fullchain.pem \
+    --key  /etc/mailstack/tls/mail.example.com/privkey.pem \
     --server-name mail.example.com
+# 证书用显式 --cert/--key：ACME（setup.cert.issue）落点是
+#   /etc/mailstack/tls/<host>/{fullchain,privkey}.pem。
+# --cert-domain 只认 Let's Encrypt 标准布局 /etc/letsencrypt/live/<host>/，
+# 若你的证书放在那里，可改用：--cert-domain mail.example.com
 # 需要读 /etc/mailstack/mailbox-passwords.json 与各账号 ~/Maildir；
 # **不需要读 /etc/shadow** —— 口令来自 PBKDF2 记录。
 User=root
+Group=root
 Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+LimitNOFILE=65536
+
+# ── 沙箱 ──
+# 会写 Maildir（~/Maildir 下 cur/new/tmp 与 sieve/），因此 /home 必须可写；
+# 其余路径（/etc/passwd、/etc/mailstack、证书）只读即可。
+ProtectSystem=strict
+ReadWritePaths=/home
+ProtectHome=no
+PrivateTmp=yes
 NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -368,7 +460,7 @@ WantedBy=multi-user.target
 * ManageSieve 4190 让客户端上传脚本；脚本存进 `<maildir>/sieve/` 并由
   `.active` 标记生效，LMTP 下一次投递即使用它。
 * `/metrics` 汇总 IMAP/POP3/ManageSieve 三份注册表（Prometheus 文本，带
-  `protocol` 标签）；只监听回环，由 Prometheus 或 `mailstack-web` 抓取。
+  `protocol` 标签）；只监听回环，供 Prometheus 抓取（`mailstack-web` 不抓取该端点）。
 
 **从 Dovecot 切换（必须离线，且只能有一个实现写同一个 Maildir）**
 
@@ -392,16 +484,72 @@ WantedBy=multi-user.target
 
 > ⚠️ **两套 UID 映射不能同时写**：同一封邮件被分配两套 UID 会让客户端重复拉信。
 
+### 3.9 Webmail 服务（`mailstack-webmail`，v1.0.0 新增）
+
+Webmail 是**独立进程**：与管理台 `mailstack-web` 的进程、端口、会话体系全部隔离，
+默认只绑 `127.0.0.1:8444`（TLS 终止同样交给反向代理 / SSH 隧道）。
+
+```ini
+# /etc/systemd/system/mailstack-webmail.service
+[Unit]
+Description=MailStack Webmail (independent web client for mailbox users)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+# 只绑回环；前端产物与管理台同一份 webui/dist（入口 mail.html）。
+ExecStart=/usr/local/bin/mailstack-webmail --bind 127.0.0.1:8444 --dist /usr/share/mailstack/admin --log info
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+LimitNOFILE=16384
+
+# 会写 Maildir（/home）与队列（/var/lib/mailstack）；其余只读。
+ProtectSystem=strict
+ReadWritePaths=/home /var/lib/mailstack
+ProtectHome=no
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+要点：
+
+* Webmail 直接读写 Maildir 并经出站队列落盘投递，**不依赖 `mailstackd` 是否已启动**；
+  与管理台是两个进程、两套会话（同一份前端产物、不同进程与端口），可独立重启。
+* **认证**：登录名是**完整邮箱地址**；口令来自 `mailbox-passwords.json`（与 IMAP/POP3/提交端口同一份），
+  账号解析走 `/var/lib/mailstack/managed-mailboxes.json` + `/etc/passwd` → `~/Maildir`；
+  家目录或 Maildir 不存在 → 登录失败（**不自动创建**）。
+* **会话**：服务端内存表 + Cookie（HTTPS 模式 `__Host-` 前缀 + `Secure`，恒为 `HttpOnly`/`SameSite=Strict`）；
+  滑动 8 小时 / 绝对 7 天；会话纪元文件 `/var/lib/mailstack/webmail-session-epoch.json`
+  在改密/锁定时 bump → 旧会话立即失效。
+* **API**：全部在 `/mail/api/*`，未匹配路径恒为 JSON 404；页面入口是 `dist/mail.html`
+  （管理台是 `index.html`，同一次 `npm run build` 产出）。
+* **发信**：只入出站队列（DKIM 由队列统一签名）并保存 `Sent` 副本；
+  队列成功而 `Sent` 失败时返回 202 + warning，不回滚已入队邮件。
+* **安全**：服务端 HTML allowlist 消毒 + 前端 sandbox iframe + 远程图片默认阻断 + CSRF + 路径穿越拒绝。
+* 功能清单、API 摘要、故障排查与已知限制见 [`docs/WEBMAIL.md`](WEBMAIL.md)。
+
 ---
 
 ## 4. 回滚
 
-`mailstackd` 与 `mailstack-web` 都是旁路进程：停止并移除 unit 即可，原有 Postfix 与旧
-mailstack-web 未被改动。审计链未被改写（这两个二进制均不含 `audit()` 调用点）。
+`mailstackd`、`mailstack-web`、`mailstack-imap`、`mailstack-webmail` 都是独立进程：
+v1.0.0 安装可用 `deploy/uninstall.sh` 卸载（默认保留 `/etc/mailstack` 与 `/var/lib/mailstack`）；
+回滚到旧栈则停止并移除新 unit、恢复旧的服务与包装器即可（旧 Postfix 若未被改动仍然可用）。
+审计链未被改写（这些二进制均不含 `audit()` 调用点）。
 
 三点必须注意：
 
-* **停止 `mailstackd` 会同时摘掉特权 RPC 的两个 socket**，管理台随即失去后端。回滚时
+* **停止 `mailstackd` 会同时摘掉特权 RPC 的两个 socket**，管理台与 Webmail 随即失去后端。回滚时
   必须**先把旧的 RPC 交付方式恢复起来**，否则会从一个「新进程不在了」变成
   「旧进程也没有」。残留的 socket 文件不影响下次启动（绑定前会先移除陈旧文件）。
 * **队列里可能留有未投递的邮件**（`/var/lib/mailstack/queue`）。那些是已经对发送方回过
@@ -413,12 +561,12 @@ mailstack-web 未被改动。审计链未被改写（这两个二进制均不含
 
 | Phase | 状态 | 说明 |
 |---|---|---|
-| Phase 0 契约冻结 | ✅ 基础 | 路由表 `crates/web/src/contract.rs`（Phase 0 冻结 62 条，Phase 3 起 72 条）、动作三集 `crates/core/src/actions.rs`、口令/审计/原语移植 |
-| Phase 1 只读面 | ✅ 完成 | `mailstack-core`（87 测试）+ `mailstack-priv`（38 测试）+ `mailstack-web`（76 测试），共 **203 测试**，clippy/rustfmt 全绿 |
-| Phase 2 SMTP 核心 | 🟡 机制层完成，进程已可运行 | 自研 SMTP / 队列 / DKIM / TLS（1.2 起）/ 连接限速 / IP 封禁 / **提交端口 SASL（Dovecot auth socket）** / **直投（MX 解析，逐域按优先级）** / 入站认证（SPF+DKIM+DMARC）/ **ARC 校验与封印** 全部落地并有测试；`mailstackd` 已能收信、投递（本地 LMTP 或中继/直投）、承载 RO/RW 特权 RPC 与优雅停机。**尚未**：Maildir 只读、对真实 Dovecot auth socket / 真实公网 MX 验证、直投的机会式 TLS（见 TEST_REPORT §5）。风险项「中继 IP 固定」已按 §5.9.3 用真实握手验证 |
-| Phase 3 前端切换 | ✅ 已接入 | **与规格书原计划的偏离**：原计划是「htmx + Askama 服务端渲染」，实际接入的是用户提供的前端产物（Vite + React 19 的单页应用，hash 路由）。新增服务入口 `bin/mailstack-web`（`mailstack-web` 此前**只有 `build_router`，没有任何二进制在跑它**）：`--dist <DIR>` 托管产物、SPA 回退、`/api/*` 兜底保持 JSON 404、并启动遥测后台采样（2 秒）。为对接前端新增 8 个只读动作与 10 条路由（含 RPC 桥 `POST /api/rpc`），并把成功响应改回**裸对象**。webmail 仍按原计划不在本期范围 |
-| Phase 4 写面切换 | ✅ 动作面完成 | **已完成**：2FA 全生命周期（AES-256-GCM 信封 + RFC 6238 + 恢复码持锁消费，INV-5/29/32）；写面动作 `admin.set`、`settings.set`、域名/别名表写入、`dkim.rotate`；**只读聚合面** `snapshot`、`logs.list`、`metrics.realtime`、`certs.list`、`network.check_port`、`system.doctor`、`security.scan`、`backup.list`（读不到的子项一律显式上报，不静默省略）；控制台写面 `services.action`、`queue.action`、`security.ban/unban`；备份 `backup.create/restore/delete`；**初始化向导** `setup.identity.apply`、`setup.dns.verify`、`setup.relay.test`、`setup.relay.apply`、`setup.mail.test`、`mail.test_loopback`（见 §3.6）。白名单动作**已全部实现（58/58，RO 22/22 + RW 36/36）**；契约路由**已全部注册（72/72）**，**没有任何路由落到 `/api` 兜底**，由 `every_implemented_action_route_is_wired_and_behind_auth` 守门。最后补齐的动作族：ACME 证书（`setup.cert.issue` / `certs.renew`，调 `acme.sh`，见 TEST_REPORT §3.8）、AI 出站（`ai.*`，含 SSRF / DNS-rebinding 防护，见 §3.9）、以及为前端新增的 8 个只读列表动作（见 §3.10）—— **三者均零新依赖**。**未完成**：真实环境验证与审计链的**真实升级演练** |
-| Phase 5 组件下线 | ⏳ 待办 | 停用 Postfix/OpenDKIM/fail2ban/Node |
+| Phase 0 契约冻结 | ✅ 基础 | 路由表 `crates/web/src/contract.rs`（当前 **73 条**，Phase 0 基线 62 条）、动作三集 `crates/core/src/actions.rs`（**59 条**：RO 21 + RW 38）、口令/审计/原语移植 |
+| Phase 1 只读面 | ✅ 完成 | 只读聚合面、特权 RPC 协议与门控、管理面基础全部落地 |
+| Phase 2 SMTP 核心 | 🟡 机制层完成，进程已可运行 | 自研 SMTP / 队列 / DKIM / TLS（1.2 起）/ 连接限速 / IP 封禁 / **提交端口 SASL（口令库 `mailbox-passwords.json`）** / **直投（MX 解析，逐域按优先级）** / 入站认证（SPF+DKIM+DMARC）/ **ARC 校验与封印** 全部落地并有测试；`mailstackd` 已能收信、投递（本地 LMTP 或中继/直投）、承载 RO/RW 特权 RPC 与优雅停机。**尚未**：真实公网 MX 联调、直投的机会式 TLS（见 TEST_REPORT §5） |
+| Phase 3 前端切换 | ✅ 已接入 | 管理台为独立前端产物（Vite + React 19 单页应用，hash 路由），由 `bin/mailstack-web` 托管：`--dist <DIR>`、SPA 回退、`/api/*` 兜底保持 JSON 404、遥测后台采样（2 秒）。**Webmail 为 v1.0.0 新增**：独立进程 `bin/mailstack-webmail`（`127.0.0.1:8444`，见 §3.9），前端入口 `mail.html` 与管理台同一次构建产出 |
+| Phase 4 写面切换 | ✅ 动作面完成 | 2FA 全生命周期、写面动作（`admin.set`/`settings.set`/域名/别名/`dkim.rotate`）、只读聚合面、控制台写面、备份、初始化向导（含 `setup.wizard.complete`）、ACME、AI 出站（含 SSRF / DNS-rebinding 防护，见 TEST_REPORT §3.9）、8 个只读列表动作（见 TEST_REPORT §3.10）。白名单动作**已全部实现（59/59，RO 21/21 + RW 38/38）**；契约路由**已全部注册（73/73）**，没有任何路由落到 `/api` 兜底，由 `every_implemented_action_route_is_wired_and_behind_auth` 守门。**未完成**：真实环境验证与审计链的真实升级演练 |
+| Phase 5 组件下线 | 🟡 协议面已接管；组件下线为迁移期可选 | Dovecot 的 imap/pop3、提交端口 SASL 与本地投递已由自研栈接管（`mailstack-imap` + `mailstackd` 自有 LMTP）。停用 Postfix/OpenDKIM/fail2ban/Dovecot 属迁移期**可选收尾步骤**，不是 v1.0.0 自动完成项；迁移期允许与 Postfix 双跑，纯 MailStack 主机（未装 Postfix）同样可完整工作 |
 
 ## 6. 发行包的 libc 兼容性（2026-10-30 实测）
 
@@ -457,7 +605,7 @@ mailstack-web 未被改动。审计链未被改写（这两个二进制均不含
 ```bash
 # 构建宿主需 Rust 1.98.1 + musl-gcc + x86_64-unknown-linux-musl target
 deploy/build.sh --musl
-ls dist/          # 6 个二进制 + SHA256SUMS + dependency-inventory.txt
+ls dist/          # 5 个二进制 + SHA256SUMS + SBOM（--musl 时另加 5 个 *-musl 全静态产物）
 
 # 在目标平台验证（示例）
 sha256sum -c SHA256SUMS

@@ -127,13 +127,25 @@ pub async fn schedule(runner: Arc<QueueRunner>, shutdown: impl std::future::Futu
         tokio::select! {
             _ = &mut shutdown => {
                 // 5.18：有界等待在途轮次，而不是丢弃它的 future。
-                if let Some(handle) = in_flight.take() {
-                    match tokio::time::timeout(ROUND_TIMEOUT, handle).await {
+                if let Some(mut handle) = in_flight.take() {
+                    match tokio::time::timeout(ROUND_TIMEOUT, &mut handle).await {
                         Ok(_) => tracing::info!("队列调度停止（在途轮次已收尾）"),
-                        Err(_) => tracing::warn!(
-                            "队列调度停止：在途轮次超过 {:?} 仍未结束，放弃等待",
-                            ROUND_TIMEOUT
-                        ),
+                        Err(_) => {
+                            // 5.21：超时后**显式取消**，而不是把句柄 detach。
+                            //
+                            // `JoinHandle` 被 drop 不会 abort 任务：它会继续在后台
+                            // 跑，而 `schedule()` 随即返回、进程随后退出 —— 在途投递
+                            // 被进程退出硬杀在任意一次 write 中间，且 `ClaimGuard`
+                            // 的 Drop 也来不及跑（租约要占满 TTL 才被接管）。
+                            // `abort()` 让 future 在下一个 await 点被取消，Drop 守卫
+                            // 正常释放租约，下一次启动即可重试而不是干等 15 分钟。
+                            handle.abort();
+                            let _ = handle.await;
+                            tracing::warn!(
+                                "队列调度停止：在途轮次超过 {:?}，已显式取消（本轮的未完成条目将在重启后重试）",
+                                ROUND_TIMEOUT
+                            );
+                        }
                     }
                 } else {
                     tracing::info!("队列调度停止");

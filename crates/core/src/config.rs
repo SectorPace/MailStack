@@ -721,20 +721,16 @@ mod tests {
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        let outcome: () = update_admin_config(&f.paths.admin_config, |current| {
-            Ok((current.clone(), ()))
-        })
-        .unwrap();
+        let outcome: () =
+            update_admin_config(&f.paths.admin_config, |current| Ok((current.clone(), ())))
+                .unwrap();
 
         let after = fs::metadata(&f.paths.admin_config)
             .unwrap()
             .modified()
             .unwrap();
         assert_eq!(outcome, ());
-        assert_eq!(
-            before, after,
-            "闭包没有改动的 update_admin_config 不得写盘"
-        );
+        assert_eq!(before, after, "闭包没有改动的 update_admin_config 不得写盘");
     }
 
     #[test]
@@ -1022,19 +1018,14 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !read_setup_config(&f.paths)
-                .unwrap()
-                .wizard_completed,
+            !read_setup_config(&f.paths).unwrap().wizard_completed,
             "旧文件必须回落 false"
         );
 
         mark_setup_wizard_complete(&f.paths).unwrap();
         let marked = read_setup_config(&f.paths).unwrap();
         assert!(marked.wizard_completed);
-        assert_eq!(
-            marked.domain, "example.com",
-            "置位不得改动其余字段"
-        );
+        assert_eq!(marked.domain, "example.com", "置位不得改动其余字段");
         let raw_first = fs::read_to_string(&f.paths.setup_config).unwrap();
 
         // 幂等：重复置位是成功的空操作（文件内容不再变化）。

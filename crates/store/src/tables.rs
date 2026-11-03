@@ -311,6 +311,10 @@ impl TableStore {
 /// 并已 `warn`）；但「表文件写成了、Postfix 却还在读旧表」若被压成 `Ok`，改路由
 /// 不生效就成了无日志的悬案。这里把失败步聚合成一个显式错误向上传播 ——
 /// 调用方（管理台/CLI）能给运维一句可行动的结论。
+///
+/// **本机没有 Postfix 不算失败**：`postmap_and_reload` 会把「找不到 postmap」判成
+/// `postfix_absent` 并让三步都为成功 —— 纯 MailStack 主机上表文件由本进程读取，
+/// 不存在需要同步的 Postfix。只有「Postfix 在、但同步失败」才走到下面的错误分支。
 fn require_postfix_sync(outcome: PostmapOutcome) -> StoreResult<()> {
     let mut failed: Vec<&'static str> = Vec::new();
     if !outcome.postmap_ok {
@@ -854,11 +858,7 @@ mod tests {
     struct FailingRunner;
 
     impl CommandRunner for FailingRunner {
-        fn run(
-            &self,
-            _program: &str,
-            _args: &[&str],
-        ) -> mailstack_core::CoreResult<CommandOutput> {
+        fn run(&self, _program: &str, _args: &[&str]) -> mailstack_core::CoreResult<CommandOutput> {
             Ok(CommandOutput {
                 status: 1,
                 stdout: String::new(),
@@ -883,7 +883,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::rooted(dir.path());
         std::fs::create_dir_all(&paths.postfix).unwrap();
-        let store = TableStore::with_parts(paths.clone(), Arc::new(FailingRunner), Arc::new(FixedEnv));
+        let store =
+            TableStore::with_parts(paths.clone(), Arc::new(FailingRunner), Arc::new(FixedEnv));
 
         let error = store.add_domain("example.com").unwrap_err();
         assert_eq!(error.kind(), "PostmapError");
@@ -894,6 +895,46 @@ mod tests {
 
         // 错误的语义是「Postfix 未同步」，不是「写入失败」—— 表文件本身已落盘。
         assert_eq!(store.domains(), vec!["example.com".to_string()]);
+    }
+
+    /// 模拟「本机没有安装 Postfix」：所有命令都返回 NotFound。
+    struct NoPostfixRunner;
+
+    impl CommandRunner for NoPostfixRunner {
+        fn run(&self, program: &str, _args: &[&str]) -> mailstack_core::CoreResult<CommandOutput> {
+            Err(mailstack_core::CoreError::NotFound(PathBuf::from(program)))
+        }
+
+        fn run_with_timeout(
+            &self,
+            program: &str,
+            args: &[&str],
+            _timeout: std::time::Duration,
+        ) -> mailstack_core::CoreResult<CommandOutput> {
+            self.run(program, args)
+        }
+    }
+
+    /// 纯 MailStack 主机（Postfix 已移除）上写表必须成功。
+    ///
+    /// 回归背景：`domains.add` 曾把「找不到 postmap」当成 Postfix 同步失败，
+    /// 于是全新安装的服务器上第一次加域名就报错。Postfix 不存在时表文件由
+    /// MailStack 自己按文本读取，同步这一步本来就不存在。
+    #[test]
+    fn a_host_without_postfix_accepts_table_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        std::fs::create_dir_all(&paths.postfix).unwrap();
+        let store =
+            TableStore::with_parts(paths.clone(), Arc::new(NoPostfixRunner), Arc::new(FixedEnv));
+
+        store.add_domain("example.com").unwrap();
+        store
+            .add_alias("sales@example.com", &["alice".to_string()])
+            .unwrap();
+
+        assert_eq!(store.domains(), vec!["example.com".to_string()]);
+        assert_eq!(store.aliases().len(), 1);
     }
 
     /// 删除域时**先写别名表、后写域名表**（postmap 的先后 = 写入的先后）。

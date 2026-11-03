@@ -61,9 +61,13 @@ pub struct ListenerPlan {
     pub offer_auth: bool,
     /// 是否强制「提交先认证」（未认证 `MAIL` → `530 5.7.0`）。
     ///
-    /// 587（submission）置位：不设防的提交口是垃圾邮件的免费通道 —— 认证前的
-    /// 会话仍然能投给本域收件人，等于给任何拨号进来的主机留了一个匿名入站口。
-    /// 465 与 25 维持既有行为（默认 `false`）。
+    /// **465 与 587 都置位**：这两个端口都是 RFC 8314 §5 定义的 *submissions*
+    /// （提交口），规范要求其上的提交必须认证。不设防的提交口是垃圾邮件的免费
+    /// 通道 —— 认证前的会话仍然能投给本域收件人，等于给任何拨号进来的主机留了
+    /// 一个匿名入站口；而伪造的本地发件人还不经 SPF/DKIM/DMARC 判定，收件人
+    /// 看到的就是「内部同事发来的」信。
+    ///
+    /// 25 是 MX 义务（必须对全世界开放收信），维持 `false`。
     pub require_auth_for_submission: bool,
 }
 
@@ -75,7 +79,9 @@ impl ListenerPlan {
                 mode: TlsMode::Implicit,
                 offer_starttls: false,
                 offer_auth: true,
-                require_auth_for_submission: false,
+                // 465 与 587 同属 submissions：隐式 TLS 只是传输层形态，
+                // 不改变「提交必须认证」这条规范要求。
+                require_auth_for_submission: true,
             },
             587 => Self {
                 port,
@@ -457,7 +463,9 @@ mod tests {
                 mode: TlsMode::Implicit,
                 offer_starttls: false,
                 offer_auth: true,
-                require_auth_for_submission: false
+                // 465 是 RFC 8314 的 submissions（隐式 TLS 提交口）：提交必须认证，
+                // 否则未认证会话可以用伪造的本地发件人直接投进本域邮箱。
+                require_auth_for_submission: true
             }
         );
         assert_eq!(
