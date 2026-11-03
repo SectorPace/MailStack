@@ -154,7 +154,13 @@ impl Session {
 
     async fn read_line(&mut self) -> String {
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(5), self.reader.read_line(&mut line))
+        // 60s 而不是 5s：这是**测试客户端**的读超时，覆盖的是「服务端在 debug
+        // 构建里跑一次 PBKDF2（310k 轮）并完成认证」的时间。debug PBKDF2 比
+        // release 慢一个数量级，而 GitHub Actions 的 4 vCPU runner 还会被同一
+        // 二进制里的其它测试并发抢占 —— 实测 5s 在 CI 上会假失败（本地 WSL
+        // 核多且快，5s 足够）。超时的语义是「服务端彻底不回」，60s 仍能捕获
+        // 死锁/挂死，不会掩盖真实缺陷。
+        tokio::time::timeout(Duration::from_secs(60), self.reader.read_line(&mut line))
             .await
             .expect("读超时")
             .expect("读取失败");
