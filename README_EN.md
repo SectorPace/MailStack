@@ -364,6 +364,25 @@ curl -fsS http://127.0.0.1:9100/metrics | head
 > `mailstackctl` exit codes: `0` success / `1` action failed / `2` usage error / `3` helper unreachable /
 > `4` timeout. Audit log: `/var/log/mailstack-rpc-audit.log` (`0600`).
 
+## Known limitations (honest disclosure)
+
+- **Direct delivery has no opportunistic TLS**: direct-to-MX is plaintext (relay transport supports TLS);
+  configure a TLS-capable relay if transport confidentiality matters.
+- **No real public-MX end-to-end test**: MX resolution/priority/per-domain backoff are covered by tests and
+  injection, but no real public-domain end-to-end delivery was run; real Dovecot data migration and audit-chain
+  upgrade drills are likewise not done.
+- **Webmail / admin console do not terminate TLS themselves**: loopback-only; public access must go through a
+  reverse proxy or SSH tunnel.
+- **DMARC `pct=` sampling only works on the offline-injection path**: production is limited by upstream
+  `mail-auth 0.13.3` and therefore enforces the published policy at 100% (the stricter direction; see
+  `crates/auth/src/dmarc.rs` and `pct_is_not_available_on_the_network_parse_path`).
+- **IMAP scope**: structural operations on shared mailboxes (CREATE/DELETE/RENAME/SUBSCRIBE) and cross-store
+  COPY/MOVE return `NO`; IMAP4rev2 and JMAP are not implemented.
+- **Some medium/low review findings are not fixed in this release**: critical/high came first; the rest are
+  recorded in the R1–R7 reports and `docs/REVIEW_FIXES.md` §5 and tracked for v1.0.x (e.g. full-queue reads in
+  the scheduler, full-uidlist rewrites on flag changes).
+- Full list: [`CHANGELOG.md`](CHANGELOG.md) §Known limitations and [`docs/TEST_REPORT.md`](docs/TEST_REPORT.md) §5.
+
 ## Testing and quality gates
 
 Measured at the v1.0.0 release gate (Ubuntu 26.04 / WSL2 + Rust 1.98.1, 2026-11-03):

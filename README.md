@@ -329,6 +329,20 @@ curl -fsS http://127.0.0.1:9100/metrics | head
 > `mailstackctl` 退出码：`0` 成功 / `1` 动作失败 / `2` 用法错误 / `3` 助手不可达 / `4` 中途超时。
 > 审计链：`/var/log/mailstack-rpc-audit.log`（`0600`）。
 
+## 已知限制（诚实披露）
+
+- **直投不做机会式 TLS**：直投链路为明文投递（中继侧支持 TLS）；对传输机密性敏感请配置支持 TLS 的中继。
+- **未做真实公网 MX 端到端联调**：MX 解析、优先级、逐域退避均有测试与注入验证，但没有用真实公网域名跑完整投递；
+  真实 Dovecot 生产数据迁移与审计链升级演练同样未做。
+- **Webmail / 管理台不内建 TLS 终止**：只绑回环，公网访问必须经反向代理或 SSH 隧道。
+- **DMARC `pct=` 抽样仅离线注入路径可用**：生产路径受上游 `mail-auth 0.13.3` 限制按 100% 执行已公布策略
+  （更严格方向；见 `crates/auth/src/dmarc.rs` 与测试 `pct_is_not_available_on_the_network_parse_path`）。
+- **IMAP 范围**：共享邮箱的结构性操作（CREATE/DELETE/RENAME/SUBSCRIBE）与跨存储 COPY/MOVE 明确返回 `NO`；
+  未实现 IMAP4rev2 与 JMAP。
+- **部分 medium/low 审查项未在本版修复**：本轮以 critical/high 优先；其余在 R1–R7 报告与
+  `docs/REVIEW_FIXES.md` §5 登记，随 v1.0.x 跟进（例：队列调度全量读内存、IMAP 标志变更的全表重写）。
+- 完整清单见 [`CHANGELOG.md`](CHANGELOG.md) §已知限制 与 [`docs/TEST_REPORT.md`](docs/TEST_REPORT.md) §5。
+
 ## 测试与质量门禁
 
 v1.0.0 发布门禁实测（Ubuntu 26.04 / WSL2 + Rust 1.98.1，2026-11-03）：

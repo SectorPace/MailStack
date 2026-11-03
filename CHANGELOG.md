@@ -126,8 +126,10 @@ All notable changes to the MailStack project are documented in this file.
 - **未做真实公网 MX 联调**：直投的 MX 解析、优先级、逐域退避有测试与注入验证，
   但没有用真实公网域名完成端到端投递联调；真实 Dovecot 生产数据迁移与审计链升级演练同样未做。
 - **Webmail 不内建 TLS 终止**：只绑回环，公网访问必须经反向代理/SSH 隧道（管理台同策略）。
-- **`pct=` 抽样为生产路径限制**（待最终口径确认）：DMARC `pct=` 的抽样语义在部分路径上不生效；
-  当前按发布策略全量执行处理，属于比发布策略更严格的方向。见 `docs/REVIEW_FIXES.md` / R1-004。
+- **`pct=` 抽样在生产路径不生效（已登记的有意偏离）**：DMARC `pct=` 语义只在离线注入路径可用；
+  生产路径由于上游 `mail-auth 0.13.3` 不回传原始记录文本，`pct=` 无法解析，按 100% 执行已公布策略
+  （比发布策略更严格的方向，不属于放宽）。实现与理由见 `crates/auth/src/dmarc.rs` 模块文档，
+  并有测试 `pct_is_not_available_on_the_network_parse_path` 钉住该事实（将来依赖升级修好后该测试会提醒改文档）。
 - **部分 medium/low 审查项未在本版修复**：本轮以 critical/high 优先，其余在 R1–R7 报告与
   `docs/REVIEW_FIXES.md` §5 登记，随 v1.0.x 跟进（例：队列调度全量读内存、IMAP 标志变更的全表重写）。
 - **IMAP 范围**：共享邮箱的结构性操作（CREATE/DELETE/RENAME/SUBSCRIBE）与跨存储 COPY/MOVE
