@@ -1,22 +1,7 @@
-//! IMAP `sequence-set`（RFC 3501 §9）。
-//!
-//! 同一份语法承载两种语义：未加 `UID` 时是**序号**（1..=邮件数，随 EXPUNGE 漂移），
-//! `UID` 命令里是**UID**（服务端分配的稳定值）。本模块只负责解析与集合判定，
-//! 两种语义由调用方选择 `max` 并决定拿 UID 还是序号去比对。
-//!
-//! ## `*` 的两种含义
-//!
-//! * 非 UID：最后一条邮件的序号（信箱空时为 0，任何集合都不命中）；
-//! * UID：当前最大 UID（信箱空时为 0）。
-//!
-//! 因此 [`SequenceSet::contains`] 必须接收 `max`，不能把 `*` 事先折叠成常量。
-
 use crate::error::{MailError, Result};
 
-/// `*` 的内部哨兵。0 不是合法序号/UID，因此不会与真实值冲突。
 pub const STAR: u32 = u32::MAX;
 
-/// 解析后的一段闭区间。`from > to` 的写法（如 `5:2`）按 RFC 归一化。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeqRange {
     pub from: u32,
@@ -28,8 +13,6 @@ pub struct SequenceSet {
     ranges: Vec<SeqRange>,
 }
 
-/// 防御「一个集合把所有消息都列一遍」的内存放大：`1:4294967295` 是合法的
-/// 6 个字符，却代表 40 亿个序号。范围数与输入长度都要设上限。
 const MAX_RANGES: usize = 1024;
 const MAX_INPUT: usize = 8192;
 
@@ -67,7 +50,6 @@ impl SequenceSet {
         Ok(Self { ranges })
     }
 
-    /// 单值集合（内部使用，例如 `UID EXPUNGE` 的单封邮件）。
     pub fn single(value: u32) -> Self {
         Self {
             ranges: vec![SeqRange {
@@ -81,30 +63,25 @@ impl SequenceSet {
         &self.ranges
     }
 
-    /// 给定「当前最大值」，判断 `value` 是否落在集合内。
     pub fn contains(&self, value: u32, max: u32) -> bool {
         if max == 0 {
-            // 空邮箱没有序号、也没有 UID；`*` 解析成 0 会把 `1:*` 变成 `0:1`，
-            // 那样会让「空文件夹里也没东西可匹配」这条不变量失效。
             return false;
         }
         self.ranges.iter().any(|range| {
             let from = resolve(range.from, max);
             let to = resolve(range.to, max);
-            // `*` 解析后可能出现 from > to（例如 `*:4` 且 max=2），统一归一化。
+
             let (low, high) = if from <= to { (from, to) } else { (to, from) };
             low <= value && value <= high
         })
     }
 
-    /// 是否包含 `*`。`UID SEARCH` 的判定需要知道这一点吗？不需要，但调试输出需要。
     pub fn has_star(&self) -> bool {
         self.ranges
             .iter()
             .any(|range| range.from == STAR || range.to == STAR)
     }
 
-    /// 把一组升序值压成紧凑的集合字符串（`COPYUID` 用）。
     pub fn from_values(values: &[u32]) -> String {
         let mut sorted: Vec<u32> = values.to_vec();
         sorted.sort_unstable();
@@ -143,7 +120,6 @@ fn parse_number(token: &str) -> Result<u32> {
         .parse()
         .map_err(|_| MailError::invalid(format!("sequence number out of range: {token:?}")))?;
     if value == 0 {
-        // RFC 3501：seq-number 从 1 开始。0 不是「空」，是语法错。
         return Err(MailError::invalid("sequence number 0 is invalid"));
     }
     Ok(value)

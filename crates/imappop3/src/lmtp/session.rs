@@ -1,21 +1,3 @@
-//! LMTP 会话（RFC 2033）：`LHLO` / `MAIL` / `RCPT` / `DATA` / `RSET` / `NOOP` / `QUIT`。
-//!
-//! ## 与 SMTP 的关键差异
-//!
-//! `DATA` 结束后**每个收件人各回一条应答**，而不是一条全局应答。少读一条会让
-//! 客户端把下一条应答错配给下一个事务，连接就此错位。
-//!
-//! ## 数据区
-//!
-//! 逐行读取并做 dot-unstuffing（`..` → `.`），总大小超过 `max_message_size`
-//! 后继续读到终止点但不再缓冲，然后对每个收件人回 `552` —— 直接断开会让上游
-//! MTA 无法区分「临时失败」与「永久过大」。
-//!
-//! ## 投递
-//!
-//! 每个收件人经 [`LmtpRouter`] 映射到独立 Maildir，写盘走 blocking 线程池。
-//! 一封信的分发是**逐收件人独立成功/失败**：一个邮箱磁盘满不影响其他收件人。
-
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -55,7 +37,7 @@ impl Default for LmtpConfig {
 pub struct LmtpContext {
     pub router: Arc<dyn LmtpRouter>,
     pub config: LmtpConfig,
-    /// Sieve `redirect`/`vacation` 的外发出口；`None` 时这两个动作会被跳过并告警。
+
     pub outbound: Option<Arc<dyn OutboundSink>>,
 }
 
@@ -81,8 +63,7 @@ struct LmtpSession<'a, S> {
     helo: bool,
     mail_from: Option<String>,
     recipients: Vec<Recipient>,
-    /// 本事务已接受的收件人（路由器同款大小写归一化）：重复 RCPT 仍回 250
-    /// （对客户端重试保持宽容），但只入队一次，避免同一封投两份。
+
     seen: HashSet<String>,
 }
 
@@ -206,7 +187,7 @@ where
             self.write_line("501 5.5.4 MAIL requires FROM").await?;
             return Ok(Control::Continue);
         };
-        // 新的 MAIL 开始新事务；即使参数被拒，也不保留上一事务的收件人。
+
         self.reset_transaction();
         let (sender, size) = match parse_path(argument, "FROM") {
             Ok(parsed) => parsed,
@@ -255,7 +236,6 @@ where
         }
         match self.ctx.router.route(&address) {
             Some(store) => {
-                // 与 router 同款归一化：同址不同写法（大小写、空白）只投一次。
                 let key = address.trim().to_ascii_lowercase();
                 if self.seen.insert(key) {
                     self.recipients.push(Recipient { address, store });
@@ -301,7 +281,7 @@ where
             let from = sender.clone();
             let to = recipient.address.clone();
             let outbound = self.ctx.outbound.clone();
-            // 过滤器与投递都在 blocking 线程里完成：要读 `.sieve`、建文件夹、发外发。
+
             let result = blocking::maildir(&store, move |store| {
                 sieve::deliver_envelope(store, &payload, &from, &to, outbound.as_deref())
             })
@@ -346,7 +326,6 @@ where
         Ok(Control::Continue)
     }
 
-    /// 读 DATA 区。返回 `None` 表示超过大小上限（已读到终止点）。
     async fn read_data(&mut self) -> Result<Option<Vec<u8>>> {
         let mut out: Vec<u8> = Vec::new();
         let mut total = 0usize;
@@ -359,9 +338,6 @@ where
             .await;
             let line = match read {
                 Err(_) => {
-                    // 空闲超时发生在 DATA 中途：会话即将结束，但必须先回 421
-                    // 再关连接 —— 静默断开会让上游 MTA 把它当成连接层故障，
-                    // 无法区分「稍后重试」与「立即换路径」。
                     let _ = self.write_line("421 4.4.2 Idle timeout").await;
                     return Err(MailError::Timeout);
                 }
@@ -407,7 +383,6 @@ where
     }
 }
 
-/// 解析 `FROM:<addr> [SIZE=n ...]` / `TO:<addr>`。
 fn parse_path(
     argument: &str,
     keyword: &str,
@@ -457,7 +432,6 @@ fn lmtp_failure(error: &MailError) -> String {
     }
 }
 
-/// 把 Sieve `reject` 的理由压成单行：脚本里的 CR/LF 不能注入到 LMTP 应答。
 fn sanitize_reason(reason: &str) -> String {
     reason
         .chars()
@@ -699,7 +673,7 @@ mod tests {
         assert!(client.line().await.starts_with("250 "));
         client.send("RCPT TO:<Alice@Example.com>").await;
         assert!(client.line().await.starts_with("250 "));
-        // 同址不同写法：仍回 250（对重试宽容），但不得投两份。
+
         client.send("RCPT TO:<alice@example.com>").await;
         assert!(client.line().await.starts_with("250 "));
         client.send("DATA").await;
@@ -708,7 +682,7 @@ mod tests {
         client.send("").await;
         client.send("body").await;
         client.send(".").await;
-        // 恰好一条逐收件人应答：若重复入队，这里会读到第二条 250。
+
         assert!(client.line().await.starts_with("250 "));
         client.send("QUIT").await;
         assert!(client.line().await.starts_with("221 "));
@@ -747,10 +721,10 @@ mod tests {
         assert!(client.line().await.starts_with("250 "));
         client.send("DATA").await;
         assert!(client.line().await.starts_with("354 "));
-        // DATA 中途停止发送：读超时必须先回 421 再关闭（不能静默断开）。
+
         let reply = client.line().await;
         assert!(reply.starts_with("421 "), "{reply}");
-        // 会话以 Timeout 错误结束（超时本来就是错误路径）。
+
         assert!(matches!(
             server.await.unwrap(),
             Err(MailError::Timeout) | Ok(LmtpExit::Closed(_))

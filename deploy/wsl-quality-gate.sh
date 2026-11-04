@@ -1,6 +1,3 @@
-#!/usr/bin/env bash
-# 完整质量门禁：格式 + lint（warnings 即错误）+ 测试。
-# 与 CI 使用同一条命令链，确保本地与 CI 判定一致。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

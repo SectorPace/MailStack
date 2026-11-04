@@ -1,23 +1,3 @@
-//! IMAP 监听器：连接配额、限速、TLS 握手、STARTTLS 就地升级与优雅停机。
-//!
-//! ## 顺序（与 smtpd 的监听器一致）
-//!
-//! ```text
-//! accept ──► 每 IP 限速 ──► 全局连接信号量（满了直接 BYE，不排队）
-//!   │
-//!   ├─► 隐式 TLS：先握手（带超时），再发问候语
-//!   └─► 明文：发问候语；若协商 STARTTLS，丢弃明文缓冲后重新握手
-//! ```
-//!
-//! 先限速后握手，是为了让被拒绝的连接**不消耗**一次 ECDHE 握手；隐式 TLS 的
-//! 握手也带超时，防止半开连接占满连接配额。
-//!
-//! ## 停机
-//!
-//! `serve_on` 在 `shutdown` 触发后停止 accept，并等待在途会话最多
-//! `shutdown_grace`。超时后任务被 abort —— IMAP 是长连接协议，无限等待会让
-//! systemd 的 stop 超时先到，反而留下一个半死进程。
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,12 +17,12 @@ use crate::metrics::Metrics;
 #[derive(Debug, Clone)]
 pub struct ImapServerConfig {
     pub bind: SocketAddr,
-    /// 建连即握手（993）。为 `true` 时 `tls` 必须存在。
+
     pub implicit_tls: bool,
     pub max_connections: usize,
     pub handshake_timeout: Duration,
     pub shutdown_grace: Duration,
-    /// 每 IP 每分钟的新连接上限；`None` 表示不限速（不建议）。
+
     pub rate_limit: Option<RateLimitConfig>,
 }
 
@@ -63,13 +43,11 @@ pub struct ImapServer {
     pub context: ImapSessionContext,
     pub config: ImapServerConfig,
     pub tls: Option<TlsAcceptor>,
-    /// 传输层指标注册表。默认每个监听器一份；用 [`ImapServer::with_metrics`] 可让
-    /// 多个监听器（如 143 与 993）汇总到同一份。
+
     pub metrics: Arc<Metrics>,
 }
 
 impl ImapServer {
-    /// 构造期校验：**声称能做到却做不到**的配置不允许启动。
     pub fn new(
         context: ImapSessionContext,
         config: ImapServerConfig,
@@ -94,9 +72,7 @@ impl ImapServer {
         })
     }
 
-    /// 用一份共享的指标注册表替换默认的每实例注册表。
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
-        // 传输层与命令级共用同一份注册表。
         self.context.metrics = Arc::clone(&metrics);
         self.metrics = metrics;
         self
@@ -208,7 +184,6 @@ async fn handle_connection(
     tls: Option<TlsAcceptor>,
     metrics: Arc<Metrics>,
 ) {
-    // 活动量表在会话结束（含 panic/提前返回）时由 guard 减回去。
     let _active = Metrics::track_active(&metrics);
     if config.implicit_tls {
         let Some(acceptor) = tls else {
@@ -295,7 +270,7 @@ mod tests {
     fn context(require_tls: bool) -> ImapSessionContext {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(MailStore::new(directory.path(), Arc::new(SystemClock)).unwrap());
-        // 目录必须活到测试结束：泄漏一个临时目录比让生命周期污染上下文更简单。
+
         std::mem::forget(directory);
         ImapSessionContext {
             store,

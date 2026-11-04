@@ -1,32 +1,3 @@
-//! DKIM 密钥：生成、落盘、权限加固与 DNS 记录（规格书 §5.8）。
-//!
-//! 本模块是 `certs.py:181 dkim_rotate` 与 `core.py:725 set_dkim_key_permissions`
-//! 的等价移植，但把 `opendkim-genkey` 换成了 **mail-auth 的原生 RSA 生成**
-//! （规格书 §3.3 要求移除 OpenDKIM）。
-//!
-//! ## 两个必须写死的正确性细节
-//!
-//! 1. **`p=` 必须是 SubjectPublicKeyInfo（SPKI），不是 PKCS#1。**
-//!    mail-auth 的 `DkimKeyPair::encoded_public_key()` 给的是 **PKCS#1** base64，
-//!    而 RFC 6376 的 `p=` 与生态里的既有记录都是 SPKI。mail-auth 的验签侧
-//!    `try_strip_rsa_prefix(..).unwrap_or(bytes)` **两种都容忍**，所以 PKCS#1 也能
-//!    通过本地自检 —— 但 Gmail / 任何按规范解析的对端会验签失败。这里显式做 SPKI
-//!    封装（[`spki_from_pkcs1`]）并用测试把前缀钉死。
-//! 2. **`.txt` 是 zone 片段，且引号拼接后必须还原完整记录。**
-//!    基线的 `network.py:115` 记录过一次真实事故：`opendkim-genkey` 把长公钥拆成
-//!    多个带引号的行，天真的正则匹配把公钥**截断**了，DKIM DNS 记录因此失效。
-//!    这里用 [`zone_txt_fragment`] 生成，并用「去引号去空白后必须逐字等于原值」
-//!    的往返测试固定该性质。
-//!
-//! ## 密钥落盘位置（已登记的偏离）
-//!
-//! 基线里有两处不一致：`network.py:105` 的 setup 流程写
-//! `/etc/opendkim/keys/<domain>/`，而 `certs.py:190` 的 `dkim.rotate` 写
-//! `/etc/mailstack/dkim/<domain>/`。规格书 §2.5/§5.8 取的是前者，且
-//! `telemetry.key_permission_scan` 的默认扫描目录也是 `/etc/opendkim/keys`。
-//! 本实现**统一采用 `/etc/opendkim/keys/<domain>/`**，把 `certs.py` 的那条路径
-//! 记为偏离（见 `docs/TEST_REPORT.md`）。
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -40,57 +11,42 @@ use serde::Serialize;
 
 use crate::error::{AuthError, AuthResult};
 
-/// selector 缺省值（`certs.py:185`）。
 pub const DEFAULT_DKIM_SELECTOR: &str = "mailstack";
-/// 密钥长度（规格书 §5.8 与基线均要求 2048）。
+
 pub const DKIM_KEY_BITS: usize = 2048;
-/// 私钥属组（`set_dkim_key_permissions`）。
+
 pub const DKIM_KEY_GROUP: &str = "opendkim";
-/// 私钥权限：属主可写、属组只读，其他人无权限。
+
 pub const DKIM_KEY_MODE: u32 = 0o640;
-/// 域名总长上限（RFC 1035 §2.3.4：表示上 255 八位组，域名本体 ≤253）。
+
 pub const MAX_DOMAIN_LENGTH: usize = 253;
 
-/// `dkim.rotate` 的返回体，逐字对齐基线：
-/// `{status:'ok', domain, selector, record}`（`certs.py:199`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DkimRotation {
     pub status: &'static str,
     pub domain: String,
     pub selector: String,
-    /// `<selector>.txt` 的内容 —— opendkim-genkey 兼容的 DNS zone 片段。
+
     pub record: String,
-    /// SPKI 的 base64，与 `.txt` 里 `p=` 之后的值逐字相同。
-    ///
-    /// 单独带出来是因为 `setup.identity.apply` 要把它作为 `dkimPublicKey` 回给向导
-    /// （运维据此粘贴 DNS 记录，无需再读磁盘）。它不是 `dkim.rotate` 对外响应的一部分，
-    /// 故不参与序列化。
+
     #[serde(skip)]
     pub public_key_spki_b64: String,
 }
 
-/// 一次生成的完整密钥材料。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DkimKeyMaterial {
     pub domain: String,
     pub selector: String,
-    /// PKCS#1 PEM（`BEGIN RSA PRIVATE KEY`），与 `opendkim-genkey` 同格式。
+
     pub private_key_pem: String,
-    /// SPKI 的 base64 —— **这才是可以放进 `p=` 的形态**。
+
     pub public_key_spki_b64: String,
-    /// `v=DKIM1; h=sha256; k=rsa; p=...` 的纯 TXT 值。
+
     pub txt_value: String,
-    /// 可直接粘贴进 DNS 的 zone 片段。
+
     pub txt_record: String,
 }
 
-/// 校验并规范化域名；失败文案与 `certs.py:184` 逐字一致。
-///
-/// [`DOMAIN_RE`] 只约束**单段**长度（每段 ≤63、TLD ≤63），对**总长**没有上界 ——
-/// 几十个长标签拼起来的域名能穿过正则。总长 ≤253 必须在这里显式守住：域名会成为
-/// 文件系统路径的一段（`<etc>/opendkim/keys/<domain>/`），超长域名要么让内核以
-/// 难排查的 `ENAMETOOLONG` 失败，要么在有人「截断再拼路径」时让两个域共享同一个
-/// 密钥目录。
 pub fn validate_domain(domain: &str) -> AuthResult<String> {
     let domain = domain.trim().to_ascii_lowercase();
     if !DOMAIN_RE.is_match(&domain) || domain.len() > MAX_DOMAIN_LENGTH {
@@ -99,10 +55,6 @@ pub fn validate_domain(domain: &str) -> AuthResult<String> {
     Ok(domain)
 }
 
-/// 校验并规范化 selector；失败文案与 `certs.py:187` 逐字一致。
-///
-/// 缺省与空串都落到 [`DEFAULT_DKIM_SELECTOR`]（基线为
-/// `str(data.get('selector', 'mailstack')).strip().lower() or 'mailstack'`）。
 pub fn validate_selector(selector: Option<&str>) -> AuthResult<String> {
     let selector = selector.unwrap_or("").trim().to_ascii_lowercase();
     let selector = if selector.is_empty() {
@@ -116,29 +68,21 @@ pub fn validate_selector(selector: Option<&str>) -> AuthResult<String> {
     Ok(selector)
 }
 
-/// 密钥目录：`<etc>/opendkim/keys/<domain>`。
 pub fn dkim_key_dir(paths: &Paths, domain: &str) -> PathBuf {
     paths.opendkim.join("keys").join(domain)
 }
 
-/// 私钥文件路径：`<etc>/opendkim/keys/<domain>/<selector>.private`。
 pub fn private_key_path(paths: &Paths, domain: &str, selector: &str) -> PathBuf {
     dkim_key_dir(paths, domain).join(format!("{selector}.private"))
 }
 
-/// DNS 记录文件路径：`<etc>/opendkim/keys/<domain>/<selector>.txt`。
 pub fn txt_record_path(paths: &Paths, domain: &str, selector: &str) -> PathBuf {
     dkim_key_dir(paths, domain).join(format!("{selector}.txt"))
 }
 
-// ───────────────────────────── base64 ─────────────────────────────
-
 const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// 标准 base64（RFC 4648，带 `=` 填充）。
-///
-/// 自实现而不引依赖：本 crate 只需要编码，且 §3.4 要求依赖面尽量小。
 pub fn base64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -162,9 +106,6 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-// ───────────────────────────── DER / SPKI ─────────────────────────────
-
-/// DER 长度字段（X.690 的定长/不定长编码里只用定长形式）。
 pub fn der_length(len: usize) -> Vec<u8> {
     if len < 0x80 {
         return vec![len as u8];
@@ -190,19 +131,13 @@ fn der_wrap(tag: u8, content: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `AlgorithmIdentifier` for `rsaEncryption` (OID 1.2.840.113549.1.1.1, NULL 参数)。
 const RSA_ALGORITHM_IDENTIFIER: [u8; 15] = [
     0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
 ];
 
-/// 把 PKCS#1 `RSAPublicKey` DER 封装成 SubjectPublicKeyInfo DER。
-///
-/// 结构：`SEQUENCE { AlgorithmIdentifier, BIT STRING { 0x00, RSAPublicKey } }`。
-/// 2048 位密钥的结果以 `MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A...` 开头 ——
-/// 这正是 RFC 6376 的 `p=` 与 mail-auth 自带测试向量的形态。
 pub fn spki_from_pkcs1(pkcs1: &[u8]) -> Vec<u8> {
     let mut bit_string = Vec::with_capacity(pkcs1.len() + 1);
-    bit_string.push(0x00); // 「未使用位数」= 0
+    bit_string.push(0x00);
     bit_string.extend_from_slice(pkcs1);
     let bit_string = der_wrap(0x03, &bit_string);
 
@@ -212,9 +147,6 @@ pub fn spki_from_pkcs1(pkcs1: &[u8]) -> Vec<u8> {
     der_wrap(0x30, &content)
 }
 
-// ───────────────────────────── PEM / zone ─────────────────────────────
-
-/// PKCS#1 私钥 PEM（每行 64 字符），与 `opendkim-genkey` 的 `.private` 同格式。
 pub fn pkcs1_pem(der: &[u8]) -> String {
     let b64 = base64_encode(der);
     let mut out = String::with_capacity(b64.len() + b64.len() / 64 + 64);
@@ -227,18 +159,8 @@ pub fn pkcs1_pem(der: &[u8]) -> String {
     out
 }
 
-/// 单个带引号字符串的字节上限（RFC 1035 的 TXT 段上限 255）。
 const TXT_CHUNK_LIMIT: usize = 255;
 
-/// 生成 zone 片段：`owner  IN  TXT  ( "chunk" "chunk" )  ; comment`。
-///
-/// **不变量**：把引号与空白全部去掉后拼接，必须逐字等于 `value`。
-/// 这是对 `network.py:115` 记录的那次公钥截断事故的回归守卫。
-///
-/// 分块只落在**字符边界**上：此前是 `debug_assert!(value.is_ascii())` +
-/// 裸 `split_at`，release 下非 ASCII 输入会在非边界处 panic。
-/// DKIM 密钥实际总是 base64（ASCII），但本函数是公开 API，必须不 panic ——
-/// 任意 UTF-8 输入现在都会被边界安全地分块，拼接往返不变量依旧逐字成立。
 pub fn zone_txt_fragment(owner: &str, value: &str, comment: &str) -> String {
     let mut chunks: Vec<&str> = Vec::new();
     let mut rest = value;
@@ -271,16 +193,10 @@ pub fn zone_txt_fragment(owner: &str, value: &str, comment: &str) -> String {
     out
 }
 
-/// 由 SPKI base64 组装 `v=DKIM1; h=sha256; k=rsa; p=<base64>`。
-///
-/// 标签顺序与 `opendkim-genkey` 一致（`v` → `h` → `k` → `p`）。
 pub fn dkim_txt_value(public_key_spki_b64: &str) -> String {
     format!("v=DKIM1; h=sha256; k=rsa; p={public_key_spki_b64}")
 }
 
-// ───────────────────────────── 生成 ─────────────────────────────
-
-/// 原生生成一套 DKIM 密钥材料（不落盘）。`bits` 生产固定 [`DKIM_KEY_BITS`]。
 pub fn generate_key_material(
     domain: &str,
     selector: &str,
@@ -306,15 +222,6 @@ pub fn generate_key_material(
     })
 }
 
-// ───────────────────────────── 权限加固 ─────────────────────────────
-
-/// 把私钥加固为 `0640 root:opendkim`（`core.py:725`）。
-///
-/// 开发机上没有 `opendkim` 组时**降级但响亮**：每次失败都经 `warn()` 上报，
-/// 而不是静默吞掉 —— 基线注释点明，正是因为静默，才出现过
-/// 「密钥以 0600 opendkim:opendkim 躺着没人发现」的情况。
-///
-/// 本函数**不返回错误**：与基线一致，权限加固失败不阻断密钥轮换。
 pub fn apply_key_permissions(path: &Path) {
     #[cfg(unix)]
     {
@@ -333,7 +240,7 @@ pub fn apply_key_permissions(path: &Path) {
                     );
                 }
             }
-            // 组不存在（开发机/容器）—— 与 chown 失败同样响亮。
+
             None => warn(&format!(
                 "chown {} to root:{}",
                 path.display(),
@@ -347,7 +254,6 @@ pub fn apply_key_permissions(path: &Path) {
     }
 }
 
-/// 读取私钥 PEM 并解出 PKCS#1 DER（签名用）。
 pub fn load_private_key_der(path: &Path) -> AuthResult<Vec<u8>> {
     let pem = fs::read(path).map_err(|error| AuthError::io(path, error))?;
     let der = PrivatePkcs1KeyDer::from_pem_slice(&pem)
@@ -355,32 +261,6 @@ pub fn load_private_key_der(path: &Path) -> AuthResult<Vec<u8>> {
     Ok(der.secret_pkcs1_der().to_vec())
 }
 
-// ───────────────────────────── dkim.rotate ─────────────────────────────
-
-/// `dkim.rotate`：生成并落盘一套 `<selector>.private` / `<selector>.txt`。
-///
-/// ## 为什么不能「先写私钥、再写 .txt」
-///
-/// 原实现是两次独立的原子写，中间没有任何事务：
-///
-/// * 第二步失败（ENOSPC / EACCES / 进程死亡）⇒ 磁盘上是**新私钥 + 旧 `.txt`**。
-///   出站签名器立刻用新私钥签名，而 DNS 上仍是旧公钥 ⇒ **所有外发邮件的 DKIM
-///   验签失败**，且旧私钥已经被毁掉、没有回滚点；
-/// * 没有跨进程锁 ⇒ 两个并发的 `dkim.rotate` 各自生成一套密钥交错写，最后写赢；
-///   先返回的调用里那个 `public_key_spki_b64` 可能与磁盘私钥根本不是一对，
-///   运维照着它发布 DNS 记录 ⇒ 同上静默失败。
-///
-/// 现在的顺序（全部在 [`mailstack_core::atomic::locked_with`] 的跨进程锁内）：
-///
-/// 1. 快照旧 pair（回滚点）；
-/// 2. 生成新密钥，在**同文件系统的 0700 staging 目录**里写好两份文件；
-/// 3. 把 staging 私钥读回并解析（写坏了就不发布）；
-/// 4. 先 `rename` `.txt`、再 `rename` `.private`，最后 fsync 目录；
-/// 5. 任何一步失败 ⇒ 用快照恢复 `.txt`；旧私钥**从未被触碰**，仍然可用。
-///
-/// 为什么 `.txt` 在前：崩溃窗口里「旧私钥 + 新 `.txt`」比「新私钥 + 旧 `.txt`」
-/// 安全 —— 前者签名仍与**已经发布**的 DNS 一致（运维还没看到新 `.txt`），后者
-/// 会让外发签名立刻全量失效（正是要修的缺陷）。
 pub fn rotate(paths: &Paths, domain: &str, selector: Option<&str>) -> AuthResult<DkimRotation> {
     let domain = validate_domain(domain)?;
     let selector = validate_selector(selector)?;
@@ -391,14 +271,11 @@ pub fn rotate(paths: &Paths, domain: &str, selector: Option<&str>) -> AuthResult
     let private_path = private_key_path(paths, &domain, &selector);
     let txt_path = txt_record_path(paths, &domain, &selector);
 
-    // 锁的 sidecar 是 `<selector>.private.lock`，与 `atomic_as` 的
-    // `.<name>.lock` 不同名 —— 持锁期间再调 atomic 不会自死锁（INV-31）。
     mailstack_core::atomic::locked_with(&private_path, || {
         rotate_locked(&dir, &domain, &selector, &private_path, &txt_path)
     })
 }
 
-/// [`rotate`] 的临界区（调用方必须已持有 `private_path` 的跨进程锁）。
 fn rotate_locked(
     dir: &Path,
     domain: &str,
@@ -406,7 +283,6 @@ fn rotate_locked(
     private_path: &Path,
     txt_path: &Path,
 ) -> AuthResult<DkimRotation> {
-    // 回滚点：两部文件当前的样子（不存在也记录成「不存在」）。
     let old_txt = mailstack_core::atomic::file_snapshot(txt_path)?;
 
     let material = generate_key_material(domain, selector, DKIM_KEY_BITS)?;
@@ -415,21 +291,18 @@ fn rotate_locked(
     let staged_private = staging.path().join("dkim.private");
     let staged_txt = staging.path().join("dkim.txt");
 
-    // 先在 staging 里把两份文件都写好（0600 私钥 / 0644 记录）。
     mailstack_core::atomic::atomic_as(
         &staged_private,
         material.private_key_pem.as_bytes(),
         0o600,
         None,
     )?;
-    // 自检：把**已经落盘的**私钥读回来解析。生成器/写入任何一环出错都在这里
-    // 暴露，而不是等出站签名器在下一封邮件上才发现。
+
     load_private_key_der(&staged_private)?;
-    // 加固（0600 → 0640 + root:opendkim）在 staging 里完成，发布即最终形态。
+
     apply_key_permissions(&staged_private);
     mailstack_core::atomic::atomic_as(&staged_txt, material.txt_record.as_bytes(), 0o644, None)?;
 
-    // ── 发布（先 .txt 后 .private）─────────────────────────────────────
     let rollback_txt = || -> String {
         match mailstack_core::atomic::file_restore(txt_path, &old_txt, None) {
             Ok(()) => "已回滚 .txt".to_string(),
@@ -438,14 +311,11 @@ fn rotate_locked(
     };
 
     if let Err(error) = fs::rename(&staged_txt, txt_path) {
-        // .txt 没发布成功：私钥还没动，直接报错即可。
         return Err(AuthError::Signing(format!(
             "DKIM 轮换失败：无法发布 DNS 记录（{error}）；私钥未改动"
         )));
     }
 
-    // 测试注入点：模拟「.txt 已发布、私钥 rename 之前失败」（ENOSPC / 进程被杀）。
-    // 只影响当前线程，避免并行用例互相干扰。
     #[cfg(test)]
     let injected_failure = FAIL_BEFORE_PRIVATE_RENAME.with(|flag| flag.replace(false));
     #[cfg(not(test))]
@@ -465,7 +335,6 @@ fn rotate_locked(
         )));
     }
 
-    // rename 只保证「本次挂起内可见」，fsync 目录才把这次替换固化。
     fsync_dir(dir);
 
     Ok(DkimRotation {
@@ -477,17 +346,12 @@ fn rotate_locked(
     })
 }
 
-// 测试注入：在当前线程的下一次轮换里，让「发布私钥」这一步失败。
 #[cfg(test)]
 thread_local! {
     static FAIL_BEFORE_PRIVATE_RENAME: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
-/// 同文件系统的 staging 目录：0700 创建，析构即清理。
-///
-/// 用的不是 `std::env::temp_dir()`：`rename` 必须与目标同文件系统才是原子的，
-/// 而 `/tmp` 经常是另一个挂载点（tmpfs）。
 struct RotationStaging {
     path: PathBuf,
 }
@@ -497,7 +361,6 @@ impl RotationStaging {
         let path = parent.join(format!(".rotate-{}", unique_tag()));
         #[cfg(unix)]
         {
-            // `DirBuilder::mode` 让 create(2) 那一刻就是 0700（umask 只会更严）。
             use std::os::unix::fs::DirBuilderExt;
             fs::DirBuilder::new()
                 .mode(0o700)
@@ -522,7 +385,6 @@ impl Drop for RotationStaging {
     }
 }
 
-/// 进程内唯一的临时名标签：`<pid>.<序号>.<纳秒>`（与 `atomic.rs` 同一模式）。
 fn unique_tag() -> String {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -533,7 +395,6 @@ fn unique_tag() -> String {
     format!("{}.{}.{}", std::process::id(), seq, nanos)
 }
 
-/// fsync 目录（`rename` 的掉电持久化保证）；失败只 warn。
 fn fsync_dir(dir: &Path) {
     match fs::File::open(dir) {
         Ok(handle) => {
@@ -556,7 +417,6 @@ mod tests {
         (dir, paths)
     }
 
-    /// 2048 位生成较慢，多个断言共用一套材料。
     fn shared_material() -> &'static DkimKeyMaterial {
         static MATERIAL: OnceLock<DkimKeyMaterial> = OnceLock::new();
         MATERIAL.get_or_init(|| {
@@ -591,7 +451,6 @@ mod tests {
 
     #[test]
     fn public_key_is_spki_not_pkcs1() {
-        // 这条是「本地绿、生产静默失败」的守门测试（见 §5.2.1）。
         let material = shared_material();
         assert!(
             material
@@ -600,7 +459,7 @@ mod tests {
             "p= 必须是 SPKI（RFC 6376 生态约定），实际前缀：{}",
             &material.public_key_spki_b64[..24.min(material.public_key_spki_b64.len())]
         );
-        // 反向确认：它不是 mail-auth 直接给的那个 PKCS#1 形态。
+
         assert!(
             !material.public_key_spki_b64.starts_with("MIIBCgKCAQEA"),
             "不得把 PKCS#1 直接当作 p= 发布"
@@ -609,7 +468,6 @@ mod tests {
 
     #[test]
     fn spki_wrapping_is_exactly_the_pkcs1_plus_a_fixed_header() {
-        // 2048 位：SPKI = 24 字节固定头 + PKCS#1 DER（270 字节）。
         let pair = DkimKeyPair::generate_rsa(DKIM_KEY_BITS).expect("生成密钥");
         let pkcs1 = pair.public_key();
         let spki = spki_from_pkcs1(pkcs1);
@@ -619,21 +477,19 @@ mod tests {
             "2048 位 SPKI 只应比 PKCS#1 多 24 字节固定头"
         );
         assert_eq!(&spki[24..], pkcs1, "SPKI 尾部必须逐字是 PKCS#1");
-        // 偏移 4 = 外层 SEQUENCE 头（`30 82 01 22`）；再往后才是 AlgorithmIdentifier。
+
         assert_eq!(
             &spki[4..19],
             &RSA_ALGORITHM_IDENTIFIER[..],
             "AlgorithmIdentifier 必须是 rsaEncryption"
         );
         assert_eq!(&spki[..4], &[0x30, 0x82, 0x01, 0x22], "外层长度必须自洽");
-        // BIT STRING 头 + 「未使用位数 = 0」
+
         assert_eq!(&spki[19..24], &[0x03, 0x82, 0x01, 0x0f, 0x00]);
     }
 
     #[test]
     fn zone_fragment_round_trips_after_stripping_quotes_and_whitespace() {
-        // 回归守卫：network.py:115 记录过一次真实事故 ——
-        // 多行带引号的公钥被天真正则截断，DKIM 记录因此失效。
         let value = dkim_txt_value(&shared_material().public_key_spki_b64);
         let fragment = zone_txt_fragment("mailstack._domainkey", &value, "----- c");
         let flattened: String = fragment
@@ -655,7 +511,6 @@ mod tests {
         let value = "A".repeat(600);
         let fragment = zone_txt_fragment("x._domainkey", &value, "c");
         for line in fragment.lines() {
-            // 只量引号之间的内容：第一行前面还有 owner/类/类型。
             let quoted: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
             for payload in quoted {
                 assert!(
@@ -695,8 +550,6 @@ mod tests {
 
     #[test]
     fn domain_total_length_is_capped_at_253_before_path_use() {
-        // DOMAIN_RE 只限单段长度：4 个 63 字符标签 + `.com` = 259 字符能穿过正则，
-        // 却会变成密钥目录路径的一段（<etc>/opendkim/keys/<domain>/）。入口必须拒。
         let a63 = "a".repeat(63);
         let too_long = format!("{a63}.{a63}.{a63}.{a63}.com");
         assert_eq!(too_long.len(), 259);
@@ -709,7 +562,6 @@ mod tests {
             "invalid domain format"
         );
 
-        // 恰好 253 的合法域名放行（63+63+63+61 四段加三个点）。
         let at_limit = format!("{a63}.{a63}.{a63}.{}", "a".repeat(61));
         assert_eq!(at_limit.len(), 253);
         assert_eq!(validate_domain(&at_limit).unwrap(), at_limit);
@@ -748,7 +600,6 @@ mod tests {
             "返回的 record 必须与 .txt 内容一致"
         );
 
-        // 私钥能被自己读回并解出 DER —— 说明写出的 PEM 是可用的。
         let der = load_private_key_der(&private).expect("读回私钥");
         assert!(!der.is_empty(), "解出的 DER 不得为空");
     }
@@ -765,9 +616,6 @@ mod tests {
         assert_eq!(mode, DKIM_KEY_MODE, "加固后应为 0640（实际 {mode:o}）");
     }
 
-    // ───────────────── 轮换的成对原子性 / 并发（R1-002）─────────────────
-
-    /// 从 `.txt` 的 zone 片段里取出 `p=` 的 base64（去引号去空白后按 `p=` 切）。
     fn spki_from_zone_record(record: &str) -> String {
         let flattened: String = record
             .chars()
@@ -782,10 +630,6 @@ mod tests {
             .collect()
     }
 
-    /// 用磁盘上的私钥签一条报文，再用 `.txt` 里 `p=` 的公钥验签。
-    ///
-    /// 这就是「私钥与已发布公钥是一对」的**可执行判据**；返回结论而不是直接断言，
-    /// 便于并发用例把失败信息与当时的 record 一起打出来。
     fn private_key_matches_record(private: &Path, record: &str) -> Result<(), String> {
         let der = load_private_key_der(private).map_err(|e| e.to_string())?;
         let message = b"From: alice@example.com\r\nSubject: pair check\r\n\r\nbody\r\n";
@@ -824,15 +668,10 @@ mod tests {
         }
     }
 
-    /// **R1-002 的失败注入反例**：`.txt` 已发布、私钥 rename 之前失败时，
-    /// 旧私钥必须**原样可用**，`.txt` 必须回滚成旧记录。
-    ///
-    /// 旧实现里两次写之间没有事务：第二步失败会留下「新私钥 + 旧 .txt」，
-    /// 出站签名立刻全量失效，而旧私钥已经没了。
     #[test]
     fn a_failed_rotation_keeps_the_old_private_key_and_the_old_record() {
         let (_dir, paths) = fixture();
-        // 第一次轮换成功 —— 这对就是「旧 pair」。
+
         let first = rotate(&paths, "example.com", None).expect("首次轮换");
         let private = private_key_path(&paths, "example.com", DEFAULT_DKIM_SELECTOR);
         let txt = txt_record_path(&paths, "example.com", DEFAULT_DKIM_SELECTOR);
@@ -841,7 +680,6 @@ mod tests {
         assert_eq!(old_record, first.record);
         private_key_matches_record(&private, &old_record).expect("旧 pair 必须自洽");
 
-        // 注入失败：.txt rename 成功之后、.private rename 之前。
         FAIL_BEFORE_PRIVATE_RENAME.with(|flag| flag.set(true));
         let error = rotate(&paths, "example.com", None).expect_err("注入点必须让轮换失败");
         assert!(
@@ -859,10 +697,9 @@ mod tests {
             old_record,
             ".txt 必须回滚成旧记录，否则运维会发布一把没有私钥的公钥"
         );
-        // 出站签名仍然可用：旧私钥 + 旧 .txt 是一对。
+
         private_key_matches_record(&private, &old_record).expect("失败后旧 pair 必须仍可用");
 
-        // staging 目录必须被清理（半成品不得留在盘上）。
         let leftovers: Vec<String> = fs::read_dir(dkim_key_dir(&paths, "example.com"))
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -872,12 +709,10 @@ mod tests {
         assert!(leftovers.is_empty(), "不得残留 staging 目录: {leftovers:?}");
     }
 
-    /// **R1-002 的并发反例**：多个线程同时轮换，最终磁盘上必须是一对**自洽**的
-    /// 私钥/公钥；调用返回的 record 也必须是某一次真正落盘的那份。
     #[test]
     fn concurrent_rotations_serialise_into_a_consistent_key_pair() {
         let (_dir, paths) = fixture();
-        // 先有一对旧密钥，让并发轮换是在「覆盖」而不是「首次创建」上竞争。
+
         rotate(&paths, "example.com", None).expect("首次轮换");
 
         let mut handles = Vec::new();
@@ -899,7 +734,7 @@ mod tests {
             rotations.iter().any(|rotation| rotation.record == on_disk),
             "磁盘上的记录必须来自某一次真实轮换（说明有人拿到了与磁盘不符的 record）"
         );
-        // 关键断言：磁盘上的私钥与磁盘上的公钥必须是一对。交错写会在这里失败。
+
         private_key_matches_record(&private, &on_disk)
             .unwrap_or_else(|error| panic!("并发轮换产生了不一致的 key pair：{error}"));
     }

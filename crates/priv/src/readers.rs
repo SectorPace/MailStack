@@ -1,17 +1,3 @@
-//! 只读聚合面（规格书 §5.4.1 的 RO 动作：`snapshot` / `logs.list` /
-//! `metrics.realtime` / `certs.list` / `network.check_port` / `system.doctor`）。
-//!
-//! ## 三条共同纪律
-//!
-//! 1. **只读、可重放、无副作用**：这些动作可以在任何时刻被任意次数调用，
-//!    因此它们绝不写任何文件（`system.doctor` 的封禁探针用的是**新建的内存表**，
-//!    不碰线上那份）。
-//! 2. **读不到的部分必须显式出现在结果里**（`unavailable`）。静默省略会把
-//!    「没数据」渲染成「没问题」，而这两者对运维的含义正好相反 —— 这正是本项目
-//!    反复出现的那类缺陷。
-//! 3. **一个子项失败不拖垮整条**：`/proc` 读不到不该让证书列表也拿不到。
-//!    每个子项各自降级，并在同一个响应里说清哪一项降级了。
-
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::IpAddr;
@@ -35,27 +21,11 @@ use mailstack_smtp::{
 use serde_json::{json, Value};
 
 use crate::acme::{Acme, AcmeProbes};
-use crate::ai::{Ai, AiEnv};
 use crate::handlers::{HandlerError, Registry};
 use crate::users::{Users, UsersEnv};
 
-/// 迁移期受管的服务单元。
-///
-/// 与 `service_ctl` 的降级链覆盖的是同一批组件：正在被替代的 Postfix / fail2ban，
-/// 以及**保留**的 Dovecot（IMAP/POP3 与 SASL 后端）。
-///
-/// 这是 `metrics.realtime` / `system.doctor` 的**活性探测**集合，刻意比
-/// [`SERVICES`] 窄：控制台列的 9 个单元里只有这三个由本项目的安装器负责，
-/// 对没装的单元反复探测只会制造噪音。
 pub const WATCHED_SERVICES: &[&str] = &["postfix", "dovecot", "fail2ban"];
 
-/// 控制台受管的服务清单：`(id, systemd 单元名)`。
-///
-/// 与基线 `core.py` 的 `SERVICES` 逐一对应 —— 控制台的「重启服务」按钮把列表里的
-/// `id` 原样回传，因此**列出什么就必须能操作什么**，两者不得分叉。
-///
-/// 迁移期这些单元与新的 `mailstackd` 并存（见 `DEPLOYMENT.md`）；待遗留单元退役时
-/// 再把 `mailstackd` 加进来。
 pub const SERVICES: &[(&str, &str)] = &[
     ("postfix", "postfix"),
     ("dovecot", "dovecot"),
@@ -68,51 +38,29 @@ pub const SERVICES: &[(&str, &str)] = &[
     ("redis", "redis-server"),
 ];
 
-/// `logs.list` 的默认行数与上限。
 pub const LOGS_DEFAULT_LINES: usize = 200;
 pub const LOGS_MAX_LINES: usize = 1000;
 
-/// `network.check_port` 只探测 25 端口族的出站可达性；端口号必须落在合法范围。
 pub const DEFAULT_PROBE_PORT: u16 = 25;
 
-/// 封禁往返探针使用的地址：TEST-NET-1（RFC 5737），**保证不可路由**，
-/// 因此即便探针真的泄漏到线上也不会指向任何真实主机。
 pub const BAN_PROBE_ADDRESS: &str = "192.0.2.1";
 
-/// `setup.identity.apply` 未显式给出 selector 时的缺省值。
-///
-/// 与基线 `network.py:135` 一致：初始化向导固定用 `mail`。注意这与
-/// `certs.py` 的 `dkim.rotate` 缺省（`mailstack`）**刻意不同** ——
-/// 改这里会让向导已经发布出去的 DNS 记录对不上。
 pub const SETUP_DEFAULT_DKIM_SELECTOR: &str = "mail";
 
-/// 中继探针（`setup.relay.test` / `setup.relay.apply` 的可注入接缝）。
-///
-/// 抽这一层是为了让「先测后写」「测试不过一行配置都不落」这些顺序断言能用
-/// 一个**可控**的成功/失败探针来验证，而不是在测试里真的去连一台 SMTP 服务器
-/// —— 那样断言会依赖外部网络，最终被人当成噪音忽略（本项目已有前车之鉴，
-/// 见 `docs/TEST_REPORT.md` §4.14）。
 pub trait RelayProbe: Send + Sync {
-    /// 分阶段测试一个中继端点（DNS → connect → TLS → auth）。
     fn test<'a>(
         &'a self,
         request: &'a RelayValidationRequest,
         private_network_enabled: bool,
     ) -> Pin<Box<dyn Future<Output = Result<RelayTestResult, RelayTestFailure>> + Send + 'a>>;
 
-    /// 本机提交端点的直投探测。
-    ///
-    /// 只证明「本地 MTA 活着」，**不证明出站 25 可用**（INV-19）—— 出站可用性由
-    /// `network.check_port` 单独判定，两者不可混淆。
     fn direct<'a>(
         &'a self,
         target: PinnedTarget,
     ) -> Pin<Box<dyn Future<Output = Result<RelayTestResult, RelayTestFailure>> + Send + 'a>>;
 }
 
-/// 生产中继探针：真实解析、IP 固定拨号、TLS 与认证。
 pub struct SystemRelayProbe {
-    /// TLS 栈构造失败时留 `None`，由调用如实报错 —— **绝不**静默退回明文连接。
     dialer: Option<PinnedDialer>,
     reason: Option<String>,
 }
@@ -191,7 +139,6 @@ impl RelayProbe for SystemRelayProbe {
     }
 }
 
-/// 未注入探针时的占位：任何调用都**如实报错**，绝不假装成功。
 struct NoRelayProbe;
 
 impl RelayProbe for NoRelayProbe {
@@ -211,15 +158,10 @@ impl RelayProbe for NoRelayProbe {
     }
 }
 
-/// 「没有可用的探针」这一类故障的**统一**错误。
-///
-/// 刻意区分「探针没接上」（配置/装配错误）与「中继不可达」（运维结论）：
-/// 前者是我们自己的问题，后者是网络/对端的问题。
 fn no_probe_error() -> SmtpError {
     SmtpError::Config("no relay probe is configured for this helper".to_string())
 }
 
-/// 把「探针本身不可用」折成一个仍带分阶段结构的失败。
 fn probe_unavailable(error: SmtpError) -> RelayTestFailure {
     RelayTestFailure {
         last_ok_stage: None,
@@ -233,10 +175,6 @@ fn probe_unavailable(error: SmtpError) -> RelayTestFailure {
     }
 }
 
-/// 解析器不可用时的占位：**每次查询都如实报错**，绝不返回空结果。
-///
-/// 返回空结果会把「解析器坏了」渲染成「DNS 记录没配」—— 后者会让运维去改一条
-/// 本来正确的记录，这是最没有价值的排查方向。
 struct UnavailableDns {
     reason: String,
 }
@@ -258,68 +196,40 @@ impl DnsQuery for UnavailableDns {
     }
 }
 
-/// 取样时钟（Unix 秒）。注入是为了让「证书还有几天到期」这类断言不随真实时间漂移。
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
-/// 只读聚合面的取样入口。
-///
-/// 生产用 [`Readers::system`]；测试注入替身运行器、假 `/proc` 与固定时钟。
 pub struct Readers {
     paths: Paths,
-    /// 服务活性探测的环境（systemd 运行目录判据等）。
+
     env: Arc<dyn ServiceEnv>,
     runner: Arc<dyn CommandRunner>,
-    /// `/proc` 根目录。
+
     proc_root: PathBuf,
     clock: Clock,
-    /// 出站探测目标。**不接受来自请求体的目标** —— 那等于把管理 API 变成一个
-    /// 任意主机的 TCP 探针（SSRF 的一半）；地址策略也只允许公网地址。
+
     probe_targets: Vec<String>,
-    /// 备份动作的运行参数（根目录 / 落地根 / 加密后端 / 家目录白名单）。
-    ///
-    /// **必须可注入**：备份恢复会往「根」里写文件，测试若用生产默认值就会去写
-    /// 真实的 `/`。这条不是便利性设计，是安全边界 —— 和 `probe_targets` 同理。
+
     backups: BackupEnv,
-    /// DNS 查询后端（`setup.dns.verify`）。
-    ///
-    /// 同样必须可注入：六条判据要能在不碰真实 DNS 的前提下逐条验证，否则断言
-    /// 会随网络抖动随机变红（`docs/TEST_REPORT.md` §4.14 的同类教训）。
+
     dns: Arc<dyn DnsQuery>,
-    /// 中继探针（`setup.relay.test` / `setup.relay.apply`）。
-    ///
-    /// 可注入的理由见 [`RelayProbe`]：让「先测后写」的顺序断言不依赖外部网络。
+
     relay: Arc<dyn RelayProbe>,
-    /// 环路自检的运行参数（家目录根 / 提交器）。
+
     mailtest: MailTestEnv,
-    /// 系统账号邮箱动作（`users.*`）。
-    ///
-    /// 与 `runner` / `clock` 共享同一份注入：用户名解析、`passwd` 调用与 epoch
-    /// bump 都要在测试里可控，不能各自去读真实的 `/etc` 或系统时间。
+
     users: Users,
-    /// 证书签发 / 续期（`certs.renew` / `setup.cert.issue`）。
-    ///
-    /// 同样共享 `runner` / `clock` / 服务探测；`acme.sh` 与 `openssl` 的存在性
-    /// 走独立的 `AcmeProbes`，测试据此替换掉真实的 `/root/.acme.sh`。
+
     acme: Acme,
-    /// AI 子系统（`ai.*`）：出站 HTTP 与 DNS 解析都经 [`AiEnv`] 注入。
-    ai: Ai,
 }
 
-/// 备份动作的运行参数。
 #[derive(Clone)]
 pub struct BackupEnv {
-    /// 归档成员名的基准，也是默认来源的根。生产是 `/`。
     pub root: PathBuf,
-    /// 恢复的落地根。生产是 `/`。
+
     pub restore_root: PathBuf,
-    /// 加密 / 解密后端。生产是 `gpg`。
+
     pub cipher: Arc<dyn mailstack_core::backup::BackupCipher>,
-    /// 允许被恢复写入家目录的账号集合（**额外**注入项）。
-    ///
-    /// 权威来源是 `managed-users.json` / `managed-mailboxes.json`：生产在
-    /// `backup.restore` 时用 [`crate::users::Users::managed_accounts`] 动态解析
-    /// （读失败上抛，不静默成空集合）。这个字段保留给测试与"额外允许某个账号"
-    /// 的场景，与动态解析结果取并集。
+
     pub home_allowlist: BTreeSet<String>,
 }
 
@@ -344,15 +254,10 @@ impl std::fmt::Debug for BackupEnv {
     }
 }
 
-/// 环路自检（`mail.test_loopback` / `setup.mail.test`）的运行参数。
 #[derive(Clone)]
 pub struct MailTestEnv {
-    /// 系统用户 Maildir 的根。生产是 `/`，于是 `~/Maildir` 就是 `/home/<user>/Maildir`。
-    ///
-    /// **必须可注入**：自检会去读文件系统里的 Maildir，测试若用生产默认值就会去扫
-    /// 真实的 `/home`。和 `BackupEnv::root` 是同一条理由。
     pub home_root: PathBuf,
-    /// 提交器。生产是向本机 `127.0.0.1:25` 的 SMTP 提交。
+
     pub submitter: Arc<dyn crate::mailtest::MailSubmitter>,
 }
 
@@ -365,7 +270,6 @@ impl Default for MailTestEnv {
     }
 }
 
-/// 未注入提交器时的占位：任何调用都**如实报错**，绝不假装邮件已发出。
 struct NoSubmitter;
 
 impl crate::mailtest::MailSubmitter for NoSubmitter {
@@ -379,10 +283,7 @@ impl crate::mailtest::MailSubmitter for NoSubmitter {
 }
 
 impl Readers {
-    /// 生产构造。
     pub fn system(paths: Paths) -> Self {
-        // 解析器构造失败不阻断整个助手启动（其余动作仍然可用），但存成
-        // 「每次查询都报错」的占位，让 `setup.dns.verify` 如实说出原因。
         let dns: Arc<dyn DnsQuery> = match HickoryDnsQuery::from_system() {
             Ok(resolver) => Arc::new(resolver),
             Err(error) => {
@@ -408,7 +309,6 @@ impl Readers {
             Arc::clone(&runner),
             Arc::clone(&clock),
         );
-        let ai = Ai::system(paths.clone());
         Self {
             paths,
             env: service_env,
@@ -422,11 +322,9 @@ impl Readers {
             mailtest: MailTestEnv::default(),
             users,
             acme,
-            ai,
         }
     }
 
-    /// 注入替身（测试用）。
     pub fn with_parts(
         paths: Paths,
         env: Arc<dyn ServiceEnv>,
@@ -435,16 +333,13 @@ impl Readers {
         clock: Clock,
         probe_targets: Vec<String>,
     ) -> Self {
-        // `users.*` 与只读面共用同一份注入运行器与时钟；用户名解析的假根由
-        // [`Readers::with_users_env`] 单独覆盖（默认仍是生产 `/etc`，测试必须显式注入）。
         let users = Users::new(
             paths.clone(),
             UsersEnv::default(),
             Arc::clone(&runner),
             Arc::clone(&clock),
         );
-        // 证书动作同样共享注入；`acme.sh` / `openssl` 探测由
-        // [`Readers::with_acme_probes`] 覆盖，默认是真实探测（测试必须显式替换）。
+
         let acme = Acme::new(
             paths.clone(),
             Arc::new(crate::acme::SystemAcmeProbes),
@@ -452,7 +347,6 @@ impl Readers {
             Arc::clone(&runner),
             Arc::clone(&clock),
         );
-        let ai = Ai::system(paths.clone());
         Self {
             paths,
             env,
@@ -461,62 +355,45 @@ impl Readers {
             clock,
             probe_targets,
             backups: BackupEnv::default(),
-            // 网络后端**刻意不默认成生产实现**：测试若忘了注入，就必须看到一个
-            // 明确的失败，而不是在 CI 里悄悄去打真实 DNS / SMTP。
+
             dns: Arc::new(UnavailableDns {
                 reason: "no DNS backend was injected for this test".to_string(),
             }),
             relay: Arc::new(NoRelayProbe),
             mailtest: MailTestEnv {
-                // 家目录根保持 `/`：自检对 Maildir 只做**只读**扫描，默认值不构成
-                // 安全边界问题（对比 `BackupEnv::root` 会往根里写）。要断言
-                // 「真的在 Maildir 里找到了」的测试必须自己注入一个临时根。
                 home_root: PathBuf::from("/"),
                 submitter: Arc::new(NoSubmitter),
             },
             users,
             acme,
-            ai,
         }
     }
 
-    /// 覆盖用户动作的运行环境（测试用；生产保持 [`UsersEnv::default`]）。
     pub fn with_users_env(mut self, env: UsersEnv) -> Self {
         self.users = self.users.with_env(env);
         self
     }
 
-    /// 覆盖 AI 子系统的出站环境（测试用；生产保持 [`AiEnv::default`]）。
-    pub fn with_ai_env(mut self, env: AiEnv) -> Self {
-        self.ai = self.ai.with_env(env);
-        self
-    }
-
-    /// 覆盖证书动作的文件/程序探测（测试用）。
     pub fn with_acme_probes(mut self, probes: Arc<dyn AcmeProbes>) -> Self {
         self.acme = self.acme.with_probes(probes);
         self
     }
 
-    /// 覆盖备份动作的运行参数（测试用；生产保持 [`BackupEnv::default`]）。
     pub fn with_backup_env(mut self, backups: BackupEnv) -> Self {
         self.backups = backups;
         self
     }
 
-    /// 覆盖 DNS 后端（测试用；生产用 [`Readers::system`] 的系统解析器）。
     pub fn with_dns(mut self, dns: Arc<dyn DnsQuery>) -> Self {
         self.dns = dns;
         self
     }
 
-    /// 覆盖中继探针（测试用；生产用 [`SystemRelayProbe`]）。
     pub fn with_relay_probe(mut self, relay: Arc<dyn RelayProbe>) -> Self {
         self.relay = relay;
         self
     }
 
-    /// 覆盖环路自检的运行参数（测试用；生产保持 [`MailTestEnv::default`]）。
     pub fn with_mailtest_env(mut self, mailtest: MailTestEnv) -> Self {
         self.mailtest = mailtest;
         self
@@ -539,15 +416,6 @@ impl Readers {
         mailstack_store::TableStore::new(self.paths.clone())
     }
 
-    /// 控制台的服务列表（基线的 `ServiceItem` 形状）。
-    ///
-    /// 字段名与形状是**冻结契约**：控制台把 `services.action` 的响应直接当成新的
-    /// 服务清单，所以这里的每一项都必须带 `id`/`status` 等界面要用的字段，
-    /// 而不是一个精简的 `{unit, active}`。
-    ///
-    /// systemd 可用时用 `systemctl show` 一次取回活性/PID/内存/启动时刻；不可用
-    /// （或命令失败）时退化为 [`is_service_active`] 的逐级探测，并把 PID/内存
-    /// 留成 0 —— 编一个假数字比留空更糟。
     fn service_items(&self) -> Vec<Value> {
         SERVICES
             .iter()
@@ -598,13 +466,11 @@ impl Readers {
             .collect()
     }
 
-    /// systemd 是否是本机的服务管理器（与 `service_ctl` 的首个判据一致）。
     fn systemd_available(&self) -> bool {
         self.env.program_available("systemctl")
             && self.env.path_exists(Path::new("/run/systemd/system"))
     }
 
-    /// 队列条目（基线的 `QueueItem` 形状）。
     fn queue_items(&self) -> Vec<Value> {
         let now = self.now();
         let mut items: Vec<Value> = self
@@ -618,10 +484,9 @@ impl Readers {
         items
     }
 
-    /// `certs.list`：`<etc>/tls/*/` 下的证书与到期天数。
     pub fn certs_list(&self, _data: &Value) -> Result<Value, HandlerError> {
         let infos = mailstack_core::certs::list_certificates(&self.paths.etc, self.now_dt());
-        // 「即将到期」单独列一遍：运维看的是这个数，而不是证书总数。
+
         let expiring: Vec<Value> = infos
             .iter()
             .filter(|c| c.expires_within(EXPIRY_WARNING_DAYS))
@@ -638,7 +503,6 @@ impl Readers {
         }))
     }
 
-    /// `metrics.realtime`：主机 + 服务 + 队列的即时读数。
     pub fn metrics_realtime(&self, _data: &Value) -> Result<Value, HandlerError> {
         let mut unavailable: Vec<&str> = Vec::new();
 
@@ -678,11 +542,6 @@ impl Readers {
         }))
     }
 
-    /// 队列的只读摘要（积压、损坏条目、出站结论）。复用持久化状态，
-    /// 因此即便 `mailstackd` 不在跑，管理台看到的也是**磁盘上的真相**。
-    ///
-    /// 状态文件读失败时 backlog/corrupt 会渲染成 0 —— 那与「队列真空」是
-    /// 两件事（INV-2），所以降级项必须显式出现在 `unavailable` 里。
     fn queue_summary(&self) -> Value {
         let store = self.queue();
         let mut unavailable: Vec<&'static str> = Vec::new();
@@ -725,21 +584,14 @@ impl Readers {
                 "lastSuccessAt": health_state.last_success_at,
                 "lastFailure": health_state.last_failure,
             },
-            // 空数组 = 全部读到。降级项（backlog / corrupt）会在这里列出来。
+
             "unavailable": unavailable,
         })
     }
 
-    /// `snapshot`：把各只读子项拼成一个响应。
-    ///
-    /// `status` 与 `snapshot` 是同一个动作（契约里两条路由都映射到 `snapshot`），
-    /// 因此这里不能有「轻量版」。**`unavailable` 是响应的一部分**：某个子项确实
-    /// 读不到时，界面必须能区分「没有数据」与「读不到数据」。用户注册表已经移植
-    /// （`users.list` 在 RO 白名单里），因此这里**不得**再谎报 `users` 不可用
-    /// （R2-007）；真正读失败的子项由各自的读取路径动态上报。
     pub fn snapshot(&self, _data: &Value) -> Result<Value, HandlerError> {
         let tables = self.tables();
-        // 5.13：读不出来就报错，不要伪装成「没有域名」。
+
         let domains = mailstack_core::atomic::try_rows(&self.paths.domains)
             .map_err(|error| {
                 HandlerError::new(format!("managed domain table is unreadable: {error}"))
@@ -778,17 +630,11 @@ impl Readers {
                 .map(certificate_to_json)
                 .collect::<Vec<_>>(),
             "services": self.service_items(),
-            // 空数组 = 全部读到。`users.*` 已实现，因此不再把 `users` 写死在这里
-            // （那会让人去查不存在的移植缺口）；真正读失败的子项在各自路径上报。
+
             "unavailable": Vec::<String>::new(),
         }))
     }
 
-    /// `logs.list`：读 systemd 日志。
-    ///
-    /// 只读、有上限、不落盘。`journalctl` 不存在或读不到时**明确回
-    /// `available: false` + 原因**，而不是回一个空数组 —— 空数组会让界面显示
-    /// 「没有日志」，而真相是「读不到日志」。
     pub fn logs_list(&self, data: &Value) -> Result<Value, HandlerError> {
         let lines = clamp_lines(data);
         let unit = data.get("unit").and_then(Value::as_str).map(str::to_string);
@@ -841,10 +687,6 @@ impl Readers {
         }
     }
 
-    /// `network.check_port`：出站 TCP 端口可达性（§5.10.2、INV-19）。
-    ///
-    /// 探测目标**只来自部署配置**（`MAILSTACK_PORT_PROBE_TARGETS`），不接受请求体
-    /// 指定的主机：否则这个只读接口就变成了一个任意主机的端口探针。
     pub async fn network_check_port(&self, data: &Value) -> Result<Value, HandlerError> {
         let port = match data.get("port") {
             None | Some(Value::Null) => DEFAULT_PROBE_PORT,
@@ -869,14 +711,9 @@ impl Readers {
         Ok(payload)
     }
 
-    /// `system.doctor`：把「现在会挡住用户的那些事」逐条查一遍。
-    ///
-    /// 每一项都是**只读**的检查；唯一的「动作」是封禁表的往返探针，它跑在一张
-    /// **新建的内存表**上，因此不改变线上状态。
     pub fn system_doctor(&self, _data: &Value) -> Result<Value, HandlerError> {
         let mut checks: Vec<Value> = Vec::new();
 
-        // 1) 身份：setup.json 存在且 mailHost 是 domain 的子域。
         let setup = mailstack_core::config::read_setup_config(&self.paths);
         checks.push(match &setup {
             Some(s) => {
@@ -899,7 +736,6 @@ impl Readers {
             None => check("identity", false, "setup.json is missing or unreadable"),
         });
 
-        // 2) 管理员凭证。
         let admin = mailstack_core::config::admin_public(&self.paths);
         checks.push(check(
             "admin_credentials",
@@ -918,10 +754,6 @@ impl Readers {
             },
         ));
 
-        // 3) 域名表：空表会让库层 fail-closed 拒收全部收件人（INV-17）。
-        //    「读不到」与「真空」必须分开说（INV-2）：把读失败渲染成
-        //    「空表：所有收件人将被拒收」会让运维去查域名配置，而真正的问题
-        //    在权限或磁盘上。
         let domains = mailstack_core::atomic::try_rows(&self.paths.domains);
         checks.push(match domains {
             Ok(rows) => {
@@ -947,16 +779,12 @@ impl Readers {
             ),
         });
 
-        // 4) 中继配置：不存在是合法的「尚未配置」，存在就必须能解析。
         checks.push(self.relay_check());
 
-        // 5) DKIM 私钥。
         checks.push(self.dkim_check(setup.as_ref()));
 
-        // 6) TLS 证书与到期。
         checks.push(self.tls_check());
 
-        // 7) 审计链。
         let verdict = mailstack_core::audit::audit_verify(&self.paths.audit_log);
         checks.push(check(
             "audit_chain",
@@ -968,7 +796,6 @@ impl Readers {
             },
         ));
 
-        // 8) 封禁表往返探针。
         checks.push(self.ban_probe());
 
         let healthy = checks.iter().all(|c| c["ok"] == json!(true));
@@ -1049,12 +876,11 @@ impl Readers {
         }
     }
 
-    /// 封禁表往返：ban → 查询命中 → unban → 查询不再命中。
     fn ban_probe(&self) -> Value {
         let Ok(ip) = BAN_PROBE_ADDRESS.parse::<IpAddr>() else {
             return check("ban_round_trip", false, "probe address is not an IP");
         };
-        // 全新实例：探针**绝不**触碰线上那份封禁表。
+
         let config = mailstack_smtpd::ban::BanConfig::default();
         let bans = mailstack_smtpd::ban::BanList::new(config);
         let now = self.now();
@@ -1078,10 +904,6 @@ impl Readers {
         )
     }
 
-    /// `security.scan`：敏感文件权限体检（只 `stat`，不改任何东西）。
-    ///
-    /// 清单里的每一项都用**写入方实际使用的权限**作为上限（见
-    /// [`mailstack_core::security`] 的说明），因此扫描器与写入方不会各说各话。
     pub fn security_scan(&self, _data: &Value) -> Result<Value, HandlerError> {
         let report = mailstack_core::security::scan(&self.security_inventory()?);
         let count = |severity| {
@@ -1095,8 +917,7 @@ impl Readers {
         Ok(json!({
             "ok": true,
             "scannedAt": mailstack_core::time_fmt::format_iso8601(self.now_dt()),
-            // 查过多少项、哪些项在这台机器上根本不存在 —— 两者都要说清楚，
-            // 否则「查了 3 项」与「查了 20 项都干净」看起来是一样的。
+
             "scanned": report.scanned,
             "absent": report.absent.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             "findings": report.findings.iter().map(finding_to_json).collect::<Vec<_>>(),
@@ -1106,21 +927,12 @@ impl Readers {
                 "info": count(mailstack_core::security::Severity::Info),
             },
             "highestSeverity": report.highest_severity().map(|s| s.as_str()),
-            // 封禁清单。控制台的安全页要用它渲染「解封」按钮，因此必须给出条目本身，
-            // 而不是只给一个数量。
-            //
-            // **只列手工封禁**，并用 `bannedIpScope` 明说这一点：由失败计数触发的
-            // 自动封禁活在 `mailstackd` 的内存里，这个只读动作看不到它们。只报手工
-            // 封禁而不加标注，会让运维以为「一共就封了这几条」—— 那比不报还糟。
+
             "bannedIps": self.manual_bans_json(),
             "bannedIpScope": "manual",
         }))
     }
 
-    /// 手工封禁清单（基线的条目形状：`{ip, jail, time, reason}`）。
-    ///
-    /// 读取失败时返回 `null` 而不是空数组：空数组的含义是「没有任何手工封禁」，
-    /// 与「读不到封禁文件」完全不是一回事（见 `mailstack_core::bans`）。
     fn manual_bans_json(&self) -> Value {
         let store = mailstack_core::bans::ManualBanStore::from_paths(&self.paths);
         match store.load() {
@@ -1130,7 +942,7 @@ impl Readers {
                     .map(|ban| {
                         json!({
                             "ip": ban.ip.to_string(),
-                            // 没有 jail 概念；基线的字段位保留成 "manual"，让前端无需分支。
+
                             "jail": "manual",
                             "time": ban.banned_at,
                             "reason": ban.note.unwrap_or_default(),
@@ -1145,11 +957,6 @@ impl Readers {
         }
     }
 
-    /// 需要体检的敏感路径清单。
-    ///
-    /// DKIM 私钥按**纳管域**枚举，因此域名表读失败必须上抛（与
-    /// [`Self::managed_domains`] 的口径一致）：静默成空集合会让扫描器
-    /// 「恰好扫不到任何 DKIM 私钥」，把一次读故障伪装成一次干净的体检。
     fn security_inventory(
         &self,
     ) -> Result<Vec<mailstack_core::security::SensitivePath>, HandlerError> {
@@ -1160,8 +967,6 @@ impl Readers {
             SensitivePath::new(
                 p.etc.clone(),
                 0o750,
-                // 目录本身不含机密：里面的文件各自是 0600/0640。目录放宽只会泄露
-                // 「有哪几个文件」这一层信息，所以按 medium 而不是 high 处理。
                 false,
                 "配置目录：放宽它会让外人看到有哪几个文件，但读不到内容",
             ),
@@ -1184,12 +989,6 @@ impl Readers {
                 true,
                 "TOTP 主密钥：只有特权进程该读到它",
             ),
-            SensitivePath::new(
-                p.ai_config.clone(),
-                0o600,
-                true,
-                "AI 供应商配置（含 apiKey）",
-            ),
             SensitivePath::new(p.relay_config.clone(), 0o600, true, "中继凭证"),
             SensitivePath::new(p.audit_log.clone(), 0o600, true, "审计日志"),
             SensitivePath::new(
@@ -1199,7 +998,6 @@ impl Readers {
                 "虚拟域名表（Postfix 要读）",
             ),
             SensitivePath::new(p.aliases.clone(), 0o644, false, "别名表（Postfix 要读）"),
-            // 谁能写它就等于谁能决定「哪个地址不许连 SMTP」——与口令同级的安全面配置。
             SensitivePath::new(
                 p.manual_bans.clone(),
                 0o600,
@@ -1208,8 +1006,6 @@ impl Readers {
             ),
         ];
 
-        // 迁移期的明文中继口令。路径取自 smtp 的载体定义（构造本身无副作用），
-        // 不在这里另写一份字符串。
         let sasl = mailstack_smtp::relay_store::PostfixRelayStore::production().sasl_passwd;
         list.push(SensitivePath::new(
             sasl,
@@ -1218,7 +1014,6 @@ impl Readers {
             "Postfix sasl_passwd：明文口令",
         ));
 
-        // DKIM 私钥：每个纳管域一把。域名表读失败上抛，不静默成「没有域」。
         for domain in self.managed_domains()? {
             let dir = mailstack_auth::keys::dkim_key_dir(&self.paths, &domain);
             let Ok(read) = std::fs::read_dir(&dir) else {
@@ -1238,7 +1033,6 @@ impl Readers {
             }
         }
 
-        // TLS 私钥：每个已签发域一把。域名清单复用证书读取，不另写一遍目录遍历。
         for info in mailstack_core::certs::list_certificates(&self.paths.etc, self.now_dt()) {
             if info.key_present {
                 list.push(SensitivePath::new(info.key_path, 0o600, true, "TLS 私钥"));
@@ -1248,12 +1042,6 @@ impl Readers {
         Ok(list)
     }
 
-    /// `backup.list`：列出备份归档。
-    ///
-    /// 返回的是**元数据数组本身**（与基线一致，控制台直接把它当成备份清单）。
-    /// 每条带 `filename` / `size` / `createdAt` / `sha256` / `encrypted` ——
-    /// 恢复页要靠 `encrypted` 决定要不要口令框，靠 `sha256` 才有完整性可言。
-    /// 读不到元数据的归档会被标 `metadataMissing` 而不是从列表里消失。
     pub fn backup_list(&self, _data: &Value) -> Result<Value, HandlerError> {
         let store = mailstack_core::backup::BackupStore::from_paths(&self.paths);
         let items = store
@@ -1262,8 +1050,6 @@ impl Readers {
             .map(|metadata| {
                 let mut value = serde_json::to_value(&metadata)?;
                 if let Value::Object(map) = &mut value {
-                    // 0 字节的归档要么没写完、要么写失败被静默留下了 —— 它必须
-                    // 在界面上看得见，否则运维会把一次失败的备份当成一份可用的备份。
                     map.insert("empty".to_string(), Value::Bool(metadata.size == 0));
                 }
                 Ok(value)
@@ -1272,16 +1058,6 @@ impl Readers {
         Ok(Value::Array(items))
     }
 
-    /// `backup.create`：把配置（可选邮件）打成一个归档。
-    ///
-    /// 三条 fail-closed：
-    /// * **公网模式下没有口令就拒绝**。明文归档在公网部署里是医生检查的 FAIL 项，
-    ///   「这次先明文」正是要避免的事。local 模式允许明文（历史行为）。
-    /// * **加密失败时连明文一起删**（在 `encrypt_in_place` 里）：运维要求了加密，
-    ///   留下明文就是静默降级。
-    /// * 打包失败时**删掉半成品**，不给运维留一个「看起来有备份」的残档。
-    /// * **请求了邮件却没有一个邮件来源就失败**（R2-013）：`includeMails: true`
-    ///   而归档里一封邮件都没有，比直接失败更危险 —— 运维会按这份响应去做灾难恢复。
     pub fn backup_create(&self, data: &Value) -> Result<Value, HandlerError> {
         let include_mails = flag(data, "includeMails");
         let include_secrets = flag(data, "includeSecrets");
@@ -1296,9 +1072,6 @@ impl Readers {
             ));
         }
 
-        // 邮件来源按**权威布局**枚举：受管账号的 `~/Maildir`（家目录经 passwd 解析，
-        // 与 `crates/imapd/src/resolver.rs` 同一口径）。注册表读失败上抛 —— 读不出来
-        // 就无从证明「没有邮件」，静默成空列表正是 R2-013 的成因。
         let (mail_dirs, mail_warnings) = if include_mails {
             self.users.managed_maildirs()?
         } else {
@@ -1329,7 +1102,6 @@ impl Readers {
             backup_timestamp(self.now_dt())
         );
         if store.dir().join(&name).exists() {
-            // 同一秒内两次创建会撞名；撞了就加一个后缀（文件名正则接受它）。
             name = format!(
                 "mailstack-backup-{}-{}.tar.gz",
                 backup_timestamp(self.now_dt()),
@@ -1351,13 +1123,11 @@ impl Readers {
         ) {
             Ok(partial) => partial,
             Err(error) => {
-                // 不留半成品：一个读得到但打不开的 `.tar.gz` 比没有备份更危险。
                 let _ = std::fs::remove_file(&target);
                 return Err(HandlerError::new(error.to_string()));
             }
         };
-        // 有受管邮箱解析不到 Maildir 时，这次归档**确实**不完整 —— 必须标出来
-        // （`partial` 会让 restore 要求 `allowPartialRestore=true`，这是有意的摩擦）。
+
         let partial = partial || !mail_warnings.is_empty();
 
         let encrypted = if passphrase.is_empty() {
@@ -1389,22 +1159,11 @@ impl Readers {
         Ok(json!({
             "created": true,
             "backup": metadata,
-            // 邮件来源不完整时把具体账号说出来，而不是只给一个 partial 布尔值。
+
             "warnings": mail_warnings,
         }))
     }
 
-    /// `backup.restore`：校验并恢复一份归档。
-    ///
-    /// 顺序与判据都在 [`mailstack_core::backup::restore_archive`] 里；这里负责
-    /// 三件属于「部署」的事：
-    ///
-    /// 1. **先做 `dryRun` 与显式确认**：恢复会覆盖 `/etc` 与 `/var/lib`，
-    ///    没有确认就不该动。
-    /// 2. **先打一个预恢复快照**（回滚点）。快照失败**不中断**恢复 —— 但那意味着
-    ///    这次恢复没有回头路，必须让调用方看见（`preRestoreSnapshotWarning`）。
-    /// 3. **恢复后重载受管服务**：配置已经换过一轮，不重载等于新配置没生效。
-    ///    `mailstackd` 自己则需要重启（它在启动期装配配置，没有热重载）。
     pub fn backup_restore(&self, data: &Value) -> Result<Value, HandlerError> {
         let name = crate::handlers::first_str(data, &["filename", "name"])?;
         let store = mailstack_core::backup::BackupStore::from_paths(&self.paths);
@@ -1428,10 +1187,7 @@ impl Readers {
             allow_partial_restore: flag(data, "allowPartialRestore"),
             dry_run,
         };
-        // 恢复允许写入的家目录账号：注册表是权威来源（R2-013）。读失败上抛 ——
-        // 退化成空集合会让整份归档因为 `home/*` 成员被拒，而错误会指向归档而不是
-        // 真正坏掉的注册表；更糟的是若哪个调用方把它放宽成「空集合 = 全放行」，
-        // 那就是一次往任意家目录写文件。
+
         let home_allowlist = self.home_allowlist()?;
         let outcome = mailstack_core::backup::restore_archive(
             &store,
@@ -1469,14 +1225,11 @@ impl Readers {
             "preRestoreSnapshot": snapshot.0,
             "preRestoreSnapshotWarning": snapshot.1,
             "sha256": outcome.sha256,
-            // 受管服务的配置已经 reload，但 `mailstackd` 在启动期装配配置、
-            // 没有热重载 —— 不重启它就仍在按旧配置跑。这一事实必须出现在
-            // 响应里，而不是只写在代码注释里。
+
             "restartRequired": true,
         }))
     }
 
-    /// `backup.delete`：删除一份归档及其元数据。
     pub fn backup_delete(&self, data: &Value) -> Result<Value, HandlerError> {
         if data.get("confirm").and_then(Value::as_bool) != Some(true) {
             return Err(HandlerError::new("Explicit confirmation is required"));
@@ -1487,17 +1240,12 @@ impl Readers {
         Ok(json!({ "deleted": true, "filename": name }))
     }
 
-    /// 恢复允许写入的家目录账号：注入项 ∪ 当前受管账号。
     fn home_allowlist(&self) -> Result<BTreeSet<String>, HandlerError> {
         let mut allow = self.backups.home_allowlist.clone();
         allow.extend(self.users.managed_accounts()?);
         Ok(allow)
     }
 
-    /// 恢复前打一个回滚点。
-    ///
-    /// 返回 `(快照路径, 告警)`。快照本身**必须可读**才登记：一个截断的快照当成
-    /// 回滚点，等于给了运维一条走不通的退路。
     fn pre_restore_snapshot(
         &self,
         store: &mailstack_core::backup::BackupStore,
@@ -1516,7 +1264,7 @@ impl Readers {
             backup_timestamp(self.now_dt())
         );
         let snapshot = store.dir().join(&name);
-        // 快照允许部分成功：宁可回滚点少几个文件，也好过没有回滚点。
+
         let created = mailstack_core::backup::create_archive(
             &self.backups.root,
             &sources,
@@ -1549,8 +1297,6 @@ impl Readers {
             passphrase,
             self.backups.cipher.as_ref(),
         ) {
-            // 公网模式下明文快照留在磁盘上正是医生检查的 FAIL 项；
-            // 加密失败就把快照删掉，降级成「没有回滚点」并如实说出去。
             let _ = std::fs::remove_file(&snapshot);
             return (
                 None,
@@ -1575,8 +1321,6 @@ impl Readers {
             metadata_missing: false,
         };
         if let Err(error) = store.write_metadata(&metadata) {
-            // 归档在、元数据不在 —— 它仍然可恢复（靠 `describe` 的兜底），
-            // 但要如实说明这次降级。
             mailstack_core::warn::warn_with_detail(
                 "pre-restore snapshot metadata",
                 &error.to_string(),
@@ -1585,10 +1329,6 @@ impl Readers {
         (Some(snapshot.display().to_string()), None)
     }
 
-    /// 恢复之后让受管服务重新读取配置。
-    ///
-    /// 失败只告警：文件已经换好了，一次 `reload` 失败不该让整个恢复动作报错
-    /// （那会让运维以为恢复没成功而重做一遍）。
     fn reload_after_restore(&self) {
         for (unit, verb) in [
             ("postfix", ServiceVerb::Reload),
@@ -1610,24 +1350,9 @@ impl Readers {
         }
     }
 
-    /// `services.action`：启停 / 重启 / 重载受管服务单元。
-    ///
-    /// 返回**服务列表本身**（与基线一致）：控制台把响应直接当成新的服务清单
-    /// （`setServices(data)`），回一个 `{ok:true}` 会让界面在按下按钮后变成空白。
-    ///
-    /// 两处刻意的判定：
-    /// * **动词必须是已知的**：`ServiceVerb::parse` 对未知动词返回 `None`，这里据此报错。
-    ///   基线的 `service_ctl` 收到未知动词会一路落到最后的 `true`（成功但什么都没做），
-    ///   那正是「点了重启，其实没重启」的来源。
-    /// * **不许停掉控制台自己**：请求正是经 `mailstack-web` 的 sudo 包装器下发的，
-    ///   停掉它之后没有任何途径再把它拉起来，只能上控制台。重启是允许的
-    ///   （systemd 会拉回，不构成自锁）。
     pub fn services_action(&self, data: &Value) -> Result<Value, HandlerError> {
-        // `key` / `op` 是管理前端的字段名（它按 `{key, op}` 提交）；
-        // 下面的 `id`/`name`/`service` 与 `verb`/`action` 是基线与控制台的字段名。
         let ident = crate::handlers::first_str(data, &["id", "name", "service", "key"])?;
-        // 与 queue.action 同一纪律：缺字段显式报错，不猜默认动词 ——
-        // 「漏传参数」被悄悄当成 restart 是在替调用方做变更决定。
+
         let verb = ["verb", "action", "op"]
             .iter()
             .find_map(|key| crate::handlers::optional_str(data, key))
@@ -1639,8 +1364,6 @@ impl Readers {
         let unit = resolve_service_unit(ident)
             .ok_or_else(|| HandlerError::new(format!("invalid service: {ident}")))?;
 
-        // `status` 是只读动词，没有任何副作用：它的产物就是下面要返回的列表本身
-        // （活性取自 `systemctl show`），所以不必再 spawn 一次 `systemctl status`。
         if verb == "status" {
             return Ok(Value::Array(self.service_items()));
         }
@@ -1661,7 +1384,6 @@ impl Readers {
             parsed,
         );
         if !outcome.success() {
-            // 命令跑了但返回非零，或 runner 不支持超时/进程未能启动：如实报错，而不是回一个「看起来重启成功」的列表。
             let detail = outcome
                 .output
                 .as_ref()
@@ -1679,19 +1401,6 @@ impl Readers {
         Ok(Value::Array(self.service_items()))
     }
 
-    /// `security.ban`：把地址写进**手工封禁文件**。
-    ///
-    /// 这里刻意**不**直接改内存里的封禁表：文件才是手工封禁的唯一真相源，
-    /// 守护进程按固定节奏把它对齐进内存（见 `bin/mailstackd/src/bans.rs`）。
-    /// 直接改内存会多出第二个真相源，而且重启即丢 —— 那正是「看起来还封着、
-    /// 其实已经放行」的成因。
-    ///
-    /// 因此本动作是**立即返回、稍后生效**的。响应里明确写出
-    /// `takesEffectAfterReload`，免得运维看到「封禁成功」就去质问为什么对方还能连。
-    ///
-    /// 兼容性说明：控制台会一并回传 fail2ban 时代的 `jail` 字段。Rust 这套栈没有
-    /// jail 概念（封禁作用在全局），该字段**接受但忽略**；响应用 `scope: "global"`
-    /// 如实说明作用范围。
     pub fn security_ban(&self, data: &Value) -> Result<Value, HandlerError> {
         let ip = ban_target(data)?;
         let note = crate::handlers::optional_str(data, "note")
@@ -1710,10 +1419,6 @@ impl Readers {
         }))
     }
 
-    /// `security.unban`：从手工封禁文件里移除地址。
-    ///
-    /// 只解除**手工**封禁。由失败计数触发的自动封禁不在这里 —— 它们由对端行为决定，
-    /// 到期自动消失；把它们也纳入这个入口会让「解封」变成一个能绕过自动防护的后门。
     pub fn security_unban(&self, data: &Value) -> Result<Value, HandlerError> {
         let ip = ban_target(data)?;
         let store = mailstack_core::bans::ManualBanStore::from_paths(&self.paths);
@@ -1727,25 +1432,9 @@ impl Readers {
         }))
     }
 
-    /// `queue.action`：重试 / 删除 / 冲刷队列条目。
-    ///
-    /// 返回**队列列表本身**（与基线一致：控制台直接 `setQueues(data)`）。
-    ///
-    /// 三处与基线的差异是刻意的：
-    /// * 基线把 id 直接交给 `postqueue -i` / `postsuper -d`；这里的 id 同时是文件名，
-    ///   因此必须先过 [`mailstack_queue::entry::is_safe_id`]，把路径穿越挡在拼路径之前。
-    /// * `retry` **重置重试预算**。只把 `next_attempt_unix` 提前而不清 `attempts`，
-    ///   对一条已耗尽预算的条目来说，下一次投递会立刻退信 —— 那等于「点了重试，
-    ///   邮件反而被删掉」。运维显式重试是一次人工决定，应当重新给它一轮预算。
-    /// * `flush` 只提前「尚未到期」的条目，已到期的条目不动（不做无谓写盘）。
     pub fn queue_action(&self, data: &Value) -> Result<Value, HandlerError> {
         let store = self.queue();
-        // 第三个候选 `op` 是给管理前端的：它按 `{id, op}` 提交。
-        //
-        // 这一条**不是**可有可无的兼容装饰 —— 少了它，前端点「删除」时参数会被
-        // 静默忽略、落到某个默认动词上，于是**队列里的邮件被重新投递而不是被
-        // 删除**。缺字段是调用方的错误，必须显式失败：在重试/删除/冲刷之间
-        // 猜一个默认值，等于让「漏传参数」悄悄变成另一种破坏性操作。
+
         let verb = ["verb", "action", "op"]
             .iter()
             .find_map(|key| crate::handlers::optional_str(data, key))
@@ -1754,13 +1443,10 @@ impl Readers {
             })?
             .trim()
             .to_ascii_lowercase();
-        // 前端把「立即投递」叫 `deliver`；本仓库对应的动作是「清零重试预算让它
-        // 马上再试一轮」，即 `retry`。
+
         let verb = match verb.as_str() {
             "deliver" => "retry".to_string(),
-            // `hold` 在本仓库的队列模型里**不存在**（条目只有「到期」与「未到期」
-            // 两态，没有挂起位）。这里显式报错而不是映射成最接近的动词：前端会
-            // 因此看到失败并提示，而不是以为邮件被挂起了、实际却发生了别的事。
+
             other => other.to_string(),
         };
         let now = self.now();
@@ -1776,7 +1462,6 @@ impl Readers {
                 Ok(Value::Array(self.queue_items()))
             }
             "retry" | "delete" => {
-                // 基线用 `rstrip('*!')` 容忍 postfix 在列表里附带的标记位。
                 let id = crate::handlers::first_str(data, &["id", "queueId"])?
                     .trim_end_matches(['*', '!']);
                 if !mailstack_queue::entry::is_safe_id(id) {
@@ -1801,22 +1486,6 @@ impl Readers {
         }
     }
 
-    // ───────────────────── setup（初始化向导，§5.2 的 setup 分组） ─────────────────────
-
-    /// `setup.identity.apply`：校验身份 → 生成 DKIM → 落 `setup.json`。
-    ///
-    /// ## 与基线的两处刻意偏离
-    ///
-    /// * **不碰 Postfix / OpenDKIM**。基线在这里跑 `postconf -e`、
-    ///   `opendkim-genkey`、写 `key.table` / `signing.table` / `trusted.hosts`，
-    ///   最后 reload 两个服务；本栈已按规格书 §3.3 移除它们，密钥由
-    ///   [`mailstack_auth::keys::rotate`] 原生生成，签名在出站路径里完成。
-    /// * **校验先于一切副作用**。域名 / 主机 / IP / selector 全部验完才动磁盘，
-    ///   因此被拒的请求不会留下半个密钥目录。
-    ///
-    /// `identity` 的形状就是 `setup.json` 本身（与 `snapshot` 读到的是同一份），
-    /// 另外把 `p=` 的 base64 单列为 `dkimPublicKey` —— 向导据此展示要粘贴的 DNS
-    /// 记录，不必让运维去读磁盘。
     pub fn setup_identity_apply(&self, data: &Value) -> Result<Value, HandlerError> {
         let domain = crate::handlers::first_str(data, &["domain"])?
             .trim()
@@ -1827,12 +1496,10 @@ impl Readers {
         let server_ip = setup_server_ip(data)?;
         let selector = setup_selector(data);
 
-        // 先验后动：不合法就一个字节都不写。
         mailstack_core::config::validate_setup_identity(&domain, &mail_host, &selector)?;
 
         let rotation = mailstack_auth::keys::rotate(&self.paths, &domain, Some(&selector))?;
 
-        // 重新走身份步骤意味着向导要重新收尾：wizardCompleted 随新配置归零。
         let config = mailstack_core::config::SetupConfig {
             domain,
             mail_host,
@@ -1851,11 +1518,6 @@ impl Readers {
         }))
     }
 
-    /// `setup.dns.verify`：按权威 DNS 的**实际应答**逐条判定发布情况。
-    ///
-    /// 判据与基线 `network.py:163` 一一对应。`observed` 把每条查询的结果原样摊开
-    /// —— 只回一个 `verified: false` 会让运维完全无从下手：是 A 记录没改，还是
-    /// 公钥粘贴时被截断了？
     pub async fn setup_dns_verify(&self, data: &Value) -> Result<Value, HandlerError> {
         let domain = crate::handlers::first_str(data, &["domain"])?
             .trim()
@@ -1897,17 +1559,13 @@ impl Readers {
             .collect();
 
         let mut checks = serde_json::Map::new();
-        // A：登记的 IP 必须逐字出现在 A 记录里。
+
         checks.insert("a".to_string(), json!(a.iter().any(|ip| ip == &server_ip)));
-        // MX：期望主机与某条 MX 记录的**目标主机精确相等**（去优先级前缀、
-        // 去结尾点、忽略大小写）。子串匹配会把 `evilemail.example.com`、
-        // `mail.example.com.attacker.net` 一并判成匹配，不设防。
+
         checks.insert("mx".to_string(), json!(mx_records_contain(&mx, &mail_host)));
-        // 恰好一条 SPF：两条 `v=spf1` 会让收信方按 RFC 7208 直接判 permerror。
+
         checks.insert("spfSingle".to_string(), json!(spf_records.len() == 1));
-        // 期望值缺省时不能恒报 false —— 那会把「SPF 实际正确」说成「期望校验
-        // 失败」。与 `dns.records` 同一口径：没有显式期望值时按惯例值
-        // `v=spf1 mx -all` 比较。
+
         let expected_spf = expected
             .as_deref()
             .map(str::trim)
@@ -1947,8 +1605,7 @@ impl Readers {
                     self.dns.lookup_txt(&ses_from).await?,
                 )
             };
-            // SES 的 MX 判据与上面同口径：精确匹配 SES Mail From 区的
-            // feedback-smtp 主机，不做子串匹配。
+
             let ses_mx_host = format!("feedback-smtp.{ses_region}.amazonses.com");
             let mx_ok = mx_records_contain(&ses_mx, &ses_mx_host);
             let spf_ok = {
@@ -1973,25 +1630,13 @@ impl Readers {
         }))
     }
 
-    /// `setup.relay.test`：分阶段测试中继端点（§5.9.4）。
-    ///
-    /// 两种「失败」刻意区分：
-    ///
-    /// * **请求写错了**（主机名非法、端口不在白名单、TLS 缺失、凭证只给一半）→
-    ///   返回**错误**。这是我们该指出的输入问题，不该混进「测试结果」里。
-    /// * **对端不通**（解析不了、连不上、握手失败、认证被拒）→ 返回
-    ///   `{connected: false, stage: "failed", stages: [...]}`，并**保留已完成的
-    ///   阶段**。基线在这里抛异常，界面只能看到一句「SMTP relay test failed」——
-    ///   那正好把分阶段可观测性的价值丢掉了（`docs/TEST_REPORT.md` §4.4）。
-    ///
-    /// `direct: true` 走本机提交端点探测，规则见 [`Readers::direct_delivery_probe`]。
     pub async fn setup_relay_test(&self, data: &Value) -> Result<Value, HandlerError> {
         if flag(data, "direct") {
             return self.direct_delivery_probe().await;
         }
         let request = relay_request(data)?;
         let private = self.relay_private_network_enabled();
-        // 参数校验在任何网络行为之前：不合法就没有「测试阶段」可言。
+
         mailstack_smtp::validate_relay(&request, private)?;
         match self.relay.test(&request, private).await {
             Ok(result) => Ok(result.to_json()),
@@ -1999,18 +1644,6 @@ impl Readers {
         }
     }
 
-    /// `setup.relay.apply`：**先测后写**，写入原生 `relay.json`。
-    ///
-    /// 载体差异：基线写 `postconf` 键 + `sasl_passwd`（还要 `postmap`），本栈读的是
-    /// `/etc/mailstack/relay.json`（`mailstackd` 的 `config::load_relay`），因此这里
-    /// 是「校验 → 测试 → 原子写该文件」，**没有** postconf / postmap。
-    ///
-    /// 「测试不过一行配置都不写」「写完回读校验」「失败回滚」这三条顺序由
-    /// [`mailstack_smtp::apply_relay`] 保证 —— 不在这里重写一遍，否则就有了第二个
-    /// 真相源。
-    ///
-    /// `direct: true` 是**撤销**语义：把已配置的中继清掉、回到直投。不走「测试」
-    /// —— 清除不需要连通任何远端；也不要求此前真的配置过中继（幂等）。
     pub async fn setup_relay_apply(&self, data: &Value) -> Result<Value, HandlerError> {
         if flag(data, "direct") {
             return self.clear_relay_direct();
@@ -2022,8 +1655,6 @@ impl Readers {
         let result = match self.relay.test(&request, private).await {
             Ok(result) => result,
             Err(failure) => {
-                // 测试没通过：一行配置都不写。把阶段信息一并回出去，界面能直接
-                // 显示「卡在哪一步」，而不是只给一句「应用失败」。
                 return Ok(json!({
                     "applied": false,
                     "rolledBack": false,
@@ -2039,24 +1670,10 @@ impl Readers {
         }
     }
 
-    /// `setup.relay.apply` + `direct: true`：清除中继，回到直投。
-    ///
-    /// 与 [`mailstack_smtp::apply_relay`] 走**同一个**配置载体（`NativeRelayStore`
-    /// → `relay.json`），清除用它的逆向 [`mailstack_smtp::clear_relay`]：apply 写过
-    /// 的键（relayhost、SASL、TLS 安全级、wrappermode）全部回到未设置，凭证一并
-    /// 删除。基线的 `postconf -e "relayhost ="` 在本栈没有对应物 —— 本栈的 apply
-    /// 从不写 postconf（见 [`Readers::setup_relay_apply`] 的载体差异说明），真正的
-    /// 逆向必须作用在 apply 真正落盘的那份载体上。
-    ///
-    /// 通道与普通 apply 相同（RW、非破坏性）：同一动作的两种载荷语义不改变它的
-    /// 归类，撤销中继与配置中继的风险等级一致。
     fn clear_relay_direct(&self) -> Result<Value, HandlerError> {
         let mut store = NativeRelayStore::production(&self.paths);
         mailstack_smtp::clear_relay(&mut store).map_err(HandlerError::from)?;
 
-        // 响应与成功的 apply 同形（`applied` / `relayhost` / `wrappermode`），
-        // 另带 `mode: "direct"` 让界面能区分「配置了中继」与「回到直投」。
-        // `relayhost` 如实为空：清除后没有任何中继。
         Ok(json!({
             "applied": true,
             "mode": "direct",
@@ -2065,39 +1682,15 @@ impl Readers {
         }))
     }
 
-    /// `setup.mail.test`：向**本机提交端点**投一封测试信。
-    ///
-    /// 载体差异：基线走 `sendmail`（本地 Postfix）；本栈向硬编码的
-    /// [`mailstack_smtp::LOCAL_SUBMISSION_ENDPOINT`]（`127.0.0.1:25`）做一次真正的
-    /// SMTP 提交 —— 那是 `mailstackd` 自己的入站面。目标是常量而非请求体字段，
-    /// 否则这个动作就是一个「任意主机的 SMTP 提交器」。
-    ///
-    /// ## 已恢复基线的两条检查（`users.*` 移植后）
-    ///
-    /// * **「sender 必须对应一个受管邮箱」**：`username` + `sender` 必须精确命中
-    ///   `managed-mailboxes.json` 里的一条记录，否则拒绝。
-    /// * **「账号未锁定」**：命中后还要确认该账号未被锁定，否则拒绝。
-    ///
-    /// 这两条检查都在**任何提交动作之前**完成，因此被拒的请求不会发出任何邮件。
-    ///
-    /// `username` / `password` 仍**不参与认证**：它们是既有口令的**回放**，
-    /// 口令只做格式校验（`validate_legacy_password_input`）—— 这是基线的真实语义，
-    /// 不是本栈的简化。
-    ///
-    /// 替代防线是**入站策略本身**（INV-17）：未认证会话不得投给外域收件人，
-    /// 因此这里不需要再写一遍域名判断 —— 写两遍迟早出现「这里放行、那边拒收」。
     pub async fn setup_mail_test(&self, data: &Value) -> Result<Value, HandlerError> {
         let sender = setup_address(data, &["sender"])?;
         let recipient = setup_address(data, &["recipient"])?;
 
-        // 四条校验全部先于发信，顺序与基线一致。
-        // `username` 用 USER_RE 单独校验（`setup_address` 只处理地址）；
-        // 基线取字段时缺省为空串，故缺失会在这里以同一文案被拒。
         let username = crate::handlers::optional_str(data, "username").unwrap_or("");
         if !mailstack_core::validate::USER_RE.is_match(username) {
             return Err(HandlerError::new("invalid mailbox or sender"));
         }
-        // 既有口令的回放：只做格式校验，绝不参与认证。
+
         let password = crate::handlers::optional_str(data, "password").unwrap_or("");
         mailstack_core::password::validate_legacy_password_input(password)
             .map_err(|error| HandlerError::new(error.to_string()))?;
@@ -2111,7 +1704,6 @@ impl Readers {
             return Err(HandlerError::new("mailbox is disabled"));
         }
 
-        // 正文用 CRLF：裸 LF 会被入站的走私防护拒收（详见 `mailtest` 模块说明）。
         let body = format!(
             "From: {sender}\r\nTo: {recipient}\r\nSubject: MailStack connectivity test\r\n\r\nThis message was sent by MailStack setup verification.\r\n"
         );
@@ -2132,25 +1724,11 @@ impl Readers {
             "scope": "local submission",
             "sender": sender,
             "recipient": recipient,
-            // 入站 MTA 的应答码：250 表示已接受并落盘，而不是「命令发出去了」。
+
             "code": report.code,
         }))
     }
 
-    /// `mail.test_loopback`：投一封带一次性 token 的环路自检信，并尽力把它找回来。
-    ///
-    /// ## 反中继守卫（基线 CHANGELOG 记录的 P0 缺口）
-    ///
-    /// 基线的旧写法是 `if managed and ...`：全新安装上还没有任何邮箱，`managed` 为空，
-    /// 守卫被**整个跳过**，于是这个动作可以对任意互联网地址投信。修好后的判据是
-    /// 「至少有一个受管域，且收件域是 `localhost` 或受管域之一」—— 它与「有没有邮箱」
-    /// 无关，因此不存在那个空集合缺口。这里照该判据实现。
-    ///
-    /// ## `maildirDelivered` 是证据，不是成败
-    ///
-    /// 提交被 `250` 接受就说明环路通了。Maildir 只是额外证据，而权威布局尚未定死
-    /// （`crates/store/src/lib.rs`），因此找不到时返回 `false` 而不是错误 ——
-    /// 把它当成「投递失败」会让人去查一个根本不存在的故障。
     pub async fn mail_test_loopback(&self, data: &Value) -> Result<Value, HandlerError> {
         let domains: Vec<String> = self
             .tables()
@@ -2165,8 +1743,7 @@ impl Readers {
             .map(|value| value.to_lowercase());
         let recipient = match requested {
             Some(recipient) => recipient,
-            // 没有邮箱注册表可查，故基线的「第一个受管邮箱」不可得；
-            // 退到 postmaster@<第一个受管域>（与基线 domains 分支一致）。
+
             None => match domains.first() {
                 Some(domain) => format!("postmaster@{domain}"),
                 None => "test@localhost".to_string(),
@@ -2232,20 +1809,12 @@ impl Readers {
             "recipient": recipient,
             "deliveryTimeMs": elapsed_ms,
             "maildirDelivered": maildir_delivered,
-            // 入站 MTA 的应答码；`maildirDelivered: false` 时它是「提交确实被接受」
-            // 的唯一证据。
+
             "code": report.code,
             "message": format!("Loopback message submitted to the local MTA ({elapsed_ms}ms)"),
         }))
     }
 
-    /// 本机提交端点探测（基线 `_direct_delivery_probe` 的等价物）。
-    ///
-    /// 目标是**硬编码**的本机提交端点，不是请求体里的主机，因此不适用 SSRF 防护
-    /// —— 这一点值得写明，否则后来者会以为这里漏了一道校验。
-    ///
-    /// 只证明「本地 MTA 活着」：**不证明出站 25 可用**（INV-19）。出站可用性由
-    /// `network.check_port` 单独判定，界面必须把两者分开呈现。
     async fn direct_delivery_probe(&self) -> Result<Value, HandlerError> {
         let (host, port) = local_submission_endpoint()?;
         let ip: IpAddr = host.parse().map_err(|_| {
@@ -2258,26 +1827,10 @@ impl Readers {
         }
     }
 
-    /// 部署是否允许私网中继目标。
-    ///
-    /// 与 `mailstackd` 的装配同一判据（`bin/mailstackd/src/config.rs`：非公网档才
-    /// 允许）。两者若各写一份，迟早会出现「向导测得过、守护进程连不上」。
     fn relay_private_network_enabled(&self) -> bool {
         !mailstack_core::mode::is_public_mode(&self.paths)
     }
 
-    // ─────────── 管理前端新增的 8 个只读列表动作（基线白名单之外的扩展） ───────────
-    //
-    // 这 8 个动作是前端列表页/面板的数据源，全部只读；它们复用上面既有的注入
-    // （`runner` / `proc_root` / `clock` / `dns` / `users`），不引入新的接缝。
-    // 字段名是**冻结契约**：前端 TS 类型直接对着它写，改字段等于改契约。
-
-    /// `users.list`：受管邮箱列表（前端 `UserAccount`）。
-    ///
-    /// `quotaUsed` / `quotaTotal` **恒为 0**：本项目的配额根本没有落盘 —— 基线
-    /// `mailstackctl/mail.py:120` 也是硬编码 `quotaUsedGb: 0, quotaMaxGb: 0`。
-    /// 这不是漏读，是「没有这个数据」；为了凑一个非零数字去估算配额才是真正的错误。
-    /// `createdAt` 同理恒为 `""`：注册表里没有创建时间字段。
     pub fn users_list(&self, _data: &Value) -> Result<Value, HandlerError> {
         let items: Vec<Value> = self
             .users
@@ -2287,7 +1840,7 @@ impl Readers {
                 json!({
                     "address": user.get("email").cloned().unwrap_or_else(|| json!("")),
                     "name": user.get("displayName").cloned().unwrap_or_else(|| json!("")),
-                    // 只有 enabled 算启用；disabled 与「读不到状态」都按未启用处理（fail-closed）。
+
                     "active": user.get("status").and_then(Value::as_str) == Some("enabled"),
                     "quotaUsed": 0,
                     "quotaTotal": 0,
@@ -2298,12 +1851,6 @@ impl Readers {
         Ok(Value::Array(items))
     }
 
-    /// `aliases.list`：别名表（前端 `AliasEntry`）。
-    ///
-    /// `active` 恒为 `true`：别名表没有「禁用」概念 —— 写进表里就是生效的，
-    /// 故不存在「禁用中的别名」，不要为凑 UI 枚举去编一个状态。
-    /// `target` 取第一个目标（基线也只取第一个），但仍把 `destinations` 全量带出，
-    /// 否则「这条别名还有另外两个目标」在前端完全看不见。
     pub fn aliases_list(&self, _data: &Value) -> Result<Value, HandlerError> {
         let items: Vec<Value> = self
             .tables()
@@ -2323,12 +1870,6 @@ impl Readers {
         Ok(Value::Array(items))
     }
 
-    /// `queue.list`：邮件队列（前端 `QueueItem`）。
-    ///
-    /// 状态映射：本仓库队列只有两态 —— `active`（到期该投了）与 `deferred`
-    /// （等下次重试），分别映射为 `sending` / `pending`。前端枚举里的
-    /// `delivered` / `failed` / `hold` **永远不会出现**：已投递的条目会离开队列、
-    /// 本仓库没有 hold 概念、永久失败也没有单独状态。不要为了凑枚举去编状态。
     pub fn queue_list(&self, _data: &Value) -> Result<Value, HandlerError> {
         let items: Vec<Value> = self
             .queue_items()
@@ -2341,7 +1882,7 @@ impl Readers {
                 let domain = recipient.rsplit_once('@').map(|(_, d)| d).unwrap_or("");
                 let status = match item.get("status").and_then(Value::as_str) {
                     Some("active") => "sending",
-                    // deferred 与「无法识别的状态」都归入等待：上游只产出这两态。
+
                     _ => "pending",
                 };
                 json!({
@@ -2359,11 +1900,6 @@ impl Readers {
         Ok(Value::Array(items))
     }
 
-    /// `services.list`：受管服务活性（前端 `ServiceStatus`）。
-    ///
-    /// 直接复用 [`Readers::service_items`] 的判定（`systemctl show`，失败再退到逐级探测），
-    /// 只把形状收成前端要的三字段。刻意**不做第二次独立探测** —— 两个真相源迟早会分叉，
-    /// 界面上就会出现「服务页说在跑、总览说已停」。
     pub fn services_list(&self, _data: &Value) -> Result<Value, HandlerError> {
         let items: Vec<Value> = self
             .service_items()
@@ -2379,20 +1915,12 @@ impl Readers {
         Ok(Value::Array(items))
     }
 
-    /// `dkim.keys`：受管域名中**已生成密钥**的 DKIM 记录（前端 `DkimKey`）。
-    ///
-    /// 只为「私钥确实存在」的域名产出条目：没有密钥的域名本来就没得轮换，
-    /// 为它编一条 `keySize: 2048` 的空记录只会误导运维。
-    ///
-    /// `keySize` 用编译期常量 [`mailstack_auth::keys::DKIM_KEY_BITS`]，**不去解析私钥** ——
-    /// 解析一份可能已损坏或权限不可读的私钥来「确认」位数，既有风险又无收益。
     pub async fn dkim_keys(&self, _data: &Value) -> Result<Value, HandlerError> {
         let selector = self.setup_dkim_selector();
         let mut items: Vec<Value> = Vec::new();
         for domain in self.managed_domains()? {
             let private = mailstack_auth::keys::private_key_path(&self.paths, &domain, &selector);
             let Ok(meta) = std::fs::metadata(&private) else {
-                // 没有密钥文件 —— 跳过该域名，而不是产出空条目。
                 continue;
             };
             let last_rotated = meta
@@ -2405,9 +1933,6 @@ impl Readers {
                 .lookup_txt(&dkim_record_name(&selector, &domain))
                 .await
             {
-                // 「查得到任何 TXT」即视为已发布。解析失败与未发布都表现为 false：
-                // 这是刻意的降级 —— 列表动作不能因解析器抖动整体失败，代价是无法
-                // 区分「没发布」与「查询失败」（两者都值得运维去看一眼 DNS）。
                 Ok(records) => !records.is_empty(),
                 Err(_) => false,
             };
@@ -2422,22 +1947,11 @@ impl Readers {
         Ok(Value::Array(items))
     }
 
-    /// `dns.records`：按向导口径列出应发布的 DNS 记录与观测结果（前端 `DnsRecord`）。
-    ///
-    /// `value` 是**期望发布的值**，`ok` 是实际查询是否匹配。`ttl` 恒为 [`DNS_TTL`]：
-    /// 本仓库的 `DnsQuery` 只返回记录文本、拿不到权威 TTL，所以那是**向导建议值**，
-    /// 不是实查值 —— 界面把它当「建议 TTL」展示即可。
-    ///
-    /// `required` 恒 `true`：这些记录缺一条都会直接影响收信或发信。
-    ///
-    /// 解析失败（`Err`）按「未匹配」（`ok: false`）处理，不让整条列表失败。
     pub async fn dns_records(&self, _data: &Value) -> Result<Value, HandlerError> {
         let setup = mailstack_core::config::read_setup_config(&self.paths);
         let selector = self.setup_dkim_selector();
         let mut items: Vec<Value> = Vec::new();
 
-        // A 依赖向导登记的主机名与服务器 IP；没有身份时**不编造**，
-        // 只列出那些不依赖身份的记录（SPF / DMARC / DKIM）。
         if let Some(setup) = &setup {
             let ok = match self.dns.lookup_a(&setup.mail_host).await {
                 Ok(ips) => ips.iter().any(|ip| ip == &setup.server_ip),
@@ -2450,7 +1964,6 @@ impl Readers {
         }
 
         for domain in self.managed_domains()? {
-            // 该域名的邮件主机：优先用向导登记的主机（仅当它属于本域），否则按惯例 `mail.<domain>`。
             let host = setup
                 .as_ref()
                 .map(|s| s.mail_host.as_str())
@@ -2458,8 +1971,6 @@ impl Readers {
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("mail.{domain}"));
 
-            // MX：观测记录的**目标主机**与期望主机精确相等（见
-            // [`mx_records_contain`]）；解析失败按「未匹配」处理，不让整条列表失败。
             let mx_ok = self
                 .dns
                 .lookup_mx_records(&domain)
@@ -2471,7 +1982,6 @@ impl Readers {
                 "ttl": DNS_TTL, "required": true, "ok": mx_ok,
             }));
 
-            // SPF：期望值与向导一致（`setup.json` 的 `expectedSpf`，缺省 `v=spf1 mx -all`）。
             let spf_value = setup
                 .as_ref()
                 .and_then(|s| s.expected_spf.clone())
@@ -2488,8 +1998,6 @@ impl Readers {
                 "ttl": DNS_TTL, "required": true, "ok": spf_ok,
             }));
 
-            // DMARC：`rua` 地址因部署而异，故只要求观测到 DMARC1 版本标签，
-            // 与 `setup_dns_verify` 的 dmarc 判据同口径。
             let dmarc_name = format!("_dmarc.{domain}");
             let dmarc_ok = self
                 .dns
@@ -2503,8 +2011,6 @@ impl Readers {
                 "ttl": DNS_TTL, "required": true, "ok": dmarc_ok,
             }));
 
-            // DKIM：只有磁盘上确实有 `.txt` zone 片段才列；期望值从片段里还原，
-            // 不凭 selector 编一个空公钥出来（那会让「未生成密钥」看起来像「已配置」）。
             if let Some(expected) = std::fs::read_to_string(mailstack_auth::keys::txt_record_path(
                 &self.paths,
                 &domain,
@@ -2530,11 +2036,6 @@ impl Readers {
         Ok(Value::Array(items))
     }
 
-    /// `metrics.system`：CPU / 内存 / 磁盘占用百分比（前端系统瓦片）。
-    ///
-    /// 三项都是 0–100 的百分比（保留一位小数）。读不到一律回 `0.0`：这是**显示用**的
-    /// 资源瓦片，没有表达「读不到」的字段，故取默认值；诊断请用 `metrics.realtime`
-    /// （它会把 `unavailable` 明确列出来）。
     pub fn metrics_system(&self, _data: &Value) -> Result<Value, HandlerError> {
         Ok(json!({
             "cpu": self.cpu_percent(),
@@ -2543,10 +2044,6 @@ impl Readers {
         }))
     }
 
-    /// 差分 CPU 占用率。
-    ///
-    /// `/proc/stat` 的计数器是单调递增的累计值，单次快照算不出占用率，因此连续采样
-    /// 两次并在中间真的等 [`CPU_SAMPLE_INTERVAL_MS`]；不等待的话两次读到的增量常常是 0。
     fn cpu_percent(&self) -> f64 {
         let Some(prev) = read_cpu_counters(&self.proc_root) else {
             return 0.0;
@@ -2558,10 +2055,6 @@ impl Readers {
         cpu_busy_percent(&prev, &now)
     }
 
-    /// 内存占用百分比：`(total - available) / total × 100`。
-    ///
-    /// 用 `MemAvailable` 而非 `MemFree`：后者不含可回收的页缓存，会让「内存告急」
-    /// 看起来比实际严重得多（同 [`mailstack_core::sysinfo::read_meminfo`] 的口径）。
     fn memory_percent(&self) -> f64 {
         let Some(mem) = mailstack_core::sysinfo::read_meminfo(&self.proc_root) else {
             return 0.0;
@@ -2575,10 +2068,6 @@ impl Readers {
         )
     }
 
-    /// 根文件系统占用百分比（`df -kP /`）。
-    ///
-    /// **必须带 `-P`**：POSIX 输出格式下长设备名不会折行，列数才与解析假设一致；
-    /// 不带 `-P` 时 `df` 会把长设备名换行，第 2/3 列随之错位。
     fn disk_percent(&self) -> f64 {
         let Ok(output) = self.runner.run("df", &["-kP", "/"]) else {
             return 0.0;
@@ -2589,16 +2078,10 @@ impl Readers {
         parse_df_percent(&output.stdout).unwrap_or(0.0)
     }
 
-    /// `activity.list`：审计日志折成的活动流（前端 `ActivityItem`），最新在前，最多 50 条。
     pub fn activity_list(&self, _data: &Value) -> Result<Value, HandlerError> {
         Ok(Value::Array(read_activity(&self.paths.audit_log)?))
     }
 
-    /// 受管域名表的第一列（与 `snapshot` 同源）。
-    ///
-    /// 5.13：返回 `Result` 而不是静默空集合 —— 这两个调用点（DKIM 密钥清单 /
-    /// DNS 记录清单）会据此**遍历域名**，空集合等于让它们报告「没有任何域名」，
-    /// 掩盖掉真正的读失败。
     fn managed_domains(&self) -> Result<Vec<String>, HandlerError> {
         mailstack_core::atomic::try_rows(&self.paths.domains)
             .map_err(|error| {
@@ -2611,8 +2094,6 @@ impl Readers {
             })
     }
 
-    /// DKIM 列表/ DNS 记录用的 selector：`setup.json` 的 `dkimSelector`，
-    /// 缺省用 auth crate 的默认常量（`mailstack`，**不是**向导的 `mail`）。
     fn setup_dkim_selector(&self) -> String {
         mailstack_core::config::read_setup_config(&self.paths)
             .map(|config| config.dkim_selector)
@@ -2621,7 +2102,6 @@ impl Readers {
     }
 }
 
-/// 拆解本机提交端点常量（`127.0.0.1:25`）。
 fn local_submission_endpoint() -> Result<(String, u16), HandlerError> {
     let raw = mailstack_smtp::LOCAL_SUBMISSION_ENDPOINT;
     let invalid = || HandlerError::new(format!("invalid local submission endpoint: {raw}"));
@@ -2632,10 +2112,6 @@ fn local_submission_endpoint() -> Result<(String, u16), HandlerError> {
     Ok((host.to_string(), port))
 }
 
-/// 解析并规范化 `serverIp`。
-///
-/// 解析成 `IpAddr` 再回写字符串 = 规范化（`::1` 与 `0:0:0:0:0:0:0:1` 落到同一种
-/// 写法），避免「界面上是对的、DNS 里却不是」这类假阴性。
 fn setup_server_ip(data: &Value) -> Result<String, HandlerError> {
     let raw = crate::handlers::first_str(data, &["serverIp", "server_ip"])?;
     raw.trim()
@@ -2644,7 +2120,6 @@ fn setup_server_ip(data: &Value) -> Result<String, HandlerError> {
         .map_err(|_| HandlerError::new("invalid server IP address"))
 }
 
-/// 向导的 DKIM selector：缺省 [`SETUP_DEFAULT_DKIM_SELECTOR`]（`mail`）。
 fn setup_selector(data: &Value) -> String {
     crate::handlers::optional_str(data, "dkimSelector")
         .map(str::trim)
@@ -2653,7 +2128,6 @@ fn setup_selector(data: &Value) -> String {
         .to_ascii_lowercase()
 }
 
-/// 期望的 SPF 记录（空串视为「没有填」）。
 fn setup_expected_spf(data: &Value) -> Option<String> {
     crate::handlers::optional_str(data, "expectedSpf")
         .map(str::trim)
@@ -2661,7 +2135,6 @@ fn setup_expected_spf(data: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 解析并校验一个邮件地址（基线用的 `ADDRESS_RE`，失败文案一致）。
 fn setup_address(data: &Value, keys: &[&str]) -> Result<String, HandlerError> {
     let address = crate::handlers::first_str(data, keys)?
         .trim()
@@ -2672,13 +2145,6 @@ fn setup_address(data: &Value, keys: &[&str]) -> Result<String, HandlerError> {
     Ok(address)
 }
 
-/// MX 期望主机与观测记录是否**精确**相等。
-///
-/// 此前用子串判定（`record.contains(host)`）：`mail.example.com` 会被
-/// `evilemail.example.com`（子串）与 `mail.example.com.attacker.net`
-/// （前缀 + 尾巴）双双命中 —— 子串匹配放在 DNS 安全判据上等于不设防。
-/// `dig +short` 的 MX 形态是 `优先级 目标主机.`，这里拆出目标主机
-/// （最后一段），去掉结尾的点、忽略大小写后做精确比较。
 fn mx_records_contain(records: &[String], host: &str) -> bool {
     let want = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if want.is_empty() {
@@ -2693,12 +2159,6 @@ fn mx_records_contain(records: &[String], host: &str) -> bool {
     })
 }
 
-/// DKIM TXT 记录里是否带一个「看起来是真的」的 RSA 公钥。
-///
-/// 判据与基线 `network.py:168` 的正则 `p=[A-Za-z0-9+/]{100,}={0,2}` 等价：
-/// 含 `v=DKIM1`，且 `p=` 之后的 base64 去掉尾部填充后不少于 100 字节。
-/// 2048 位 SPKI 的 base64 约 344 字符，100 是「绝不是空占位」的下界 ——
-/// 粘错 / 被截断的公钥会在这里被挡下，而不是等对端拒收。
 fn has_dkim_public_key(record: &str) -> bool {
     if !record.contains("v=DKIM1") {
         return false;
@@ -2713,49 +2173,27 @@ fn has_dkim_public_key(record: &str) -> bool {
     key.trim_end_matches('=').len() >= 100
 }
 
-// ─────────────────── 管理前端只读列表动作的辅助（CPU / DNS / 审计） ───────────────────
-
-/// CPU 差分采样的间隔（毫秒）。太短会因计数器粒度而得到 0 增量。
 const CPU_SAMPLE_INTERVAL_MS: u64 = 100;
 
-/// `dns.records` 展示的 TTL（秒）。
-///
-/// 是**向导建议值**而非实查值：本仓库的 `DnsQuery` 只返回记录文本，拿不到权威 TTL。
 const DNS_TTL: u64 = 3600;
 
-/// `activity.list` 最多返回的条目数（最新在前）。
 const ACTIVITY_MAX_ITEMS: usize = 50;
 
-/// `activity.list` 每次读取的日志尾部字节数。
-///
-/// 审计日志只增不减，此前每次调用都把**整个文件**读进内存再取最后 50 条 ——
-/// 一台跑了几年、日志几百 MB 的机器上，这会把一个前端轮询动作变成 IO 放大器。
-/// 256 KiB 与 `mailstack_core::audit` 的尾部窗口同量级；日志在追加，尾部
-/// 字节里解析出的记录必然是最新的。极端情况下（单条记录超大）50 条装不满
-/// 256 KiB 的窗口会回更少的条目 —— 对「活动流」这是可接受的截断。
 const ACTIVITY_TAIL_BYTES: u64 = 262_144;
 
-/// DKIM TXT 记录的 owner 名：`<selector>._domainkey.<domain>`。
 fn dkim_record_name(selector: &str, domain: &str) -> String {
     format!("{selector}._domainkey.{domain}")
 }
 
-/// 一次 `/proc/stat` 的 CPU 累计计数器。
 struct CpuCounters {
-    /// 空闲口径 `idle + iowait`（与基线 `telemetry.py:_cpu_percent` 一致）。
     idle: u64,
     total: u64,
 }
 
-/// 读 `/proc/stat` 的 CPU 计数器（取首个 `cpu` 行，即汇总行）。
-///
-/// 解析前**先剥掉核心序号**：`cpu0 <user> ...` 里的 `0` 会占掉 `user` 的位置，
-/// 整列错位一格（本项目在遥测首版踩过，见 `docs/TEST_REPORT.md` §4.20）。
-/// 汇总行本身没有序号，但同一段解析要对两种形态都成立。
 fn read_cpu_counters(proc_root: &Path) -> Option<CpuCounters> {
     let text = std::fs::read_to_string(proc_root.join("stat")).ok()?;
     let line = text.lines().find(|line| line.starts_with("cpu"))?;
-    // 汇总行是 `cpu `（紧跟空白），每核行是 `cpu0`；两种都先去掉可能的序号。
+
     let rest = line.strip_prefix("cpu")?;
     let counters = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     let fields: Vec<u64> = counters
@@ -2765,29 +2203,24 @@ fn read_cpu_counters(proc_root: &Path) -> Option<CpuCounters> {
     if fields.len() < 4 {
         return None;
     }
-    // user nice system idle iowait irq softirq steal
+
     Some(CpuCounters {
         idle: fields[3].saturating_add(fields.get(4).copied().unwrap_or(0)),
         total: fields.iter().take(8).sum(),
     })
 }
 
-/// 由两次采样算忙时百分比（0–100，保留一位小数）。
 fn cpu_busy_percent(prev: &CpuCounters, now: &CpuCounters) -> f64 {
     let total_delta = now.total.saturating_sub(prev.total);
     let idle_delta = now.idle.saturating_sub(prev.idle);
     if total_delta == 0 {
         return 0.0;
     }
-    // idle_delta 理论上 ≤ total_delta；截断一下防止计数器回绕或夹具异常算出负值。
+
     let busy = total_delta.saturating_sub(idle_delta.min(total_delta));
     round1((busy as f64 / total_delta as f64 * 100.0).clamp(0.0, 100.0))
 }
 
-/// 解析 `df -kP /` 输出中的容量百分比。
-///
-/// 要求字段数 ≥ 6 且第 2/3 列是数字：表头行（`1024-blocks`）正因为不是数字而被跳过。
-/// 解析不出来就回 `None`，不拿残缺行凑一个数字。
 fn parse_df_percent(stdout: &str) -> Option<f64> {
     for line in stdout.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -2805,11 +2238,6 @@ fn parse_df_percent(stdout: &str) -> Option<f64> {
     None
 }
 
-/// 从 DKIM 的 zone 片段里还原纯 TXT 值（拼接各引号段）。
-///
-/// 片段形如 `<owner>\tIN\tTXT\t( "chunk1"\n\t"chunk2" )  ; comment`。取第一个 `(`
-/// 与最后一个 `)` 之间、奇数位的引号内容拼回 —— 与生成端
-/// [`mailstack_auth::keys::zone_txt_fragment`] 的往返不变量对应。
 fn zone_txt_value(fragment: &str) -> Option<String> {
     let open = fragment.find('(')?;
     let close = fragment.rfind(')')?;
@@ -2827,7 +2255,6 @@ fn zone_txt_value(fragment: &str) -> Option<String> {
     }
 }
 
-/// 审计动作的前缀 → 前端活动流的 `kind`。
 fn activity_kind(action: &str) -> &'static str {
     if action.starts_with("users.") {
         "user"
@@ -2844,20 +2271,11 @@ fn activity_kind(action: &str) -> &'static str {
     }
 }
 
-/// 读审计日志（JSON lines）的**尾部**并折成前端活动项，最新在前，最多
-/// [`ACTIVITY_MAX_ITEMS`] 条。
-///
-/// 无法解析的行（被截断的半行、格式回滚的旧记录）**跳过**而不是让整个列表失败 ——
-/// 审计日志随时可能正被追加，半行是正常中间态。日志不存在回空数组：还没写过审计
-/// 是合法状态，不是错误。
-///
-/// 日志是追加写的，故倒排即「最新在前」。**不**按 `time` 字符串重排：不同条目的
-/// 时区偏移可能不同，字典序排序会得出错误顺序。
 fn read_activity(log_path: &Path) -> Result<Vec<Value>, HandlerError> {
     let Some((tail, truncated)) = read_log_tail(log_path, ACTIVITY_TAIL_BYTES)? else {
         return Ok(Vec::new());
     };
-    // 窗口是从日志中间切开的，第一行几乎必然是残行 —— 跳过它再解析。
+
     let mut items: Vec<Value> = tail
         .lines()
         .skip(if truncated { 1 } else { 0 })
@@ -2877,12 +2295,6 @@ fn read_activity(log_path: &Path) -> Result<Vec<Value>, HandlerError> {
     Ok(items)
 }
 
-/// 读日志文件的最后 `max_bytes` 字节。
-///
-/// 返回 `(文本, 窗口是否从行中间切开)`；文件不存在返回 `Ok(None)` ——
-/// 审计日志还没写过是合法状态。文件大于窗口时 `seek` 到 `len - max_bytes`
-/// 再读，**绝不**把整个文件读进内存：`activity.list` 是前端轮询的动作，
-/// 全量读等于把每次轮询变成一次 IO 放大。
 fn read_log_tail(log_path: &Path, max_bytes: u64) -> Result<Option<(String, bool)>, HandlerError> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -2911,14 +2323,10 @@ fn read_log_tail(log_path: &Path, max_bytes: u64) -> Result<Option<(String, bool
     file.take(max_bytes)
         .read_to_end(&mut bytes)
         .map_err(read_error)?;
-    // 日志可能含非 UTF-8 的尾巴；有损解码与展示面的口径一致。
+
     Ok(Some((String::from_utf8_lossy(&bytes).into_owned(), true)))
 }
 
-/// `YYYY-MM-DD HH:MM:SS`（UTC）。
-///
-/// 慎用 `OffsetDateTime::to_string()`：格式随版本而变。`time_fmt` 只提供 ISO8601，
-/// 而 `dkim.keys` 的契约要的是空格分隔的展示形态，故这里本地拼一次。
 fn format_utc_stamp(dt: time::OffsetDateTime) -> String {
     let dt = dt.to_offset(time::UtcOffset::UTC);
     format!(
@@ -2932,17 +2340,11 @@ fn format_utc_stamp(dt: time::OffsetDateTime) -> String {
     )
 }
 
-/// 把请求载荷折算成中继端点校验请求。
-///
-/// 端口从宽到严走 `validate_relay` 的白名单判定；这里只负责把「不是端口的东西」
-/// 挡在类型边界外（`as_u64` 之后必须能装进 `u16`，否则强转会**静默回绕**成
-/// 一个合法端口）。
 fn relay_request(data: &Value) -> Result<RelayValidationRequest, HandlerError> {
     let host = crate::handlers::first_str(data, &["host", "relayHost"])?.to_string();
     let port = match data.get("port") {
         None | Some(Value::Null) => 587u16,
         Some(value) => {
-            // `as_u64` 之后必须能装进 `u16`：否则强转会**静默回绕**成一个合法端口。
             let raw = value
                 .as_u64()
                 .filter(|raw| *raw <= u16::MAX as u64)
@@ -2967,10 +2369,6 @@ fn relay_request(data: &Value) -> Result<RelayValidationRequest, HandlerError> {
     })
 }
 
-/// 从载荷里解析被封禁的地址。
-///
-/// 解析成 `IpAddr` 而不是留着字符串：解析即规范化，`::1` 与 `0:0:0:0:0:0:0:1`
-/// 会落到同一条记录上。按字符串存的话，「解封」只会解掉运维恰好回传的那一种写法。
 fn ban_target(data: &Value) -> Result<IpAddr, HandlerError> {
     let raw = crate::handlers::first_str(data, &["ip", "address"])?;
     raw.trim()
@@ -2978,10 +2376,6 @@ fn ban_target(data: &Value) -> Result<IpAddr, HandlerError> {
         .map_err(|_| HandlerError::new(format!("invalid ip address: {raw:?}")))
 }
 
-/// 控制台 id / 单元名 → systemd 单元名。
-///
-/// 与基线同序：先按 **id** 命中，再按**单元名**命中。因此 `id` 与单元名相同的
-/// 条目（如 `postfix`）两条路径结果一致，不会出现「同一入参两种解释」。
 fn resolve_service_unit(ident: &str) -> Option<&'static str> {
     if let Some((_, unit)) = SERVICES.iter().find(|(id, _)| *id == ident) {
         return Some(unit);
@@ -2992,7 +2386,6 @@ fn resolve_service_unit(ident: &str) -> Option<&'static str> {
         .map(|(_, unit)| *unit)
 }
 
-/// 解析 `systemctl show` 的 `key=value` 输出中的某个键。
 fn systemd_property<'a>(stdout: &'a str, key: &str) -> Option<&'a str> {
     stdout.lines().find_map(|line| {
         let (name, value) = line.split_once('=')?;
@@ -3000,22 +2393,14 @@ fn systemd_property<'a>(stdout: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-/// 数字属性解析：`[not set]` 之类的非数字一律当作 0（宁可留空也不编）。
 fn parse_u64(value: Option<&str>) -> u64 {
     value.and_then(|v| v.trim().parse().ok()).unwrap_or(0)
 }
 
-/// 保留一位小数（与基线的 `round(x, 1)` 一致）。
 fn round1(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
 }
 
-/// 队列条目 → 控制台的 `QueueItem`。
-///
-/// 字段名沿用基线（`queueId` / `arrivalDate` / `retryCount` ...），因为新前端的
-/// 队列页是按这套字段写的。额外多带一个 `recipients` 数组：基线只取第一个收件人，
-/// 于是「这一条还有另外两个收件人待投递」在界面上完全看不见 —— 多一个字段比
-/// 藏掉信息划算。
 fn queue_item_json(entry: &mailstack_queue::QueueEntry, now: i64) -> Value {
     let deferred = entry.next_attempt_unix > now;
     json!({
@@ -3029,22 +2414,16 @@ fn queue_item_json(entry: &mailstack_queue::QueueEntry, now: i64) -> Value {
         "status": if deferred { "deferred" } else { "active" },
         "errorReason": entry.last_error.clone().unwrap_or_default(),
         "retryCount": entry.attempts,
-        // 下面两项是基线没有的：出站退信与用户邮件在界面上长得一样，
-        // 运维排查时看不出哪一条是系统自己发的退信。
+
         "kind": entry.kind.as_str(),
         "nextAttemptUnix": entry.next_attempt_unix,
     })
 }
 
-/// 取一个布尔标志；缺失或不是布尔一律当作 `false`。
-///
-/// 与 `ActionGate` 对 `confirm` 的处理同一口径：**不做真值转换**，字符串 "true"
-/// 不是 `true`。「大概是这个意思」在安全开关上不是可以接受的理由。
 fn flag(data: &Value, key: &str) -> bool {
     data.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
-/// 备份文件名的时刻部分：`YYYYMMDD-HHMMSS`（UTC）。
 fn backup_timestamp(dt: time::OffsetDateTime) -> String {
     format!(
         "{:04}{:02}{:02}-{:02}{:02}{:02}",
@@ -3057,7 +2436,6 @@ fn backup_timestamp(dt: time::OffsetDateTime) -> String {
     )
 }
 
-/// 同一秒内撞名时用的后缀（小写十六进制，符合文件名正则的 `[a-z0-9_-]+`）。
 fn collision_suffix() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3066,7 +2444,6 @@ fn collision_suffix() -> String {
     format!("{nanos:08x}")
 }
 
-/// 体检结论 → 线上结构（camelCase）。
 fn finding_to_json(finding: &mailstack_core::security::Finding) -> Value {
     json!({
         "path": finding.path.display().to_string(),
@@ -3079,18 +2456,12 @@ fn finding_to_json(finding: &mailstack_core::security::Finding) -> Value {
     })
 }
 
-/// 证书到期告警窗口（天）。
 pub const EXPIRY_WARNING_DAYS: i64 = 14;
 
-/// 组装一条检查项。
 fn check(name: &str, ok: bool, detail: impl Into<String>) -> Value {
     json!({ "name": name, "ok": ok, "detail": detail.into() })
 }
 
-/// 把 [`mailstack_core::certs::CertificateInfo`] 转成线上结构（camelCase）。
-///
-/// `pub(crate)`：`acme.rs` 的 `certs.renew` / `setup.cert.issue` 成功后要返回同一
-/// 形状的证书对象，避免两处各写一份映射而漂移。
 pub(crate) fn certificate_to_json(info: mailstack_core::certs::CertificateInfo) -> Value {
     json!({
         "domain": info.domain,
@@ -3109,7 +2480,6 @@ pub(crate) fn certificate_to_json(info: mailstack_core::certs::CertificateInfo) 
     })
 }
 
-/// 读 `relay.json` 里的 relayhost（只取主机名，不碰凭证）。
 fn read_relay_host(paths: &Paths) -> Option<String> {
     let text = std::fs::read_to_string(&paths.relay_config).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
@@ -3121,10 +2491,6 @@ fn read_relay_host(paths: &Paths) -> Option<String> {
         .filter(|h| !h.is_empty())
 }
 
-/// 行数夹取：默认 200，上限 1000。
-///
-/// 上限是必须的：这是一条可以随时被调用的只读接口，没有任何上限就等于给了
-/// 调用方一个「把 journalctl 全量倒出来」的开关。
 fn clamp_lines(data: &Value) -> usize {
     data.get("lines")
         .and_then(Value::as_u64)
@@ -3132,12 +2498,6 @@ fn clamp_lines(data: &Value) -> usize {
         .unwrap_or(LOGS_DEFAULT_LINES)
 }
 
-/// journald 的 JSON 记录 → 线上结构。
-///
-/// `MESSAGE` 可能是字符串，也可能是字节数组（非 UTF-8 的日志会有后者）。
-/// 两种情况都要能读出来 —— 一条二进制日志不该让整个列表解析失败。
-/// 字节数组按 UTF-8 **有损**解码（与基线 `errors='replace'` 同口径）；
-/// `b as char` 的 Latin-1 展开会把每个非 ASCII 字节变成两个乱码字。
 fn journal_entry_to_json(raw: &Value) -> Value {
     let message = raw
         .get("MESSAGE")
@@ -3177,7 +2537,6 @@ fn journal_entry_to_json(raw: &Value) -> Value {
     })
 }
 
-/// syslog 优先级 → 名字（RFC 5424 §6.2.1，`0` 最高）。
 fn priority_name(priority: u8) -> &'static str {
     match priority {
         0 => "emerg",
@@ -3191,7 +2550,6 @@ fn priority_name(priority: u8) -> &'static str {
     }
 }
 
-/// 把只读聚合面的处理器注册进注册表。
 pub fn register(registry: &mut Registry, readers: Arc<Readers>) {
     let certs = Arc::clone(&readers);
     registry.register("certs.list", move |data| certs.certs_list(data));
@@ -3216,8 +2574,6 @@ pub fn register(registry: &mut Registry, readers: Arc<Readers>) {
     let backups = Arc::clone(&readers);
     registry.register("backup.list", move |data| backups.backup_list(data));
 
-    // ── 变更面（RW）：这两个动作的响应是**列表本身**，控制台直接当成新状态 ──
-    // 注册位置不影响通道判定：RO / RW 由 `ActionGate` 在调用之前决定。
     let services = Arc::clone(&readers);
     registry.register("services.action", move |data| {
         services.services_action(data)
@@ -3248,7 +2604,6 @@ pub fn register(registry: &mut Registry, readers: Arc<Readers>) {
         Box::pin(async move { probe.network_check_port(&data).await })
     });
 
-    // ── 初始化向导（§5.2 的 setup 分组） ──
     let identity = Arc::clone(&readers);
     registry.register("setup.identity.apply", move |data| {
         identity.setup_identity_apply(data)
@@ -3275,7 +2630,6 @@ pub fn register(registry: &mut Registry, readers: Arc<Readers>) {
         Box::pin(async move { relay_apply.setup_relay_apply(&data).await })
     });
 
-    // ── 邮件环路自检（`setup.mail.test` 与 `mail.test_loopback` 配对） ──
     let mail_test = Arc::clone(&readers);
     registry.register_async("setup.mail.test", move |data| {
         let mail_test = Arc::clone(&mail_test);
@@ -3290,10 +2644,6 @@ pub fn register(registry: &mut Registry, readers: Arc<Readers>) {
         Box::pin(async move { loopback.mail_test_loopback(&data).await })
     });
 
-    // ── 系统账号邮箱（§5.4.1 的 `users.*`；全部归 RW） ──
-    //
-    // 与 backup/security/setup 同一处注册：通道由 `ActionGate` 在调用前判定，
-    // 注册位置不影响 RO/RW。
     let add = Arc::clone(&readers);
     registry.register("users.add", move |data| add.users.add(data));
 
@@ -3306,64 +2656,12 @@ pub fn register(registry: &mut Registry, readers: Arc<Readers>) {
     let remove = Arc::clone(&readers);
     registry.register("users.delete", move |data| remove.users.delete(data));
 
-    // ── 证书签发 / 续期（`certs.*`；均归 RW） ──
-    //
-    // 用同步处理器（非 `register_async`）：`acme.sh` 最长可跑 300 秒，而本仓库
-    // 既有的破坏性/写面动作（`backup.create` 跑 tar、`dkim.rotate` 生成密钥）也同样
-    // 是同步处理器 —— 保持一条通道一种风格，且真正的阻塞上界由
-    // `CommandRunner::run_with_timeout` 兜住，不会无限期占住调用方。
     let renew = Arc::clone(&readers);
     registry.register("certs.renew", move |data| renew.acme.renew(data));
 
     let issue = Arc::clone(&readers);
     registry.register("setup.cert.issue", move |data| issue.acme.issue(data));
 
-    // ── AI 子系统（`ai.*`） ──
-    //
-    // `ai.config.set` 是纯本地校验+落盘（DNS 用同步解析器），故为同步处理器；
-    // 其余五个都会出站，注册为 async 并在其中 await transport。
-    let config_set = Arc::clone(&readers);
-    registry.register("ai.config.set", move |data| config_set.ai.config_set(data));
-
-    let models = Arc::clone(&readers);
-    registry.register_async("ai.models.list", move |data| {
-        let models = Arc::clone(&models);
-        let data = data.clone();
-        Box::pin(async move { models.ai.models_list(&data).await })
-    });
-
-    let ai_test = Arc::clone(&readers);
-    registry.register_async("ai.test", move |data| {
-        let ai_test = Arc::clone(&ai_test);
-        let data = data.clone();
-        Box::pin(async move { ai_test.ai.test(&data).await })
-    });
-
-    let chat = Arc::clone(&readers);
-    registry.register_async("ai.chat", move |data| {
-        let chat = Arc::clone(&chat);
-        let data = data.clone();
-        Box::pin(async move { chat.ai.chat(&data).await })
-    });
-
-    let diagnose = Arc::clone(&readers);
-    registry.register_async("ai.diagnose", move |data| {
-        let diagnose = Arc::clone(&diagnose);
-        let data = data.clone();
-        Box::pin(async move { diagnose.ai.diagnose(&data).await })
-    });
-
-    let parse = Arc::clone(&readers);
-    registry.register_async("ai.parse", move |data| {
-        let parse = Arc::clone(&parse);
-        let data = data.clone();
-        Box::pin(async move { parse.ai.parse(&data).await })
-    });
-
-    // ── 管理前端新增的 8 个只读列表动作（基线白名单之外的扩展） ──
-    //
-    // 通道由 `ActionGate` 在调用前判定，注册位置不影响 RO/RW。需要 await DNS 的
-    // `dkim.keys` / `dns.records` 用 `register_async`，其余六个是纯本地读。
     let users_list = Arc::clone(&readers);
     registry.register("users.list", move |data| users_list.users_list(data));
 
@@ -3410,10 +2708,8 @@ mod tests {
     use std::fs;
     use std::sync::Mutex;
 
-    /// 固定时钟：2026-01-01T00:00:00Z。
     const NOW: i64 = 1_767_225_600;
 
-    /// 记账用的假运行器：任何命令都返回同一份脚本化输出，并记下被调用的参数。
     struct FakeRunner {
         calls: Mutex<Vec<(String, Vec<String>)>>,
         output: CommandOutput,
@@ -3431,7 +2727,6 @@ mod tests {
             })
         }
 
-        /// 被调用过的程序名（按调用顺序）。
         fn called(&self) -> Vec<String> {
             self.calls
                 .lock()
@@ -3441,7 +2736,6 @@ mod tests {
                 .collect()
         }
 
-        /// 被调用过的完整命令（程序 + 参数）。
         fn calls(&self) -> Vec<(String, Vec<String>)> {
             self.calls.lock().unwrap().clone()
         }
@@ -3466,7 +2760,6 @@ mod tests {
         }
     }
 
-    /// 什么都不存在的环境探测：所有服务都判为未运行。
     struct NoServices;
 
     impl ServiceEnv for NoServices {
@@ -3478,7 +2771,6 @@ mod tests {
         }
     }
 
-    /// 只声明给定程序 / 路径存在的环境探测。
     struct EnvListing {
         programs: Vec<&'static str>,
         paths: Vec<&'static str>,
@@ -3495,8 +2787,6 @@ mod tests {
         }
     }
 
-    /// 备份加密的替身：把口令长度写在头部，好断言「确实走了加密路径」。
-    /// 真实实现在 `mailstack_core::backup::GpgCipher`（口令只经 stdin 传给 gpg）。
     struct TestCipher;
 
     impl mailstack_core::backup::BackupCipher for TestCipher {
@@ -3540,11 +2830,9 @@ mod tests {
         root: PathBuf,
         paths: Paths,
         proc_root: PathBuf,
-        /// 备份动作的「根」：一棵生产形状的临时文件树（`etc/mailstack/...`）。
-        ///
-        /// 有了它，备份测试既不会去读生产主机的 `/etc`，更不会往真实的 `/` 里写。
+
         backup_root: PathBuf,
-        /// 恢复的落地根。
+
         restore_root: PathBuf,
     }
 
@@ -3573,7 +2861,6 @@ mod tests {
             )
             .unwrap();
 
-            // 生产形状的备份源树。
             let backup_root = root.join("fsroot");
             for relative in ["etc/mailstack", "etc/postfix", "var/lib/mailstack"] {
                 fs::create_dir_all(backup_root.join(relative)).unwrap();
@@ -3603,7 +2890,6 @@ mod tests {
             }
         }
 
-        /// 备份动作专用的 Reader：根与落地根都在临时目录里，加密用假后端。
         fn backup_readers(&self, runner: Arc<dyn CommandRunner>) -> Readers {
             self.readers(runner).with_backup_env(BackupEnv {
                 root: self.backup_root.clone(),
@@ -3613,9 +2899,6 @@ mod tests {
             })
         }
 
-        /// 带一个**受管邮箱**的备份装置：权威布局 `~/Maildir` + 两份注册表 + passwd。
-        ///
-        /// 家目录从注入的 `<passwd_root>/passwd` 解析（与 `imapd::resolver` 同一口径）。
         fn backup_readers_with_a_managed_mailbox(&self, runner: Arc<dyn CommandRunner>) -> Readers {
             let home = self.backup_root.join("home/alice");
             fs::create_dir_all(home.join("Maildir/new")).unwrap();
@@ -3653,7 +2936,6 @@ mod tests {
                 })
         }
 
-        /// 归档里的成员名（按归档内顺序）。
         fn archive_members(&self, filename: &str) -> Vec<String> {
             let archive = self.paths.backups_dir.join(filename);
             let file = fs::File::open(&archive).unwrap();
@@ -3668,7 +2950,6 @@ mod tests {
             self.readers_with_env(runner, Arc::new(NoServices))
         }
 
-        /// 与 [`Fixture::readers`] 相同，但可注入「哪些程序/路径存在」的替身环境。
         fn readers_with_env(
             &self,
             runner: Arc<dyn CommandRunner>,
@@ -3684,7 +2965,6 @@ mod tests {
             )
         }
 
-        /// 用 rcgen 签一张 `days` 天后到期的自签证书。
         fn issue(&self, domain: &str, days: i64) {
             let not_before = time::OffsetDateTime::from_unix_timestamp(NOW).unwrap();
             let not_after = not_before + time::Duration::days(days);
@@ -3750,8 +3030,6 @@ mod tests {
 
     #[test]
     fn the_write_surface_actions_are_registered_too() {
-        // 注册表只负责「已放行动作怎么执行」；通道由 `ActionGate` 判定，
-        // 因此这两条必须真的可被分派，否则控制台的按钮会落到 NOT_IMPLEMENTED。
         let f = Fixture::new("registered-rw");
         let registry = Registry::new().with_readers(Arc::new(f.readers(always_ok_runner())));
         for action in [
@@ -3774,7 +3052,7 @@ mod tests {
         assert_eq!(out["ok"], true);
         assert_eq!(out["identity"]["domain"], "example.com");
         assert_eq!(out["version"], mailstack_core::VERSION);
-        // `users.list` 已经实现，因此不得再谎报用户模块不可用（R2-007）。
+
         assert_eq!(out["unavailable"], json!([]));
     }
 
@@ -3804,7 +3082,6 @@ mod tests {
             health["message"]
         );
 
-        // 配了中继之后，结论从「请配中继」变成「中继本身在失败」。
         fs::write(
             &f.paths.relay_config,
             r#"{"host":"relay.example.net","port":587}"#,
@@ -3836,7 +3113,6 @@ mod tests {
         .unwrap();
         store.enqueue(&entry).unwrap();
 
-        // 往隔离目录放一条（坏条目应当被计入「已被隔离」，而不是消失）。
         fs::create_dir_all(store.corrupt_dir()).unwrap();
         fs::write(store.corrupt_dir().join("bad.json.1.corrupt"), b"x").unwrap();
 
@@ -3847,11 +3123,9 @@ mod tests {
 
     #[test]
     fn queue_summary_marks_unreadable_state_instead_of_reporting_zero() {
-        // 状态读不到时 backlog/corrupt 仍是 0 —— 但必须同时在 `unavailable`
-        // 里显式列出，否则「读不到」被渲染成「队列真空」（INV-2）。
         let f = Fixture::new("queueunreadable");
         let store = mailstack_queue::QueueStore::from_paths(&f.paths);
-        // 隔离目录的位置被一个文件占住 → read_dir 必然失败。
+
         fs::create_dir_all(store.corrupt_dir().parent().unwrap()).unwrap();
         fs::write(store.corrupt_dir(), b"not a directory").unwrap();
 
@@ -3865,11 +3139,9 @@ mod tests {
 
     #[test]
     fn security_scan_propagates_an_unreadable_domain_table() {
-        // DKIM 私钥按纳管域枚举：域名表读失败必须报错 —— 静默成空表会让
-        // 体检「恰好扫不到任何 DKIM 私钥」，把读故障伪装成一次干净的体检。
         let f = Fixture::new("scanunreadable");
         fs::create_dir_all(f.paths.domains.parent().unwrap()).unwrap();
-        // 位置上是一个目录 → read_to_string 必然失败。
+
         fs::create_dir_all(&f.paths.domains).unwrap();
 
         let err = f
@@ -3895,7 +3167,7 @@ mod tests {
         assert_eq!(out["load"]["one"], 0.10);
         assert_eq!(out["memory"]["totalBytes"], 1000 * 1024);
         assert_eq!(out["memory"]["availableBytes"], 400 * 1024);
-        // 控制台列出的服务必须**逐条**出现，且带上界面要用的字段。
+
         let ids: Vec<&str> = out["services"]
             .as_array()
             .unwrap()
@@ -3923,7 +3195,7 @@ mod tests {
 
         assert!(out["memory"].is_null(), "读不到就不能编一个 0 出来");
         assert_eq!(out["unavailable"], json!(["memory"]));
-        // 其余子项不受影响。
+
         assert_eq!(out["uptimeSec"], 86400);
     }
 
@@ -3999,8 +3271,6 @@ mod tests {
 
     #[test]
     fn journal_binary_messages_are_decoded_as_utf8_lossy_not_latin1() {
-        // `b as char` 的 Latin-1 展开会把每个非 ASCII 字节变成一个乱码字，
-        // 且多字节 UTF-8 序列全部损坏；有损解码与展示面的口径一致。
         let raw = json!({
             "MESSAGE": [72, 0xE9, 0xFF, 108, 111],
             "__REALTIME_TIMESTAMP": "1767225600000000",
@@ -4040,7 +3310,6 @@ mod tests {
 
     #[test]
     fn network_check_port_never_accepts_targets_from_the_request() {
-        // 目标只来自部署配置：否则这个只读接口就是一个任意主机的 TCP 探针。
         let f = Fixture::new("probetargets");
         let readers = f.readers(always_ok_runner());
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4054,7 +3323,7 @@ mod tests {
                 "target": "127.0.0.1",
             })))
             .unwrap();
-        // 注入的目标清单为空 ⇒ 一个目标都不探测；请求体里的目标不得生效。
+
         assert_eq!(out["details"].as_array().unwrap().len(), 0);
         assert_eq!(out["port"], 25);
     }
@@ -4074,7 +3343,6 @@ mod tests {
             .clone();
         assert_eq!(ban["ok"], true, "封禁往返探针必须通过: {ban}");
 
-        // 探针跑在新建的内存表上 ⇒ 再跑一次结果一模一样（没有累积状态）。
         let second = readers.system_doctor(&json!({})).unwrap();
         assert_eq!(first, second, "诊断不得留下任何状态");
     }
@@ -4082,7 +3350,7 @@ mod tests {
     #[test]
     fn system_doctor_reports_each_broken_precondition() {
         let f = Fixture::new("doctorbad");
-        // 未设置身份、未设口令、域名表为空、无 DKIM 私钥、无证书。
+
         let out = f
             .readers(always_ok_runner())
             .system_doctor(&json!({}))
@@ -4107,9 +3375,9 @@ mod tests {
             .contains("INV-17"));
         assert_eq!(check_of("dkim_key")["ok"], false);
         assert_eq!(check_of("tls_certificate")["ok"], false);
-        // 没有任何中继配置是**合法状态**，不是故障。
+
         assert_eq!(check_of("relay_config")["ok"], true);
-        // 不存在的审计日志视为空链，通过。
+
         assert_eq!(check_of("audit_chain")["ok"], true);
 
         let names: Vec<&str> = out["checks"]
@@ -4140,7 +3408,7 @@ mod tests {
         mailstack_core::config::admin_set(&f.paths, "admin", "Tr0ubadour9x").unwrap();
         fs::write(&f.paths.domains, "example.com OK\n").unwrap();
         f.issue("mail.example.com", 90);
-        // DKIM 私钥：放到 keys::private_key_path 指向的位置。
+
         let key = mailstack_auth::keys::private_key_path(&f.paths, "example.com", "mail");
         fs::create_dir_all(key.parent().unwrap()).unwrap();
         fs::write(&key, "-----BEGIN RSA PRIVATE KEY-----\nxx\n").unwrap();
@@ -4152,8 +3420,6 @@ mod tests {
         assert_eq!(out["healthy"], true, "全部检查: {}", out["checks"]);
         assert_eq!(out["checks"].as_array().unwrap().len(), 8);
     }
-
-    // ── security.scan ──
 
     #[cfg(unix)]
     fn chmod(path: &std::path::Path, mode: u32) {
@@ -4199,7 +3465,7 @@ mod tests {
             "整份报告: {out}"
         );
         assert_eq!(out["highestSeverity"], Value::Null);
-        // 没装的组件不该被报成问题，但要能被区分出来。
+
         let absent: Vec<&str> = out["absent"]
             .as_array()
             .unwrap()
@@ -4213,8 +3479,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn security_scan_reports_the_config_directory_itself() {
-        // 目录放宽（0755）虽然读不到里面的 0600 文件，但会把「有哪几个文件」
-        // 暴露出去，比单个文件更该被看见。
         let f = Fixture::new("scandir");
         chmod(&f.paths.etc, 0o755);
         let out = f
@@ -4237,7 +3501,7 @@ mod tests {
     fn the_inventory_covers_the_plaintext_relay_password_and_every_key_kind() {
         let f = Fixture::new("inventory");
         f.issue("mail.example.com", 90);
-        // DKIM 私钥是按**纳管域**枚举的，所以域名表里得先有这个域。
+
         fs::write(&f.paths.domains, "example.com OK\n").unwrap();
         let dkim = mailstack_auth::keys::private_key_path(&f.paths, "example.com", "mail");
         fs::create_dir_all(dkim.parent().unwrap()).unwrap();
@@ -4251,22 +3515,18 @@ mod tests {
             .map(|e| e.path.display().to_string())
             .collect();
 
-        // 明文中继口令：基线点名要求扫它。
         assert!(
             paths.iter().any(|p| p.ends_with("sasl_passwd")),
             "清单必须包含 sasl_passwd: {paths:?}"
         );
         assert!(paths.iter().any(|p| p.ends_with("totp.key")));
         assert!(paths.iter().any(|p| p.ends_with("relay.json")));
-        assert!(paths.iter().any(|p| p.ends_with("ai-provider.json")));
-        // 每个已签发域的 TLS 私钥 + 每个纳管域的 DKIM 私钥。
+
         assert!(paths
             .iter()
             .any(|p| p.ends_with("mail.example.com/privkey.pem")));
         assert!(paths.iter().any(|p| p.ends_with(".private")));
     }
-
-    // ── backup.list ──
 
     #[test]
     fn backup_list_on_a_missing_directory_is_empty_not_an_error() {
@@ -4299,7 +3559,7 @@ mod tests {
             b"",
         )
         .unwrap();
-        // 点文件与不合规的名字都不是备份，必须被跳过。
+
         fs::write(f.paths.backups_dir.join(".hidden.tmp"), b"x").unwrap();
         fs::write(
             f.paths.backups_dir.join("mailstack-2026-01-03.tar.gz"),
@@ -4336,16 +3596,13 @@ mod tests {
             true,
             "0 字节的归档必须被标出来，否则一次失败的备份看起来是成功的"
         );
-        // 没有元数据 sidecar 时必须标出来，而不是把这份备份从列表里抹掉。
+
         assert_eq!(
             by_name("mailstack-backup-20260101-000000.tar.gz")["metadataMissing"],
             true
         );
     }
 
-    // ───────────────────── services.action ─────────────────────
-
-    /// 造一个「systemd 可用」的替身：`systemctl` 存在且 `/run/systemd/system` 是目录。
     fn systemd_env() -> Arc<dyn ServiceEnv> {
         Arc::new(EnvListing {
             programs: vec!["systemctl"],
@@ -4363,12 +3620,10 @@ mod tests {
             .services_action(&json!({ "id": "dovecot", "verb": "restart" }))
             .unwrap();
 
-        // 响应必须**是列表本身**：控制台把它直接当成新的服务清单。
         let items = out.as_array().expect("必须是数组");
         assert_eq!(items.len(), SERVICES.len());
         assert_eq!(items[0]["id"], SERVICES[0].0);
 
-        // 降级链首命中 systemctl，动词原样下发。
         let calls = runner.calls();
         assert_eq!(calls[0].0, "systemctl");
         assert_eq!(
@@ -4379,7 +3634,6 @@ mod tests {
 
     #[test]
     fn services_action_accepts_a_unit_name_as_well_as_the_console_id() {
-        // 控制台传 id（`clamav`），运维习惯传单元名（`clamav-daemon`）—— 两者都要能操作。
         let f = Fixture::new("svcunit");
         let runner = FakeRunner::returning(0, "");
         let readers = f.readers_with_env(runner.clone(), systemd_env());
@@ -4392,7 +3646,6 @@ mod tests {
 
     #[test]
     fn services_action_refuses_to_stop_the_console_from_itself() {
-        // 停掉 mailstack-web 之后没有任何途径再把它拉起来 —— 必须拒绝，且不得执行命令。
         let f = Fixture::new("svcself");
         let runner = FakeRunner::returning(0, "");
         let readers = f.readers_with_env(runner.clone(), systemd_env());
@@ -4403,7 +3656,6 @@ mod tests {
         assert!(err.to_string().contains("refusing to stop"), "实际: {err}");
         assert!(runner.calls().is_empty(), "被拒绝的动作不得产生任何副作用");
 
-        // 而 restart 是允许的：systemd 会把它拉回来，不构成自锁。
         readers
             .services_action(&json!({ "id": "mailstack-web", "verb": "restart" }))
             .unwrap();
@@ -4426,8 +3678,6 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("invalid service"), "实际: {err}");
 
-        // 未知动词必须报错。基线的 `service_ctl` 会一路落到 `true`（成功但什么都没做），
-        // 那正是「点了重启、其实没重启」的来源。
         let err = readers
             .services_action(&json!({ "id": "dovecot", "verb": "explode" }))
             .unwrap_err();
@@ -4437,7 +3687,6 @@ mod tests {
         );
         assert!(runner.calls().is_empty(), "被拒绝的动作不得执行任何命令");
 
-        // 缺 id 是真错误，不得猜一个默认服务。
         assert!(readers
             .services_action(&json!({ "verb": "restart" }))
             .is_err());
@@ -4445,7 +3694,6 @@ mod tests {
 
     #[test]
     fn services_action_without_a_verb_is_an_error_not_a_default_restart() {
-        // 与 queue.action 同一纪律：缺 verb 不能默认成 restart（变更性动作）。
         let f = Fixture::new("svcnoverb");
         let runner = FakeRunner::returning(0, "");
         let readers = f.readers_with_env(runner.clone(), systemd_env());
@@ -4465,7 +3713,6 @@ mod tests {
 
     #[test]
     fn services_action_reports_a_failing_command_instead_of_a_success_list() {
-        // 命令跑了但返回非零：不能回一个「看起来重启成功」的列表。
         let f = Fixture::new("svcfail");
         let runner = FakeRunner::returning(1, "");
         let readers = f.readers_with_env(runner, systemd_env());
@@ -4516,8 +3763,6 @@ mod tests {
             .unwrap();
         assert!(out.is_array());
 
-        // 只允许 `systemctl show ...` 这类**只读**探测；不得出现 `systemctl status`，
-        // 更不得出现 start/stop/restart/reload。
         for (program, args) in runner.calls() {
             assert_eq!(program, "systemctl");
             assert_eq!(args.first().map(String::as_str), Some("show"), "{args:?}");
@@ -4528,9 +3773,6 @@ mod tests {
         );
     }
 
-    // ───────────────────── queue.action ─────────────────────
-
-    /// 往队列里放一条条目并返回它的 id。
     fn enqueue(f: &Fixture, attempts: u32, next_attempt_unix: i64) -> String {
         let store = mailstack_queue::QueueStore::from_paths(&f.paths);
         let mut entry = mailstack_queue::QueueEntry::new(
@@ -4562,8 +3804,8 @@ mod tests {
     #[test]
     fn queue_action_flush_makes_only_the_deferred_entries_due() {
         let f = Fixture::new("qflush");
-        let due = enqueue(&f, 1, NOW); // 已到期
-        let deferred = enqueue(&f, 1, NOW + 3600); // 退避中
+        let due = enqueue(&f, 1, NOW);
+        let deferred = enqueue(&f, 1, NOW + 3600);
         let readers = f.readers(always_ok_runner());
 
         let out = readers.queue_action(&json!({ "verb": "flush" })).unwrap();
@@ -4581,8 +3823,6 @@ mod tests {
 
     #[test]
     fn queue_action_retry_restarts_the_attempt_budget() {
-        // 只把时间提前而不清 `attempts`，对一条已耗尽预算的条目来说下一次投递会立刻退信 ——
-        // 那等于「点了重试，邮件反而被删掉」。所以重试必须重新给一轮预算。
         let f = Fixture::new("qretry");
         let id = enqueue(&f, 9, NOW + 7200);
         let readers = f.readers(always_ok_runner());
@@ -4602,9 +3842,6 @@ mod tests {
 
     #[test]
     fn queue_action_accepts_the_frontend_field_names() {
-        // 管理前端按 `{id, op}` 提交。少了 `op` 这个候选名，`op:"delete"` 会被忽略、
-        // 落到默认的 `retry` —— 于是「删除队列条目」变成「立刻重新投递」，
-        // 而且两边都不报错。这条测试就是钉死这个后果。
         let f = Fixture::new("qfrontend");
         let id = enqueue(&f, 0, NOW);
         let readers = f.readers(always_ok_runner());
@@ -4629,14 +3866,11 @@ mod tests {
         let id = enqueue(&f, 3, NOW + 3600);
         let readers = f.readers(always_ok_runner());
 
-        // 前端的 `deliver` = 本仓库的 `retry`（清零预算并提前到期）。
         let out = readers
             .queue_action(&json!({ "id": id, "op": "deliver" }))
             .unwrap();
         assert_eq!(out[0]["status"], "active");
 
-        // `hold` 在本仓库的队列模型里没有对应状态：必须显式失败，
-        // 而不是映射成某个「最接近」的动词悄悄做成别的事。
         let err = readers
             .queue_action(&json!({ "id": id, "op": "hold" }))
             .unwrap_err();
@@ -4645,7 +3879,6 @@ mod tests {
 
     #[test]
     fn services_action_accepts_the_frontend_field_names() {
-        // 前端按 `{key, op}` 提交；只认 `id`/`verb` 会让重启请求变成默认动作或报错。
         let f = Fixture::new("svcfrontend");
         let readers = f.readers(always_ok_runner());
 
@@ -4673,8 +3906,6 @@ mod tests {
 
     #[test]
     fn queue_action_without_a_verb_is_an_error_not_a_default_retry() {
-        // 缺 verb 不能默认成 `retry`（变更性动作）：漏传参数必须显式失败，
-        // 否则「前端漏传 op」会被悄悄执行成一次重新投递。
         let f = Fixture::new("qnoverb");
         let id = enqueue(&f, 0, NOW);
         let readers = f.readers(always_ok_runner());
@@ -4699,7 +3930,6 @@ mod tests {
         let f = Fixture::new("qbad");
         let readers = f.readers(always_ok_runner());
 
-        // id 同时是文件名：路径穿越必须在拼路径**之前**就被挡死。
         for bad in ["../../etc/passwd", "a/b", "", "a b"] {
             let err = readers
                 .queue_action(&json!({ "id": bad, "verb": "delete" }))
@@ -4712,7 +3942,6 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("invalid queue action"), "{err}");
 
-        // 合法但不存在的 id：报「没有这条」，而不是静默成功。
         let err = readers
             .queue_action(&json!({ "id": "DEADBEEF0001", "verb": "retry" }))
             .unwrap_err();
@@ -4721,7 +3950,6 @@ mod tests {
 
     #[test]
     fn queue_action_tolerates_the_markers_postfix_prints_in_the_list() {
-        // 基线用 `rstrip('*!')` 去掉列表里的标记位；控制台可能把带标记的字符串回传。
         let f = Fixture::new("qmarker");
         let id = enqueue(&f, 0, NOW);
         let readers = f.readers(always_ok_runner());
@@ -4746,13 +3974,10 @@ mod tests {
         assert_eq!(items[0]["status"], "deferred", "未到期的是 deferred");
         assert_eq!(items[0]["retryCount"], 3);
         assert_eq!(items[0]["errorReason"], "connection refused");
-        // 积压摘要仍然在（两个字段并存：摘要给仪表盘，明细给队列页）。
+
         assert_eq!(out["queue"]["backlog"], 1);
     }
 
-    // ───────────────────── security.ban / security.unban ─────────────────────
-
-    /// 读出测试夹具里的手工封禁文件。
     fn manual_bans(f: &Fixture) -> Vec<mailstack_core::bans::ManualBan> {
         mailstack_core::bans::ManualBanStore::from_paths(&f.paths)
             .load()
@@ -4784,7 +4009,6 @@ mod tests {
 
     #[test]
     fn security_ban_normalises_equivalent_addresses() {
-        // 同一个 IPv6 地址的两种写法必须落到同一条记录，否则「解封」只解掉一半。
         let f = Fixture::new("bannorm");
         let readers = f.readers(always_ok_runner());
         readers.security_ban(&json!({ "ip": "::1" })).unwrap();
@@ -4813,10 +4037,10 @@ mod tests {
                 "{bad:?} 实际: {err}"
             );
         }
-        // 缺字段是真错误，不得猜一个「全部封禁」之类的默认值。
+
         let err = readers.security_ban(&json!({})).unwrap_err();
         assert!(err.to_string().contains("missing required field"), "{err}");
-        // 一次都不该落盘。
+
         assert!(manual_bans(&f).is_empty());
     }
 
@@ -4841,7 +4065,6 @@ mod tests {
         assert_eq!(bans.len(), 1);
         assert_eq!(bans[0].ip.to_string(), "198.51.100.8");
 
-        // 幂等：再解封一次不是错误（运维会连点）。
         readers
             .security_unban(&json!({ "ip": "198.51.100.7" }))
             .unwrap();
@@ -4849,7 +4072,6 @@ mod tests {
 
     #[test]
     fn a_manual_ban_is_never_written_over_a_corrupt_file() {
-        // 损坏时拒绝写入：新写一份会把运维可能还想抢救的旧内容彻底抹掉。
         let f = Fixture::new("bancorrupt");
         fs::create_dir_all(f.paths.manual_bans.parent().unwrap()).unwrap();
         fs::write(&f.paths.manual_bans, "{ not a ban list").unwrap();
@@ -4886,7 +4108,6 @@ mod tests {
 
     #[test]
     fn security_scan_reports_a_null_ban_list_when_the_file_cannot_be_read() {
-        // null（读不到）与 []（确实没有）在运维眼里是两件完全不同的事。
         let f = Fixture::new("scanbancorrupt");
         mailstack_core::config::admin_set(&f.paths, "admin", "Tr0ubadour9x").unwrap();
         fs::create_dir_all(f.paths.manual_bans.parent().unwrap()).unwrap();
@@ -4924,9 +4145,6 @@ mod tests {
         assert_eq!(finding["severity"], "high", "它能决定谁可以连 SMTP");
     }
 
-    // ───────────────────── backup.create / restore / delete ─────────────────────
-
-    /// 从列表里按文件名取一条。
     fn listed<'a>(items: &'a [Value], filename: &str) -> &'a Value {
         items
             .iter()
@@ -4959,8 +4177,7 @@ mod tests {
         let listed_items = readers.backup_list(&json!({})).unwrap();
         let items = listed_items.as_array().unwrap().to_vec();
         let entry = listed(&items, filename);
-        // `metadataMissing` 只在为真时出现；元数据齐全时它就该缺席，
-        // 因此这里断言「元数据确实读到了」——即校验和在场。
+
         assert!(
             entry["sha256"].is_string(),
             "刚写完的备份必须带校验和：{entry}"
@@ -4986,7 +4203,6 @@ mod tests {
         let out = readers.backup_create(&json!({})).unwrap();
         let filename = out["backup"]["filename"].as_str().unwrap().to_string();
 
-        // 直接读归档，确认 admin.json 真的不在里面。
         let archive = f.paths.backups_dir.join(&filename);
         let file = fs::File::open(&archive).unwrap();
         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
@@ -5008,7 +4224,7 @@ mod tests {
     #[test]
     fn backup_create_says_so_when_there_is_nothing_to_back_up() {
         let f = Fixture::new("bempty");
-        // 把源树清空：没有来源时不许产出一个空归档假装成功。
+
         fs::remove_dir_all(&f.backup_root).unwrap();
         let err = f
             .backup_readers(always_ok_runner())
@@ -5029,7 +4245,6 @@ mod tests {
             .unwrap();
         let filename = created["backup"]["filename"].as_str().unwrap().to_string();
 
-        // 没有 confirm：拒绝，且**不得**动落地根。
         let err = readers
             .backup_restore(&json!({ "filename": filename }))
             .unwrap_err();
@@ -5037,7 +4252,6 @@ mod tests {
         let restored_count = walk(&f.restore_root).len();
         assert_eq!(restored_count, 0, "被拒绝的恢复不得写任何文件");
 
-        // 路径穿越的文件名：必须在进入核心之前就被挡掉。
         let err = readers
             .backup_restore(&json!({ "filename": "../../etc/passwd", "confirm": true }))
             .unwrap_err();
@@ -5071,7 +4285,6 @@ mod tests {
             .unwrap();
         let filename = created["backup"]["filename"].as_str().unwrap().to_string();
 
-        // 先破坏现场：恢复之后必须能把内容还原回来。
         fs::write(f.backup_root.join("etc/mailstack/settings.json"), "{}").unwrap();
         let out = readers
             .backup_restore(&json!({ "filename": filename, "confirm": true }))
@@ -5079,13 +4292,13 @@ mod tests {
 
         assert_eq!(out["restored"], true);
         assert!(out["filesCount"].as_u64().unwrap() > 0);
-        // `mailstackd` 没有热重载：恢复完成后必须告诉调用方「要重启才能生效」。
+
         assert_eq!(out["restartRequired"], true);
         assert_eq!(
             fs::read_to_string(f.restore_root.join("etc/mailstack/settings.json")).unwrap(),
             "{}"
         );
-        // 回滚点必须真的登记上了，否则这次恢复没有回头路。
+
         assert!(
             out["preRestoreSnapshot"].is_string(),
             "缺少预恢复快照：{out}"
@@ -5094,7 +4307,6 @@ mod tests {
         let snapshot = out["preRestoreSnapshot"].as_str().unwrap();
         assert!(std::path::Path::new(snapshot).is_file());
 
-        // 回滚点自身也要能被解析回一个合法归档名。
         let store = mailstack_core::backup::BackupStore::from_paths(&f.paths);
         assert!(store
             .resolve(
@@ -5133,13 +4345,6 @@ mod tests {
         assert!(!metadata_path.exists(), "元数据必须一并删除");
     }
 
-    // ─────────── R2-013：includeMails 必须归档权威布局（~/Maildir） ───────────
-
-    /// 反例：`includeMails: true` 的归档里必须真的有受管邮箱的邮件。
-    ///
-    /// 修复前 `default_sources` 把邮件来源写死成 `var/vmail`（本栈从不创建），
-    /// 于是归档只有 `etc/*` 与 `var/lib/*`，而响应仍回 `includeMails: true`、
-    /// `partial: false` —— 一份"完整备份"里一封邮件都没有。
     #[test]
     fn backup_create_includes_the_managed_maildir() {
         let f = Fixture::new("bmail");
@@ -5163,7 +4368,6 @@ mod tests {
         );
     }
 
-    /// 反向：同一份归档必须能被 `backup.restore` 还原到临时根。
     #[test]
     fn backup_restore_puts_a_managed_maildir_back_into_the_target_root() {
         let f = Fixture::new("bmailrestore");
@@ -5173,7 +4377,6 @@ mod tests {
             .unwrap();
         let filename = created["backup"]["filename"].as_str().unwrap().to_string();
 
-        // 破坏现场：还原之后必须把邮件放回去。
         fs::remove_file(
             f.backup_root
                 .join("home/alice/Maildir/new/1712000000.M1P1.mx.eml"),
@@ -5195,7 +4398,6 @@ mod tests {
         );
     }
 
-    /// 反例：请求了邮件却一个来源都没有 → 必须报错，绝不产出"空邮件备份"。
     #[test]
     fn backup_create_refuses_include_mails_when_no_maildir_is_resolvable() {
         let f = Fixture::new("bmailnone");
@@ -5209,7 +4411,6 @@ mod tests {
         );
     }
 
-    /// 反例：注册表读不出来时必须报错，不能当成"没有受管邮箱"继续打一个空备份。
     #[test]
     fn backup_create_fails_closed_when_the_managed_registry_is_corrupt() {
         let f = Fixture::new("bmailcorrupt");
@@ -5225,11 +4426,10 @@ mod tests {
         );
     }
 
-    /// 反例：非受管账号的家目录成员仍然被拒（白名单语义没有放宽）。
     #[test]
     fn backup_restore_still_rejects_an_unmanaged_home_member() {
         let f = Fixture::new("bmailunmanaged");
-        // 手工造一份含 home/bob/** 的归档（bob 不在任何注册表里）。
+
         let bob_maildir = f.backup_root.join("home/bob/Maildir/new");
         fs::create_dir_all(&bob_maildir).unwrap();
         fs::write(bob_maildir.join("1.eml"), "Subject: bob\r\n\r\nx").unwrap();
@@ -5276,7 +4476,6 @@ mod tests {
         );
     }
 
-    /// 递归列出一个目录下的全部文件（相对路径）。
     fn walk(root: &std::path::Path) -> Vec<String> {
         let mut out = Vec::new();
         let Ok(read) = fs::read_dir(root) else {
@@ -5293,17 +4492,11 @@ mod tests {
         out
     }
 
-    // ───────────────────── setup（初始化向导） ─────────────────────
-
-    /// 可编程的 DNS 替身：按记录类型返回预设值。
-    ///
-    /// 必须完全离线：`setup.dns.verify` 的判据只能靠**受控的应答**来验证，
-    /// 打真实 DNS 的断言会随网络抖动随机变红（`docs/TEST_REPORT.md` §4.14）。
     struct StaticDns {
         a: Vec<String>,
         mx: Vec<String>,
         txt: std::collections::HashMap<String, Vec<String>>,
-        /// 非空时每次查询都失败（用于断言「解析故障必须上抛，而不是判为未发布」）。
+
         failure: Option<String>,
     }
 
@@ -5369,12 +4562,10 @@ mod tests {
         }
     }
 
-    /// 一段「看起来是真的」的 DKIM 公钥体。
     fn dkim_txt_value() -> String {
         format!("v=DKIM1; k=rsa; p={}", "A".repeat(120))
     }
 
-    /// 分阶段成功结果（形状与 `stages::run_relay_test` 的产物一致）。
     fn passed_relay_result() -> RelayTestResult {
         RelayTestResult {
             connected: true,
@@ -5393,11 +4584,10 @@ mod tests {
         }
     }
 
-    /// 脚本化的中继探针。
     struct ScriptedRelayProbe {
         test: Result<RelayTestResult, String>,
         direct: Result<RelayTestResult, String>,
-        /// 收到的请求 —— 用于断言「参数校验发生在任何网络行为之前」。
+
         seen: Mutex<Vec<RelayValidationRequest>>,
     }
 
@@ -5451,7 +4641,6 @@ mod tests {
         }
     }
 
-    /// 换掉网络后端的 Reader：DNS 与中继探针都由替身接管。
     fn readers_with_networks(
         f: &Fixture,
         dns: Arc<dyn DnsQuery>,
@@ -5462,7 +4651,6 @@ mod tests {
             .with_relay_probe(relay)
     }
 
-    /// 一份「已经正确发布」的 DNS 应答。
     fn published_dns() -> StaticDns {
         StaticDns::new()
             .with_a(&["203.0.113.10"])
@@ -5509,11 +4697,9 @@ mod tests {
         assert_eq!(out["identity"]["mailHost"], "mail.example.com");
         assert_eq!(out["identity"]["serverIp"], "203.0.113.10");
         assert_eq!(out["identity"]["expectedSpf"], "v=spf1 mx -all");
-        // 缺省 selector 与基线一致（`mail`，不是 dkim.rotate 的 `mailstack`）。
+
         assert_eq!(out["identity"]["dkimSelector"], "mail");
 
-        // 返回的公钥必须与落盘的 zone 片段里的 p= 一致 —— 否则向导会把一份
-        // 对不上号的公钥展示给运维。
         let public_key = out["dkimPublicKey"].as_str().unwrap();
         assert!(!public_key.is_empty());
         let txt = fs::read_to_string(mailstack_auth::keys::txt_record_path(
@@ -5531,7 +4717,6 @@ mod tests {
             "返回的 dkimPublicKey 与 .txt 不一致"
         );
 
-        // setup.json 与私钥都真的落盘了。
         assert!(f.paths.setup_config.is_file());
         assert!(mailstack_auth::keys::private_key_path(&f.paths, "example.com", "mail").is_file());
         let stored = mailstack_core::config::read_setup_config(&f.paths).unwrap();
@@ -5545,12 +4730,9 @@ mod tests {
 
         for bad in [
             json!({ "domain": "not a domain", "mailHost": "mail.example.com", "serverIp": "203.0.113.10" }),
-            // mailHost 必须是 domain 的子域。
             json!({ "domain": "example.com", "mailHost": "example.com", "serverIp": "203.0.113.10" }),
             json!({ "domain": "example.com", "mailHost": "mail.other.com", "serverIp": "203.0.113.10" }),
-            // IP 不是地址。
             json!({ "domain": "example.com", "mailHost": "mail.example.com", "serverIp": "not-an-ip" }),
-            // selector 非法。
             json!({ "domain": "example.com", "mailHost": "mail.example.com", "serverIp": "203.0.113.10", "dkimSelector": "bad selector" }),
         ] {
             assert!(
@@ -5558,10 +4740,9 @@ mod tests {
                 "{bad} 必须被拒绝"
             );
         }
-        // 缺字段也是错误，不得猜默认值。
+
         assert!(readers.setup_identity_apply(&json!({})).is_err());
 
-        // 被拒的请求不得留下任何痕迹：没有 setup.json，也没有密钥目录。
         assert!(!f.paths.setup_config.exists());
         assert!(!f.paths.opendkim.exists(), "校验失败不得创建密钥目录");
     }
@@ -5578,7 +4759,7 @@ mod tests {
             assert_eq!(out["checks"][check], true, "{check} 应为真: {out}");
         }
         assert_eq!(out["spfRecordCount"], 1);
-        // observed 原样摊开每条查询：只回 false 会让运维无从下手。
+
         assert_eq!(out["observed"]["a"][0], "203.0.113.10");
         assert_eq!(out["observed"]["mx"][0], "10 mail.example.com.");
         assert_eq!(out["observed"]["spf"][0], "v=spf1 mx -all");
@@ -5590,7 +4771,6 @@ mod tests {
 
     #[tokio::test]
     async fn setup_dns_verify_reports_missing_records_as_unverified_not_as_an_error() {
-        // 「DNS 里没有」与「查询故障」是两件事：前者是结论，后者才是错误。
         let f = Fixture::new("setupdnsnone");
         let readers = readers_with_networks(
             &f,
@@ -5626,7 +4806,6 @@ mod tests {
 
     #[tokio::test]
     async fn setup_dns_verify_rejects_a_second_spf_record() {
-        // 两条 `v=spf1` 会让收信方按 RFC 7208 直接判 permerror。
         let f = Fixture::new("setupdnsspf");
         let dns =
             published_dns().with_txt("example.com", &["v=spf1 mx -all", "v=spf1 include:x -all"]);
@@ -5641,8 +4820,7 @@ mod tests {
     #[tokio::test]
     async fn setup_dns_verify_checks_the_ses_mail_from_records() {
         let f = Fixture::new("setupdnsses");
-        // 主域记录齐全；SES 的 Mail-From 域只发布了 SPF、没有反馈 MX（真实里常见）。
-        // 判据必须能分别说清哪一条没配好，而不是笼统地「没通过」。
+
         let dns =
             published_dns().with_txt("bounce.example.com", &["v=spf1 include:amazonses.com -all"]);
         let readers = readers_with_networks(&f, Arc::new(dns), ScriptedRelayProbe::passing());
@@ -5664,9 +4842,6 @@ mod tests {
 
     #[test]
     fn mx_records_contain_requires_an_exact_host_match() {
-        // 子串匹配会把 `evilemail.example.com`（含期望串）与
-        // `mail.example.com.attacker.net`（期望串作前缀）一并判成命中 ——
-        // DNS 安全判据必须按**目标主机**精确相等。
         let records = vec![
             "10 evilemail.example.com.".to_string(),
             "20 mail.example.com.attacker.net.".to_string(),
@@ -5675,7 +4850,7 @@ mod tests {
             !mx_records_contain(&records, "mail.example.com"),
             "子串 / 后缀伪装不得命中"
         );
-        // 正常命中：去结尾点、忽略大小写、`dig +short` 的优先级前缀要能拆掉。
+
         assert!(mx_records_contain(
             &["10 mail.example.com.".to_string()],
             "mail.example.com"
@@ -5684,14 +4859,12 @@ mod tests {
             &["10 MAIL.EXAMPLE.COM".to_string()],
             "mail.example.com."
         ));
-        // 空期望主机不命中任何东西。
+
         assert!(!mx_records_contain(&records, "  "));
     }
 
     #[tokio::test]
     async fn spf_expected_falls_back_to_the_conventional_value_when_absent() {
-        // 请求不带 expectedSpf 时不能恒报 false：SPF 实际正确（恰好一条
-        // `v=spf1 mx -all`）应如实报告为通过 —— 与 dns.records 的缺省口径一致。
         let f = Fixture::new("spfdefault");
         let mut payload = identity_payload();
         payload.as_object_mut().unwrap().remove("expectedSpf");
@@ -5705,8 +4878,6 @@ mod tests {
 
     #[tokio::test]
     async fn setup_relay_test_reports_a_failed_probe_as_a_conclusion_with_stages() {
-        // 对端不通是**结论**，不是「服务器出错」：返回 200 + connected:false +
-        // 已完成的阶段，界面才能显示卡在哪一步。
         let f = Fixture::new("setuptestfail");
         let probe = ScriptedRelayProbe::failing();
         let readers = readers_with_networks(&f, Arc::new(published_dns()), probe.clone());
@@ -5771,7 +4942,7 @@ mod tests {
     #[tokio::test]
     async fn setup_relay_test_refuses_a_private_relay_when_the_deployment_disallows_it() {
         let f = Fixture::new("setuptestprivate");
-        // 公网档：私网中继一律拒绝（INV-15）。
+
         fs::write(&f.paths.install_args_conf, "ACCESS_MODE=caddy\n").unwrap();
         let probe = ScriptedRelayProbe::passing();
         let readers = readers_with_networks(&f, Arc::new(published_dns()), probe.clone());
@@ -5803,7 +4974,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out["connected"], true);
-        // 直投探测只证明本机 MTA 活着（INV-19），故不涉及出站端口判定。
+
         assert!(!out["stages"].as_array().unwrap().is_empty());
     }
 
@@ -5826,7 +4997,6 @@ mod tests {
         assert_eq!(out["relayhost"], "[smtp.sendgrid.net]:587");
         assert_eq!(out["test"]["connected"], true);
 
-        // 落在守护进程真正会读的那份文件上（`config::load_relay`）。
         let doc: Value =
             serde_json::from_str(&fs::read_to_string(&f.paths.relay_config).unwrap()).unwrap();
         assert_eq!(doc["relayhost"], "[smtp.sendgrid.net]:587");
@@ -5848,7 +5018,6 @@ mod tests {
 
     #[tokio::test]
     async fn setup_relay_apply_leaves_the_config_untouched_when_the_test_fails() {
-        // 「先测后写」的字面含义：测试不过就一行配置都不写。
         let f = Fixture::new("setupapplyfail");
         let readers =
             readers_with_networks(&f, Arc::new(published_dns()), ScriptedRelayProbe::failing());
@@ -5867,7 +5036,6 @@ mod tests {
 
     #[tokio::test]
     async fn setup_relay_apply_never_overwrites_the_previous_config_when_the_test_fails() {
-        // 已有中继配置时失败，旧配置必须原样保留（不能因为一次失败测试而清掉）。
         let f = Fixture::new("setupapplykeep");
         fs::write(
             &f.paths.relay_config,
@@ -5891,9 +5059,8 @@ mod tests {
     async fn setup_relay_apply_with_direct_clears_a_previously_configured_relay() {
         use mailstack_smtp::RelayConfigStore;
 
-        // `direct: true` 是撤销语义：apply 写过的键与凭证必须全部回到未设置。
         let f = Fixture::new("setupapplydirect");
-        // 先落一份「与生产 apply 同形」的配置（直接经同一载体写入）。
+
         let mut store = NativeRelayStore::production(&f.paths);
         store
             .write_key(
@@ -5919,12 +5086,11 @@ mod tests {
             .setup_relay_apply(&json!({ "direct": true }))
             .await
             .unwrap();
-        // 响应与成功的 apply 同形，且 mode 标明回到直投。
+
         assert_eq!(out["applied"], true);
         assert_eq!(out["mode"], "direct");
         assert_eq!(out["relayhost"], "");
 
-        // 落在守护进程真正会读的那份文件上：中继相关的键与凭证都不在了。
         let doc: Value =
             serde_json::from_str(&fs::read_to_string(&f.paths.relay_config).unwrap()).unwrap();
         for key in [
@@ -5939,7 +5105,6 @@ mod tests {
             assert!(doc.get(key).is_none(), "{key} 必须被清除，实际: {doc}");
         }
 
-        // 幂等：再 clear 一次仍是成功。
         let again = readers
             .setup_relay_apply(&json!({ "direct": true }))
             .await
@@ -5950,7 +5115,6 @@ mod tests {
 
     #[tokio::test]
     async fn setup_relay_apply_with_direct_on_a_fresh_install_is_a_successful_no_op() {
-        // 从未配置过中继时，direct 清除也必须成功（幂等语义），不得报错。
         let f = Fixture::new("setupapplydirectfresh");
         let readers = f.readers(always_ok_runner());
         let out = readers
@@ -5963,23 +5127,19 @@ mod tests {
 
     #[test]
     fn a_truncated_dkim_key_is_not_accepted_as_published() {
-        // 回归守卫：`network.py:115` 记录过一次公钥被截断的真实事故 ——
-        // 截断的公钥在本地看着像「记录已发布」，对端却验不过。
         assert!(has_dkim_public_key(&dkim_txt_value()));
         assert!(!has_dkim_public_key(&format!(
             "v=DKIM1; k=rsa; p={}",
             "A".repeat(99)
         )));
-        // 只有 `v=` 没有 `p=`。
+
         assert!(!has_dkim_public_key("v=DKIM1; k=rsa;"));
-        // 完全不是 DKIM 记录。
+
         assert!(!has_dkim_public_key(&"A".repeat(200)));
     }
 
     #[test]
     fn setup_selector_defaults_to_the_baseline_value_not_the_rotation_default() {
-        // 两个缺省刻意不同：向导用 `mail`，dkim.rotate 用 `mailstack`。
-        // 混用会让已发布的 DNS 记录对不上。
         assert_eq!(setup_selector(&json!({})), SETUP_DEFAULT_DKIM_SELECTOR);
         assert_eq!(setup_selector(&json!({ "dkimSelector": "  " })), "mail");
         assert_eq!(
@@ -5992,14 +5152,11 @@ mod tests {
         );
     }
 
-    // ───────────────────── 邮件环路自检 ─────────────────────
-
-    /// 脚本化的本机提交器。
     struct RecordingSubmitter {
         seen: Mutex<Vec<crate::mailtest::LocalSubmission>>,
-        /// `Ok(code)` = 入站 MTA 接受；`Err(说明)` = 被拒或连接失败。
+
         outcome: Result<u16, String>,
-        /// 非空时把收到的报文写进这个目录（模拟 MTA 已投递到 Maildir）。
+
         deliver_to: Option<PathBuf>,
     }
 
@@ -6020,7 +5177,6 @@ mod tests {
             })
         }
 
-        /// 与 [`RecordingSubmitter::accepting`] 相同，但会把报文落进给定目录。
         fn delivering_to(dir: PathBuf) -> Arc<Self> {
             Arc::new(Self {
                 seen: Mutex::new(Vec::new()),
@@ -6061,7 +5217,6 @@ mod tests {
         }
     }
 
-    /// 换掉提交器的 Reader：家目录根指向夹具临时目录，绝不扫真实 `/home`。
     fn readers_with_mailtest(f: &Fixture, submitter: Arc<RecordingSubmitter>) -> Readers {
         f.readers(always_ok_runner())
             .with_mailtest_env(MailTestEnv {
@@ -6070,7 +5225,6 @@ mod tests {
             })
     }
 
-    /// 往受管邮箱注册表写一条记录（`setup.mail.test` 的存在性检查据此命中）。
     fn register_managed_mailbox(f: &Fixture, unix_user: &str, email: &str) {
         let boxes = json!([{ "email": email, "unixUser": unix_user, "displayName": "" }]);
         fs::create_dir_all(f.paths.managed_mailboxes.parent().unwrap()).unwrap();
@@ -6093,7 +5247,7 @@ mod tests {
     #[tokio::test]
     async fn setup_mail_test_submits_with_crlf_and_enforces_the_mailbox_checks() {
         let f = Fixture::new("mailtest");
-        // 命中存在性检查且未锁定：`alice@example.com` 必须在受管邮箱注册表里。
+
         register_managed_mailbox(&f, "alice", "alice@example.com");
         let submitter = RecordingSubmitter::accepting();
         let readers = readers_with_mailtest(&f, Arc::clone(&submitter));
@@ -6103,7 +5257,7 @@ mod tests {
                 "sender": "alice@example.com",
                 "recipient": "bob@example.com",
                 "username": "alice",
-                // 既有口令的回放：只做格式校验，不参与认证。
+
                 "password": "Sup3rSecret!",
             }))
             .await
@@ -6114,7 +5268,7 @@ mod tests {
         assert_eq!(out["sender"], "alice@example.com");
         assert_eq!(out["recipient"], "bob@example.com");
         assert_eq!(out["code"], 250);
-        // 偏离已撤销：受管邮箱检查真实执行了，不再有「跳过」字段。
+
         assert!(
             out.get("mailboxChecksSkipped").is_none(),
             "mailboxChecksSkipped 必须已移除: {out}"
@@ -6125,7 +5279,7 @@ mod tests {
         let submission = &submissions[0];
         assert_eq!(submission.mail_from, "alice@example.com");
         assert_eq!(submission.recipient, "bob@example.com");
-        // 裸 LF 会被入站的走私防护拒收，正文必须已是 CRLF。
+
         assert!(
             submission.data.contains("\r\n"),
             "正文必须用 CRLF 行尾: {:?}",
@@ -6136,7 +5290,7 @@ mod tests {
             "正文不得残留裸 LF: {:?}",
             submission.data
         );
-        // 口令不得被带进报文。
+
         assert!(!submission.data.contains("Sup3rSecret!"));
     }
 
@@ -6156,8 +5310,7 @@ mod tests {
                 "{bad} 实际: {err}"
             );
         }
-        // 缺字段是另一类错误，且必须比「格式不对」更精确 —— 否则调用方会把
-        // 「字段名写错了」误当成「地址非法」。
+
         let err = readers
             .setup_mail_test(&json!({ "sender": "alice@example.com" }))
             .await
@@ -6171,21 +5324,18 @@ mod tests {
 
     #[tokio::test]
     async fn setup_mail_test_requires_a_managed_mailbox_matching_the_sender() {
-        // sender 与 username 必须**同时**精确命中注册表里的一条记录。
         let f = Fixture::new("mailtestnomatch");
         register_managed_mailbox(&f, "alice", "alice@example.com");
         let submitter = RecordingSubmitter::accepting();
         let readers = readers_with_mailtest(&f, Arc::clone(&submitter));
 
         for payload in [
-            // username 根本不在注册表里。
             json!({
                 "sender": "bob@example.com",
                 "recipient": "bob@example.com",
                 "username": "bob",
                 "password": "Sup3rSecret!",
             }),
-            // username 在注册表里，但 sender 与它记录里的地址不一致。
             json!({
                 "sender": "carol@example.com",
                 "recipient": "bob@example.com",
@@ -6211,7 +5361,7 @@ mod tests {
         let f = Fixture::new("mailtestlocked");
         register_managed_mailbox(&f, "alice", "alice@example.com");
         let submitter = RecordingSubmitter::accepting();
-        // `passwd -S` 的第 2 个字段为 `L` ⇒ 账号被锁定。
+
         let tracked = Arc::clone(&submitter);
         let readers = f
             .readers(FakeRunner::returning(0, "alice L 01/01/2026 0 99999 7 -1"))
@@ -6243,7 +5393,6 @@ mod tests {
         let submitter = RecordingSubmitter::accepting();
         let readers = readers_with_mailtest(&f, Arc::clone(&submitter));
 
-        // username 非法（大写）：与 sender/recipient 合并成同一文案。
         let err = readers
             .setup_mail_test(&json!({
                 "sender": "alice@example.com",
@@ -6255,7 +5404,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.to_string(), "invalid mailbox or sender");
 
-        // 口令形状非法（空）：这是既有口令的回放，只做格式校验。
         let err = readers
             .setup_mail_test(&json!({
                 "sender": "alice@example.com",
@@ -6297,8 +5445,6 @@ mod tests {
 
     #[tokio::test]
     async fn mail_test_loopback_requires_a_managed_domain() {
-        // 空域名表 = 全新安装：基线曾被 `if managed and ...` 整个跳过守卫，
-        // 这里必须直接拒绝，绝不能对互联网地址投信。
         let f = Fixture::new("loopnodomain");
         let submitter = RecordingSubmitter::accepting();
         let readers = readers_with_mailtest(&f, Arc::clone(&submitter));
@@ -6349,7 +5495,7 @@ mod tests {
     async fn mail_test_loopback_reports_the_token_and_finds_it_in_the_maildir() {
         let f = Fixture::new("loopfound");
         fs::write(&f.paths.domains, "example.com OK\n").unwrap();
-        // 提交器把报文落进 vmail 布局里的一处候选位置。
+
         let maildir_new = f
             .paths
             .vmail
@@ -6374,7 +5520,6 @@ mod tests {
         );
         assert!(out["deliveryTimeMs"].as_u64().unwrap() >= 1);
 
-        // 报文里确实带着那个 token，且用 CRLF 行尾。
         let submissions = submitter.submissions();
         assert_eq!(submissions.len(), 1);
         assert!(submissions[0].data.contains(&token));
@@ -6384,7 +5529,6 @@ mod tests {
 
     #[tokio::test]
     async fn mail_test_loopback_reports_a_missing_maildir_as_absent_evidence_not_failure() {
-        // 提交被 250 接受就说明环路通了；Maildir 只是额外证据。
         let f = Fixture::new("loopmaildirnone");
         fs::write(&f.paths.domains, "example.com OK\n").unwrap();
         let submitter = RecordingSubmitter::accepting();
@@ -6413,8 +5557,6 @@ mod tests {
         assert!(err.to_string().contains("Connection refused"), "{err}");
     }
 
-    // ───────────── 管理前端新增的 8 个只读列表动作 ─────────────
-
     #[test]
     fn the_frontend_list_actions_are_registered() {
         let f = Fixture::new("frontregistered");
@@ -6433,9 +5575,6 @@ mod tests {
         }
     }
 
-    /// 造一个能读到受管邮箱的 Reader：假 passwd 根 + 假注册表。
-    ///
-    /// `locked` 决定 `passwd -S` 的输出（`L` = 锁定），用来验证 `active` 的映射。
     fn users_readers(
         f: &Fixture,
         passwd: &str,
@@ -6458,7 +5597,6 @@ mod tests {
         .unwrap();
 
         let env = UsersEnv {
-            // 生产是 `/etc`；测试必须指向临时根，否则会去读真实的 `/etc/passwd`。
             passwd_root: etc.to_path_buf(),
             session_epoch_owner: None,
             ..UsersEnv::default()
@@ -6488,7 +5626,7 @@ mod tests {
         assert_eq!(items[0]["address"], "alice@example.com");
         assert_eq!(items[0]["name"], "Alice");
         assert_eq!(items[0]["active"], true);
-        // 配额没有落盘，恒为 0 —— 不是漏读，是本项目根本没有这个数据。
+
         assert_eq!(items[0]["quotaUsed"], 0);
         assert_eq!(items[0]["quotaTotal"], 0);
         assert_eq!(items[0]["createdAt"], "");
@@ -6528,7 +5666,7 @@ mod tests {
             items[0]["destinations"],
             json!(["alice@example.com", "bob@example.com"])
         );
-        // 别名表没有「禁用」概念 —— 写进表里就是生效的。
+
         assert_eq!(items[0]["active"], true);
         assert_eq!(items[0]["createdAt"], "");
     }
@@ -6546,8 +5684,8 @@ mod tests {
     #[test]
     fn queue_list_maps_only_the_two_real_states_and_derives_the_domain() {
         let f = Fixture::new("queuelist");
-        enqueue(&f, 1, NOW); // 已到期 → active
-        enqueue(&f, 3, NOW + 3600); // 未到期 → deferred
+        enqueue(&f, 1, NOW);
+        enqueue(&f, 3, NOW + 3600);
 
         let out = f
             .readers(always_ok_runner())
@@ -6560,13 +5698,13 @@ mod tests {
             .map(|item| item["status"].as_str().unwrap())
             .collect();
         statuses.sort_unstable();
-        // 只有 sending / pending 两态；delivered/failed/hold 本仓库永不产生。
+
         assert_eq!(statuses, vec!["pending", "sending"]);
         for item in items {
             assert_eq!(item["domain"], "example.test");
             assert_eq!(item["recipient"], "bob@example.test");
             assert_eq!(item["service"], "outbound");
-            // `time` 是队列条目的到达时刻，落盘形态是 ISO8601（不是 unix 秒）。
+
             assert_eq!(item["time"], "2026-01-01T00:00:00+00:00");
             assert!(item["retry"].is_number());
         }
@@ -6575,7 +5713,7 @@ mod tests {
     #[test]
     fn services_list_maps_active_status_to_running_and_reuses_the_service_items() {
         let f = Fixture::new("serviceslist");
-        // systemd 不可用且 `pgrep` 失败 → 全部判为未运行。
+
         let out = f
             .readers(FakeRunner::returning(1, ""))
             .services_list(&json!({}))
@@ -6586,7 +5724,6 @@ mod tests {
         assert_eq!(items[0]["detail"], SERVICES[0].1);
         assert_eq!(items[0]["running"], false);
 
-        // systemd 可用且报告 active → running 为真。
         let stdout =
             "ActiveState=active\nMainPID=42\nMemoryCurrent=1048576\nActiveEnterTimestamp=\n";
         let readers = f.readers_with_env(FakeRunner::returning(0, stdout), systemd_env());
@@ -6597,10 +5734,9 @@ mod tests {
     #[tokio::test]
     async fn dkim_keys_lists_only_domains_with_a_private_key() {
         let f = Fixture::new("dkimkeys");
-        f.set_identity(); // selector = mail
+        f.set_identity();
         fs::write(&f.paths.domains, "example.com OK\nother.test OK\n").unwrap();
 
-        // 只给 example.com 造一个私钥文件（动作只 stat，不解析内容）。
         let private = mailstack_auth::keys::private_key_path(&f.paths, "example.com", "mail");
         fs::create_dir_all(private.parent().unwrap()).unwrap();
         fs::write(&private, b"-----BEGIN RSA PRIVATE KEY-----\n").unwrap();
@@ -6637,7 +5773,7 @@ mod tests {
             ScriptedRelayProbe::passing(),
         );
         let out = readers.dkim_keys(&json!({})).await.unwrap();
-        // 解析失败与未发布都表现为 false：不得谎报已发布，也不得拖垮整条列表。
+
         assert_eq!(out[0]["published"], false);
     }
 
@@ -6646,7 +5782,7 @@ mod tests {
         let f = Fixture::new("dnsrecords");
         f.set_identity();
         fs::write(&f.paths.domains, "example.com OK\n").unwrap();
-        // 造出 DKIM 的 zone 片段：`dns.records` 的期望值从它还原。
+
         let txt = mailstack_auth::keys::txt_record_path(&f.paths, "example.com", "mail");
         fs::create_dir_all(txt.parent().unwrap()).unwrap();
         fs::write(
@@ -6697,7 +5833,7 @@ mod tests {
 
         let out = readers.dns_records(&json!({})).await.unwrap();
         let items = out.as_array().unwrap();
-        // 没有 DKIM 片段文件 ⇒ 不产出 DKIM 条目；A/MX/SPF/DMARC 都在但 ok 为 false。
+
         assert_eq!(items.len(), 4, "缺 DKIM 密钥时不编造条目: {out}");
         assert!(items.iter().all(|item| item["ok"] == false));
     }
@@ -6705,13 +5841,13 @@ mod tests {
     #[test]
     fn metrics_system_reports_cpu_memory_and_disk_percentages() {
         let f = Fixture::new("metricssystem");
-        // 两次读数相同的 /proc/stat → cpu 增量为 0。
+
         fs::write(
             f.proc_root.join("stat"),
             "cpu  100 0 100 800 0 0 0 0 0 0\ncpu0 50 0 50 400 0 0 0 0 0 0\n",
         )
         .unwrap();
-        // meminfo 夹具：total 1000 - available 400 ⇒ 60%。
+
         let df = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 10000 2500 7500 25% /\n";
         let out = f
             .readers(FakeRunner::returning(0, df))
@@ -6725,14 +5861,14 @@ mod tests {
     #[test]
     fn metrics_system_reports_zero_when_proc_and_df_are_unavailable() {
         let f = Fixture::new("metricssystemfail");
-        // 无 stat 文件 + df 失败 ⇒ 全部 0，而不是恐慌。
+
         let out = f
             .readers(FakeRunner::returning(1, "df: /: Permission denied"))
             .metrics_system(&json!({}))
             .unwrap();
         assert_eq!(out["cpu"], 0.0);
         assert_eq!(out["disk"], 0.0);
-        // 内存仍能读到夹具。
+
         assert_eq!(out["memory"], 60.0);
     }
 
@@ -6740,13 +5876,12 @@ mod tests {
     fn read_cpu_counters_strips_the_core_index_before_splitting() {
         let root = std::env::temp_dir().join(format!("mailstack-cpustat-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
-        // 汇总行的 `cpu` 后面直接是计数器。
+
         fs::write(root.join("stat"), "cpu  100 0 100 800 0 0 0 0 0 0\n").unwrap();
         let aggregate = read_cpu_counters(&root).unwrap();
         assert_eq!(aggregate.total, 1000);
         assert_eq!(aggregate.idle, 800);
 
-        // 每核行的序号必须被剥掉，否则整列错位一格（docs/TEST_REPORT.md §4.20）。
         fs::write(root.join("stat"), "cpu0 100 0 100 700 100 0 0 0 0 0\n").unwrap();
         let core = read_cpu_counters(&root).unwrap();
         assert_eq!(core.total, 1000, "user..steal 八项之和");
@@ -6764,7 +5899,7 @@ mod tests {
             idle: 300,
             total: 600,
         };
-        // idle +200、总量 +400 ⇒ 一半忙。
+
         assert_eq!(cpu_busy_percent(&prev, &now), 50.0);
         assert_eq!(cpu_busy_percent(&now, &now), 0.0, "零增量不能除零");
     }
@@ -6802,7 +5937,7 @@ mod tests {
         mailstack_core::audit::audit(log, "users.add", true, "", "alice").unwrap();
         mailstack_core::audit::audit(log, "domains.add", true, "", "example.com").unwrap();
         mailstack_core::audit::audit(log, "services.action", false, "boom", "postfix").unwrap();
-        // 半行与格式回滚的旧记录都必须被跳过，而不是让整条列表失败。
+
         let mut text = fs::read_to_string(log).unwrap();
         text.push_str("{\"action\":\"legacy\"}\n{\"partial\":");
         fs::write(log, text).unwrap();
@@ -6833,9 +5968,6 @@ mod tests {
 
     #[test]
     fn activity_list_reads_only_the_tail_of_a_large_log() {
-        // 审计日志只增不减：读取必须限制在尾部窗口（[`ACTIVITY_TAIL_BYTES`]），
-        // 否则一个前端轮询动作会随日志增长变成 IO 放大器。先垫 ~400KB 的
-        // 填充行（模拟一台跑了几年的日志），窗口之外的内容不得影响结果。
         let f = Fixture::new("activitytail");
         let log = &f.paths.audit_log;
         fs::create_dir_all(log.parent().unwrap()).unwrap();

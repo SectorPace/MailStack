@@ -1,18 +1,8 @@
-//! 证书读取（`certs.list`）。
-//!
-//! 布局与基线一致：`<etc>/tls/<domain>/fullchain.pem` 与 `privkey.pem`
-//! （与 `mailstack_smtpd::tls::CertPaths` 同源，改一侧必须改另一侧）。
-//!
-//! 这里只做**读取与解析**，不做链校验 —— 校验由 rustls 在握手时完成，
-//! 在那之前先接受一个证书毫无意义。本模块存在的理由是运维真正要看的那个数：
-//! **还有几天到期**。
-
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use time::OffsetDateTime;
 
-/// 一个域名的证书状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertificateInfo {
     pub domain: String,
@@ -20,35 +10,29 @@ pub struct CertificateInfo {
     pub key_path: PathBuf,
     pub cert_present: bool,
     pub key_present: bool,
-    /// 私钥权限位（八进制）。
+
     pub key_mode: Option<u32>,
-    /// 私钥是否对「非属主」可读 —— 这是一个必须能被看见的问题。
+
     pub key_group_or_world_readable: bool,
     pub not_after: Option<String>,
     pub not_before: Option<String>,
     pub days_until_expiry: Option<i64>,
     pub issuer: Option<String>,
     pub subject: Option<String>,
-    /// 读取或解析失败的原因。存在它时 `not_after` 之类仍可能为 `None`。
+
     pub error: Option<String>,
 }
 
 impl CertificateInfo {
-    /// 是否在 `days` 天内到期（或已过期）。
     pub fn expires_within(&self, days: i64) -> bool {
         self.days_until_expiry.map(|d| d <= days).unwrap_or(false)
     }
 }
 
-/// TLS 目录：`<etc>/tls`。
 pub fn tls_dir(etc: &Path) -> PathBuf {
     etc.join("tls")
 }
 
-/// 枚举 `<etc>/tls/*/` 下的证书。
-///
-/// 目录名不是合法域名的条目会被**跳过**（它们不是本模块管辖的对象），
-/// 而不合法内容不会被当作域名拼进路径。
 pub fn list_certificates(etc: &Path, now: OffsetDateTime) -> Vec<CertificateInfo> {
     let dir = tls_dir(etc);
     let Ok(read) = std::fs::read_dir(&dir) else {
@@ -73,11 +57,6 @@ pub fn list_certificates(etc: &Path, now: OffsetDateTime) -> Vec<CertificateInfo
     out
 }
 
-/// 读取单个域名的证书。
-///
-/// **不返回 `Option`**：证书缺失也是要上报的事实（`cert_present: false`），
-/// 而不是「没有这一项」—— 前者会在界面上显示为「未配置证书」，后者会显示为
-/// 「这个域不存在」，两者对运维的含义完全不同。
 pub fn read_certificate(etc: &Path, domain: &str, now: OffsetDateTime) -> CertificateInfo {
     let dir = tls_dir(etc).join(domain);
     let cert_path = dir.join("fullchain.pem");
@@ -128,9 +107,6 @@ pub fn read_certificate(etc: &Path, domain: &str, now: OffsetDateTime) -> Certif
     info
 }
 
-/// 从 PEM 文本里取出第一段 `CERTIFICATE` 的 DER 字节。
-///
-/// 只认第一段：`fullchain.pem` 的后续条目是中间证书，到期判断看的是叶证书。
 pub fn first_certificate_der(pem: &str) -> Option<Vec<u8>> {
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";
@@ -138,16 +114,11 @@ pub fn first_certificate_der(pem: &str) -> Option<Vec<u8>> {
     let start = pem.find(BEGIN)? + BEGIN.len();
     let rest = &pem[start..];
     let end = rest.find(END)?;
-    // PEM 正文可以跨多行；去掉所有空白后才是纯 base64。
+
     let body: String = rest[..end].chars().filter(|c| !c.is_whitespace()).collect();
     base64::engine::general_purpose::STANDARD.decode(body).ok()
 }
 
-/// 把 X.509 名称渲染成一行：`CN=mail.example.com, O=Example`。
-///
-/// `asn1-rs` 的 `Oid` 打完是点分形式（`2.5.4.3`），直接透出去运维读不懂；
-/// 这里把最常见的几个属性映射成 openssl 风格的短名，其余保留点分形式
-/// （**不猜**，认不出来就如实显示 OID）。
 fn render_name(name: &x509_parser::x509::X509Name<'_>) -> String {
     name.iter()
         .map(|rdn| {
@@ -164,7 +135,6 @@ fn render_name(name: &x509_parser::x509::X509Name<'_>) -> String {
         .join(", ")
 }
 
-/// 常见 X.509 名称属性的短名（来自 `oid_registry` 的标准 OID）。
 fn short_attribute_name(oid: &str) -> &str {
     match oid {
         "2.5.4.3" => "CN",
@@ -215,8 +185,6 @@ mod tests {
             Self { root }
         }
 
-        /// 用 rcgen 现场签一张自签证书 —— 不预置 fixture 是为了让「解析出来的
-        /// 到期时间」与「生成时声明的时间」能做逐字比对，而不是只断言「非空」。
         fn issue(&self, domain: &str, days: i64) -> Vec<u8> {
             let not_before = now();
             let not_after = not_before + time::Duration::days(days);
@@ -225,8 +193,7 @@ mod tests {
             };
 
             let mut params = rcgen::CertificateParams::new(vec![domain.to_string()]).unwrap();
-            // rcgen 默认不写 DN，只写 SAN；这里显式写 CN，好让「subject 渲染」
-            // 这条断言真的在验解析结果，而不是在验一个空串。
+
             params
                 .distinguished_name
                 .push(rcgen::DnType::CommonName, domain);
@@ -273,13 +240,13 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("CN=mail.example.com"));
-        // 自签证书的签发者就是自己。
+
         assert!(info
             .issuer
             .as_deref()
             .unwrap()
             .contains("CN=mail.example.com"));
-        // 解析出的 DER 必须与生成时的相同。
+
         assert_eq!(
             first_certificate_der(
                 &fs::read_to_string(tls_dir(&f.root).join("mail.example.com/fullchain.pem"))
@@ -364,7 +331,7 @@ mod tests {
         let f = Fixture::new("listing");
         f.issue("b.example.com", 30);
         f.issue("a.example.com", 30);
-        // 非域名的目录不该被当作证书条目（它可能是运维留下的临时目录）。
+
         fs::create_dir_all(tls_dir(&f.root).join("not a domain")).unwrap();
         fs::create_dir_all(tls_dir(&f.root).join(".hidden")).unwrap();
 
@@ -385,13 +352,12 @@ mod tests {
         assert_eq!(short_attribute_name("2.5.4.3"), "CN");
         assert_eq!(short_attribute_name("2.5.4.10"), "O");
         assert_eq!(short_attribute_name("1.2.840.113549.1.9.1"), "emailAddress");
-        // 认不出来的 OID 如实显示，不猜一个名字出来。
+
         assert_eq!(short_attribute_name("1.2.3.4.5"), "1.2.3.4.5");
     }
 
     #[test]
     fn pem_extraction_handles_multiline_and_padded_bodies() {
-        // 单行 base64、带空行、带行尾空白 —— 都应当被还原成同一段字节。
         let der = first_certificate_der(
             "junk before\n-----BEGIN CERTIFICATE-----\nZm9v\nYmFy\n-----END CERTIFICATE-----\njunk after\n",
         )

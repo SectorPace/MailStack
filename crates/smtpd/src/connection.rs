@@ -1,19 +1,3 @@
-//! 会话驱动：把字节流接到 [`Session`] 上（规格书 §5.10）。
-//!
-//! ## 只有一个输入缓冲
-//!
-//! 命令阶段与 DATA 阶段**共用**同一个缓冲，且缓冲里始终是「尚未消费的字节」。
-//! 这不是实现细节而是正确性要求：客户端可以把正文与后续命令**流水线**在同一个
-//! TCP 段里发出来，若命令读取器与 [`DataSink`] 各自持有一份缓冲，必然有一方读到
-//! 另一方的字节。`DataSink::feed` 返回「已消费多少字节」正是为此。
-//!
-//! ## 命令阶段也拒绝裸 LF
-//!
-//! 与 DATA 阶段用**同一条策略**（[`crate::data::BareNewlinePolicy`]）。命令阶段的
-//! 边界歧义同样可以被利用：上游按裸 LF 切、本机不切，两边对「哪一段是命令」理解
-//! 不一致。默认 `Reject` —— 遇到裸 LF 就回 500 并**断开**，因为此时双方对边界的
-//! 认知已经分叉，继续解析是在拿对方的理解当自己的。
-
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -27,18 +11,12 @@ use crate::reply::{texts, Reply};
 use crate::sasl::{AuthOutcome, AuthRequest, Authenticator};
 use crate::session::{AcceptedMessage, Action, Session};
 
-/// 命令行的原始缓冲上限（含未结束的行）。
-///
-/// 解析器自己还有 512 的上限；这个更宽松的上限用来兜住「永远不发 CRLF」的行，
-/// 否则我们会在解析之前就把内存吃光。
 pub const MAX_COMMAND_BUFFER: usize = 2048;
 
-/// 驱动限制。
 #[derive(Debug, Clone)]
 pub struct ServerLimits {
-    /// 等待下一条命令的时长（RFC 5321 §4.5.3.2）。
     pub command_timeout: Duration,
-    /// 等待 DATA 正文的时长（RFC 5321 建议 10 分钟）。
+
     pub data_timeout: Duration,
 }
 
@@ -51,32 +29,14 @@ impl Default for ServerLimits {
     }
 }
 
-/// 投递失败时返回给对端的应答。
 pub type SinkFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Reply>> + Send + 'a>>;
 
-/// 收下一封邮件的去处。
-///
-/// 实现者负责「真正接管这封邮件」：跑入站认证、写入队列。**只有**返回 `Ok(())`
-/// 之后驱动才会回 250 —— 先答 250 再落盘，等于对发送方说谎。
 pub trait MessageSink: Send + Sync {
     fn accept<'a>(&'a self, message: AcceptedMessage, peer: SocketAddr) -> SinkFuture<'a>;
 }
 
-/// 同一连接内允许的**连续**认证失败次数，超过即断开。
-///
-/// ## 为什么必须有这个上限
-///
-/// RFC 4954 允许客户端在一条连接上重试 `AUTH`，但**没有规定次数上限**。
-/// 原实现对认证失败只打日志、不计数、不封禁，于是同一条连接可以无限次重发
-/// `AUTH PLAIN`，每次都真的打到 Dovecot auth socket —— 一次成功的爆破可以
-/// 持续整条 TCP 连接的时长（提交端口的空闲超时是分钟级）。
-///
-/// 与封禁表的关系：这里是**每连接**的止损（让爆破必须重新建连、重新过准入），
-/// [`BanList`](crate::ban::BanList) 是**跨连接**的封禁（真正的惩罚）。两者都要有：
-/// 只有前者则换个 IP 即可重来；只有后者则连接内的重试完全免费。
 pub const MAX_CONSECUTIVE_AUTH_FAILURES: u32 = 5;
 
-/// 把一条已渲染的应答写出去。
 pub(crate) async fn write_reply<S>(stream: &mut S, reply: &Reply) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -85,40 +45,19 @@ where
     stream.flush().await
 }
 
-/// 一次 `serve` 调用的结束原因。
-///
-/// 监听层据此决定「关掉连接」还是「就地升级到 TLS 后重新进入会话」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeOutcome {
-    /// 会话正常结束（QUIT、对端断开、超时或协议违规断开）。
     Closed,
-    /// 对端要求 STARTTLS；**明文读缓冲已在返回前丢弃**，
-    /// 调用方应完成 TLS 握手后以 [`serve_after_upgrade`] 重新进入。
+
     StartTls,
-    /// 会话期间发生了**这么多次**认证失败（凭据错，不是后端不可用）。
-    ///
-    /// ## 为什么把它带回监听层
-    ///
-    /// 封禁表（[`BanList`](crate::ban::BanList)）归监听层所有，`drive` 拿不到它。
-    /// 而认证失败必须计入封禁 —— 否则提交端口（465/587）上同一条连接可以
-    /// 无限次重发 `AUTH`，每次都真打到 Dovecot auth socket，而
-    /// 「替代 fail2ban」的那套封禁表**对爆破完全失明**（限速只按连接数计数，
-    /// 认证尝试不消耗任何配额）。
-    ///
-    /// 只回传**计数**而不是「要不要封禁」：阈值与封禁时长是监听层的策略，
-    /// 会话驱动不该知道全局策略。
-    ClosedAfterAuthFailures {
-        /// 连续的凭据错误次数。
-        failures: u32,
-    },
+
+    ClosedAfterAuthFailures { failures: u32 },
 }
 
-/// 取出一行（不含行结束符）以及「已消费到哪」。
 enum LineOutcome {
-    /// 拿到的行 + 该行在缓冲中占用的字节数（含行结束符）。
     Line(Vec<u8>, usize),
     NeedMore,
-    /// 裸 LF（`Reject` 策略）。
+
     BareLineFeed,
     TooLong,
 }
@@ -129,7 +68,7 @@ fn next_line(buffer: &[u8], policy: BareNewlinePolicy) -> LineOutcome {
             continue;
         }
         let has_cr = index > 0 && buffer[index - 1] == b'\r';
-        // 裸 LF：默认拒绝（见模块说明），归一化策略下当作行结束符接受。
+
         if !has_cr && policy == BareNewlinePolicy::Reject {
             return LineOutcome::BareLineFeed;
         }
@@ -144,13 +83,6 @@ fn next_line(buffer: &[u8], policy: BareNewlinePolicy) -> LineOutcome {
     }
 }
 
-/// 驱动一次会话直到连接结束（发送 220 问候）。
-///
-/// `stream` 可以是任何字节流：生产里是 TCP（或 TLS），测试里是
-/// `tokio::io::duplex`。`session` 以可变引用传入，是为了让调用方在
-/// STARTTLS 握手成功后调用 [`Session::activate_tls`] 并重新进入。
-///
-/// `auth` 是 SASL 认证后端（见 [`crate::sasl`]）：只有驱动做 I/O，状态机只收结果。
 pub async fn serve<S, K, A>(
     stream: S,
     session: &mut Session<'_>,
@@ -167,10 +99,6 @@ where
     drive(stream, session, sink, auth, peer, limits, true).await
 }
 
-/// STARTTLS 升级完成后重新进入会话。
-///
-/// **不**再发送 220 问候：客户端在连接建立时已经收到过一次，RFC 3207 规定升级后
-/// 由客户端首先发 EHLO。若这里再问一次，客户端会把它当成对 EHLO 的应答而错位。
 pub async fn serve_after_upgrade<S, K, A>(
     stream: S,
     session: &mut Session<'_>,
@@ -203,8 +131,7 @@ where
 {
     let policy = session.config().bare_newline_policy;
     let mut buffer: Vec<u8> = Vec::with_capacity(4096);
-    // 连续凭据错误次数。`InvalidCredentials` 才 +1；`TemporaryFailure`（后端挂了）
-    // 不算 —— 否则 Dovecot 一抖动就把正常用户全封了。
+
     let mut auth_failures: u32 = 0;
 
     if greet {
@@ -212,7 +139,6 @@ where
     }
 
     loop {
-        // ── 取一条命令行 ──
         let line = loop {
             match next_line(&buffer, policy) {
                 LineOutcome::Line(line, consumed) => {
@@ -220,7 +146,6 @@ where
                     break Some(line);
                 }
                 LineOutcome::BareLineFeed => {
-                    // 双方对命令边界的认知已经分叉，不能继续解析。
                     let reply = Reply::with_enhanced(500, "5.5.2", texts::BARE_LINE_FEED);
                     write_reply(&mut stream, &reply).await?;
                     return Ok(ServeOutcome::Closed);
@@ -236,10 +161,10 @@ where
                         match tokio::time::timeout(limits.command_timeout, stream.read(&mut chunk))
                             .await
                         {
-                            Ok(Ok(0)) => return Ok(ServeOutcome::Closed), // 对端正常关闭
+                            Ok(Ok(0)) => return Ok(ServeOutcome::Closed),
                             Ok(Ok(read)) => read,
                             Ok(Err(error)) => return Err(error),
-                            // 超时：安静地关掉，不猜对方想干什么。
+
                             Err(_) => return Ok(ServeOutcome::Closed),
                         };
                     buffer.extend_from_slice(&chunk[..read]);
@@ -251,11 +176,6 @@ where
             return Ok(ServeOutcome::Closed);
         };
 
-        // ── 解析并处理 ──
-        //
-        // SASL 交换进行中时，这一行是**凭据应答**（base64），不是命令：把它交给
-        // 命令解析器只会得到一个 "Unknown" 动词。这是会话层与驱动之间唯一的
-        // 「原始行」通道，由 `awaiting_auth_response()` 显式标出。
         let action = if session.awaiting_auth_response() {
             session.continue_auth(&line)
         } else {
@@ -274,20 +194,16 @@ where
             }
             Action::StartTls(reply) => {
                 write_reply(&mut stream, &reply).await?;
-                // 明文读缓冲在此**随函数返回被丢弃**：升级前注入的字节绝不能
-                // 带进 TLS 之后的会话。这不是疏漏，是刻意的确定性行为。
+
                 return Ok(ServeOutcome::StartTls);
             }
             Action::AuthChallenge(reply) => {
-                // 空挑战（PLAIN）。下一轮循环读到的行由 `continue_auth` 消费。
                 write_reply(&mut stream, &reply).await?;
             }
             Action::AuthVerify {
                 mechanism,
                 response,
             } => {
-                // 凭据校验要 I/O，只有驱动能做；状态机拿结果（`complete_auth`）并
-                // 决定最终应答。口令只在这两个值之间传递，绝不写日志。
                 let request = AuthRequest {
                     mechanism,
                     response,
@@ -298,17 +214,13 @@ where
                 match &outcome {
                     AuthOutcome::Success { user } => {
                         tracing::info!(peer = %peer, user = %user, "提交认证成功");
-                        // 成功即清零：限流要罚的是**连续**爆破，不是累计次数。
+
                         auth_failures = 0;
                     }
                     AuthOutcome::TemporaryFailure(reason) => {
-                        // 只记原因，不记凭据 —— 这是排查「Dovecot 挂了」与
-                        // 「用户口令错」的唯一区分点。
                         tracing::warn!(peer = %peer, reason = %reason, "认证后端暂时不可用");
                     }
                     AuthOutcome::InvalidCredentials => {
-                        // 原来这里只打日志就放过 —— 于是同一条连接可以无限次重发
-                        // `AUTH`，每次都真的打到后端，封禁表完全不知情。
                         auth_failures = auth_failures.saturating_add(1);
                         tracing::info!(
                             peer = %peer,
@@ -320,9 +232,6 @@ where
                 let reply = session.complete_auth(outcome);
                 write_reply(&mut stream, &reply).await?;
 
-                // 达阈值就断开：连接留着等于给了爆破一个**零成本**的无限重试通道。
-                // 阈值用会话侧的常量（见 `MAX_CONSECUTIVE_AUTH_FAILURES`），封禁
-                // 仍由监听层的表决定。
                 if auth_failures >= MAX_CONSECUTIVE_AUTH_FAILURES {
                     return Ok(ServeOutcome::ClosedAfterAuthFailures {
                         failures: auth_failures,
@@ -330,17 +239,6 @@ where
                 }
             }
             Action::EnterData(reply) => {
-                // 全局收信并发预算：按**字节**而不是按条数封顶（R3-011）。
-                //
-                // 每条连接在 DATA 阶段最多缓冲 `max_message_size` 字节；生产默认
-                // 是 50 MiB（`settings.max_message_size_mb`），而连接数上限（512）
-                // 完全不约束**字节**。原实现用「48 条并发 × 每封至多 25 MiB」
-                // 估算上界，既与实际默认值不符，也漏掉了 sink 里整封复制一份的
-                // 峰值。现在改为从 `max_message_size` 动态预留字节额度：
-                // 所有并发 DATA 的**预留总量**不超过 [`DATA_MEMORY_BUDGET`]，
-                // 与实际配置无关地给出确定的内存上界。
-                // 到顶的新 DATA 按 451 临时拒绝（不开 354、事务状态不动），
-                // 客户端稍后重试即可。
                 let Some(_data_slot) = DataSlot::acquire(session.config().max_message_size) else {
                     let backpressure = Reply::with_enhanced(451, "4.3.2", texts::DATA_BACKPRESSURE);
                     write_reply(&mut stream, &backpressure).await?;
@@ -351,13 +249,10 @@ where
                     DataOutcome::Closed => return Ok(ServeOutcome::Closed),
                     DataOutcome::Rejected(reply) => {
                         write_reply(&mut stream, &reply).await?;
-                        // 裸 LF：边界认知已分叉，断开而不是继续。
+
                         return Ok(ServeOutcome::Closed);
                     }
-                    // 552 已经在收集过程中发过了（那时才知道超限），这里不再重复。
-                    // 但事务必须在此终结（RFC 5321 §4.1.1.4：DATA 的最终应答结束
-                    // 事务）—— 否则信封残留：下一条 MAIL 撞 503「嵌套 MAIL」，
-                    // 重复 DATA 会把新正文投给上一位收件人。
+
                     DataOutcome::Discarded => session.discard_data(),
                     DataOutcome::Received(data) => {
                         let (reply, accepted) = session.finish_data(data);
@@ -376,32 +271,18 @@ where
 }
 
 enum DataOutcome {
-    /// 报文收完并保留。
     Received(Vec<u8>),
-    /// 因超限被丢弃；552 已在收集过程中发给对端（那时才知道超限）。
+
     Discarded,
-    /// 必须断开（裸 LF）。
+
     Rejected(Reply),
-    /// 对端提前关闭。
+
     Closed,
 }
 
-/// 同时处于「收正文」阶段的**缓冲字节**预算（进程级）。
-///
-/// 与「条数上限」相比，字节预算才是内存上界的正确口径：条目数上限要乘上
-/// `max_message_size` 才知道占多少内存，而后者来自 `settings.json`（生产默认
-/// 50 MiB），改一个配置就悄悄改变了上界。这里直接对字节记账：
-/// 每条进入 DATA 的连接按本次会话的 `max_message_size` 预留额度，预留总量
-/// 不超过本常量；sink 侧已改成就地插入头（不再整封复制），所以实际峰值
-/// ≈ 预留总量，没有隐藏的 2 倍系数。
-///
-/// 1 GiB 的取舍：默认 50 MiB × 20 条并发 DATA；在 512 连接的小内存 VPS 上
-/// 既留足并发收信能力，又让未认证攻击者无法仅靠 DATA 把进程推向 OOM。
 const DATA_MEMORY_BUDGET: usize = 1024 * 1024 * 1024;
 static ACTIVE_DATA_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// 收正文的字节额度占位。Drop 时归还，任何早退路径（断开、裸 LF、超限）
-/// 都不会泄漏。
 struct DataSlot {
     bytes: usize,
 }
@@ -409,8 +290,7 @@ struct DataSlot {
 impl DataSlot {
     fn acquire(message_size: usize) -> Option<Self> {
         use std::sync::atomic::Ordering;
-        // 至少按 1 字节记账：`max_message_size = 0` 的畸形配置不能变成
-        // 「无限并发」（每条都 0 字节）。
+
         let request = message_size.max(1);
         let mut current = ACTIVE_DATA_BYTES.load(Ordering::Relaxed);
         loop {
@@ -436,10 +316,6 @@ impl Drop for DataSlot {
     }
 }
 
-/// 收一封正文，直到结束标记。
-///
-/// 超限时**先回 552、再继续读到结束标记**。少了后半步，客户端剩下的正文会被当成
-/// 命令解析 —— 一条正常的 `MAIL` 就可能被当成对超限的回应，整个会话错位。
 async fn collect_data<S>(
     stream: &mut S,
     buffer: &mut Vec<u8>,
@@ -454,7 +330,6 @@ where
     let mut told_too_large = false;
 
     loop {
-        // 先把缓冲里已有的字节喂进去（流水线场景）。
         if !buffer.is_empty() {
             let (event, consumed) = sink.feed(buffer);
             buffer.drain(..consumed);
@@ -475,9 +350,7 @@ where
                         )
                         .await?;
                     }
-                    // 缓冲里可能还有后续字节（正文剩余 + 下一条命令）。这里必须回头
-                    // 继续消化，而不能往下走去 read：对端可能已经半关闭，read 会立刻
-                    // 返回 0，那批缓冲字节就被当成「对端断线」丢掉了。
+
                     continue;
                 }
                 DataEvent::BareLineFeed => {
@@ -510,7 +383,6 @@ mod tests {
     use crate::sasl::{AuthFuture, UnavailableAuthenticator};
     use crate::session::{RecipientChecker, SessionConfig};
 
-    /// 记录收到的邮件，并可被要求拒绝。
     #[derive(Default)]
     struct RecordingSink {
         accepted: Mutex<Vec<AcceptedMessage>>,
@@ -537,10 +409,6 @@ mod tests {
         }
     }
 
-    /// 跑一次会话：把 `input` 当客户端发的东西，返回客户端读到的全部文本。
-    ///
-    /// 客户端与服务端用 `join!` 并发跑在同一条任务上 —— 写成「先写完再读」会在
-    /// 任何一方填满管道时死锁，而这正是这类测试最容易假绿的地方。
     async fn run_collect_with(
         input: &[u8],
         limits: ServerLimits,
@@ -550,7 +418,6 @@ mod tests {
         run_collect_with_auth(input, limits, config, sink, &UnavailableAuthenticator).await
     }
 
-    /// 同上，但可以注入一个认证后端。
     async fn run_collect_with_auth<A: Authenticator + ?Sized>(
         input: &[u8],
         limits: ServerLimits,
@@ -564,7 +431,7 @@ mod tests {
 
         let client_task = async {
             client.write_all(input).await.unwrap();
-            // 半关闭：让驱动看到 EOF，但读侧仍然可用。
+
             client.shutdown().await.unwrap();
             let mut out = String::new();
             client.read_to_string(&mut out).await.unwrap();
@@ -578,10 +445,6 @@ mod tests {
         (out, sink.accepted.lock().unwrap().clone())
     }
 
-    /// 同 [`run_collect_with_auth`]，但把 [`ServeOutcome`] 也带回来。
-    ///
-    /// 需要它来断言「认证失败达阈值后**主动断开**」—— 那条信息只出现在
-    /// 返回值里，光看输出文本无法区分「回 535 后继续」与「回 535 后断开」。
     async fn run_collect_outcome<A: Authenticator + ?Sized>(
         input: &[u8],
         limits: ServerLimits,
@@ -607,7 +470,6 @@ mod tests {
         (out, served.expect("会话驱动不应返回 I/O 错误"))
     }
 
-    /// 记录认证请求并回一个可配置的结果。
     #[derive(Default)]
     struct RecordingAuth {
         seen: Mutex<Vec<AuthRequest>>,
@@ -640,10 +502,6 @@ mod tests {
         }
     }
 
-    /// 提交端口上的会话配置：已在 TLS 之上且通告 AUTH。
-    ///
-    /// 用 `tls_active: true` 直接表达「隐式 TLS 已经握手完成」—— 这里的重点不是
-    /// 握手本身（那有独立测试），而是认证之后的事务行为。
     fn submission_config() -> SessionConfig {
         SessionConfig {
             offer_auth: true,
@@ -690,7 +548,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_sink_runs_before_the_250_is_sent() {
-        // 先答 250 再落盘等于对发送方说谎：一旦落盘失败，邮件就凭空消失了。
         let sink = RecordingSink::default();
         *sink.reject.lock().unwrap() =
             Some(Reply::with_enhanced(451, "4.3.0", "queue write failed"));
@@ -724,7 +581,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_pipelined_transaction_in_one_segment_is_handled_in_order() {
-        // 客户端可以把整段会话一次性发出来；驱动必须在同一个缓冲里按序消费。
         let input = concat!(
             "EHLO c.test\r\nMAIL FROM:<a@remote.test>\r\nRCPT TO:<b@example.org>\r\n",
             "DATA\r\nSubject: p\r\n\r\nbody\r\n.\r\nQUIT\r\n"
@@ -737,7 +593,6 @@ mod tests {
 
     #[tokio::test]
     async fn commands_pipelined_after_the_data_terminator_are_not_lost() {
-        // 正文的结束标记与下一条命令在同一个 TCP 段里 —— 这在真实网络下很常见。
         let input = concat!(
             "EHLO c.test\r\nMAIL FROM:<a@remote.test>\r\nRCPT TO:<b@example.org>\r\n",
             "DATA\r\nbody\r\n.\r\nRSET\r\nQUIT\r\n"
@@ -782,8 +637,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_oversized_message_is_refused_and_the_session_stays_in_sync() {
-        // 超限时若丢掉正文读取器，剩下的正文会被当成命令解析 —— 会话直接错位。
-        // 这条断言「超限之后的下一条命令仍然被正确执行」，正是那个缺陷的回归守卫。
         let mut config = session_config();
         config.max_message_size = 32;
         let sink = RecordingSink::default();
@@ -813,7 +666,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_peer_that_disappears_mid_command_ends_the_session_quietly() {
-        // 断线不是错误：安静收尾，不留下半开状态。
         let (out, accepted) = run_collect(b"EHLO c.test\r\n", limits()).await;
         assert!(accepted.is_empty());
         assert!(out.contains("250"), "{out}");
@@ -821,9 +673,6 @@ mod tests {
 
     #[tokio::test]
     async fn starttls_returns_the_upgrade_outcome_and_discards_pipelined_plaintext() {
-        // 攻击面：在 STARTTLS 之前把后续命令与 STARTTLS 流水线在同一段里发出来。
-        // 若升级后仍保留明文读缓冲，那条「MAIL FROM」就会在 TLS 建立之后被当作
-        // 加密会话里的命令执行 —— 攻击者借此把明文注入到加密会话中。
         let mut config = session_config();
         config.offer_starttls = true;
 
@@ -857,7 +706,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_upgraded_session_never_repeats_the_220_greeting() {
-        // RFC 3207：升级后由客户端首发 EHLO，服务端不得再发 220。
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let mut session = Session::new(session_config(), RelayPolicy::new(["example.org"]));
         let peer: SocketAddr = "203.0.113.7:54321".parse().unwrap();
@@ -884,8 +732,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_authenticated_submission_may_relay_to_a_foreign_domain() {
-        // 这一条把三件事串起来验：`AUTH` 被真正校验、状态机据结果置位、
-        // 反中继（INV-17）随后放行外域收件人。少任何一环，587 就只是个空壳。
         let auth = RecordingAuth::with_outcome(AuthOutcome::Success {
             user: "alice@example.org".to_string(),
         });
@@ -923,14 +769,12 @@ mod tests {
         assert_eq!(requests.len(), 1, "只应校验一次");
         assert_eq!(requests[0].mechanism, "PLAIN");
         assert!(requests[0].secured, "TLS 之上必须如实声明 secured");
-        // 原样转发：状态机不解析、不解码凭据（口令不进任何中间结构）。
+
         assert_eq!(requests[0].response, "AGFsaWNlQGV4YW1wbGUub3JnAHNlY3JldA==");
     }
 
     #[tokio::test]
     async fn a_bare_auth_gets_a_challenge_and_the_next_line_is_taken_as_the_response() {
-        // 两段式交换：`AUTH PLAIN` → `334 ` → base64 单独一行。第二行绝不能
-        // 走命令解析器，否则它会被当成一个未知动词。
         let auth = RecordingAuth::with_outcome(AuthOutcome::Success {
             user: "alice".to_string(),
         });
@@ -958,8 +802,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_sasl_response_that_is_not_base64_never_reaches_the_auth_backend() {
-        // 一行非 base64 的应答如果被转发，就会在 Dovecot 的制表符分隔协议行里
-        // 凭空多出字段（TAB 注入）。必须在这里被拦下，且**后端一次都不能被调用**。
         let auth = RecordingAuth::with_outcome(AuthOutcome::Success {
             user: "attacker".to_string(),
         });
@@ -990,8 +832,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_auth_backend_yields_454_and_never_535() {
-        // 454（临时不可用）与 535（凭据错）混同，会让客户端在 Dovecot 抖动时
-        // 去改密码 —— 这正是要避免的运维事故。
         let auth = RecordingAuth::with_outcome(AuthOutcome::TemporaryFailure(
             "dovecot socket refused".to_string(),
         ));
@@ -1016,7 +856,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_credential_does_not_grant_relay() {
-        // 认证失败必须保持「未认证」，反中继随后仍拒绝外域收件人。
         let auth = RecordingAuth::with_outcome(AuthOutcome::InvalidCredentials);
         let sink = RecordingSink::default();
         let input = concat!(
@@ -1040,22 +879,11 @@ mod tests {
         assert!(accepted.is_empty());
     }
 
-    /// 反例守卫：同一条连接上的**重复**认证失败必须被计数并在阈值处断开。
-    ///
-    /// ## 为什么原测试全都漏了它
-    ///
-    /// 原有的认证测试每条只发**一次** `AUTH`（失败或成功），所以它们完全
-    /// 看不到「连续多次」这条路径 —— 而这正是爆破的形态。RFC 4954 允许
-    /// 在一条连接上重试 `AUTH` 且不规定次数上限，原实现也不计数、不封禁、
-    /// 不断开，于是同一条连接可以无限次重发、每次都真的打到 Dovecot auth socket。
-    ///
-    /// 断言两件事：返回值的 `failures`（供监听层记账）与**确实断开**
-    /// （后面几条命令不得有应答）。
     #[tokio::test]
     async fn repeated_auth_failures_are_counted_and_the_connection_is_dropped() {
         let auth = RecordingAuth::with_outcome(AuthOutcome::InvalidCredentials);
         let sink = RecordingSink::default();
-        // 连发 6 次 AUTH：阈值是 5，第 6 次根本不该被处理。
+
         let mut input = String::from("EHLO client.test\r\n");
         for _ in 0..MAX_CONSECUTIVE_AUTH_FAILURES + 1 {
             input.push_str("AUTH PLAIN AGJhZABwYXNz\r\n");
@@ -1086,9 +914,7 @@ mod tests {
             "第 {} 次 AUTH 不该再打到认证后端",
             MAX_CONSECUTIVE_AUTH_FAILURES + 1
         );
-        // 断开后不得再处理任何命令。注意 `250-` 是 EHLO 的能力行（正常），
-        // 所以要看**最后一次 AUTH 之后**有没有出现收尾应答 `250 `（带空格）
-        // 或 `250 MAIL`——那些都说明连接还活着。
+
         let after_first_auth = out
             .find("535 5.7.8")
             .map(|idx| &out[idx..])
@@ -1107,13 +933,8 @@ mod tests {
         );
     }
 
-    /// 反例守卫：**一次成功就把连续失败计数清零**。
-    ///
-    /// 要罚的是**连续**爆破，不是累计次数。否则一个每次都换错口令的用户
-    /// （比如口误的老手）会在第 N 次被误断开，而真正的爆破在成功那一刻就已结束。
     #[tokio::test]
     async fn a_success_resets_the_consecutive_failure_count() {
-        // 前 4 次失败、第 5 次成功 —— 不应触发断开。
         struct FlakyAuth {
             calls: Mutex<usize>,
         }
@@ -1166,10 +987,6 @@ mod tests {
         assert!(out.contains("235"), "最后一次 AUTH 应当成功：{out}");
     }
 
-    /// 反例守卫：后端**临时不可用**不得计入连续失败。
-    ///
-    /// 否则 Dovecot 一抖动，正在提交邮件的正常用户会在 5 次 454 之后被断开。
-    /// 凭据错（535）与后端不可用（454）的区分正是这一条要守的东西。
     #[tokio::test]
     async fn a_temporary_backend_failure_does_not_accumulate() {
         let auth = RecordingAuth::with_outcome(AuthOutcome::TemporaryFailure(
@@ -1202,9 +1019,6 @@ mod tests {
         );
     }
 
-    // ────────────── 本地收件人存在性：从 RCPT 到 MessageSink 的端到端 ──────────────
-
-    /// 只放行一个地址的假名录；其余一律「确认不存在」。
     struct OnlyAlice;
 
     impl RecipientChecker for OnlyAlice {
@@ -1213,7 +1027,6 @@ mod tests {
         }
     }
 
-    /// 名录后端不可用。
     struct BrokenDirectory;
 
     impl RecipientChecker for BrokenDirectory {
@@ -1222,7 +1035,6 @@ mod tests {
         }
     }
 
-    /// 跑一次带名录的会话。
     async fn run_collect_with_directory<D: RecipientChecker>(
         input: &[u8],
         config: SessionConfig,
@@ -1256,16 +1068,11 @@ mod tests {
         (out, sink.accepted.lock().unwrap().clone())
     }
 
-    /// 反例守卫：**不存在的本域收件人不得进 `MessageSink`**。
-    ///
-    /// 这是任务里点名的两条之一。只断言 550 是不够的 —— 拒了但邮件仍被
-    /// 交给投递方，等于什么都没做（还会产生 backscatter）。
     #[tokio::test]
     async fn an_unknown_local_recipient_is_refused_and_never_reaches_the_sink() {
         let sink = RecordingSink::default();
         let input = concat!(
             "EHLO c.test\r\n",
-            // 伪造第三方发件人 + 不存在的本域收件人 = 典型 backscatter 组合。
             "MAIL FROM:<victim@third.com>\r\n",
             "RCPT TO:<nobody@example.org>\r\n",
             "DATA\r\n",
@@ -1283,11 +1090,10 @@ mod tests {
             accepted.is_empty(),
             "被拒的收件人绝不能进 MessageSink：{out}"
         );
-        // 会话没有错位：QUIT 仍被处理。
+
         assert!(out.contains("221 "), "QUIT 必须被处理：{out}");
     }
 
-    /// 回归守卫：名录里的收件人照旧一路走到 sink。
     #[tokio::test]
     async fn a_known_local_recipient_still_reaches_the_sink() {
         let sink = RecordingSink::default();
@@ -1310,9 +1116,6 @@ mod tests {
         );
     }
 
-    /// 反例守卫：名录不可用时**不得**误拒 —— 邮件必须继续走到 sink。
-    ///
-    /// 若「查不了」被当成「不存在」，磁盘一抖就会全站拒收真邮件。
     #[tokio::test]
     async fn an_unavailable_directory_does_not_reject_a_real_message() {
         let sink = RecordingSink::default();
@@ -1336,7 +1139,6 @@ mod tests {
         );
     }
 
-    /// 远程域**不得**因为挂了名录就被拒 —— 反中继与提交语义不受影响。
     #[tokio::test]
     async fn a_remote_recipient_is_unaffected_by_the_local_directory() {
         let sink = RecordingSink::default();
@@ -1359,13 +1161,8 @@ mod tests {
         );
     }
 
-    /// R3-011：DATA 内存上界按**字节**记账，而不是「条数 × 一个假设的报文大小」。
-    ///
-    /// 这条测试刻意不依赖当前并发占用：请求一个超过整个预算的量，无论别的测试
-    /// 此刻占了多少都必须被拒绝；额度释放后同一个量又能拿到。
     #[test]
     fn the_data_memory_budget_is_byte_based_and_released_on_drop() {
-        // 超过预算的请求必须被拒（无论当前已占多少）。
         assert!(
             DataSlot::acquire(usize::MAX / 2).is_none(),
             "超过总预算的 DATA 必须被 451 背压拒绝"
@@ -1377,7 +1174,7 @@ mod tests {
             drop(first);
             drop(second);
         }
-        // 归还后额度可复用 —— 早退路径（Drop）不会泄漏记账。
+
         assert!(
             DataSlot::acquire(4096).is_some(),
             "DATA 结束后必须归还字节额度"

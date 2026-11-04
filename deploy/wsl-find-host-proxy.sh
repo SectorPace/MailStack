@@ -1,6 +1,3 @@
-#!/usr/bin/env bash
-# 找出 WSL 到 Windows 宿主代理（Clash 混合端口 7890）的可达路径。
-# Windows 侧实测：127.0.0.1:7890 -> 200（7897 虽监听但不可用）。
 set -uo pipefail
 
 echo "=== resolv.conf nameserver (WSL2 NAT 下通常就是宿主 IP) ==="
@@ -19,7 +16,6 @@ GW=$(ip route show default 2>/dev/null | awk '{print $3}' | head -1)
 [ -n "${GW:-}" ] && CANDIDATES+=("$GW")
 CANDIDATES+=("127.0.0.1")
 
-# 去掉重复
 UNIQ=()
 for c in "${CANDIDATES[@]}"; do
   dup=0

@@ -1,34 +1,3 @@
-//! TCP 监听与连接生命周期（规格书 §5.10）。
-//!
-//! ## 一条连接上发生的事情，以及顺序为什么是这样
-//!
-//! ```text
-//! accept ──► 连接数配额（Semaphore，满了直接关掉，不排队）
-//!   │
-//!   ├─► 封禁检查        ── 命中 → 421 + 断开（不计失败，因为没做任何事）
-//!   ├─► 限速检查        ── 超速 → 421 + 断开 + **计入失败**（多次触发会升级为封禁）
-//!   ├─► （隐式 TLS）握手 ── 失败 → 计入失败 + 断开
-//!   ├─► 会话（明文 STARTTLS）
-//!   │     └─ STARTTLS → 就地握手 ── 失败 → 计入失败 + 断开
-//!   │                              └─ 成功 → 重新进入会话（不再发 220）
-//!   └─► 会话 I/O 错误   ── 计入失败 + 断开
-//! ```
-//!
-//! **顺序是刻意的**：封禁/限速在握手之前，因此被拦下的连接**不会**消耗一次 TLS
-//! 握手（那正是攻击者想让我们花的 CPU）。而「封禁检查命中」不计入失败 —— 否则
-//! 一个已经被封的 IP 会因为不断重连而把 `strike` 越滚越高。
-//!
-//! 整条连接还受**会话级总时限**（`SESSION_TOTAL_TIMEOUT`，15 分钟）约束：从
-//! accept 起算，覆盖 STARTTLS 升级前后的两轮 `serve`，到点尽力回 `421 4.4.2`
-//! 后断开。per-read 超时（`ServerLimits`）只约束**单次**读取，管不住每次都在
-//! 超时前喂 1 字节的滴水客户端；会话级上限把「占住连接许可不放」这件事本身
-//! 变成有时限的。
-//!
-//! ## 时间源是注入的
-//!
-//! [`Clock`] 让「限速窗口」与「封禁到期」这类行为的验证不需要 `sleep`。生产用
-//! [`SystemClock`]，测试用固定时钟。
-
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -51,34 +20,14 @@ use crate::sasl::{AuthBackend, Authenticator, UnavailableAuthenticator};
 use crate::session::{RecipientChecker, Session, SessionConfig};
 use crate::tls::{BoxedStream, TlsMode};
 
-/// TLS 握手超时。IMAP 侧同为 15 秒；没有它，每个卡住的握手都会永久占用一个
-/// 连接许可（`max_connections`），少量 IP 即可耗尽全部许可造成全端口拒绝服务。
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// 会话级总时限：一条 TCP 连接从 accept 到关闭的最长占用时间。
-///
-/// 15 分钟 = 25 × `data_timeout`（600s）。对慢链路上的合法大报文投递足够宽裕
-/// （DATA 阶段单次读超时是 10 分钟，整条会话的预算还有 25 倍于它的余量），同时
-/// 给「滴水」客户端划上硬上界：per-read 超时只约束**单次** read 等了多久，一个
-/// 每次都在超时前喂 1 字节的客户端可以把连接（连同它的连接许可）无限期占下去
-/// —— 没有会话级上限，slowloris 式占位就没有终点。时钟从 accept 起算，覆盖
-/// STARTTLS 升级前后的**两轮** `serve`；到点先尽力回 `421 4.4.2` 再断开。
 const SESSION_TOTAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-/// 时间源。注入的目的是让时间相关行为可被确定性验证。
 pub trait Clock: Send + Sync + 'static {
-    /// 当前 Unix 毫秒。
     fn now_millis(&self) -> i64;
 }
 
-/// 每来源（IPv6 /64）的**并发连接**计数（R3-006）。
-///
-/// 与限速器（连接速率）和封禁表（失败次数）都不同：这里量的是「此刻同时占着
-/// 多少条连接」。一个 slowloris 客户端只需要**合法速率**就能慢慢攒满全局许可，
-/// 只有并发计数能把它挡在源头。
-///
-/// 表里只有「当前活跃连接」的条目：连接结束（guard Drop）即减少/删除，因此
-/// 条目数天然 ≤ `max_connections`，不需要另设淘汰逻辑。
 #[derive(Debug)]
 struct PeerConnections {
     max_per_peer: usize,
@@ -110,7 +59,6 @@ impl PeerConnections {
         })
     }
 
-    /// 当前某来源的活跃连接数（仅测试观测用）。
     #[cfg(test)]
     fn active_for(&self, ip: std::net::IpAddr) -> usize {
         self.active
@@ -122,7 +70,6 @@ impl PeerConnections {
     }
 }
 
-/// 一条活跃连接的占位；Drop 时归还该来源的并发额度。
 struct PeerConnectionSlot {
     owner: Arc<PeerConnections>,
     key: PeerKey,
@@ -144,7 +91,6 @@ impl Drop for PeerConnectionSlot {
     }
 }
 
-/// 生产用时钟。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemClock;
 
@@ -157,38 +103,26 @@ impl Clock for SystemClock {
     }
 }
 
-/// 服务端配置。
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// 会话状态机配置（问候名、上限、裸 LF 策略等）。
     pub session: SessionConfig,
-    /// 反中继策略（INV-17）。
+
     pub relay: RelayPolicy,
-    /// 超时限制。
+
     pub limits: ServerLimits,
-    /// 同时在处理的连接数上限。
+
     pub max_connections: usize,
-    /// **单个来源**（IPv6 按 /64 聚合）可同时占用的连接数上限（R3-006）。
-    ///
-    /// 全局 `max_connections` 只约束总数：一个 IP 用合法速率慢慢连、每条连接
-    /// 每次都在超时前喂 1 字节，就能在约 9 分钟内占满全部全局许可，之后**所有
-    /// 端口**对所有人直接 `drop(stream)`。每来源上限把「占满」的成本抬到需要
-    /// 上千个地址（IPv6 还要跨 /64），而正常客户端不会同时开十几条连接。
+
     pub max_connections_per_ip: usize,
-    /// 连接限速参数。
+
     pub rate_limit: RateLimitConfig,
-    /// 自动封禁参数。
+
     pub ban: BanConfig,
-    /// 停机时等待在途会话收尾的时长。
+
     pub shutdown_grace: Duration,
-    /// SASL 认证后端（§3.5）。**会话通告 AUTH 时它必须存在**，由构造期校验 ——
-    /// 通告了却做不到会让客户端白跑一次认证。
+
     pub auth: Option<AuthBackend>,
-    /// 本地收件人名录（`RCPT` 阶段的存在性判定）。
-    ///
-    /// `None` 表示**不查**（只判域）—— 与引入该判定之前的行为一致。刻意做成
-    /// `Option` 而不是默认实现：生产装配（`mailstackd`）必须显式提供名录，
-    /// 「忘了配」与「有意不查」因此在代码里是两件可分辨的事。
+
     pub recipients: Option<Arc<dyn RecipientChecker>>,
 }
 
@@ -199,8 +133,7 @@ impl Default for ServerConfig {
             relay: RelayPolicy::new(Vec::<String>::new()),
             limits: ServerLimits::default(),
             max_connections: 512,
-            // 16：正常 MTA/客户端同时开几条连接；16 已覆盖「多线程客户端 +
-            // 重试」的合法突发，同时让单 IP 最多占全局许可的 1/32。
+
             max_connections_per_ip: 16,
             rate_limit: RateLimitConfig::default(),
             ban: BanConfig::default(),
@@ -211,10 +144,6 @@ impl Default for ServerConfig {
     }
 }
 
-/// 构造期的配置错误。
-///
-/// 这些错误都指向同一类问题：**配置让服务端声称自己能做一件它其实做不到的事**。
-/// 与其在运行时静默降级（例如通告了 STARTTLS 却无法握手），不如在启动时就拒绝。
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConfigError {
     #[error("隐式 TLS 需要提供 TlsAcceptor")]
@@ -227,7 +156,6 @@ pub enum ConfigError {
     AuthAdvertisedWithoutAuthenticator,
 }
 
-/// 监听服务。
 pub struct MailServer<S: MessageSink + ?Sized> {
     listener: TcpListener,
     config: ServerConfig,
@@ -237,21 +165,15 @@ pub struct MailServer<S: MessageSink + ?Sized> {
     clock: Arc<dyn Clock>,
     rate: Arc<RateLimiter>,
     bans: Arc<BanList>,
-    /// 每来源并发连接计数（见 [`PeerConnections`]）。
+
     peers: Arc<PeerConnections>,
-    /// 与 `config.recipients` 同源，但单独持有一份以便在每条连接上借用。
+
     recipients: Option<Arc<dyn RecipientChecker>>,
-    /// 会话级总时限。生产固定为 [`SESSION_TOTAL_TIMEOUT`]；可注入是为了让
-    /// 同模块测试能在真实时钟下用秒级时限验证滴水防线（不依赖 test-util）。
+
     session_timeout: Duration,
 }
 
 impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
-    /// 构造服务端，并按 `config` 自建**独立**的限速器与封禁表。
-    ///
-    /// 只跑一个监听时用这个。**同时起多个监听（25/465/587）时必须用
-    /// [`MailServer::with_shared`]** —— 否则每个端口一份配额，攻击者轮换端口即可
-    /// 拿到成倍配额，且 `strike` 永远攒不满、永久封禁无从触发。
     pub fn new(
         listener: TcpListener,
         config: ServerConfig,
@@ -265,10 +187,6 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
         Self::with_shared(listener, config, tls, tls_mode, sink, clock, rate, bans)
     }
 
-    /// 构造服务端，复用调用方提供的限速器与封禁表。
-    ///
-    /// 多个监听共用同一对 `Arc` 时，准入判定才是**按 IP 全局**生效的：限速配额只有
-    /// 一份、`strike` 在端口之间累加、永久封禁对三个端口同时生效。
     #[allow(clippy::too_many_arguments)]
     pub fn with_shared(
         listener: TcpListener,
@@ -298,7 +216,6 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
         })
     }
 
-    /// 实际监听的地址（端口为 0 时用于测试取回真实端口）。
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
     }
@@ -311,7 +228,6 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
         &self.bans
     }
 
-    /// 接受连接直到 `shutdown` 完成；随后给在途会话一个上限时间收尾。
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> std::io::Result<()> {
         let MailServer {
             listener,
@@ -341,10 +257,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((mut stream, peer)) => {
-                            // 每来源并发配额（R3-006）：在**全局许可之前**判定，
-                            // 一个 IP 打满自己的份额时不去挤占别人的全局名额。
-                            // 超限时回 421 而不是静默 drop —— 对端才知道是限流、
-                            // 而不是服务器坏了。
+
                             let Some(peer_slot) = peers.try_acquire(peer.ip()) else {
                                 tracing::warn!(
                                     peer = %peer,
@@ -359,8 +272,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
                                 let _ = write_reply(&mut stream, &reply).await;
                                 continue;
                             };
-                            // 连接数配额：满了就**直接关掉**而不是排队。
-                            // 排队会让内存随攻击者的连接数增长，而拒绝对端立刻可重试。
+
                             let permit = match semaphore.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
                                 Err(_) => {
@@ -387,7 +299,7 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
                             });
                         }
                         Err(error) => {
-                            // 瞬时错误（如 EMFILE）不应让整个服务退出。
+
                             tracing::warn!(error = %error, "accept 失败");
                             tokio::time::sleep(Duration::from_millis(100)).await;
                         }
@@ -406,11 +318,6 @@ impl<S: MessageSink + ?Sized + 'static> MailServer<S> {
     }
 }
 
-/// 构造期的配置一致性校验。
-///
-/// 四条判定的共同点：**配置让服务端声称自己能做到一件它其实做不到的事**。与其在
-/// 运行时静默降级（例如通告了 STARTTLS 却无法握手、通告了 AUTH 却没有后端），
-/// 不如在启动时就拒绝。
 fn validate(
     config: &ServerConfig,
     tls: Option<&TlsAcceptor>,
@@ -425,14 +332,13 @@ fn validate(
     if config.session.offer_starttls && tls.is_none() {
         return Err(ConfigError::StartTlsAdvertisedWithoutAcceptor);
     }
-    // 通告 AUTH 却没有后端 = 每次认证都必然 454；那是在骗客户端，不只是不好用。
+
     if config.session.offer_auth && config.auth.is_none() {
         return Err(ConfigError::AuthAdvertisedWithoutAuthenticator);
     }
     Ok(())
 }
 
-/// 每条连接处理所需的共享上下文。
 struct ConnectionContext<S: MessageSink + ?Sized> {
     config: ServerConfig,
     tls: Option<TlsAcceptor>,
@@ -442,7 +348,7 @@ struct ConnectionContext<S: MessageSink + ?Sized> {
     rate: Arc<RateLimiter>,
     bans: Arc<BanList>,
     recipients: Option<Arc<dyn RecipientChecker>>,
-    /// 会话级总时限（自 `MailServer.session_timeout` 注入；生产为 15 分钟）。
+
     session_timeout: Duration,
 }
 
@@ -450,7 +356,6 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
     async fn handle(&self, mut stream: TcpStream, peer: SocketAddr) {
         let ip = peer.ip();
 
-        // ── 1) 准入：封禁 / 限速。判定与真实拒绝路径共用同一份实现 ──
         match admit(&self.rate, &self.bans, ip, self.clock.now_millis()) {
             AdmitVerdict::Allowed => {}
             AdmitVerdict::BannedPermanently => {
@@ -478,7 +383,6 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
             }
         }
 
-        // ── 2) 隐式 TLS（465）：建连即握手 ──
         let mut session_config = self.config.session.clone();
         let mut stream: BoxedStream = match self.tls_mode {
             TlsMode::Implicit => {
@@ -490,24 +394,16 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
                     Ok(Ok(encrypted)) => Box::new(encrypted),
                     Ok(Err(error)) => {
                         tracing::warn!(peer = %peer, error = %error, "隐式 TLS 握手失败");
-                        // 不记入封禁表（R3-009）：握手失败在真实互联网上大量来自
-                        // 非恶意原因（只支持 TLS 1.0/1.1、证书链过期、中间设备做
-                        // TLS 拦截、证书轮换期的短暂不匹配）。把它按「协议滥用」
-                        // 计数会让合法发信方被 421 封 1 小时、三次后升级为永久封禁。
-                        // 连接速率限制与每来源并发上限已经兜住握手洪泛。
+
                         return;
                     }
                     Err(_) => {
-                        // 握手没有超时会永久占用一个连接许可（max_connections）：
-                        // 对端收到 TCP 后不发 ClientHello，少量 IP 就能耗尽全部
-                        // 许可，把所有启用 TLS 的端口拖成全端口拒绝服务。
                         tracing::warn!(
                             peer = %peer,
                             timeout_secs = TLS_HANDSHAKE_TIMEOUT.as_secs(),
                             "TLS 握手超时"
                         );
-                        // 同上：超时同样可能来自网络/中间设备。可归因的协议失败
-                        // 才进封禁表；这里只断开。
+
                         return;
                     }
                 }
@@ -524,23 +420,11 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
         );
         let mut upgraded = false;
 
-        // 没有后端时用占位实现：此时会话不会通告 AUTH（构造期已校验），
-        // 因此它实际不会被调用；真被调用说明配置被绕过，按临时错误处理。
         let auth: &dyn Authenticator = match self.config.auth.as_ref() {
             Some(backend) => backend.as_dyn(),
             None => &UnavailableAuthenticator,
         };
 
-        // ── 4) 会话（可能因 STARTTLS 重入一次）──
-        //
-        // 会话级总时限：deadline 是在 accept 时取定的**绝对时刻**，两轮 `serve` 与
-        // STARTTLS 握手的每个 await 都受**同一个** deadline 约束 —— 若每轮 serve
-        // 各自起算，升级重入会把占位时限重置回满额，滴水客户端就能无限期续命。
-        // 到点先尽力回 `421 4.4.2` 再断开：连接随即关闭，连接许可随之释放。
-        //
-        // 用 `timeout_at(deadline, …)` 包每个 await 点而不是把整个循环包进一个
-        // `timeout`：STARTTLS 分支要把明文流 move 进握手，整体包装会迫使循环体
-        // 按值捕获 `stream` —— 超时弃掉 future 时流会被一并丢弃，421 就无处可写。
         let deadline = tokio::time::Instant::now() + self.session_timeout;
         loop {
             let served = if upgraded {
@@ -582,13 +466,6 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
             match outcome {
                 Ok(ServeOutcome::Closed) => return,
                 Ok(ServeOutcome::ClosedAfterAuthFailures { failures }) => {
-                    // 认证失败必须进封禁表。这是本项目自称「替代 fail2ban」的那套
-                    // 机制最该管的场景，而原实现的 `record_failure` 只出现在
-                    // TLS 握手失败 / I/O 错误 / 触发限速三处 —— 认证失败一条都没有，
-                    // 于是提交端口上的口令爆破**永远不会被封**。
-                    //
-                    // 逐次记账（而不是只记一次）：阈值判定在封禁表里，
-                    // 这里只负责把「又失败了一次」如实喂进去。
                     let now = self.clock.now_millis() / 1000;
                     let mut ban = None;
                     for _ in 0..failures.max(1) {
@@ -612,15 +489,10 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
                 }
                 Ok(ServeOutcome::StartTls) => {
                     let Some(acceptor) = self.tls.as_ref() else {
-                        // 状态机只在 offer_starttls 时回 StartTls，而构造期已保证
-                        // offer_starttls ⇒ 有 acceptor。走到这里说明配置被绕过，
-                        // 断开而不是继续明文会话。
                         tracing::error!(peer = %peer, "收到 STARTTLS 但没有可用的 TLS 配置");
                         return;
                     };
-                    // 握手受「15s 握手超时」与「会话级总时限」中**先到**者的约束。
-                    // 总时限先到时不写 421：TLS 协商进行到一半，明文应答只会是对端
-                    // 解不了的噪声 —— 直接断开。
+
                     let next: BoxedStream = match tokio::time::timeout_at(
                         deadline,
                         tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)),
@@ -630,11 +502,10 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
                         Ok(Ok(Ok(encrypted))) => Box::new(encrypted),
                         Ok(Ok(Err(error))) => {
                             tracing::warn!(peer = %peer, error = %error, "STARTTLS 握手失败");
-                            // 不记入封禁表（R3-009），理由见隐式 TLS 分支。
+
                             return;
                         }
                         Ok(Err(_)) => {
-                            // 与隐式 TLS 同理：无超时的握手会永久占用连接许可。
                             tracing::warn!(
                                 peer = %peer,
                                 timeout_secs = TLS_HANDSHAKE_TIMEOUT.as_secs(),
@@ -656,9 +527,6 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
                     upgraded = true;
                 }
                 Err(error) => {
-                    // 客户端主动断开（回程 RST / 半关）不是攻击行为：记进封禁表
-                    // 只会惩罚 NAT 后的正常用户（默认 8 次/600 秒即封 1 小时），
-                    // 还会用 TCP 重置噪音灌满封禁表。
                     let benign_disconnect = matches!(
                         error.kind(),
                         std::io::ErrorKind::ConnectionReset
@@ -677,9 +545,6 @@ impl<S: MessageSink + ?Sized> ConnectionContext<S> {
     }
 }
 
-/// 会话总时限在 `serve` 期间到点：尽力发出 `421 4.4.2` 后由调用方断开。
-///
-/// 「尽力」：对端可能早已不在，写失败不改变「连接即将关闭」的结果。
 async fn session_deadline_elapsed(stream: &mut BoxedStream, peer: SocketAddr, timeout: Duration) {
     tracing::warn!(
         peer = %peer,
@@ -690,10 +555,6 @@ async fn session_deadline_elapsed(stream: &mut BoxedStream, peer: SocketAddr, ti
     let _ = write_reply(stream, &reply).await;
 }
 
-/// 连接准入判定：封禁优先于限速，限速触发即计入失败。
-///
-/// 抽成函数是为了让「准入」这条决策链**只有一份实现**，同时可以在不起真实 socket
-/// 的情况下被穷举测试。
 fn admit(
     rate: &RateLimiter,
     bans: &BanList,
@@ -711,14 +572,12 @@ fn admit(
     match rate.check(ip, now_millis) {
         RateDecision::Allowed => AdmitVerdict::Allowed,
         RateDecision::Limited { retry_after_secs } => {
-            // 与真实路径一致：触发限速即计入失败。
             bans.record_failure(ip, now);
             AdmitVerdict::RateLimited { retry_after_secs }
         }
     }
 }
 
-/// [`admit`] 的判定结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmitVerdict {
     Allowed,
@@ -755,12 +614,12 @@ mod tests {
 
         assert_eq!(admit(&rate, &bans, ip(), 0), AdmitVerdict::Allowed);
         assert_eq!(admit(&rate, &bans, ip(), 0), AdmitVerdict::Allowed);
-        // 第三次超速：计入一次失败。
+
         assert!(matches!(
             admit(&rate, &bans, ip(), 0),
             AdmitVerdict::RateLimited { .. }
         ));
-        // 再超速一次 → 失败达到阈值 → 封禁。
+
         assert!(matches!(
             admit(&rate, &bans, ip(), 0),
             AdmitVerdict::RateLimited { .. }
@@ -782,7 +641,7 @@ mod tests {
             permanent_after: 2,
             max_entries: 100,
         });
-        // 一次失败即封禁（阈值 1）。
+
         bans.record_failure(ip(), 0);
         for _ in 0..10 {
             assert_eq!(
@@ -797,11 +656,6 @@ mod tests {
         );
     }
 
-    /// 三个监听（25/465/587）必须共用**同一份**准入状态。
-    ///
-    /// 若各端口自建，攻击者只需在端口之间轮换，就能拿到成倍配额；更糟的是 `strike`
-    /// 被摊薄到每个端口都不够阈值，**永久封禁永远不会触发**。这条断言「配额只有一份」
-    /// 是结构性的，不依赖网络。
     #[tokio::test]
     async fn servers_sharing_a_limiter_use_one_budget_across_listeners() {
         struct NullSink;
@@ -849,7 +703,6 @@ mod tests {
             "多个监听必须共用同一份封禁表"
         );
 
-        // 行为证据：配额只有一份 —— 在第一个监听上耗尽后，第二个立刻超速。
         assert!(first.rate_limiter().check(ip(), 0).is_allowed());
         assert!(
             !second.rate_limiter().check(ip(), 0).is_allowed(),
@@ -857,19 +710,6 @@ mod tests {
         );
     }
 
-    /// 滴水客户端（持续喂零散字节，永远凑不出一行命令）必须在会话级总时限处
-    /// 收到 `421 4.4.2` 并被断开。
-    ///
-    /// ## 这条测试为什么必须「滴水」而不是干等
-    ///
-    /// 客户端不发字节时，per-read 超时（300s）先于会话总时限到点，
-    /// 那条路径安静地回 `Closed`、没有 421 —— 它验证不了本条防线。只有让每次
-    /// read 都在超时前恰好等到 1 字节，per-read 超时被不断重置，才轮得到会话级
-    /// 上限出场 —— 这正是 slowloris 的真实形态。
-    ///
-    /// 时限是**可注入**的（`MailServer.session_timeout`）：测试用 500ms 的真实
-    /// 时钟时限，滴水间隔 50ms 远小于 per-read 超时 —— 不依赖 `test-util`
-    /// 的虚拟时钟。
     #[tokio::test]
     async fn a_dribbling_session_is_bounded_by_the_total_deadline() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -896,13 +736,12 @@ mod tests {
             Arc::new(SystemClock),
         )
         .expect("构造监听");
-        // 秒级总时限：滴水间隔（50ms）仍远小于 per-read 超时（300s），
-        // 防线的「被滴水不断喂活」前提不变，但真实时钟下瞬时走完。
+
         server.session_timeout = Duration::from_millis(500);
         tokio::spawn(async move { server.run(std::future::pending()).await });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
-        // 先读完整的 220 问候行（以 CRLF 结尾），确认会话已进入命令阶段。
+
         let mut greeting = Vec::new();
         let mut chunk = [0u8; 128];
         while !greeting.windows(2).any(|window| window == b"\r\n") {
@@ -916,9 +755,6 @@ mod tests {
             String::from_utf8_lossy(&greeting)
         );
 
-        // 滴水节奏 50ms < per-read 超时 300s：每次 read 都在超时前被喂活，
-        // per-read 超时永远到不了点。写失败（连接已被服务端关掉）即退出。
-        // tokio 的 TcpStream 不能 try_clone —— 拆成读写两半，写半给滴水任务。
         let (mut reader, mut writer) = client.into_split();
         tokio::spawn(async move {
             for _ in 0..40 {
@@ -929,8 +765,6 @@ mod tests {
             }
         });
 
-        // 读到 421（或对端关闭）。外层给一个真实上限：回归（总时限失效）时
-        // 滴水 eventually 耗尽、连接安静关闭，断言会给出明确失败而不是挂死。
         let mut seen = Vec::new();
         let mut chunk = [0u8; 128];
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -955,7 +789,6 @@ mod tests {
         );
     }
 
-    /// R3-006：单个来源的并发连接数必须封顶，且额度在连接结束时归还。
     #[test]
     fn a_single_peer_cannot_exceed_its_concurrent_connection_quota() {
         let peers = Arc::new(PeerConnections::new(3));
@@ -970,7 +803,7 @@ mod tests {
             peers.try_acquire(attacker).is_none(),
             "超过每 IP 并发上限必须拒绝"
         );
-        // 另一个 IP 不受影响 —— 单点占满不能连坐所有人。
+
         assert!(peers.try_acquire(other).is_some(), "另一个来源应仍可建连");
         assert_eq!(peers.active_for(attacker), 3);
 
@@ -979,7 +812,6 @@ mod tests {
         assert!(peers.try_acquire(attacker).is_some(), "额度应可复用");
     }
 
-    /// R3-007 配套：IPv6 的并发计数按 /64 聚合，轮换地址拿不到新配额。
     #[test]
     fn ipv6_concurrency_is_aggregated_by_slash_64() {
         let peers = Arc::new(PeerConnections::new(2));

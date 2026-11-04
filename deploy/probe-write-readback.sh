@@ -1,14 +1,3 @@
-#!/usr/bin/env bash
-# 复现「写入 noanonymous 后 -n 读回空值」的怪现象。
-#
-# 探测全程在**隔离目录**里进行（`postconf -c <dir>`）：先把宿主的 main.cf 原样
-# 拷进去作为基线，之后所有 postconf -e / -n / -h 都指向该副本 —— 宿主的真实
-# /etc/postfix/main.cf 只被**只读**核对，绝不被写入。
-#
-# 早先版本直接 `postconf -e` 改宿主配置，结束时还刻意把
-# smtp_sasl_security_options=noanonymous 留在原地 —— 那是真实的测试残留：
-# noanonymous 会放开匿名认证（对内网中继即匿名投递），改变宿主 Postfix 的
-# 安全行为。故整个探测改为 -c 隔离，不再触碰、也不再需要清理宿主配置。
 set -uo pipefail
 export PATH="/usr/sbin:/sbin:$PATH"
 
@@ -24,8 +13,6 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/mailstack-postconf-probe.XXXXXXXX") || {
 }
 trap 'rm -rf "$WORK"' EXIT
 chmod 700 "$WORK"
-# 基线：隔离副本与宿主完全一致，-n/-h 的读回结果因此与真实场景同构
-# （副本目录 0700 且退出即删，不引入额外的暴露面）。
 cp -a "$MAIN" "$WORK/main.cf"
 
 K=smtp_sasl_security_options

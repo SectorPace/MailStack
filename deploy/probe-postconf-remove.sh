@@ -1,5 +1,3 @@
-#!/usr/bin/env bash
-# 探测 postconf -X（移除参数）是否可用，以及 -e key=（设为空）与「从未设置」的差异。
 set -uo pipefail
 export PATH="/usr/sbin:/sbin:$PATH"
 
@@ -7,7 +5,6 @@ WORK=/tmp/pfx-test.cf
 cp /etc/postfix/main.cf "$WORK"
 echo "=== 用临时配置文件独立试验（不碰 main.cf）==="
 
-# postconf 支持 -c 指定 config_directory
 TMPDIR_TEST=/tmp/pfx-conf
 mkdir -p "$TMPDIR_TEST"
 cp /etc/postfix/main.cf "$TMPDIR_TEST/main.cf"

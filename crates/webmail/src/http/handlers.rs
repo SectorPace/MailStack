@@ -1,14 +1,3 @@
-//! 全部 `/mail/api` 处理器。
-//!
-//! 统一纪律：
-//! * 认证与 CSRF 由 [`crate::http::auth::AuthSession`] 提取器完成——处理器只要
-//!   声明它就自动受保护，不存在「忘了鉴权」的路由；
-//! * 所有 Maildir / 队列 / PBKDF2 调用都经 [`crate::http::blocking`]，不阻塞
-//!   async worker；
-//! * JSON 拒绝（畸形 / 类型错 / 缺 Content-Type）统一映射成契约错误模型，
-//!   不把 serde 的内部报错回显给客户端；
-//! * 响应只含业务字段，不回显内部路径 / 堆栈（细节只进日志）。
-
 use std::net::SocketAddr;
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
@@ -29,11 +18,6 @@ use crate::maildir_service::{BatchRequest, FlagPatch, ListOptions, MaildirServic
 use crate::session;
 use crate::{DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, VERSION};
 
-// ---------------------------------------------------------------------------
-// 响应形状
-// ---------------------------------------------------------------------------
-
-/// 会话响应里的用户对象（契约 §1.1）。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserView {
@@ -42,7 +26,6 @@ pub struct UserView {
     pub display_name: String,
 }
 
-/// 会话响应体（契约 §1.1 / §1.2）。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionView {
@@ -51,22 +34,18 @@ pub struct SessionView {
     pub expires_in_seconds: i64,
 }
 
-/// 登录请求体（契约 §1.1）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoginRequest {
-    /// 完整邮箱地址。`email` 作为别名接受（契约写 `login`）。
     #[serde(alias = "email")]
     pub login: String,
     pub password: String,
 }
 
-/// 文件夹创建 / 重命名请求体。
 #[derive(Debug, Clone, Deserialize)]
 pub struct FolderNameRequest {
     pub name: String,
 }
 
-/// 移动 / 复制请求体。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MoveRequest {
@@ -75,7 +54,6 @@ pub struct MoveRequest {
     pub copy: Option<bool>,
 }
 
-/// 列表查询参数。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MessageListQuery {
     #[serde(default)]
@@ -94,21 +72,18 @@ pub struct MessageListQuery {
     pub sort: Option<String>,
 }
 
-/// 详情查询参数（`?images=1` 显示远程图片）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DetailQuery {
     #[serde(default)]
     pub images: Option<u8>,
 }
 
-/// 部件查询参数（`?download=1` 强制附件下载）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PartQuery {
     #[serde(default)]
     pub download: Option<u8>,
 }
 
-/// 搜索查询参数。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SearchQuery {
     #[serde(default)]
@@ -120,10 +95,6 @@ pub struct SearchQuery {
     #[serde(default)]
     pub offset: Option<usize>,
 }
-
-// ---------------------------------------------------------------------------
-// 解析辅助
-// ---------------------------------------------------------------------------
 
 fn json_response(status: StatusCode, value: impl serde::Serialize) -> WebmailResult<Response> {
     Ok((status, Json(value)).into_response())
@@ -180,7 +151,6 @@ fn parse_query<T: serde::de::DeserializeOwned>(
     }
 }
 
-/// 解析路径里的 uid（十进制 u32）。非法值回 400，而不是 404（那是「不存在」）。
 fn parse_uid(raw: &str) -> WebmailResult<u32> {
     raw.parse::<u32>()
         .map_err(|_| WebmailError::bad_request("INVALID_UID", "uid must be a non-negative integer"))
@@ -200,11 +170,6 @@ fn folder_or_inbox(folder: Option<String>) -> String {
         .unwrap_or_else(|| "INBOX".to_string())
 }
 
-/// 安全地把 MIME 类型变成 `Content-Type` 头：非 `type/subtype` token 形状回
-/// `application/octet-stream`。
-///
-/// 邮件的 Content-Type 是不可信输入；把它原样塞进响应头，若含 CR/LF 就是响应头
-/// 注入。这里只放行 ASCII token，其它一律降级。
 fn safe_content_type(raw: &str) -> HeaderValue {
     let token = |value: &str| {
         !value.is_empty()
@@ -241,7 +206,6 @@ fn safe_content_type(raw: &str) -> HeaderValue {
     }
 }
 
-/// 这些类型即使声明为 inline 也强制按附件下载：浏览器会把它们当文档/脚本渲染。
 fn is_unsafe_render_type(content_type: &str) -> bool {
     matches!(
         content_type.trim().to_ascii_lowercase().as_str(),
@@ -255,7 +219,6 @@ fn is_unsafe_render_type(content_type: &str) -> bool {
     )
 }
 
-/// 构造 `Content-Disposition`（RFC 6266 + RFC 5987）。
 fn content_disposition(disposition: &str, filename: Option<&str>) -> HeaderValue {
     let Some(filename) = filename.filter(|name| !name.trim().is_empty()) else {
         return HeaderValue::from_static("attachment");
@@ -296,11 +259,6 @@ fn rfc5987_encode(value: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
-// 健康检查 / 会话
-// ---------------------------------------------------------------------------
-
-/// `GET /mail/api/health`（免认证；编排与冒烟用）。
 pub async fn health(State(state): State<AppState>) -> Response {
     Json(serde_json::json!({
         "ok": true,
@@ -313,7 +271,6 @@ pub async fn health(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
-/// `POST /mail/api/session` —— 登录。
 pub async fn login(
     State(state): State<AppState>,
     peer: Option<ConnectInfo<SocketAddr>>,
@@ -321,7 +278,7 @@ pub async fn login(
     body: Result<Json<LoginRequest>, JsonRejection>,
 ) -> WebmailResult<Response> {
     let payload = parse_json(body)?;
-    // 同源检查先于一切：跨站登录请求连限流状态都不该触碰。
+
     if !session::origin_matches_host(&headers) {
         return Err(WebmailError::origin_rejected());
     }
@@ -351,7 +308,6 @@ pub async fn login(
     };
     state.inner.throttle.record_success(&payload.login);
 
-    // 会话纪元：登录时记录当前值；之后 bump 即踢下线。
     let epochs = state.inner.epochs.clone();
     let email = account.email.clone();
     let epoch = blocking(move || Ok(epochs.current(&email))).await?;
@@ -374,7 +330,6 @@ pub async fn login(
     Ok(response)
 }
 
-/// `GET /mail/api/session` —— 当前会话。
 pub async fn session_info(auth: AuthSession) -> WebmailResult<Response> {
     json_response(
         StatusCode::OK,
@@ -382,7 +337,6 @@ pub async fn session_info(auth: AuthSession) -> WebmailResult<Response> {
     )
 }
 
-/// `DELETE /mail/api/session` —— 注销（写方法，因此必须带 CSRF）。
 pub async fn logout(
     State(state): State<AppState>,
     peer: Option<ConnectInfo<SocketAddr>>,
@@ -408,18 +362,12 @@ pub async fn logout(
     Ok(response)
 }
 
-// ---------------------------------------------------------------------------
-// 文件夹
-// ---------------------------------------------------------------------------
-
-/// `GET /mail/api/folders`。
 pub async fn list_folders(auth: AuthSession) -> WebmailResult<Response> {
     let service = MaildirService::new(auth.account());
     let folders = blocking(move || service.list_folders()).await?;
     json_response(StatusCode::OK, serde_json::json!({ "folders": folders }))
 }
 
-/// `POST /mail/api/folders`。
 pub async fn create_folder(
     auth: AuthSession,
     body: Result<Json<FolderNameRequest>, JsonRejection>,
@@ -430,7 +378,6 @@ pub async fn create_folder(
     json_response(StatusCode::CREATED, serde_json::json!({ "name": name }))
 }
 
-/// `PATCH /mail/api/folders/{folder}`。
 pub async fn rename_folder(
     auth: AuthSession,
     path: Result<Path<String>, PathRejection>,
@@ -443,7 +390,6 @@ pub async fn rename_folder(
     json_response(StatusCode::OK, serde_json::json!({ "name": name }))
 }
 
-/// `DELETE /mail/api/folders/{folder}`（仅空文件夹）。
 pub async fn delete_folder(
     auth: AuthSession,
     path: Result<Path<String>, PathRejection>,
@@ -454,11 +400,6 @@ pub async fn delete_folder(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-// ---------------------------------------------------------------------------
-// 邮件列表 / 详情 / 原始 / 部件
-// ---------------------------------------------------------------------------
-
-/// `GET /mail/api/messages?folder=...`。
 pub async fn list_messages(
     auth: AuthSession,
     query: Result<Query<MessageListQuery>, QueryRejection>,
@@ -483,7 +424,6 @@ pub async fn list_messages(
     json_response(StatusCode::OK, list)
 }
 
-/// `GET /mail/api/messages/{folder}/{uid}?images=1`。
 pub async fn message_detail(
     auth: AuthSession,
     path: Result<Path<(String, String)>, PathRejection>,
@@ -498,7 +438,6 @@ pub async fn message_detail(
     json_response(StatusCode::OK, serde_json::json!({ "message": detail }))
 }
 
-/// `GET /mail/api/messages/{folder}/{uid}/raw`。
 pub async fn raw_message(
     auth: AuthSession,
     path: Result<Path<(String, String)>, PathRejection>,
@@ -524,7 +463,6 @@ pub async fn raw_message(
         .into_response())
 }
 
-/// `GET /mail/api/messages/{folder}/{uid}/parts/{partId}?download=1`。
 pub async fn message_part(
     auth: AuthSession,
     path: Result<Path<(String, String, String)>, PathRejection>,
@@ -535,8 +473,7 @@ pub async fn message_part(
     let query = parse_query(query)?;
     let service = MaildirService::new(auth.account());
     let part = blocking(move || service.part(&folder, uid, &part_id)).await?;
-    // 契约：`?download=1` 强制 attachment；除此之外，非 inline 的部件也是附件；
-    // 可渲染类型（HTML/SVG/XML）一律强制 attachment（防内容嗅探 + 防脚本执行）。
+
     let force_download =
         truthy(query.download) || !part.inline || is_unsafe_render_type(&part.content_type);
     let disposition = if force_download {
@@ -563,11 +500,6 @@ pub async fn message_part(
     Ok(response)
 }
 
-// ---------------------------------------------------------------------------
-// 标志 / 移动 / 删除 / 批量
-// ---------------------------------------------------------------------------
-
-/// `PATCH /mail/api/messages/{folder}/{uid}`。
 pub async fn patch_flags(
     auth: AuthSession,
     path: Result<Path<(String, String)>, PathRejection>,
@@ -581,7 +513,6 @@ pub async fn patch_flags(
     json_response(StatusCode::OK, serde_json::json!({ "flags": flags }))
 }
 
-/// `POST /mail/api/messages/{folder}/{uid}/move`。
 pub async fn move_message(
     auth: AuthSession,
     path: Result<Path<(String, String)>, PathRejection>,
@@ -598,7 +529,6 @@ pub async fn move_message(
     json_response(StatusCode::OK, result)
 }
 
-/// `DELETE /mail/api/messages/{folder}/{uid}`（永久删除）。
 pub async fn delete_message(
     auth: AuthSession,
     path: Result<Path<(String, String)>, PathRejection>,
@@ -610,7 +540,6 @@ pub async fn delete_message(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// `POST /mail/api/messages/batch`。
 pub async fn batch(
     auth: AuthSession,
     body: Result<Json<BatchRequest>, JsonRejection>,
@@ -621,11 +550,6 @@ pub async fn batch(
     json_response(StatusCode::OK, serde_json::json!({ "affected": affected }))
 }
 
-// ---------------------------------------------------------------------------
-// 搜索 / 配额 / 草稿 / 发信
-// ---------------------------------------------------------------------------
-
-/// `GET /mail/api/search?q=...`。
 pub async fn search(
     auth: AuthSession,
     query: Result<Query<SearchQuery>, QueryRejection>,
@@ -646,14 +570,12 @@ pub async fn search(
     json_response(StatusCode::OK, list)
 }
 
-/// `GET /mail/api/quota`。
 pub async fn quota(auth: AuthSession) -> WebmailResult<Response> {
     let service = MaildirService::new(auth.account());
     let quota = blocking(move || service.quota()).await?;
     json_response(StatusCode::OK, quota)
 }
 
-/// `POST /mail/api/messages` —— 保存草稿。
 pub async fn create_draft(
     auth: AuthSession,
     body: Result<Json<DraftRequest>, JsonRejection>,
@@ -667,7 +589,6 @@ pub async fn create_draft(
     )
 }
 
-/// `POST /mail/api/send` —— 入队 + Sent 副本。
 pub async fn send_message(
     State(state): State<AppState>,
     auth: AuthSession,
@@ -682,21 +603,13 @@ pub async fn send_message(
         "queueId": outcome.queue_id,
         "sentUid": outcome.sent_uid,
     });
-    // `warning` 只在副本失败时出现（契约 §2.2 的「202 + warning」）。
+
     if let Some(warning) = outcome.warning {
         payload["warning"] = serde_json::Value::String(warning);
     }
     json_response(StatusCode::ACCEPTED, payload)
 }
 
-// ---------------------------------------------------------------------------
-// 兜底
-// ---------------------------------------------------------------------------
-
-/// 未匹配路径：`/mail/api/*` 一律 JSON 404，其余交给静态产物。
-///
-/// 这是契约 §3 的硬边界：把 `mail.html` 回给一个打错的 API 路径，前端会把
-/// 「接口不存在」解析成「服务端坏了」。
 pub async fn fallback(State(state): State<AppState>, uri: Uri) -> Response {
     if crate::http::is_api_path(uri.path()) {
         return crate::http::error::json_error(WebmailError::api_not_found());
@@ -738,7 +651,6 @@ mod tests {
         assert!(raw.contains("filename*=UTF-8''%E6%8A%A5%E5%91%8A.pdf"));
         assert!(raw.is_ascii(), "响应头必须是 ASCII：{raw}");
 
-        // 引号/反斜杠不得破坏头部。
         let value = content_disposition("attachment", Some("a\"b\\c.txt"));
         let raw = value.to_str().unwrap();
         assert!(raw.is_ascii());

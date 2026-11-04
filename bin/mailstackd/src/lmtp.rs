@@ -1,26 +1,3 @@
-//! 本地投递的落箱服务：`mailstack-imappop3` 的 LMTP 服务端 + Sieve 过滤。
-//!
-//! ## 为什么是「自己 LMTP 自己」
-//!
-//! INV-11：落箱只有 `mailstack-store` 的 `LmtpClient` 一条路。过去它的对端是
-//! Dovecot 的 LMTP socket；现在换成 [`mailstack_imappop3::lmtp::LmtpServer`] 的
-//! **自有** unix socket —— 于是本地投递天然经过 Sieve（`fileinto` / `reject` /
-//! `redirect` / `vacation`），队列只负责排队与重试，「每个收件人独立应答」的语义
-//! 仍由 LMTP 承担，与 Dovecot 时代完全一致。
-//!
-//! ## 路由：与 IMAP/POP3 同一条 userdb
-//!
-//! [`ResolverRouter`] 把收件人地址经 `mailstack-imapd` 的
-//! `SystemMaildirResolver`（`/etc/passwd` 家目录 + `~/Maildir`）解析成
-//! `MailStore`。解析不到 = 本机没有这个收件人 → `550`，队列按投递失败处理，
-//! 与 Dovecot 拒收语义一致；**绝不**退回某个默认邮箱。
-//!
-//! ## 外发出口
-//!
-//! Sieve 的 `redirect` / `vacation` 产物经 [`mailstack_imappop3::outbound::QueueOutboundSink`]
-//! 进入**同一条**出站队列 —— 转发与自动回复和普通外发走同一套中继/直投、重试与
-//! DSN 路径，不会凭空多出第二条出站通道。
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -35,18 +12,13 @@ use mailstack_imappop3::resolver::MailboxResolver;
 use crate::config::RuntimeConfig;
 use crate::error::DaemonError;
 
-/// 生产布局的 passwd 目录与 Maildir 目录名，与 `mailstack-imapd` 的默认一致。
 const PASSWD_ROOT: &str = "/etc";
 const MAILDIR_NAME: &str = "Maildir";
 
-/// LMTP 服务端的 unix socket：`<run_dir>/lmtp.sock`。
-///
-/// 队列侧的 `LmtpEndpoint` 默认也指向它（可用 `MAILSTACK_LMTP_SOCKET` 覆盖）。
 pub fn socket_path(paths: &mailstack_core::Paths) -> PathBuf {
     paths.run_dir.join("lmtp.sock")
 }
 
-/// 把「收件人地址 → MailStore」接到 IMAP/POP3 同一条 userdb 上。
 struct ResolverRouter {
     resolver: Arc<dyn MailboxResolver>,
 }
@@ -57,12 +29,10 @@ impl LmtpRouter for ResolverRouter {
     }
 }
 
-/// 生产装配：`/etc/passwd` 家目录 + `~/Maildir`，外发出口 = 本机出站队列。
 pub fn build_server(config: &RuntimeConfig) -> Result<LmtpServer, DaemonError> {
     build_server_at(Path::new(PASSWD_ROOT), MAILDIR_NAME, &config.queue_root)
 }
 
-/// 可注入根目录的装配（测试/旁路部署用）。
 pub fn build_server_at(
     passwd_root: &Path,
     maildir_name: &str,
@@ -82,7 +52,6 @@ pub fn build_server_at(
     Ok(server)
 }
 
-/// 建 run_dir 并返回 socket 路径。残留 socket 由 `serve_unix` 自己清理。
 pub fn socket_file(paths: &mailstack_core::Paths) -> Result<PathBuf, DaemonError> {
     std::fs::create_dir_all(&paths.run_dir).map_err(|error| {
         DaemonError::Lmtp(format!(
@@ -101,7 +70,6 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
-    /// passwd + 家目录 + 队列根。
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let passwd_root = dir.path().join("etc");
@@ -117,7 +85,6 @@ mod tests {
         (dir, home, queue_root)
     }
 
-    /// 等待 socket 出现（绑定在服务任务里异步完成）。
     async fn wait_for_socket(socket: &Path) {
         for _ in 0..400 {
             if socket.exists() {
@@ -128,8 +95,6 @@ mod tests {
         panic!("socket 未在预期时间内出现：{}", socket.display());
     }
 
-    /// 发一行，读到本条命令的**终止应答**（`250 `/`354 `/`550 `/`221 `，多行应答
-    /// 的中间行是 `250-`）。
     async fn command(
         writer: &mut tokio::io::WriteHalf<UnixStream>,
         reader: &mut BufReader<tokio::io::ReadHalf<UnixStream>>,
@@ -194,7 +159,6 @@ mod tests {
         assert!(delivered.starts_with("250 "), "投递应成功：{delivered}");
         command(&mut write_half, &mut reader, "QUIT").await;
 
-        // 信落到了 dave 自己的 Maildir（new/ 或已被读走的 cur/）。
         let maildir = home.join("Maildir");
         let mut count = 0;
         for directory in ["new", "cur"] {

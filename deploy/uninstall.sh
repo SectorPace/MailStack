@@ -1,33 +1,3 @@
-#!/usr/bin/env bash
-# =============================================================================
-# MailStack v1.0.0 卸载脚本
-# =============================================================================
-#
-# 用法:
-#   sudo bash deploy/uninstall.sh [选项]
-#
-# 选项:
-#   --prefix DIR        只卸载 DIR 下的 staging 安装（默认 /）
-#   --purge             连配置与数据一起删除（/etc/mailstack、/var/lib/mailstack、
-#                       /var/backups/mailstack）；默认**保留**它们
-#   --non-interactive   不交互确认（CI / 测试 / 无人值守）
-#   -h, --help          显示帮助
-#   --version           显示版本
-#
-# 默认行为（非 --purge）：
-#   * 停止并禁用 4 个 unit，删除 unit 文件、特权包装器、sudoers 规则、5 个二进制、
-#     前端产物、运行时目录；
-#   * **保留** /etc/mailstack（配置/管理员/身份）、/var/lib/mailstack（队列/注册表）、
-#     /var/backups/mailstack（备份）—— 邮件服务器卸载后重装不该丢信、丢身份；
-#   * 保留系统账号/组（可能被并存部署共用）。
-#
-# 安全守卫：
-#   * 全程 set -Eeuo pipefail；
-#   * 所有 rm -rf 都走 safe_rm_rf：绝对路径、非根/非系统目录、且（staging 时）
-#     必须位于 --prefix 之下；
-#   * staging 前缀必须能证明是 MailStack 安装（安装标记或二进制存在），
-#     否则拒绝删除 —— 防止 `--prefix /root` 之类的误操作清空家目录。
-# =============================================================================
 
 set -Eeuo pipefail
 umask 022
@@ -147,7 +117,6 @@ derive_paths() {
   UNIT_DIR="$(prefix_path /etc/systemd/system)"
 }
 
-# 删除前守卫（与 install.sh 同口径）。
 safe_rm_rf() {
   local target="$1"
   [ -n "$target" ] || return 0
@@ -190,7 +159,6 @@ check_environment() {
   command -v stat >/dev/null 2>&1 || die "缺少 stat（coreutils）"
 }
 
-# staging 前缀的安全证明：能证明「这里确实是一次 MailStack 安装」才允许删除。
 verify_staging_prefix() {
   [ -n "$PREFIX_NORM" ] || return 0
   local marker="$ETC_DIR/.mailstack-installed"
@@ -236,7 +204,6 @@ stop_services() {
 remove_install_files() {
   say "删除安装文件"
   local name unit
-  # unit 文件（宿主安装的 unit 与 staging 前缀下的 unit 都在这里删除）
   for unit in "${UNIT_NAMES[@]}"; do
     rm_file "$UNIT_DIR/${unit}.service"
   done
@@ -246,11 +213,9 @@ remove_install_files() {
   rm_file "$LIBEXEC_DIR/$WRAPPER_NAME"
   rm_file "$LIBEXEC_DIR/mailstack-uninstall"
   rm_file "$ETC_DIR/sudoers.d/$SUDOERS_NAME"
-  # sudoers.d 目录本身保留（属主与模式有系统约定），只删我们的文件。
   if [ -d "$DIST_DIR" ]; then
     safe_rm_rf "$DIST_DIR"
   fi
-  # /usr/share/mailstack 若只剩空目录则一并清理。
   local share_dir
   share_dir="$(prefix_path /usr/share/mailstack)"
   if [ -d "$share_dir" ] && [ -z "$(ls -A "$share_dir" 2>/dev/null)" ]; then
@@ -259,7 +224,6 @@ remove_install_files() {
   if [ -d "$RUN_DIR" ]; then
     safe_rm_rf "$RUN_DIR"
   fi
-  # 安装标记：不 purge 时清掉（数据目录仍在，但「已安装」状态结束）。
   rm_file "$ETC_DIR/.mailstack-installed"
 }
 
@@ -267,7 +231,6 @@ keep_or_purge_data() {
   if [ "$PURGE" -eq 1 ]; then
     say "删除配置与数据（--purge）"
     if [ -d "$ETC_DIR" ]; then
-      # 先撤销安装器可能收敛过的 /etc/mailstack 属组，再删目录本身。
       safe_rm_rf "$ETC_DIR"
     fi
     if [ -d "$VAR_LIB_DIR" ]; then

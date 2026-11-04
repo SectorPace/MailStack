@@ -13,12 +13,9 @@ import { useIsMobile } from "./hooks/useIsMobile";
 import { CommandPalette } from "./components/CommandPalette";
 import { ToastHost } from "./components/ui";
 import { IconUser, IconSearch, IconGear, IconChevronDown } from "./components/icons";
-
-// 页面按路由分包，首屏只加载 Dashboard
 const Login = lazy(() => import("./pages/Login"));
 const Setup = lazy(() => import("./pages/Setup"));
 const Dashboard = lazy(() => import("./pages/Dashboard"));
-const AiSuite = lazy(() => import("./pages/AiSuite"));
 const Domains = lazy(() => import("./pages/Domains"));
 const Users = lazy(() => import("./pages/Users"));
 const Aliases = lazy(() => import("./pages/Aliases"));
@@ -30,433 +27,283 @@ const Logs = lazy(() => import("./pages/Logs"));
 const Services = lazy(() => import("./pages/Services"));
 const Security = lazy(() => import("./pages/Security"));
 const Settings = lazy(() => import("./pages/Settings"));
-
 const PAGE_FOR: Record<RouteKey, React.ComponentType> = {
-  dashboard: Dashboard,
-  ai: AiSuite,
-  domains: Domains,
-  users: Users,
-  aliases: Aliases,
-  relay: Relay,
-  dkim: DkimDns,
-  tls: TlsCerts,
-  queue: MailQueue,
-  logs: Logs,
-  services: Services,
-  security: Security,
-  settings: Settings,
+    dashboard: Dashboard,
+    domains: Domains,
+    users: Users,
+    aliases: Aliases,
+    relay: Relay,
+    dkim: DkimDns,
+    tls: TlsCerts,
+    queue: MailQueue,
+    logs: Logs,
+    services: Services,
+    security: Security,
+    settings: Settings,
 };
-
-/** 全局刷新信号：工具栏刷新按钮 → 页面重新拉数据 */
-export const RefreshContext = createContext<() => void>(() => {});
-
-/**
- * 折射位移图（Refraction）：R 通道 = 水位 ramp（左 1 → 右 0），G 通道 = 垂直 ramp（上 1 → 下 0）。
-   feDisplacementMap 在边缘把背景向内弯折、中心保持中性 —— 展板「Refraction 折射效果」的实现。
- * 仅 Chromium 支持 backdrop-filter: url()；Safari/Firefox 走 CSS 双声明中的基础磨砂（自动降级）。
- */
+export const RefreshContext = createContext<() => void>(() => { });
 function makeLensMap(): string {
-  const s = 128;
-  const c = document.createElement("canvas");
-  c.width = c.height = s;
-  const ctx = c.getContext("2d");
-  if (!ctx) return "";
-  const img = ctx.createImageData(s, s);
-  for (let y = 0; y < s; y++) {
-    for (let x = 0; x < s; x++) {
-      const i = (y * s + x) * 4;
-      img.data[i] = Math.round(255 * (1 - x / (s - 1)));
-      img.data[i + 1] = Math.round(255 * (1 - y / (s - 1)));
-      img.data[i + 2] = 128;
-      img.data[i + 3] = 255;
+    const s = 128;
+    const c = document.createElement("canvas");
+    c.width = c.height = s;
+    const ctx = c.getContext("2d");
+    if (!ctx)
+        return "";
+    const img = ctx.createImageData(s, s);
+    for (let y = 0; y < s; y++) {
+        for (let x = 0; x < s; x++) {
+            const i = (y * s + x) * 4;
+            img.data[i] = Math.round(255 * (1 - x / (s - 1)));
+            img.data[i + 1] = Math.round(255 * (1 - y / (s - 1)));
+            img.data[i + 2] = 128;
+            img.data[i + 3] = 255;
+        }
     }
-  }
-  ctx.putImageData(img, 0, 0);
-  return c.toDataURL("image/png");
+    ctx.putImageData(img, 0, 0);
+    return c.toDataURL("image/png");
 }
-const LENS_MAP =
-  typeof document !== "undefined" && /Chrom(e|ium)/.test(navigator.userAgent)
+const LENS_MAP = typeof document !== "undefined" && /Chrom(e|ium)/.test(navigator.userAgent)
     ? makeLensMap()
     : "";
 const REFRACT = LENS_MAP !== "";
-
 function useRefreshSignal() {
-  const [n, setN] = useState(0);
-  return [n, useCallback(() => setN((v) => v + 1), [])] as const;
+    const [n, setN] = useState(0);
+    return [n, useCallback(() => setN((v) => v + 1), [])] as const;
 }
-
-/** hash 的首段路径（与 router.ts parse() 同口径），用于识别显式再入 #/setup。 */
 function parseHash(): string {
-  return location.hash.replace(/^#\/?/, "").split("?")[0];
+    return location.hash.replace(/^#\/?/, "").split("?")[0];
 }
-
 export default function App() {
-  return (
-    <SettingsProvider>
+    return (<SettingsProvider>
       <Shell />
-    </SettingsProvider>
-  );
+    </SettingsProvider>);
 }
-
 function Shell() {
-  const { prefs, customBg, t } = useSettings();
-  const [route, nav] = useRoute();
-  const [scrolled, setScrolled] = useState(false);
-  const [paletteOpen, setPaletteOpen] = useState(false);
-  const [range, setRange] = useState<TimeRange>("24h");
-  const [refreshN, refresh] = useRefreshSignal();
-  const [mode, setMode] = useState<Mode>(getMode());
-  const [booted, setBooted] = useState(false);
-  const [authed, setAuthed] = useState(false);
-  const [setupDone, setSetupDone] = useState<boolean | null>(null);
-  const [menuOpen, setMenuOpen] = useState(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const vp = useViewport();
-  const variant: "fixed" | "rail" | "drawer" = vp.isDrawer ? "drawer" : vp.isRail ? "rail" : "fixed";
-  // 移动断点（<768，与 CSS iOS 度量档同口径）：决定底部标签栏与内容底部避让
-  const isMobile = useIsMobile();
+    const { prefs, customBg, t } = useSettings();
+    const [route, nav] = useRoute();
+    const [scrolled, setScrolled] = useState(false);
+    const [paletteOpen, setPaletteOpen] = useState(false);
+    const [range, setRange] = useState<TimeRange>("24h");
+    const [refreshN, refresh] = useRefreshSignal();
+    const [mode, setMode] = useState<Mode>(getMode());
+    const [booted, setBooted] = useState(false);
+    const [authed, setAuthed] = useState(false);
+    const [setupDone, setSetupDone] = useState<boolean | null>(null);
+    const [menuOpen, setMenuOpen] = useState(false);
+    const scrollRef = useRef<HTMLDivElement>(null);
+    const vp = useViewport();
+    const variant: "fixed" | "rail" | "drawer" = vp.isDrawer ? "drawer" : vp.isRail ? "rail" : "fixed";
+    const isMobile = useIsMobile();
+    const forceLogin = useMemo(() => new URLSearchParams(location.search).get("login") === "1", []);
+    useEffect(() => onModeChange(setMode), []);
+    const boot = useCallback(async () => {
+        setBooted(false);
+        const m = await initApi();
+        if (m === "unreachable") {
+            setBooted(true);
+            return;
+        }
+        if (m === "mock") {
+            setAuthed(!forceLogin);
+            setBooted(true);
+            return;
+        }
+        const s = await rpc<{
+            csrf?: string;
+            username?: string;
+        }>("auth.session");
+        if (s.ok) {
+            captureCsrf(((s.data ?? {}) as {
+                csrf?: string;
+            }).csrf);
+            if (!forceLogin)
+                setAuthed(true);
+        }
+        setBooted(true);
+    }, [forceLogin]);
+    useEffect(() => {
+        void boot();
+    }, [boot]);
+    useEffect(() => {
+        if (!authed || !booted)
+            return;
+        let live = true;
+        rpc<{
+            completed?: boolean;
+            identityConfigured?: boolean;
+        }>("setup.status").then((r) => {
+            if (!live)
+                return;
+            const d = r.ok ? (r.data ?? {}) : null;
+            const done = d == null
+                ? true
+                : typeof d.completed === "boolean"
+                    ? d.completed
+                    : !(d.identityConfigured ?? false);
+            setSetupDone(done);
+        });
+        return () => {
+            live = false;
+        };
+    }, [authed, booted]);
+    useEffect(() => {
+        document.documentElement.dataset.refract = String(REFRACT);
+    }, []);
+    useEffect(() => {
+        const fn = () => {
+            setAuthed(false);
+            setSetupDone(null);
+        };
+        window.addEventListener("mailstack:unauthorized", fn);
+        window.addEventListener("mailstack:logout", fn);
+        return () => {
+            window.removeEventListener("mailstack:unauthorized", fn);
+            window.removeEventListener("mailstack:logout", fn);
+        };
+    }, []);
+    const [forceSetup, setForceSetup] = useState(() => parseHash() === "setup");
+    useEffect(() => {
+        const fn = () => setForceSetup(parseHash() === "setup");
+        window.addEventListener("hashchange", fn);
+        return () => window.removeEventListener("hashchange", fn);
+    }, []);
+    useEffect(() => {
+        const key = `nav_${route}` as DictKey;
+        const name = Object.prototype.hasOwnProperty.call(DICT, key) ? t(key) : "MailStack";
+        document.title = `${name} · MailStack`;
+    }, [route, t]);
+    useEffect(() => {
+        scrollRef.current?.scrollTo({ top: 0 });
+    }, [route]);
+    const handleSetupDone = useCallback(() => {
+        setSetupDone(true);
+        if (parseHash() === "setup")
+            location.hash = "#/dashboard";
+    }, []);
+    useEffect(() => {
+        const fn = (e: KeyboardEvent) => {
+            if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+                e.preventDefault();
+                setPaletteOpen((o) => !o);
+            }
+        };
+        window.addEventListener("keydown", fn);
+        return () => window.removeEventListener("keydown", fn);
+    }, []);
+    const Page = PAGE_FOR[route];
+    const refreshCtx = useMemo(() => refresh, [refresh]);
+    return (<MotionConfig reducedMotion={prefs.reduceMotion ? "always" : "user"}>
 
-  const forceLogin = useMemo(() => new URLSearchParams(location.search).get("login") === "1", []);
-
-  useEffect(() => onModeChange(setMode), []);
-
-  /**
-   * 启动流程（fail-closed）：
-   *   探活失败 → 后端不可达错误页（可重试），**不降级到 mock**；
-   *   探活成功 → GET /api/auth/session 恢复登录态与 CSRF token。
-   * 原先刷新页面必然重登：csrf 只来自登录响应体，内存变量随刷新丢失。
-   */
-  const boot = useCallback(async () => {
-    setBooted(false);
-    const m = await initApi();
-    if (m === "unreachable") {
-      setBooted(true);
-      return;
-    }
-    if (m === "mock") {
-      // 仅开发构建（import.meta.env.DEV）可能到达；生产包不含该分支
-      setAuthed(!forceLogin);
-      setBooted(true);
-      return;
-    }
-    const s = await rpc<{ csrf?: string; username?: string }>("auth.session");
-    if (s.ok) {
-      captureCsrf(((s.data ?? {}) as { csrf?: string }).csrf);
-      if (!forceLogin) setAuthed(true);
-    }
-    setBooted(true);
-  }, [forceLogin]);
-
-  useEffect(() => {
-    void boot();
-  }, [boot]);
-
-  // 登录后检查初次设置是否完成（原版流程：setup.status → 向导 → 控制台）
-  useEffect(() => {
-    if (!authed || !booted) return;
-    let live = true;
-    // 后端（priv/handlers.rs setup_status_json）返回 completed（setup.json 的
-    // wizardCompleted；旧配置文件回落 false），与 identityConfigured（第一步完成
-    // 即为真）刻意区分 —— 向导弃了一半时 identityConfigured=true 而 completed=false，
-    // 向导必须重新弹出。以 completed 为准；后端没带该字段（旧契约）才回落
-    // identityConfigured（防御式兼容，绝不把「未收尾」当成「已完成」）。
-    rpc<{ completed?: boolean; identityConfigured?: boolean }>("setup.status").then((r) => {
-      if (!live) return;
-      // {ok:true} 无载荷时 r.data 为 undefined：缺数据按「未配置」处理（保持原
-      // 语义：fail 向向导，不向控制台）。
-      const d = r.ok ? (r.data ?? {}) : null;
-      const done =
-        d == null
-          ? true
-          : typeof d.completed === "boolean"
-            ? d.completed
-            : !(d.identityConfigured ?? false);
-      setSetupDone(done);
-    });
-    return () => {
-      live = false;
-    };
-  }, [authed, booted]);
-
-  // 折射开关落到 <html>，CSS 据此启用 backdrop-filter: url(#ms-lens)
-  useEffect(() => {
-    document.documentElement.dataset.refract = String(REFRACT);
-  }, []);
-
-  // 401 / 注销 → 登录门
-  useEffect(() => {
-    const fn = () => {
-      setAuthed(false);
-      setSetupDone(null);
-    };
-    window.addEventListener("mailstack:unauthorized", fn);
-    window.addEventListener("mailstack:logout", fn);
-    return () => {
-      window.removeEventListener("mailstack:unauthorized", fn);
-      window.removeEventListener("mailstack:logout", fn);
-    };
-  }, []);
-
-  // 显式再入向导：hash 路由 #/setup 强制渲染向导（即使 completed === true）。
-  // ROUTES（router.ts）刻意不含 "setup"——它不是导航页，parse() 会把未知 hash
-  // 回落 dashboard；这里在 Shell 单独解析。用途：向导收尾后又想重跑（改域名、
-  // 重发 DNS 校验）时，直接打开 #/setup 即可；向导的「进入控制台」按钮会重新
-  // 调 setup.wizard.complete 固化完成态并清掉该 hash。
-  const [forceSetup, setForceSetup] = useState(() => parseHash() === "setup");
-  useEffect(() => {
-    const fn = () => setForceSetup(parseHash() === "setup");
-    window.addEventListener("hashchange", fn);
-    return () => window.removeEventListener("hashchange", fn);
-  }, []);
-
-  // document.title 随路由：<页面名> · MailStack。页面名用现有导航词典；
-  // 键缺失时用常量兜底（RouteKey 与 nav_* 一一对应，缺失只可能是未来加路由忘配词典）。
-  useEffect(() => {
-    const key = `nav_${route}` as DictKey;
-    const name = Object.prototype.hasOwnProperty.call(DICT, key) ? t(key) : "MailStack";
-    document.title = `${name} · MailStack`;
-  }, [route, t]);
-
-  // 路由切换显式回顶：page-scroll 是滚动容器，motion.div 只做入场动画，
-  // 不复位的话从长列表页切到短设置页会停在中部/底部。
-  useEffect(() => {
-    scrollRef.current?.scrollTo({ top: 0 });
-  }, [route]);
-
-  // 向导收尾回调：固化 completed 后清掉 #/setup，否则 forceSetup 会把刚进
-  // 控制台的用户再拉回向导。
-  const handleSetupDone = useCallback(() => {
-    setSetupDone(true);
-    if (parseHash() === "setup") location.hash = "#/dashboard";
-  }, []);
-
-  // ⌘K 命令面板
-  useEffect(() => {
-    const fn = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setPaletteOpen((o) => !o);
-      }
-    };
-    window.addEventListener("keydown", fn);
-    return () => window.removeEventListener("keydown", fn);
-  }, []);
-
-  const Page = PAGE_FOR[route];
-  const refreshCtx = useMemo(() => refresh, [refresh]);
-
-  return (
-    <MotionConfig reducedMotion={prefs.reduceMotion ? "always" : "user"}>
-      {/* 折射滤镜定义（feDisplacementMap + 运行时生成的 ramp 位移图） */}
       <svg width="0" height="0" style={{ position: "absolute" }} aria-hidden focusable="false">
         <filter id="ms-lens" x="0" y="0" width="100%" height="100%" colorInterpolationFilters="sRGB">
-          <feImage href={LENS_MAP} preserveAspectRatio="none" />
-          {/* in2 省略 = 上一原语（feImage 位移图）的结果 */}
-          <feDisplacementMap in="SourceGraphic" scale="28" xChannelSelector="R" yChannelSelector="G" />
+          <feImage href={LENS_MAP} preserveAspectRatio="none"/>
+
+          <feDisplacementMap in="SourceGraphic" scale="28" xChannelSelector="R" yChannelSelector="G"/>
         </filter>
       </svg>
       <div className="relative flex h-full">
-      {/* 背景活动光场 —— 晨光山湖照片 + 主题罩层 + 漂移柔光（玻璃折射的真实内容）。
-          仅未登录 / 向导态渲染：登录后的控制台是数据表面，全屏照片会从玻璃后面
-          一直顶到内容层（也更耗合成层）；控制台背景回落 --canvas。 */}
-      {(!authed || setupDone === false) && (
-        <div className="lightfield" aria-hidden>
-          {/* customBg 来自 localStorage，可被外部改写：url() 必须带引号并转义（lib/format.cssUrl） */}
-          <div className="lf-photo" style={customBg ? { backgroundImage: `url(${cssUrl(customBg)})` } : undefined} />
-          <div className="lf-veil" />
-          <div className="blob b1" />
-        </div>
-      )}
 
-      {!booted ? (
-        <div className="relative z-10 flex h-full w-full items-center justify-center">
+      <div className="lightfield" aria-hidden>
+        <div className="lf-photo" style={customBg ? { backgroundImage: `url(${cssUrl(customBg)})` } : undefined}/>
+        <div className="lf-veil"/>
+        <div className="blob b1"/>
+      </div>
+
+      {!booted ? (<div className="relative z-10 flex h-full w-full items-center justify-center">
           <PageSkeleton />
-        </div>
-      ) : mode === "unreachable" ? (
-        <BackendUnreachable onRetry={() => void boot()} />
-      ) : !authed ? (
-        <div className="relative z-10 h-full w-full overflow-y-auto">
+        </div>) : mode === "unreachable" ? (<BackendUnreachable onRetry={() => void boot()}/>) : !authed ? (<div className="relative z-10 h-full w-full overflow-y-auto">
           <Suspense fallback={<PageSkeleton />}>
-            <Login onOk={() => setAuthed(true)} />
+            <Login onOk={() => setAuthed(true)}/>
           </Suspense>
-        </div>
-      ) : setupDone === false || forceSetup ? (
-        <div className="relative z-10 h-full w-full overflow-y-auto">
+        </div>) : setupDone === false || forceSetup ? (<div className="relative z-10 h-full w-full overflow-y-auto">
           <Suspense fallback={<PageSkeleton />}>
-            <Setup onDone={handleSetupDone} />
+            <Setup onDone={handleSetupDone}/>
           </Suspense>
-        </div>
-      ) : (
-      <>
-      <Sidebar
-        route={route}
-        nav={nav}
-        variant={variant}
-        open={menuOpen}
-        onClose={() => setMenuOpen(false)}
-        onSearch={() => setPaletteOpen(true)}
-      />
+        </div>) : (<>
+      <Sidebar route={route} nav={nav} variant={variant} open={menuOpen} onClose={() => setMenuOpen(false)} onSearch={() => setPaletteOpen(true)}/>
 
-      <main
-        className="relative z-10 flex min-w-0 flex-1 flex-col"
-        style={{
-          padding: variant === "drawer" ? 10 : "10px 10px 10px 0",
-          // 移动端内容底部避让 TabBar（fixed，不占布局）：scroll 区止步于标签栏上方
-          paddingBottom: isMobile
-            ? "calc(var(--tabbar-height) + env(safe-area-inset-bottom))"
-            : undefined,
-        }}
-      >
-        <Toolbar
-          route={route}
-          nav={nav}
-          scrolled={scrolled}
-          onRefresh={refresh}
-          range={range}
-          setRange={setRange}
-          openPalette={() => setPaletteOpen(true)}
-          mode={mode}
-          showMenu={variant === "drawer"}
-          onMenu={() => setMenuOpen((o) => !o)}
-          menuOpen={menuOpen}
-        />
-        <div
-          ref={scrollRef}
-          className="page-scroll mt-2.5 min-h-0 flex-1"
-          onScroll={(e) => setScrolled((e.target as HTMLDivElement).scrollTop > 6)}
-        >
+      <main className="relative z-10 flex min-w-0 flex-1 flex-col" style={{
+                padding: variant === "drawer" ? 10 : "10px 10px 10px 0",
+                paddingBottom: isMobile
+                    ? "calc(var(--tabbar-height) + env(safe-area-inset-bottom))"
+                    : undefined,
+            }}>
+        <Toolbar route={route} nav={nav} scrolled={scrolled} onRefresh={refresh} range={range} setRange={setRange} openPalette={() => setPaletteOpen(true)} mode={mode} showMenu={variant === "drawer"} onMenu={() => setMenuOpen((o) => !o)} menuOpen={menuOpen}/>
+        <div ref={scrollRef} className="page-scroll mt-2.5 min-h-0 flex-1" onScroll={(e) => setScrolled((e.target as HTMLDivElement).scrollTop > 6)}>
           <RefreshContext.Provider value={refreshCtx}>
-            {/* 仅入场动画：路由切换干脆利落，避免快速切换时退出动画互相排队 */}
-            <motion.div
-              key={route}
-              initial={prefs.reduceMotion ? false : { opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ type: "spring", stiffness: 460, damping: 40, mass: 0.7 }}
-            >
+
+            <motion.div key={route} initial={prefs.reduceMotion ? false : { opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ type: "spring", stiffness: 460, damping: 40, mass: 0.7 }}>
               <Suspense fallback={<PageSkeleton />}>
-                <Page key={`${route}-${refreshN}`} />
+                <Page key={`${route}-${refreshN}`}/>
               </Suspense>
             </motion.div>
           </RefreshContext.Provider>
         </div>
       </main>
 
-      {/* 移动底部标签栏（<768）：主导航 5 定页；其余路由走汉堡抽屉。
-          抽屉遮罩 z-40 > TabBar z-30，打开抽屉时标签栏被盖住（符合预期）。 */}
-      {isMobile && <TabBar route={route} nav={nav} />}
+      {isMobile && <TabBar route={route} nav={nav}/>}
 
-      </>
-      )}
-      {vp.isDesktop && authed && (
-      <ScrollRail
-        visible={scrolled}
-        onSearch={() => setPaletteOpen(true)}
-        nav={nav}
-        onBottom={() => {
-          const el = scrollRef.current;
-          if (el) el.scrollTo({ top: el.scrollHeight, behavior: prefs.reduceMotion ? "auto" : "smooth" });
-        }}
-      />
-      )}
-      {authed && <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} nav={nav} />}
+      </>)}
+      {vp.isDesktop && authed && (<ScrollRail visible={scrolled} onSearch={() => setPaletteOpen(true)} nav={nav} onBottom={() => {
+                const el = scrollRef.current;
+                if (el)
+                    el.scrollTo({ top: el.scrollHeight, behavior: prefs.reduceMotion ? "auto" : "smooth" });
+            }}/>)}
+      {authed && <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} nav={nav}/>}
       <ToastHost />
       </div>
-    </MotionConfig>
-  );
+    </MotionConfig>);
 }
-
-/** 滚动边缘工具栏（Scroll-edge toolbar）：内容滚动后自动浮现的竖向玻璃快捷条（对齐展板） */
-function ScrollRail({
-  visible,
-  onSearch,
-  nav,
-  onBottom,
-}: {
-  visible: boolean;
-  onSearch: () => void;
-  nav: (r: RouteKey) => void;
-  onBottom: () => void;
+function ScrollRail({ visible, onSearch, nav, onBottom, }: {
+    visible: boolean;
+    onSearch: () => void;
+    nav: (r: RouteKey) => void;
+    onBottom: () => void;
 }) {
-  const { t } = useSettings();
-  return (
-    <motion.div
-      className="glass--clear edge-lens scroll-rail"
-      role="toolbar"
-      aria-label={t("command_hint")}
-      aria-hidden={!visible}
-      // 隐藏时整体不可交互/不可聚焦：仅 pointerEvents:none 挡不住 Tab 键，
-      // 焦点会跑进一个视觉上并不存在的工具栏（WEBUI_AUDIT §3.2）。
-      inert={!visible}
-      initial={false}
-      animate={visible ? { opacity: 1, x: 0 } : { opacity: 0, x: 16 }}
-      transition={{ type: "spring", stiffness: 420, damping: 34 }}
-      style={{ pointerEvents: visible ? "auto" : "none" }}
-    >
+    const { t } = useSettings();
+    return (<motion.div className="glass--clear edge-lens scroll-rail" role="toolbar" aria-label={t("command_hint")} aria-hidden={!visible} inert={!visible} initial={false} animate={visible ? { opacity: 1, x: 0 } : { opacity: 0, x: 16 }} transition={{ type: "spring", stiffness: 420, damping: 34 }} style={{ pointerEvents: visible ? "auto" : "none" }}>
       <button className="rail-btn" onClick={onSearch} aria-label={t("search_placeholder")} title={t("search_placeholder")}>
-        <IconSearch size={16} />
+        <IconSearch size={16}/>
       </button>
       <button className="rail-btn" onClick={() => nav("settings")} aria-label={t("admin_profile")} title={t("admin_profile")}>
-        <IconUser size={16} />
+        <IconUser size={16}/>
       </button>
       <button className="rail-btn" onClick={() => nav("settings")} aria-label={t("settings_title")} title={t("settings_title")}>
-        <IconGear size={16} />
+        <IconGear size={16}/>
       </button>
-      <span className="rail-sep" aria-hidden />
+      <span className="rail-sep" aria-hidden/>
       <button className="rail-btn" onClick={onBottom} aria-label="↓" title="↓">
-        <IconChevronDown size={16} />
+        <IconChevronDown size={16}/>
       </button>
-    </motion.div>
-  );
+    </motion.div>);
 }
-
 function PageSkeleton() {
-  return (
-    <div className="p-4">
-      <div className="skeleton mb-4 h-8 w-56" />
+    return (<div className="p-4">
+      <div className="skeleton mb-4 h-8 w-56"/>
       <div className="grid grid-cols-4 gap-3">
-        {[0, 1, 2, 3].map((i) => (
-          <div key={i} className="skeleton h-24" />
-        ))}
+        {[0, 1, 2, 3].map((i) => (<div key={i} className="skeleton h-24"/>))}
       </div>
-      <div className="skeleton mt-3 h-64" />
-    </div>
-  );
+      <div className="skeleton mt-3 h-64"/>
+    </div>);
 }
-
-/**
- * 后端不可达页（fail-closed）。
- *
- * 原行为：探活失败即降级到内置 mock 并**跳过认证**，管理员在故障时看到的是一份
- * 完整、自洽、数字漂亮但全部虚构的健康报告（WEBUI_AUDIT §1.1）。现在改为明确报错
- * 并提供重试入口 —— 宁可什么都不显示，也不显示假数据。
- */
-function BackendUnreachable({ onRetry }: { onRetry: () => void }) {
-  const { t, prefs } = useSettings();
-  return (
-    <div className="relative z-10 flex h-full w-full items-center justify-center overflow-y-auto p-4">
+function BackendUnreachable({ onRetry }: {
+    onRetry: () => void;
+}) {
+    const { t, prefs } = useSettings();
+    return (<div className="relative z-10 flex h-full w-full items-center justify-center overflow-y-auto p-4">
       <div className="glass--clear edge-lens w-full max-w-[460px] rounded-[22px] p-6 text-center">
-        <div
-          className="mx-auto flex h-12 w-12 items-center justify-center rounded-full"
-          style={{ background: "rgb(var(--err-rgb) / 0.12)", color: "rgb(var(--err-rgb))" }}
-        >
-          <IconGear size={22} />
+        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full" style={{ background: "rgb(var(--err-rgb) / 0.12)", color: "rgb(var(--err-rgb))" }}>
+          <IconGear size={22}/>
         </div>
         <h1 className="mt-3 text-[18px] font-semibold text-[var(--text-1)]">{t("error_title")}</h1>
         <p className="mt-2 text-[13px] leading-relaxed text-[var(--text-2)]">{t("backend_unreachable")}</p>
         <p className="mt-1 text-[11.5px] leading-relaxed text-[var(--text-3)]">{t("backend_unreachable_hint")}</p>
-        <button
-          className="btn btn-accent mx-auto mt-5"
-          onClick={onRetry}
-        >
+        <button className="btn btn-accent mx-auto mt-5" onClick={onRetry}>
           {t("retry_op")}
         </button>
-        {import.meta.env.DEV && (
-          <p className="mt-3 text-[10.5px] text-[var(--text-3)]">
+        {import.meta.env.DEV && (<p className="mt-3 text-[10.5px] text-[var(--text-3)]">
             {prefs.lang === "zh" ? "开发构建可用 ?mock=1 进入演示数据。" : "Dev build: append ?mock=1 for demo data."}
-          </p>
-        )}
+          </p>)}
       </div>
-    </div>
-  );
+    </div>);
 }
-

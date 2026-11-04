@@ -1,9 +1,3 @@
-//! SCRAM-SHA-256（RFC 5802 / RFC 7677）服务端消息处理。
-//!
-//! 只实现 `SCRAM-SHA-256`（不实现 `-PLUS` 通道绑定）；因此拒绝 `p=` 的 GS2
-//! 头。凭据来自 [`ScramCredentials`]（由既有 PBKDF2 记录派生），不新增第二份
-//! 口令存储。
-
 use base64::Engine;
 
 use crate::auth::{hmac_sha256, ScramCredentials};
@@ -11,9 +5,8 @@ use crate::error::{MailError, Result};
 
 #[derive(Debug, Clone)]
 pub struct ClientFirst {
-    /// `n,,` / `y,,` 的原文，用于校验客户端的 `c=`。
     pub gs2_header: String,
-    /// 不含 GS2 头的 client-first-bare。
+
     pub bare: String,
     pub username: String,
     pub nonce: String,
@@ -69,9 +62,7 @@ fn decode_saslname(value: &str) -> Result<String> {
             if index + 2 >= bytes.len() {
                 return Err(MailError::invalid("invalid SCRAM username escape"));
             }
-            // =2C/=3D 都是 ASCII，按字节校验即可；不能对 &str 切片 ——
-            // 多字节字符落在转义序列中间时 `&value[index + 1..index + 3]`
-            // 会因不在 char boundary 上而 panic。
+
             let mut hex = [bytes[index + 1], bytes[index + 2]];
             hex.make_ascii_uppercase();
             match &hex {
@@ -109,7 +100,6 @@ pub fn server_first(
     )
 }
 
-/// 校验 client-final，成功时返回服务端签名（`v=` 的值）。
 pub fn verify_client_final(
     client: &ClientFirst,
     server_first: &str,
@@ -134,7 +124,7 @@ pub fn verify_client_final(
         match key {
             "c" => channel_binding = Some(value.to_string()),
             "r" => nonce = Some(value.to_string()),
-            // RFC 5802 §5.1：m= 是强制扩展协商，不支持就必须失败，不能静默忽略。
+
             "m" => {
                 return Err(MailError::invalid(
                     "SCRAM mandatory extension is not supported",
@@ -183,7 +173,6 @@ mod tests {
     use crate::auth::scram_credentials_from_record;
 
     fn pbkdf2(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
-        // 单块 PBKDF2-HMAC-SHA256（dkLen = 32）。
         let mut u = {
             let mut first = Vec::new();
             first.extend_from_slice(salt);
@@ -212,8 +201,6 @@ mod tests {
 
     #[test]
     fn saslname_escape_over_a_multibyte_char_is_rejected_without_panicking() {
-        // '=' 后面跟着多字节 UTF-8 字符：转义序列必须按字节校验。
-        // 旧的 &str 切片写法会在 char boundary 上 panic。
         assert!(parse_client_first("n,,n=a=\u{4E2D}b,r=x").is_err());
         assert!(parse_client_first("n,,n==\u{4E2D},r=x").is_err());
     }
@@ -225,7 +212,7 @@ mod tests {
         record.username = "alice@example.com".to_string();
         let credentials = scram_credentials_from_record(&record).unwrap();
         let client = parse_client_first("n,,n=alice@example.com,r=clientnonce").unwrap();
-        // m= 出现在 client-final：RFC 5802 要求服务端失败，而不是忽略。
+
         let wrong = verify_client_final(
             &client,
             "s=AA==,i=1",
@@ -299,7 +286,6 @@ mod vector_tests {
 
     #[test]
     fn pbkdf2_matches_known_vector() {
-        // password="password", salt="salt", iterations=1, dkLen=32
         let mut salt = Vec::new();
         salt.extend_from_slice(b"salt");
         salt.extend_from_slice(&1u32.to_be_bytes());

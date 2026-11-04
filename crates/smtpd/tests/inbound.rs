@@ -1,10 +1,3 @@
-//! 入站服务的端到端验证：**真实 TCP**、**真实 TLS 握手**、真实入队。
-//!
-//! 这里刻意不复用 `connection.rs` 的 `duplex` 测试替身 —— 那些测的是协议核心。
-//! 本文件要回答的是另一类问题：监听层在真实 socket 上是否正确地把「准入 → 明文
-//! 会话 → STARTTLS 升级 → 加密会话」串起来，以及限速 / 封禁在真实连接上是否
-//! 真的会对对端生效。
-
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,9 +19,6 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const TLS_HOSTNAME: &str = "localhost";
 
-// ─────────────────────────── 测试 sink ───────────────────────────
-
-/// 只记录收到的邮件。
 #[derive(Default)]
 struct RecordingSink {
     accepted: Mutex<Vec<AcceptedMessage>>,
@@ -49,9 +39,6 @@ impl RecordingSink {
     }
 }
 
-// ─────────────────────────── 客户端 ───────────────────────────
-
-/// 能读「完整一条 SMTP 应答」的最小客户端。
 struct Client<S> {
     stream: S,
     buffered: Vec<u8>,
@@ -74,7 +61,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
         self.stream.flush().await.unwrap();
     }
 
-    /// 读到一条完整应答（多行时读到首字符后第 4 个字节为空格的那一行）。
     async fn read_reply(&mut self) -> String {
         loop {
             if let Some((reply, consumed)) = take_reply(&self.buffered) {
@@ -111,8 +97,6 @@ fn take_reply(buffer: &[u8]) -> Option<(String, usize)> {
     }
 }
 
-// ─────────────────────────── TLS 测试材料 ───────────────────────────
-
 struct TestPki {
     ca_der: CertificateDer<'static>,
     cert_dir: tempfile::TempDir,
@@ -140,7 +124,6 @@ impl TestPki {
         let key = KeyPair::generate().unwrap();
         let cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
 
-        // 落到真实 PEM 文件，走生产同一条装载路径（`CertificateDer::pem_file_iter`）。
         let dir = tempfile::tempdir().unwrap();
         let cert_pem = cert.pem();
         let key_pem = key.serialize_pem();
@@ -167,7 +150,6 @@ impl TestPki {
             .with_no_client_auth()
     }
 
-    /// 只允许 TLS 1.2 的客户端配置 —— 用来证明服务端确实接受 1.2。
     fn tls12_client_config(&self) -> ClientConfig {
         let mut roots = RootCertStore::empty();
         roots.add(self.ca_der.clone()).unwrap();
@@ -184,8 +166,6 @@ impl TestPki {
         ServerName::try_from(TLS_HOSTNAME).unwrap()
     }
 }
-
-// ─────────────────────────── 服务端装配 ───────────────────────────
 
 fn base_config() -> ServerConfig {
     ServerConfig {
@@ -239,7 +219,6 @@ async fn spawn<S: MessageSink + 'static>(
     Harness { addr, shutdown }
 }
 
-/// 走一遍完整事务（EHLO → MAIL → RCPT → DATA → QUIT），断言每步成功。
 async fn run_transaction<S: AsyncRead + AsyncWrite + Unpin>(client: &mut Client<S>) {
     let greeting = client.read_reply().await;
     assert!(greeting.starts_with("220 "), "{greeting}");
@@ -263,8 +242,6 @@ async fn run_transaction<S: AsyncRead + AsyncWrite + Unpin>(client: &mut Client<
     client.send("QUIT\r\n").await;
     assert!(client.read_reply().await.starts_with("221"));
 }
-
-// ─────────────────────────── 测试 ───────────────────────────
 
 #[tokio::test]
 async fn a_full_transaction_over_real_tcp_reaches_the_sink() {
@@ -305,8 +282,6 @@ async fn starttls_upgrades_in_place_and_the_session_restarts_at_ehlo() {
     client.send("STARTTLS\r\n").await;
     assert!(client.read_reply().await.starts_with("220 "));
 
-    // 就地升级：把明文流换成 TLS 流。此处检验「升级前缓冲为空」——
-    // 若服务端保留了明文缓冲，升级后我们读到的第一条应答就会错位。
     let (stream, leftover) = client.into_inner();
     assert!(leftover.is_empty(), "升级前不应有未消费的明文");
     let tls = pki
@@ -341,7 +316,6 @@ async fn starttls_upgrades_in_place_and_the_session_restarts_at_ehlo() {
 
 #[tokio::test]
 async fn a_client_that_only_speaks_tls12_can_still_connect() {
-    // 「TLS 1.2 及以上」里的下界必须真的能协商，否则运维把老客户端接进来会失败。
     let pki = TestPki::generate();
     let sink = Arc::new(RecordingSink::default());
     let harness = spawn(
@@ -365,7 +339,6 @@ async fn a_client_that_only_speaks_tls12_can_still_connect() {
 
 #[tokio::test]
 async fn implicit_tls_handshakes_before_the_greeting() {
-    // 465 语义：建连即握手，问候语只能出现在加密通道里。
     let pki = TestPki::generate();
     let sink = Arc::new(RecordingSink::default());
     let harness = spawn(
@@ -392,7 +365,7 @@ async fn implicit_tls_handshakes_before_the_greeting() {
 async fn connections_beyond_the_burst_are_refused_with_421() {
     let sink = Arc::new(RecordingSink::default());
     let mut config = base_config();
-    // 突发 2、几乎不补充：第 3 条连接必须被拒。
+
     config.rate_limit.burst = 2;
     config.rate_limit.refill_per_second = 0.001;
     let harness = spawn(config, None, TlsMode::StartTls, Arc::clone(&sink)).await;
@@ -415,14 +388,13 @@ async fn repeated_rate_limit_triggers_ban_the_address() {
     config.rate_limit.burst = 1;
     config.rate_limit.refill_per_second = 0.001;
     config.ban.max_failures = 2;
-    config.ban.permanent_after = 0; // 只做临时封禁，便于断言
+    config.ban.permanent_after = 0;
     config.ban.temp_ban_secs = 300;
     let harness = spawn(config, None, TlsMode::StartTls, Arc::clone(&sink)).await;
 
     let mut first = harness.connect().await;
     assert!(first.read_reply().await.starts_with("220 "));
 
-    // 第 2、3 条触发限速 → 两次失败 → 达到阈值并封禁。
     for _ in 0..2 {
         let mut client = harness.connect().await;
         assert!(client.read_reply().await.starts_with("421 "));
@@ -440,17 +412,10 @@ async fn repeated_rate_limit_triggers_ban_the_address() {
 
 #[tokio::test]
 async fn tls_handshake_failures_do_not_get_the_peer_banned() {
-    // R3-009：握手失败在真实互联网上大量来自非恶意原因（对端只支持 TLS 1.0/1.1、
-    // 证书链过期、中间设备做 TLS 拦截、证书轮换期的短暂不匹配）。把它们按
-    // 「协议滥用」计入失败，会让一个合法发信方被 421 封 1 小时、三次后升级为
-    // 永久封禁 —— 邮件全部延迟且需要人工解封。
-    //
-    // 本测试把封禁阈值压到 2 次，先制造 4 次握手失败，再用正常 TLS 客户端连接：
-    // 必须照常收到 220，而不是 421 blocked。
     let pki = TestPki::generate();
     let sink = Arc::new(RecordingSink::default());
     let mut config = base_config();
-    // 限速放宽，确保结果只反映「握手失败是否进封禁表」。
+
     config.rate_limit.burst = 100;
     config.rate_limit.refill_per_second = 100.0;
     config.ban.max_failures = 2;
@@ -465,7 +430,6 @@ async fn tls_handshake_failures_do_not_get_the_peer_banned() {
     )
     .await;
 
-    // 四条「连上就发垃圾再断开」的连接：隐式 TLS 握手必定失败。
     for _ in 0..4 {
         let mut stream = TcpStream::connect(harness.addr).await.unwrap();
         let _ = stream
@@ -476,7 +440,6 @@ async fn tls_handshake_failures_do_not_get_the_peer_banned() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // 正常客户端仍然可用：TLS 1.2+ 握手成功、收到 220。
     let stream = TcpStream::connect(harness.addr).await.unwrap();
     let tls = pki
         .connector(pki.client_config())
@@ -492,22 +455,16 @@ async fn tls_handshake_failures_do_not_get_the_peer_banned() {
     harness.stop();
 }
 
-/// 假 Dovecot auth socket：跑一遍 v1.2 握手，然后对唯一一条 `AUTH` 请求作答。
-///
-/// 它存在的意义是**验证真实协议字节**：本机客户端发的握手与 `AUTH` 行必须能被
-/// Dovecot 那一侧解析（制表符分隔、`service=`、`resp=`、id 回抄）。
 async fn serve_fake_dovecot(listener: UnixListener, accept: bool) {
     let (stream, _) = listener.accept().await.expect("接受认证连接");
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    // 横幅：Dovecot 在连接建立后立即发送（协议 1.2）。
     write_half
         .write_all(b"VERSION\t1\t2\nSPID\t1\nCUID\t1\nMECH\tPLAIN\nMECH\tLOGIN\nDONE\n")
         .await
         .unwrap();
 
-    // 读到第一条 AUTH 请求为止（前面是客户端握手 VERSION/CPID）。
     let mut auth_line = String::new();
     loop {
         let mut line = String::new();
@@ -544,8 +501,6 @@ async fn serve_fake_dovecot(listener: UnixListener, accept: bool) {
 
 #[tokio::test]
 async fn a_submission_over_implicit_tls_authenticates_against_a_dovecot_auth_socket() {
-    // 端到端：真实 TCP + 隐式 TLS + 真实 auth socket（假 Dovecot）→ 认证通过 →
-    // 反中继随后放行外域收件人。这是「587 不再是空壳」的完整证据链。
     let pki = TestPki::generate();
     let socket_dir = tempfile::tempdir().unwrap();
     let socket_path = socket_dir.path().join("auth-client");
@@ -609,8 +564,6 @@ async fn a_submission_over_implicit_tls_authenticates_against_a_dovecot_auth_soc
 
 #[tokio::test]
 async fn a_dovecot_temporary_failure_surfaces_as_454_and_keeps_the_peer_unauthenticated() {
-    // Dovecot 回 FAIL+temp（后端抖动）时，对端必须看到 454 而不是 535，
-    // 且会话保持未认证 —— 反中继继续拒绝外域。
     let pki = TestPki::generate();
     let socket_dir = tempfile::tempdir().unwrap();
     let socket_path = socket_dir.path().join("auth-client");
@@ -659,7 +612,6 @@ async fn a_dovecot_temporary_failure_surfaces_as_454_and_keeps_the_peer_unauthen
 
 #[tokio::test]
 async fn contradictory_tls_configuration_is_refused_at_construction() {
-    // 隐式 TLS 却没有材料：必须启动失败，而不是假装提供了加密。
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let sink = Arc::new(RecordingSink::default());
     let error = mailstack_smtpd::MailServer::new(
@@ -677,7 +629,6 @@ async fn contradictory_tls_configuration_is_refused_at_construction() {
         mailstack_smtpd::ConfigError::ImplicitTlsWithoutAcceptor
     );
 
-    // 通告了 STARTTLS 却没有材料。
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = base_config();
     config.session.offer_starttls = true;
@@ -696,7 +647,6 @@ async fn contradictory_tls_configuration_is_refused_at_construction() {
         mailstack_smtpd::ConfigError::StartTlsAdvertisedWithoutAcceptor
     );
 
-    // 通告了 AUTH 却没有认证后端：每次认证都必然 454，等于在骗客户端。
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = base_config();
     config.session.offer_auth = true;
@@ -719,14 +669,11 @@ async fn contradictory_tls_configuration_is_refused_at_construction() {
 
 #[tokio::test]
 async fn a_verified_message_enters_the_queue_end_to_end() {
-    // 全链路：真实 TCP 会话 → QueueSink 认证 → 加头 → 入队 → 读回队列文件。
     let dir = tempfile::tempdir().unwrap();
     let cache = TxtCache::new();
-    // DMARC 会从 From 域逐级向上走查；不把祖先那一级也钉住就会漏到真实 DNS。
+
     cache.pin_dmarc_walk("example.com");
-    // SPF 的「EHLO + MAIL FROM 双身份」会**先查 HELO 域**（本用例的 HELO 是
-    // `client.test`）；不钉住这一条，入队前的 SPF 就会去打真实 DNS，在 Clash
-    // fake-IP 下时快时慢，表现为随机 5 秒读超时。
+
     cache.pin_absent("client.test");
     cache
         .add_spf("example.com", b"v=spf1 ip4:127.0.0.1 -all")
@@ -764,7 +711,7 @@ async fn a_verified_message_enters_the_queue_end_to_end() {
 
     let entries = QueueStore::new(dir.path()).load_all().expect("读取队列");
     assert_eq!(entries.len(), 1, "通过认证的邮件必须入队");
-    // R3-002：第一跳 trace 头必须由本机补上（先于 Authentication-Results）。
+
     assert!(
         entries[0].data.starts_with("Received: from client.test"),
         "入站必须写 Received 头：{}",

@@ -1,5 +1,3 @@
-#!/usr/bin/env bash
-# 诊断 WSL 出网：代理 7890 / 7897 / 直连，各自看 curl 退出码与 HTTP 状态。
 set -uo pipefail
 
 for target in "proxy7890|http://127.0.0.1:7890" "proxy7897|http://127.0.0.1:7897" "direct|"; do

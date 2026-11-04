@@ -11,7 +11,7 @@ All notable changes to the MailStack project are documented in this file.
   （前端只在构建机用 Node 产出静态产物）。
 - 交付 5 个二进制：`mailstackd`、`mailstackctl`、`mailstack-web`、`mailstack-imap`、`mailstack-webmail`；
   11 个 crate 的单一 Cargo workspace，`Cargo.lock` 锁定。
-- 特权动作白名单 **59 条**（只读 21 + 变更 38，含 `setup.wizard.complete`）、HTTP 契约路由 **73 条**
+- 特权动作白名单 **52 条**（只读 20 + 变更 32，含 `setup.wizard.complete`）、HTTP 契约路由 **62 条**（AI 功能已移除，见「产品增量」）
   （2 条免认证：`/api/health`、`/api/auth/login`），全部接线且有守卫测试。
 - 自带管理控制台与 Webmail；提供 curl 一键安装与源码构建两种安装方式。
 - 发布前完成 7 份独立第三方代码审查（R1–R7，共 144 条发现：1 critical / 26 high / 59 medium / 58 low），
@@ -31,7 +31,20 @@ All notable changes to the MailStack project are documented in this file.
   legacy 的 Node 版 Webmail 随旧栈退役；新实现为新的独立进程（端口由 legacy 的 `18788`
   改为默认 `8444`）。详见 `docs/WEBMAIL.md`。
 - **安装器（两种形态）**：
-  - **curl 一键脚本**：从 GitHub Release 下载 `mailstack-v1.0.0-x86_64-unknown-linux-gnu.tar.gz`
+  - **一行安装 + 服务器管理脚本**：`curl ... install.sh | sudo bash -s -- --domain ... --admin-user ...
+  --admin-password ... --access-mode ...` 一条命令完成全部前提；新增
+  `/usr/local/bin/mailstack-manage`（3x-ui 风格 CLI/交互菜单）管理域名、账号、TLS 与访问方式。
+- **六种访问模式**：SSH 隧道（默认）、Caddy、nginx、公网 IP + ACME、独立面板域名
+  （panel.example.com，强制与 mail/imap/smtp 域区分）、Cloudflare Tunnel；统一生成
+  反向代理/Tunnel 配置并以 `install-args.conf` 为唯一状态源。
+- **Webmail UI 修复**：顶栏 flex 布局（此前子项堆叠导致右侧操作区被挤出）、移动端单栏
+  玻璃卡片、窄窗格工具栏换行；管理台内容表面统一材质（列表/设置/域名页同一玻璃观感）。
+- **注释清理与代码精简**：删除发行代码中的非功能性注释；发布脚本瘦身并补全
+  install.sh 与管理脚本的集成（`write_deployment_state`、`STATE_REL_PATH`、访问层应用）。
+- **特权通道修复**：`mailstackctl --privileged-stdin` 补齐 Readers 注册表，
+  修复 users.* / setup.* / certs.* 经 sudo 包装器全部 NOT_IMPLEMENTED 的生产级缺陷。
+
+- **curl 一键脚本**：从 GitHub Release 下载 `mailstack-v1.0.0-x86_64-unknown-linux-gnu.tar.gz`
     （可选 musl 变体）并校验 `SHA256SUMS`；创建系统用户/组、目录与权限、二进制、
     特权包装器与 sudoers、systemd unit，并初始化管理员凭据。
   - **源码构建**：`git clone` → `deploy/build.sh` → `deploy/install.sh --binary-dir dist`。
@@ -47,7 +60,7 @@ All notable changes to the MailStack project are documented in this file.
   出站中继与直投（逐域 MX、固定 IP 拨号、null MX、SSRF 地址策略）互不兜底；
   队列持久化 + 指数退避 + 投递租约 + DSN 退信 + 出站必签 DKIM。
 - **2FA 全生命周期**：AES-256-GCM 信封 + RFC 6238 + 恢复码持锁一次性消费；
-  审计哈希链、系统备份/恢复、ACME、出站 AI 配置等运维能力。
+  审计哈希链、系统备份/恢复、ACME 等运维能力。
 
 ### 安全加固
 
@@ -62,9 +75,9 @@ All notable changes to the MailStack project are documented in this file.
   RCPT 阶段校验收件人是否存在、`Authentication-Results` 防 `;` 注入、TOTP 重放保护、
   `admin.totp.disable` 零验证、会话 Cookie 加 `__Host-` 前缀、破坏性路由守卫双向对照。
 - **批 4（特权与密码学，18 条）**：锁/读失败 fail-closed、命令执行超时与 PATH 劫持防护、
-  账号管理三处忽略退出码、RPC 帧长度先校验后分配、AI 出站 SSRF/DNS-rebinding/CRLF 注入收紧。
+  账号管理三处忽略退出码、RPC 帧长度先校验后分配、出站动作的 SSRF/DNS-rebinding/CRLF 注入收紧。
 - **批 5（Web 与队列，19 条）**：请求体上限真正生效、登录时序消除用户名枚举、PBKDF2 移入
-  `spawn_blocking`、`503` 不计入账号锁定、CSRF 空 token 修复、AI 限流接线、会话时钟回拨与日志泄漏、
+  `spawn_blocking`、`503` 不计入账号锁定、CSRF 空 token 修复、会话时钟回拨与日志泄漏、
   队列重入/投递租约/回执/DSN 编码修复。
 - **批 6（工程化，16 条）**：`cargo-deny`/`cargo audit` 真正强制并修掉 **7 条 RUSTSEC 通告**
   （rustls ×4、rustls-webpki、tokio、webpki-roots）、不变量门禁防「掏空测试」、CI action pin 到 SHA、
@@ -109,9 +122,7 @@ All notable changes to the MailStack project are documented in this file.
    沿用旧包装器（`exec … "$@"` 指向旧 Python 助手）会让全部变更动作失败。
 4. **HTTP 契约扩展**：路由表以 legacy 基线为起点新增 RPC 桥、向导收尾与只读列表端点；
    成功响应为**裸对象**（不再套 `{ok,data}` 外壳）；`/api` 兜底恒为 JSON 404。
-5. **AI 出站收紧**：`http://` 端点在任何配置下都被拒绝（含 `MAILSTACK_ALLOW_PRIVATE_AI=1`）；
-   自托管的本地模型（如 `http://127.0.0.1:11434`）不再可用，需走显式 HTTPS 通道。
-6. **`ai.models.list` 从只读面移到变更面**（出站携带受保护凭据）：直连 RO socket 的旧脚本会被拒。
+5. **AI 功能整体移除（产品增量）**：管理台 AI 套件、`/api/ai/*` 契约路由、`ai.*` 特权动作与 AI 出站配置全部删除（前后端一致）；白名单动作降至 **52 条**（RO 20 + RW 32），契约路由降至 **62 条**，AI 相关安全测试与限流一并退役。
 7. **`users.delete` 在 `userdel`/`deluser` 都不存在时返回错误**（legacy 为静默成功）——
    「注册表已删、系统账号还在」不能报成功。
 8. **CLI 退出码固定**：`0` 成功 / `1` 动作失败 / `2` 用法错误 / `3` 助手不可达 / `4` 中途超时。

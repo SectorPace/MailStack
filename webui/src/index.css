@@ -1,68 +1,38 @@
-/* Layer 顺序必须先于 @import 声明（cascade layer 的首次声明定序）：
-   tokens → theme(Tailwind) → base → components → utilities。
-   这样 Tailwind 工具类（hidden / sm:inline-flex …）稳定压过自定义组件类 ——
-   修复了未分层 .btn/.badge 的 `display:inline-flex` 压过 `hidden` 导致的
-   443px 移动端溢出（P1，曾被记录为“hidden 类在手机上不生效”）。 */
+
 @layer tokens, theme, base, components, utilities;
 @import "tailwindcss";
 
-/* ============================================================
-   MailStack Admin Console — design-system foundation
-   macOS 27 “Golden Gate” 桌面内容设计 / iOS 27 移动内容设计。
-   仅页面内容设计：不伪造 OS chrome（无红绿灯 / 菜单栏 / Dock / 状态条 / Home Indicator）。
-
-   架构（重要）：
-   - 本文件是唯一 token / 材质来源；组件里禁止散装堆 blur()。
-   - 双平台 profile：:root = 桌面（macOS 度量，紧凑）；[data-platform="ios"] 与
-     @media (max-width: 767px) = 移动（iOS 度量，44px 控件 / 17px 正文）。
-     data-platform 由 public/theme-init.js 首帧写入（初值）；媒体查询是运行期的
-     唯一真源（JS 不参与换档）。两个 ios 块内容需保持同步。
-   - 材质预算（glass budget）：玻璃只属于 chrome（侧栏/工具栏/菜单/浮层/滚动条）。
-     main 内容区的 .glass* 统一降级为近实心 --surface，无 backdrop-filter ——
-     全页 backdrop-filter 图层从 ~27 降到 chrome 的个位数。
-   - 圆角体系：--radius-control/panel/window 三档 + 同心规则（内层半径 = 外层半径 −
-     内边距）；支持 corner-shape 的浏览器渐进启用 squircle。
-   ============================================================ */
-
-/* ============================================================
-   1. TOKENS —— 主题 / 平台 / 密度（唯一来源）
-   ============================================================ */
 @layer tokens {
   :root {
     color-scheme: light;
 
-    /* ---- 平台度量：macOS “Golden Gate” 桌面内容（默认 profile） ---- */
-    --control-h: 28px;                  /* 控件行高：按钮/输入框/图标钮/侧栏行 */
-    --control-h-lg: 32px;               /* 大号控件：页签/设置行 */
-    --font-body: 13px;                  /* 正文 */
-    --font-caption: 11px;               /* 脚注/组头/徽标文字 */
-    --font-title: 16px;                 /* 页面标题（旧 25px 样式收缩档；ui.tsx PageHeader 采纳用） */
-    --radius-control: 6px;              /* 控件 */
-    --radius-panel: 10px;               /* 面板/卡片 */
-    --radius-window: 12px;              /* 窗口级：弹层/对话框 */
-    --radius-sheet: 16px;               /* 抽屉/表单纸（桌面回落档；iOS profile 覆盖为 26px） */
-    --sidebar-width: 240px;             /* 桌面全高侧栏宽（贴边，无外边距） */
-    --sidebar-rail-width: 56px;         /* 折叠图标栏宽 */
-    --sidebar-inset: 0px;               /* 侧栏/抽屉与屏幕边缘的间隙（桌面贴边 = 0） */
-    --toolbar-height: 48px;             /* 全宽工具栏高 */
-    --badge-h: 22px;                    /* 徽标高度 */
+    --control-h: 28px;
+    --control-h-lg: 32px;
+    --font-body: 13px;
+    --font-caption: 11px;
+    --font-title: 16px;
+    --radius-control: 10px;
+    --radius-panel: 16px;
+    --radius-window: 20px;
+    --radius-sheet: 26px;
+    --sidebar-width: 240px;
+    --sidebar-rail-width: 56px;
+    --sidebar-inset: 0px;
+    --toolbar-height: 48px;
+    --badge-h: 22px;
 
-    /* 内容表面（glass budget）：近实心卡片面，替代内容区玻璃 */
     --surface-rgb: 255 255 255;
     --surface: rgb(var(--surface-rgb) / 0.92);
 
-    /* 强调色：Apple systemBlue */
-    --accent-rgb: 0 122 255;            /* #007AFF */
+    --accent-rgb: 0 122 255;
     --accent: rgb(var(--accent-rgb));
     --accent-deep-rgb: 0 100 220;
 
-    /* 语义色（双编码：颜色 + 图标/文字） */
-    --ok-rgb: 52 199 89;                /* green   */
-    --warn-rgb: 255 159 10;             /* amber   */
-    --err-rgb: 255 59 48;               /* red     */
-    --hold-rgb: 255 149 0;              /* orange  */
+    --ok-rgb: 52 199 89;
+    --warn-rgb: 255 159 10;
+    --err-rgb: 255 59 48;
+    --hold-rgb: 255 149 0;
 
-    /* 画布与文字 */
     --canvas: #f2f2f7;
     --text-1: rgba(10, 15, 26, 0.92);
     --text-2: rgba(10, 15, 26, 0.58);
@@ -70,7 +40,6 @@
     --hairline: rgba(15, 32, 60, 0.10);
     --hairline-strong: rgba(15, 32, 60, 0.16);
 
-    /* 玻璃基色（rgb 三元组）与透明度 —— 仅 chrome 材质消费 */
     --glass-rgb: 255 255 255;
     --glass-a: 0.44;
     --glass-a-top: 0.12;
@@ -79,22 +48,19 @@
     --glass-shadow: 0 10px 28px rgba(23, 43, 77, 0.09), 0 2px 6px rgba(23, 43, 77, 0.05);
     --glass-shadow-hover: 0 14px 34px rgba(23, 43, 77, 0.14), 0 2px 6px rgba(23, 43, 77, 0.07);
 
-    /* 配对边缘高光：内侧镜面高光 + 外侧结构轮廓 */
     --edge-spec: rgba(255, 255, 255, 0.85);
     --edge-inner: rgba(255, 255, 255, 0.30);
     --edge-bottom: rgba(255, 255, 255, 0.5);
     --edge-outer: rgba(23, 43, 77, 0.14);
     --edge-lens: rgba(255, 255, 255, 0.45);
-    /* 顶部柔光 sheen（双层高光的第二层，固定光源不追鼠标） */
+
     --sheen: 0.10;
 
-    /* 旧几何 token（保留别名：组件文件仍引用 --r-*，勿删） */
     --r-control: var(--radius-control);
     --r-panel: var(--radius-panel);
     --r-overlay: var(--radius-window);
     --r-sidebar: var(--radius-sheet);
 
-    /* 滚动边缘工具栏 */
     --toolbar-a: 0.42;
     --toolbar-blur: 14px;
 
@@ -105,7 +71,7 @@
   [data-theme="dark"] {
     color-scheme: dark;
 
-    --accent-rgb: 10 132 255;           /* #0A84FF */
+    --accent-rgb: 10 132 255;
     --accent-deep-rgb: 8 106 214;
 
     --ok-rgb: 48 209 88;
@@ -113,7 +79,6 @@
     --err-rgb: 255 105 97;
     --hold-rgb: 255 159 10;
 
-    /* 画布近黑（禁止纯黑铺底） */
     --canvas: #0b0d12;
     --text-1: rgba(240, 244, 250, 0.94);
     --text-2: rgba(226, 234, 246, 0.62);
@@ -121,11 +86,9 @@
     --hairline: rgba(255, 255, 255, 0.09);
     --hairline-strong: rgba(255, 255, 255, 0.16);
 
-    /* 内容表面（dark：深灰蓝近实心） */
     --surface-rgb: 22 24 30;
     --surface: rgb(var(--surface-rgb) / 0.92);
 
-    /* Dark 玻璃必须是「更亮的中调玻璃」——比背景更浅更亮 */
     --glass-rgb: 168 188 216;
     --glass-a: 0.18;
     --glass-a-top: 0.10;
@@ -147,18 +110,15 @@
     --bar-track: rgba(255, 255, 255, 0.10);
   }
 
-  /* ---- 平台度量：iOS 27 移动内容 profile ----
-     初值由 public/theme-init.js 写到 <html data-platform>；运行期换档只由下面的
-     媒体查询驱动（宽度 ≤767px，任务指定 width-based）。两个块需保持同步。 */
   [data-platform="ios"] {
-    --control-h: 44px;                  /* iOS 触控行高 */
+    --control-h: 44px;
     --control-h-lg: 44px;
     --font-body: 17px;
     --font-caption: 13px;
     --radius-control: 10px;
-    --radius-sheet: 26px;               /* 抽屉/表单纸圆角 */
-    --tabbar-height: 49px;              /* 预留：未来移动标签栏 */
-    --sidebar-inset: 10px;              /* 抽屉与屏幕边缘间隙 */
+    --radius-sheet: 26px;
+    --tabbar-height: 49px;
+    --sidebar-inset: 10px;
     --badge-h: 26px;
   }
   @media (max-width: 767px) {
@@ -175,15 +135,12 @@
     }
   }
 
-  /* 减少透明度：token 级覆写（class 级在 components 层）。
-     settings.tsx 在此开关打开时会移除内联 --glass-a*，让这里的值生效。 */
   [data-a11y-reduced-transparency="true"] {
     --glass-a: 0.97;
     --glass-a-top: 0.01;
     --toolbar-a: 0.97;
   }
 
-  /* 增加对比度（token 级；必须位于 :root / [data-theme] 之后才能覆盖） */
   [data-a11y-contrast="true"] {
     --text-2: rgba(10, 15, 26, 0.78);
     --text-3: rgba(10, 15, 26, 0.6);
@@ -199,9 +156,6 @@
   }
 }
 
-/* ============================================================
-   2. BASE —— 元素默认值 + 内容画布
-   ============================================================ */
 @layer base {
   html,
   body,
@@ -211,8 +165,7 @@
 
   body {
     margin: 0;
-    /* SF Pro 优先（Apple 设备原生），Windows/Linux 用 Inter（OFL，最接近 SF Pro 的开源字体），
-       中文回退 PingFang / 雅黑 / 思源 */
+
     font-family: -apple-system, BlinkMacSystemFont, "Inter Variable", "SF Pro Text",
       "SF Pro Display", "Segoe UI", "PingFang SC", "Hiragino Sans GB",
       "Microsoft YaHei UI", "Noto Sans SC", sans-serif;
@@ -235,7 +188,6 @@
     border-radius: var(--radius-control);
   }
 
-  /* 滚动条：iOS 式完全隐藏（滚轮 / 触摸板 / 触摸滚动不受影响） */
   * {
     scrollbar-width: none;
     -ms-overflow-style: none;
@@ -246,19 +198,11 @@
     display: none;
   }
 
-  /* ---- 内容画布（照片预算） ----
-     全屏 alpine-lake 光场（.lightfield，z-0）只作为登录/设置页与 chrome 边缘的背景。
-     main 铺一层不透明画布压在光场之上：登录后照片只从侧栏玻璃与缝隙里透出，
-     内容区回到中性画布。App.tsx 已把 .lightfield 的渲染条件收紧为
-     「未登录 || 向导未完成」—— 双层防线：画布遮罩 + 条件渲染。 */
   main {
-    background: var(--canvas);
+    background: transparent;
   }
 }
 
-/* ============================================================
-   3. COMPONENTS —— 材质 / 控件 / 弹层（全部可被 utilities 覆盖）
-   ============================================================ */
 @layer components {
   .mono {
     font-family: "SF Mono", ui-monospace, "Cascadia Mono", Consolas, "JetBrains Mono", monospace;
@@ -266,12 +210,6 @@
   }
 
   .tnum { font-variant-numeric: tabular-nums; }
-
-  /* ---------- 3.1 背景活动光场（玻璃折射的对象；登录/设置页全幅可见） ----------
-     真实照片打底 + 主题罩层 + 一团缓慢漂移的柔光。登录后 main 铺不透明画布，
-     且 App.tsx 已把光场渲染条件收紧到「未登录 || 向导未完成」——
-     照片仅在 chrome 边缘透出。
-     Ken-Burns / 漂移幅度已按报告调低（scale 1.06→1.03，位移减半）。 */
 
   .lightfield {
     position: fixed;
@@ -317,18 +255,6 @@
   [data-theme="dark"] .lightfield .lf-veil { background: rgba(7, 18, 32, 0.81); }
   [data-theme="dark"] .lightfield .b1 { background: rgba(58, 110, 163, 0.1); }
 
-  /* ---------- 3.2 玻璃材质系统（唯一玻璃来源；glass budget：chrome 专用） ----------
-     变体 = token 组合，不允许组件内自定义模糊。
-     .glass            regular 玻璃（chrome 常规面板）
-     .glass--clear     clear 玻璃（内容之上的浮层/弹层）
-     .glass--toolbar   工具栏（滚动后获得硬磨砂 + 底部刻线）
-     .glass--sidebar   侧边栏
-     .glass--control   控件（按钮/输入框/胶囊）
-     .glass--well      内嵌凹槽（反向高光）
-     .glass--data      结构化数据表面（低模糊、克制、可读优先）
-     .glass--surface   近实心内容表面（无 backdrop-filter；glass budget 的显式档）
-     main 内容区内的 .glass* 由下方「内容表面」规则统一降级为 --surface。 */
-
   .glass,
   .glass--clear,
   .glass--toolbar,
@@ -352,7 +278,7 @@
         rgb(var(--glass-rgb) / calc(var(--glass-a) + var(--glass-a-top))),
         rgb(var(--glass-rgb) / var(--glass-a))
       );
-    /* HIG：regular 材质「blurs and adjusts the luminosity of background content」 */
+
     -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
     backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
     box-shadow:
@@ -363,7 +289,6 @@
       var(--glass-shadow);
   }
 
-  /* 侧边栏（chrome）：比卡片更通透，背景水色透出来 */
   .glass--sidebar {
     background:
       linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 22%),
@@ -439,9 +364,8 @@
       inset 0 0 0 1px rgba(255, 255, 255, 0.06);
   }
 
-  /* 数据表面（chrome 内使用；main 内会被降级为 --surface） */
   .glass--data {
-    background: rgb(var(--glass-rgb) / 0.62);
+    background: rgb(var(--glass-rgb) / 0.8);
     -webkit-backdrop-filter: blur(10px) saturate(1.2) brightness(1.04);
     backdrop-filter: blur(10px) saturate(1.2) brightness(1.04);
     box-shadow:
@@ -453,7 +377,29 @@
     background: rgb(46 68 96 / 0.72);
   }
 
-  /* 近实心内容表面（glass budget 显式档）：1px 发丝描边，无 backdrop-filter */
+  .glass,
+  .glass--data,
+  .content-surface {
+    background:
+      linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 22%),
+      rgb(var(--glass-rgb) / 0.8);
+    -webkit-backdrop-filter: blur(20px) saturate(var(--glass-sat)) brightness(1.03);
+    backdrop-filter: blur(20px) saturate(var(--glass-sat)) brightness(1.03);
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 -1px 0 var(--edge-bottom),
+      inset 0 0 0 1px var(--edge-inner),
+      0 0 0 1px var(--edge-outer),
+      var(--glass-shadow);
+  }
+  [data-theme="dark"] .glass,
+  [data-theme="dark"] .glass--data,
+  [data-theme="dark"] .content-surface {
+    background:
+      linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 22%),
+      rgb(22 24 30 / 0.82);
+  }
+
   .glass--surface {
     background: var(--surface);
     box-shadow:
@@ -461,37 +407,14 @@
       var(--glass-shadow);
   }
 
-  /* ---- 内容表面降级（glass budget 核心） ----
-     main 里的 .glass* 不再消耗 backdrop-filter：近实心 --surface + 发丝描边。
-     portal 到 body 的浮层（下拉/对话框）不在 main 内，保持真玻璃。
-     [data-theme] 前缀 companion 用于压过上面的 dark .glass--data 特异性。 */
-  main .glass,
-  main .glass--clear,
-  main .glass--control,
-  main .glass--data {
-    background: var(--surface);
-    -webkit-backdrop-filter: none;
-    backdrop-filter: none;
-    box-shadow:
-      0 0 0 1px var(--hairline),
-      var(--glass-shadow);
+  [data-refract="true"] .glass {
+    -webkit-backdrop-filter: url(#ms-lens) blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
+    backdrop-filter: url(#ms-lens) blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
   }
-  [data-theme="dark"] main .glass--data {
-    background: var(--surface);
-    -webkit-backdrop-filter: none;
-    backdrop-filter: none;
+  [data-refract="true"] .glass--data {
+    -webkit-backdrop-filter: url(#ms-lens) blur(10px) saturate(1.2) brightness(1.04);
+    backdrop-filter: url(#ms-lens) blur(10px) saturate(1.2) brightness(1.04);
   }
-
-  /* 表头（内容表面，sticky 需要遮住滚过的行）：近实心 + 无模糊
-     （--surface-rgb 随主题自适应，无需 dark companion） */
-  .data-table thead th {
-    background: rgb(var(--surface-rgb) / 0.97);
-  }
-
-  /* ---- 折射（Refraction）：仅限 chrome 容器 ----
-     Chromium 走 backdrop-filter: url(#ms-lens) 让玻璃下的背景在边缘真实弯折；
-     其余浏览器自动回落到基础磨砂声明。旧规则作用于所有 .glass（含内容卡片），
-     现收窄到 chrome：.app-sidebar / .app-toolbar / [data-chrome] / .scroll-rail。 */
   [data-refract="true"] .app-sidebar {
     -webkit-backdrop-filter: url(#ms-lens) blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
     backdrop-filter: url(#ms-lens) blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
@@ -506,11 +429,25 @@
     backdrop-filter: url(#ms-lens) blur(30px) saturate(var(--glass-sat)) brightness(1.04);
   }
 
-  /* ---- 边缘透镜（edge-lens）：仅限 chrome ----
-     默认 no-op（content:none）；只有 chrome 容器内的 .edge-lens 渲染镜面环。
-     页面里遗留的 18 处 .edge-lens（Dashboard 等）由此静默失效，无需改页面。 */
   .edge-lens::before {
-    content: none;
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 2.5px;
+    background: linear-gradient(
+      180deg,
+      var(--edge-lens) 0%,
+      rgba(255, 255, 255, 0.04) 42%,
+      rgb(var(--accent-rgb) / 0.10) 100%
+    );
+    -webkit-backdrop-filter: blur(2.5px) brightness(1.05);
+    backdrop-filter: blur(2.5px) brightness(1.05);
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    mask-composite: exclude;
+    pointer-events: none;
   }
   .app-sidebar.edge-lens::before,
   .app-toolbar.edge-lens::before,
@@ -536,8 +473,6 @@
     pointer-events: none;
   }
 
-  /* 交互玻璃：悬停抬升 2px + 高光增强（0.24s + decel 曲线）；
-     按下弹性压缩由 Motion spring 完成 */
   .glass-hover {
     transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.24s cubic-bezier(0.16, 1, 0.3, 1);
   }
@@ -551,13 +486,18 @@
   }
   .glass-hover:active { transform: translateY(0) scale(0.985); }
 
-  /* ---------- 3.3 chrome 覆写：Golden Gate 全高侧栏 / 全宽工具栏 ---------- */
-
-  /* 桌面侧栏：贴边全高（无外边距/圆角），仅右侧发丝分隔；
-     抽屉形态保留纸张圆角与完整玻璃描边。 */
   .app-sidebar {
-    border-radius: 0;
-    box-shadow: inset -1px 0 0 var(--hairline);
+    border-radius: var(--radius-sheet);
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 -1px 0 var(--edge-bottom),
+      inset 0 0 0 1px var(--edge-inner),
+      0 0 0 1px var(--edge-outer),
+      var(--glass-shadow);
+  }
+
+  .app-sidebar:not([data-variant="drawer"]) {
+    margin: 10px;
   }
   .app-sidebar[data-variant="drawer"] {
     border-radius: var(--radius-sheet);
@@ -568,16 +508,20 @@
       var(--glass-shadow);
   }
 
-  /* 工具栏：全宽贴顶（非浮动胶囊），底部 0.5px 发丝线；
-     滚动后刻线加强 + 硬磨砂（--toolbar-a/--toolbar-blur 由 .glass--toolbar.is-scrolled 提供）。 */
   .app-toolbar {
-    border-bottom: 0.5px solid var(--hairline);
-    box-shadow: inset 0 1px 0 var(--edge-spec);
-  }
-  .app-toolbar.is-scrolled {
-    border-bottom-color: var(--hairline-strong);
+    border-radius: var(--radius-panel);
     box-shadow:
       inset 0 1px 0 var(--edge-spec),
+      inset 0 0 0 1px var(--edge-inner),
+      0 0 0 1px var(--edge-outer),
+      0 2px 10px rgba(15, 32, 60, 0.05);
+  }
+  .app-toolbar.is-scrolled {
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 0 0 1px var(--edge-inner),
+      0 0 0 1px var(--edge-outer),
+      0 1px 0 var(--hairline-strong),
       0 8px 22px rgba(15, 32, 60, 0.10);
   }
   [data-theme="dark"] .app-toolbar.is-scrolled {
@@ -585,8 +529,6 @@
       inset 0 1px 0 var(--edge-spec),
       0 8px 22px rgba(0, 0, 0, 0.4);
   }
-
-  /* ---------- 3.4 导航胶囊（选中态 = accent） ---------- */
 
   .nav-capsule-light {
     background: linear-gradient(180deg, rgb(var(--accent-rgb) / 1), rgb(var(--accent-deep-rgb) / 1));
@@ -597,7 +539,7 @@
       0 3px 10px rgb(var(--accent-rgb) / 0.35);
   }
   [data-theme="dark"] .nav-capsule-dark {
-    /* 深色选中胶囊：accent 染色玻璃 + accent 文字（Golden Gate 源列表选中态） */
+
     background: linear-gradient(180deg, rgb(var(--accent-rgb) / 0.28), rgb(var(--accent-rgb) / 0.16));
     color: rgb(var(--accent-rgb));
     box-shadow:
@@ -605,8 +547,6 @@
       inset 0 1px 0 rgba(255, 255, 255, 0.10);
   }
   [data-theme="dark"] .nav-capsule-dark .nav-label { color: rgb(var(--accent-rgb)); }
-
-  /* ---------- 3.5 控件（度量消费平台 token） ---------- */
 
   .btn {
     display: inline-flex;
@@ -687,10 +627,6 @@
     box-shadow: inset 0 0 0 1px var(--hairline), inset 0 -1px 0 var(--hairline);
   }
 
-  /* Squircle（渐进增强）：仅在浏览器支持 corner-shape 时启用；
-     不支持的走普通 border-radius。同心规则：内层半径 = 外层半径 − 内边距
-     （例如卡片 --radius-panel 10px 内嵌按钮 --radius-control 6px，pad 4px）。
-     胶囊类（badge/tab/nav-capsule/switch）保持全圆，不参与 squircle。 */
   @supports (corner-shape: squircle) {
     .btn,
     .icon-btn,
@@ -710,8 +646,6 @@
       corner-shape: squircle;
     }
   }
-
-  /* ---------- 3.6 徽标 / 状态（颜色 + 图标 + 文字 双编码） ---------- */
 
   .badge {
     display: inline-flex;
@@ -739,8 +673,6 @@
   [data-theme="dark"][data-a11y-contrast="true"] .badge-err { color: rgb(255 140 134 / 1); }
   [data-theme="dark"][data-a11y-contrast="true"] .badge-warn { color: rgb(255 224 100 / 1); }
 
-  /* ---------- 3.7 数据表面：表格（12px 表体 / caption 表头） ---------- */
-
   .data-table {
     width: 100%;
     border-collapse: collapse;
@@ -753,14 +685,18 @@
     text-align: left;
     font-weight: 600;
     font-size: var(--font-caption);
+    background: rgb(var(--glass-rgb) / 0.88);
+    -webkit-backdrop-filter: blur(10px) saturate(var(--glass-sat));
+    backdrop-filter: blur(10px) saturate(var(--glass-sat));
     letter-spacing: 0.02em;
     color: var(--text-2);
     padding: 9px 12px;
     border-bottom: 1px solid var(--hairline-strong);
     white-space: nowrap;
     user-select: none;
-    /* 背景由 3.2 节「内容表面」规则提供（近实心、无模糊） */
+
   }
+  [data-theme="dark"] .data-table thead th { background: rgb(22 24 30 / 0.9); }
   .data-table thead th.sortable { cursor: pointer; }
   .data-table thead th.sortable:hover { color: var(--text-1); }
   .data-table tbody td {
@@ -772,8 +708,6 @@
   .data-table tbody tr:last-child td { border-bottom: none; }
   .data-table tbody tr { transition: background 0.15s ease; }
   .data-table tbody tr:hover { background: rgb(var(--accent-rgb) / 0.055); }
-
-  /* ---------- 3.8 占比条 ---------- */
 
   .bar {
     height: 5px;
@@ -791,8 +725,6 @@
   .bar > i.ok { background: linear-gradient(90deg, rgb(var(--ok-rgb) / 0.75), rgb(var(--ok-rgb))); }
   .bar > i.warn { background: linear-gradient(90deg, rgb(var(--warn-rgb) / 0.8), rgb(var(--warn-rgb))); }
   .bar > i.err { background: linear-gradient(90deg, rgb(var(--err-rgb) / 0.8), rgb(var(--err-rgb))); }
-
-  /* ---------- 3.9 Radix 弹层挂载材质（chrome：真玻璃 + data-chrome 作用域） ---------- */
 
   .radix-pop {
     z-index: 60;
@@ -854,7 +786,6 @@
     to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
   }
 
-  /* Radix Slider / Switch 视觉（iOS 式） */
   .radix-slider { position: relative; display: flex; align-items: center; height: 28px; touch-action: none; user-select: none; }
   .radix-track { position: relative; height: 5px; flex: 1; border-radius: 999px; background: var(--bar-track); box-shadow: inset 0 1px 2px rgba(10, 20, 40, 0.08); }
   [data-theme="dark"] .radix-track { box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.5); }
@@ -895,7 +826,6 @@
   }
   .radix-switch[data-checked="true"] .knob { transform: translateX(20px); }
 
-  /* Tabs：设置页白瓷浮起胶囊；队列页 accent 胶囊（tabs-pill） */
   .tab-trigger {
     height: var(--control-h-lg);
     padding: 0 14px;
@@ -926,7 +856,6 @@
       0 2px 6px rgba(0, 0, 0, 0.3);
   }
 
-  /* 设置页竖排标签：激活项浅蓝胶囊 + accent 文字 */
   .vtab {
     display: flex;
     width: 100%;
@@ -952,7 +881,6 @@
     box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 0.2);
   }
 
-  /* 队列页 pill tabs：激活 = systemBlue 实色胶囊 */
   .tabs-pill { gap: 4px; }
   .tabs-pill .tab-trigger { height: var(--control-h); padding: 0 16px; }
   .tabs-pill .tab-trigger[data-state="active"] {
@@ -967,7 +895,6 @@
     color: #fff;
   }
 
-  /* 设置页主题三选一：近实心选项卡（内容表面），激活 = accent 描边 + 浅蓝晕 */
   .option-card {
     flex: 1;
     height: 44px;
@@ -997,7 +924,6 @@
       0 2px 8px rgb(var(--accent-rgb) / 0.18);
   }
 
-  /* Liquid Glass 透明度五档预设（超清澈 → 柔和暗色），激活 = accent 描边 */
   .preset-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
   .preset-box {
     border-radius: var(--radius-control);
@@ -1046,8 +972,6 @@
   .preset-box .pv { font-size: 9.5px; color: var(--text-3); }
   .preset-box[data-active="true"] .pl { color: rgb(var(--accent-rgb)); font-weight: 600; }
 
-  /* ---------- 3.10 滚动边缘工具栏（chrome） ---------- */
-
   .scroll-rail {
     position: fixed;
     right: 14px;
@@ -1083,10 +1007,6 @@
   .rail-btn:active { transform: scale(0.92); }
   .rail-sep { width: 20px; height: 1px; margin: 3px 0; background: var(--hairline-strong); }
 
-  /* ---------- 3.11 可访问性降级（三个开关真实生效；class 级规则） ---------- */
-
-  /* 减少透明度：chrome 玻璃接近不透明、去掉折射与透镜
-     （token 覆写在 tokens 层；这里关掉滤镜与透镜本体） */
   [data-a11y-reduced-transparency="true"] .glass,
   [data-a11y-reduced-transparency="true"] .glass--clear,
   [data-a11y-reduced-transparency="true"] .glass--toolbar,
@@ -1100,7 +1020,6 @@
   [data-a11y-reduced-transparency="true"] .edge-lens::before { content: none; background: none; }
   [data-a11y-reduced-transparency="true"] .lightfield .blob { opacity: 0.22; animation: none; }
 
-  /* 减少动态效果（JS 侧同时把 Motion spring 换成 fade） */
   [data-a11y-reduced-motion="true"] .lightfield .blob { animation: none; }
   [data-a11y-reduced-motion="true"] .glass-hover { transition: none; }
   [data-a11y-reduced-motion="true"] .radix-pop,
@@ -1111,7 +1030,6 @@
     .lightfield .blob { animation: none; }
   }
 
-  /* 强制色彩模式（系统级无障碍）：材质退化为系统画布 + 描边 */
   @media (forced-colors: active) {
     .glass, .glass--clear, .glass--toolbar, .glass--sidebar,
     .glass--control, .glass--well, .glass--data, .glass--surface {
@@ -1129,8 +1047,6 @@
     .edge-lens::before { content: none; background: none; -webkit-backdrop-filter: none; backdrop-filter: none; }
   }
 
-  /* ---------- 3.12 其它 ---------- */
-
   .hairline-b { box-shadow: 0 1px 0 var(--hairline); }
 
   .page-scroll {
@@ -1147,16 +1063,11 @@
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 }
 
-/* ============================================================================
-   Webmail（MailStack Webmail v1.0.0）—— 追加 section（append-only）
-   复用 tokens（--accent / --surface / --radius-* / --control-h / --font-*）与
-   管理台已有的 .btn/.input/.badge/.glass--toolbar/.bar 等组件类；这里只补 Webmail
-   的布局与列表/阅读/写信/弹层专属样式。不修改上方任何既有规则。
-   移动断点与管理台一致：<768px 单栏（iOS 度量档由 tokens 自动换挡）。
-   ============================================================================ */
 @layer components {
-  /* ---------- 根布局 ---------- */
+
   .mail-root {
+    position: relative;
+    isolation: isolate;
     display: flex;
     flex-direction: column;
     height: 100dvh;
@@ -1164,6 +1075,27 @@
     overflow: hidden;
     background: var(--canvas);
     color: var(--text-1);
+  }
+
+  .mail-root::before {
+    content: "";
+    position: absolute;
+    inset: -3%;
+    z-index: -2;
+    background: url("/alpine-lake.png") center 48% / cover no-repeat;
+    animation: lf-kenburns 180s ease-in-out infinite alternate;
+    will-change: transform;
+  }
+  .mail-root::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    background: rgba(238, 247, 255, 0.3);
+  }
+  [data-theme="dark"] .mail-root::after { background: rgba(7, 18, 32, 0.81); }
+  @media (prefers-reduced-motion: reduce) {
+    .mail-root::before { animation: none; }
   }
   .mail-boot {
     display: flex;
@@ -1212,7 +1144,6 @@
   .mail-meta-loading { position: fixed; bottom: 14px; right: 16px; font-size: var(--font-caption); color: var(--text-3); }
   .mail-empty-fallback { display: flex; align-items: center; justify-content: center; flex: 1; min-height: 0; }
 
-  /* ---------- 登录页 ---------- */
   .mail-login { position: relative; display: flex; align-items: center; justify-content: center; flex: 1; min-height: 0; overflow-y: auto; padding: 24px 16px; }
   .mail-login-tools { position: absolute; top: 14px; right: 14px; display: flex; gap: 6px; z-index: 2; }
   .mail-lang-tag { margin-left: 2px; font-size: 10px; font-weight: 650; }
@@ -1223,10 +1154,19 @@
     flex-direction: column;
     gap: 12px;
     padding: 28px 26px 22px;
-    border-radius: 24px;
-    background: var(--surface);
-    box-shadow: 0 0 0 1px var(--hairline), 0 24px 60px rgba(9, 20, 40, 0.16);
+    border-radius: var(--radius-sheet);
+    background:
+      linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 22%),
+      rgb(var(--glass-rgb) / 0.8);
+    -webkit-backdrop-filter: blur(26px) saturate(var(--glass-sat)) brightness(1.04);
+    backdrop-filter: blur(26px) saturate(var(--glass-sat)) brightness(1.04);
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 0 0 1px var(--edge-inner),
+      0 0 0 1px var(--edge-outer),
+      0 24px 60px rgba(9, 20, 40, 0.16);
   }
+  [data-theme="dark"] .mail-login-card { background: rgb(22 24 30 / 0.82); }
   .mail-login-brand { display: flex; flex-direction: column; align-items: center; gap: 4px; padding-bottom: 4px; }
   .mail-login-title { margin: 6px 0 0; font-size: 18px; font-weight: 700; letter-spacing: -0.01em; }
   .mail-login-subtitle { font-size: var(--font-caption); letter-spacing: 0.08em; color: var(--text-3); text-transform: uppercase; }
@@ -1271,8 +1211,17 @@
   .mail-login-security-title { font-size: 11px; font-weight: 600; color: var(--text-1); }
   .mail-login-security-protocol { margin-top: 2px; font-size: 10px; color: var(--text-3); }
 
-  /* ---------- 顶栏 ---------- */
-  .mail-header { gap: 6px; padding: 0 10px; }
+  .mail-header {
+    display: flex;
+    align-items: center;
+    flex: none;
+    height: var(--toolbar-height);
+    margin: 10px 10px 0;
+    padding: 0 10px;
+    gap: 6px;
+    min-width: 0;
+    overflow: hidden;
+  }
   .mail-header-btn { flex: none; }
   .mail-brand { display: flex; align-items: center; gap: 8px; min-width: 0; flex: none; }
   .mail-brand-name { font-size: 14px; font-weight: 650; letter-spacing: -0.01em; white-space: nowrap; }
@@ -1280,8 +1229,8 @@
   .mail-search {
     display: flex;
     align-items: center;
-    flex: 1 1 auto;
-    min-width: 0;
+    flex: 1 1 240px;
+    min-width: 120px;
     max-width: 520px;
     height: var(--control-h);
     margin: 0 8px;
@@ -1332,19 +1281,59 @@
   .mail-menu-item--danger { color: rgb(var(--err-rgb)); }
   .mail-menu-item--danger:hover { background: rgb(var(--err-rgb) / 0.1); }
 
-  /* ---------- 三栏外壳 ---------- */
-  .mail-shell { position: relative; display: grid; grid-template-columns: 212px minmax(280px, 380px) minmax(0, 1fr); flex: 1; min-height: 0; overflow: hidden; }
+  .mail-shell { position: relative; display: grid; grid-template-columns: 212px minmax(280px, 380px) minmax(0, 1fr); flex: 1; min-height: 0; overflow: hidden; padding: 10px; gap: 10px; }
   .mail-pane { display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; }
-  .mail-pane--list { border-right: 0.5px solid var(--hairline); }
-  .mail-pane--reader { background: var(--surface); }
+
+  .mail-folders,
+  .mail-pane--list,
+  .mail-pane--reader {
+    border-radius: var(--radius-panel);
+    background:
+      linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 22%),
+      rgb(var(--glass-rgb) / 0.8);
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
+    backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-sat)) brightness(1.04);
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 -1px 0 var(--edge-bottom),
+      inset 0 0 0 1px var(--edge-inner),
+      0 0 0 1px var(--edge-outer),
+      var(--glass-shadow);
+  }
+  [data-theme="dark"] .mail-folders,
+  [data-theme="dark"] .mail-pane--list,
+  [data-theme="dark"] .mail-pane--reader {
+    background: rgb(22 24 30 / 0.82);
+  }
   .mail-mobile-pane { flex: 1; min-height: 0; }
   @media (max-width: 767px) {
-    .mail-shell { grid-template-columns: 1fr; }
+    .mail-shell { grid-template-columns: 1fr; padding: 8px; gap: 8px; }
+    .mail-header { height: 48px; margin: 8px 8px 0; gap: 4px; }
+    .mail-brand-name,
+    .mail-demo-badge { display: none; }
+    .mail-search { flex: 1 1 auto; min-width: 0; margin: 0 2px; }
+    .mail-header-actions > .icon-btn.mail-header-btn { display: none; }
+    .mail-account-name { display: none; }
+
+    .mail-mobile-pane {
+      border-radius: var(--radius-panel);
+      background:
+        linear-gradient(180deg, rgb(255 255 255 / var(--sheen)), rgb(255 255 255 / 0) 22%),
+        rgb(var(--glass-rgb) / 0.88);
+      -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-sat));
+      backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-sat));
+      box-shadow:
+        inset 0 1px 0 var(--edge-spec),
+        inset 0 0 0 1px var(--edge-inner),
+        0 0 0 1px var(--edge-outer),
+        var(--glass-shadow);
+      overflow: hidden;
+    }
+    [data-theme="dark"] .mail-mobile-pane { background: rgb(22 24 30 / 0.9); }
   }
 
-  /* ---------- 文件夹栏 ---------- */
-  .mail-folders { display: flex; flex-direction: column; min-height: 0; padding: 8px 8px 10px; border-right: 0.5px solid var(--hairline); overflow: hidden; }
-  .mail-folders-panel { display: flex; flex-direction: column; width: min(290px, 86vw); height: 100%; padding: 10px 10px 12px; background: var(--surface); border-radius: 0 var(--radius-window) var(--radius-window) 0; box-shadow: 16px 0 48px rgba(9, 20, 40, 0.18); overflow: hidden; }
+  .mail-folders { display: flex; flex-direction: column; min-height: 0; padding: 8px 8px 10px; overflow: hidden; }
+  .mail-folders-panel { display: flex; flex-direction: column; width: min(290px, 86vw); height: 100%; padding: 10px 10px 12px; border-radius: var(--radius-sheet); background: rgb(var(--glass-rgb) / 0.8); -webkit-backdrop-filter: blur(30px) saturate(var(--glass-sat)); backdrop-filter: blur(30px) saturate(var(--glass-sat)); box-shadow: inset 0 1px 0 var(--edge-spec), inset 0 0 0 1px var(--edge-inner), 0 0 0 1px var(--edge-outer), 0 20px 54px rgba(9, 20, 40, 0.24); overflow: hidden; }
   .mail-drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 0 2px 8px; }
   .mail-drawer-title { font-size: 13px; font-weight: 650; }
   .mail-folder-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 1px; }
@@ -1366,10 +1355,9 @@
   .mail-quota-label { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 5px; font-size: var(--font-caption); color: var(--text-2); }
   .mail-quota-unlimited { font-size: 10.5px; color: var(--text-3); }
   .mail-drawer-overlay { position: fixed; inset: 0; z-index: 68; background: rgba(10, 16, 28, 0.38); -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px); }
-  .mail-folder-drawer { position: fixed; top: 0; bottom: 0; left: 0; z-index: 70; display: flex; animation: mail-drawer-in 0.24s cubic-bezier(0.32, 0.72, 0, 1); }
+  .mail-folder-drawer { position: fixed; top: max(8px, env(safe-area-inset-top)); bottom: 8px; left: 8px; z-index: 70; display: flex; animation: mail-drawer-in 0.24s cubic-bezier(0.32, 0.72, 0, 1); }
   @keyframes mail-drawer-in { from { transform: translateX(-100%); } to { transform: none; } }
 
-  /* ---------- 邮件列表 ---------- */
   .mail-list { display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; }
   .mail-list-head { flex: none; display: flex; flex-direction: column; gap: 6px; padding: 8px 10px 7px; border-bottom: 0.5px solid var(--hairline); }
   .mail-list-title-row { display: flex; align-items: center; gap: 8px; }
@@ -1377,11 +1365,11 @@
   .mail-list-title-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mail-list-count { flex: none; font-size: var(--font-caption); font-weight: 500; color: var(--text-3); }
   .mail-list-refresh { margin-left: auto; flex: none; }
-  .mail-toolbar { display: flex; align-items: center; gap: 4px; min-height: 26px; }
+  .mail-toolbar { display: flex; align-items: center; gap: 4px; min-height: 26px; flex-wrap: wrap; row-gap: 2px; }
   .mail-check { width: 14px; height: 14px; flex: none; margin: 0; accent-color: rgb(var(--accent-rgb)); cursor: pointer; }
   .mail-select-all { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; flex: none; }
   .mail-selected-count { min-width: 52px; font-size: var(--font-caption); color: var(--text-2); white-space: nowrap; }
-  .mail-toolbar-group { display: flex; align-items: center; gap: 1px; margin-left: auto; flex-wrap: wrap; }
+  .mail-toolbar-group { display: flex; align-items: center; gap: 1px; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; min-width: 0; }
   .mail-tool-btn { width: 26px; height: 26px; border-radius: 6px; color: var(--text-2); background: transparent; border: 0; }
   .mail-tool-btn:hover:not(:disabled) { background: rgb(var(--text-1) / 0.07); color: var(--text-1); }
   .mail-tool-btn:disabled { opacity: 0.35; cursor: default; pointer-events: none; }
@@ -1413,10 +1401,9 @@
   .mail-list--compact .mail-row { padding-top: 6px; padding-bottom: 6px; }
   .mail-list--compact .mail-snippet { display: none; }
   .mail-load-more { display: flex; justify-content: center; padding: 12px; }
-  .mail-list-foot { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 12px; border-top: 0.5px solid var(--hairline); font-size: var(--font-caption); color: var(--text-2); background: rgb(var(--surface-rgb) / 0.85); }
+  .mail-list-foot { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 12px; border-top: 0.5px solid var(--hairline); font-size: var(--font-caption); color: var(--text-2); background: transparent; }
   .mail-clear-selection { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border: 0; border-radius: 50%; background: rgb(var(--text-1) / 0.08); color: var(--text-2); cursor: pointer; }
 
-  /* ---------- 空态 / 骨架 / 错误 ---------- */
   .mail-empty { display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; gap: 8px; min-height: 0; padding: 36px 20px; text-align: center; }
   .mail-empty-icon { display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 50%; color: var(--text-3); background: rgb(var(--text-1) / 0.05); }
   .mail-empty-title { font-size: var(--font-body); font-weight: 600; color: var(--text-2); }
@@ -1430,7 +1417,6 @@
   .mail-error-text { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mail-error-retry { display: inline-flex; align-items: center; gap: 4px; flex: none; height: 24px; padding: 0 9px; border: 0; border-radius: 6px; background: rgb(var(--err-rgb) / 0.12); color: rgb(var(--err-rgb)); font-size: var(--font-caption); cursor: pointer; }
 
-  /* ---------- 阅读窗格 ---------- */
   .mail-reader { display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; flex: 1; }
   .mail-reader--empty { align-items: stretch; justify-content: center; }
   .mail-reader-head { flex: none; padding: 12px 14px 4px; border-bottom: 0.5px solid var(--hairline); }
@@ -1459,7 +1445,7 @@
   .mail-banner-text { flex: 1; min-width: 0; }
   .mail-banner-hint { margin-top: 2px; color: var(--text-3); }
   .mail-banner-btn { flex: none; height: 26px; font-size: var(--font-caption); }
-  .mail-reader-body { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--surface); }
+  .mail-reader-body { flex: 1; min-height: 0; display: flex; flex-direction: column; background: transparent; }
   .mail-reader-frame { flex: 1; width: 100%; height: 100%; border: 0; background: #fff; }
   [data-theme="dark"] .mail-reader-frame { background: #16181e; }
   .mail-reader-text-wrap { flex: 1; overflow: auto; }
@@ -1477,7 +1463,6 @@
   .mail-attachment-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mail-attachment-size { flex: none; color: var(--text-3); }
 
-  /* ---------- 写信浮层 ---------- */
   .mail-compose {
     position: fixed;
     right: 16px;
@@ -1488,13 +1473,20 @@
     width: min(560px, calc(100vw - 32px));
     height: min(580px, calc(100dvh - 96px));
     border-radius: var(--radius-window);
-    background: var(--surface);
-    box-shadow: 0 0 0 1px var(--hairline), 0 28px 70px rgba(9, 20, 40, 0.3);
+    background: rgb(var(--glass-rgb) / 0.84);
+    -webkit-backdrop-filter: blur(30px) saturate(var(--glass-sat));
+    backdrop-filter: blur(30px) saturate(var(--glass-sat));
+    box-shadow:
+      inset 0 1px 0 var(--edge-spec),
+      inset 0 0 0 1px var(--edge-inner),
+      0 0 0 1px var(--edge-outer),
+      0 28px 70px rgba(9, 20, 40, 0.3);
     overflow: hidden;
     animation: mail-compose-in 0.22s cubic-bezier(0.32, 0.72, 0, 1);
   }
   @keyframes mail-compose-in { from { opacity: 0; transform: translateY(14px) scale(0.985); } to { opacity: 1; transform: none; } }
-  .mail-compose--full { inset: 10px; right: auto; bottom: auto; width: auto; height: auto; }
+  .mail-compose--full { inset: 10px; right: auto; bottom: auto; width: auto; height: auto; background: var(--surface); }
+  [data-theme="dark"] .mail-compose { background: rgb(22 24 30 / 0.9); }
   .mail-compose-head { flex: none; display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 14px; border-bottom: 0.5px solid var(--hairline); }
   .mail-compose-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 650; }
   .mail-compose-head-actions { display: flex; gap: 1px; flex: none; }
@@ -1536,7 +1528,6 @@
     .mail-compose-body { padding-top: 4px; }
   }
 
-  /* ---------- 弹层 / 对话框 ---------- */
   .mail-overlay { position: fixed; inset: 0; z-index: 90; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(10, 16, 28, 0.4); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); animation: fade-in 0.18s ease; }
   .mail-dialog { width: min(460px, 100%); max-height: 88dvh; overflow-y: auto; padding: 18px 18px 16px; border-radius: var(--radius-window); background: var(--surface); box-shadow: 0 0 0 1px var(--hairline), 0 28px 70px rgba(9, 20, 40, 0.32); animation: dialog-in 0.22s cubic-bezier(0.32, 0.72, 0, 1); }
   .mail-dialog--narrow { width: min(360px, 100%); }
@@ -1552,7 +1543,6 @@
   .mail-dialog-badge--danger { color: rgb(var(--err-rgb)); background: rgb(var(--err-rgb) / 0.12); }
   .mail-btn-danger { background: linear-gradient(180deg, rgb(var(--err-rgb)), rgb(var(--err-rgb) / 0.85)); color: #fff; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 2px 8px rgb(var(--err-rgb) / 0.3); }
 
-  /* ---------- 设置 ---------- */
   .mail-settings-group { margin-top: 14px; padding-top: 4px; border-top: 0.5px solid var(--hairline); }
   .mail-settings-field { display: block; margin: 10px 0; }
   .mail-settings-label { display: block; font-size: 12.5px; font-weight: 600; color: var(--text-1); }
@@ -1576,7 +1566,6 @@
   .mail-settings-dot { width: 7px; height: 7px; border-radius: 50%; background: #ffcc00; }
   .mail-settings-dot[data-dark="true"] { background: #3a3a3c; box-shadow: 0 0 0 1px var(--hairline-strong); }
 
-  /* ---------- Toast ---------- */
   .mail-toasts { position: fixed; left: 50%; bottom: calc(22px + env(safe-area-inset-bottom)); z-index: 100; display: flex; flex-direction: column; align-items: center; gap: 8px; transform: translateX(-50%); pointer-events: none; width: min(92vw, 560px); }
   .mail-toast { pointer-events: auto; display: flex; align-items: center; gap: 8px; max-width: 100%; padding: 8px 10px 8px 13px; border-radius: 999px; background: rgb(28 34 44 / 0.94); color: #f4f6fa; font-size: var(--font-caption); box-shadow: 0 10px 30px rgba(9, 20, 40, 0.35), inset 0 0 0 1px rgba(255, 255, 255, 0.08); animation: mail-toast-in 0.22s cubic-bezier(0.32, 0.72, 0, 1); }
   @keyframes mail-toast-in { from { opacity: 0; transform: translateY(10px) scale(0.97); } to { opacity: 1; transform: none; } }

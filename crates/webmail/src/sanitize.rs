@@ -1,32 +1,7 @@
-//! 服务端 HTML 消毒器（allowlist）。
-//!
-//! 邮件 HTML 是**不可信输入**：它来自任何能往这个邮箱发信的人。契约 §2.2 要求
-//! 服务端消毒后再交付，前端还会用 sandbox iframe 二次隔离——两层都要有，
-//! 服务端这一层是唯一能保证「即使前端有 bug 也不执行脚本」的那层。
-//!
-//! ## 设计
-//!
-//! * 手写 tokenizer，不引 HTML 解析库（契约不允许新增依赖；且这里需要的语义比
-//!   完整 HTML5 解析简单得多：**只输出 allowlist 内的结构**）；
-//! * 白名单标签 / 属性；未列入的标签**剥离标签保留文本**，危险标签**连内容一起丢**；
-//! * URL 只允许 `http: https: mailto: cid:`，相对 URL 一律剥离；HTML 实体先解码
-//!   再判 scheme（`jav&#x61;script:` 这种写法必须在解码后才被认出来）；
-//! * 远程图片默认阻断：`src` 改写成 `data-blocked-src` 并计数，只有显式
-//!   `?images=1` 才保留（防追踪像素与远程内容）；
-//! * `cid:` 图片改写为本站 API 部件 URL；
-//! * 输出是**合法 HTML**：文本节点与属性值都转义，标签栈保证闭合。
-//!
-//! ## 为什么必须「输出合法 HTML」
-//!
-//! 消毒器自己拼接字符串时，一个没转义的 `"` 就能把属性值提前闭合、注入新属性
-//! ——那和没消毒等价。因此这里的每个输出点都过 [`escape_text`] /
-//! [`escape_attribute`]，测试里还有「消毒结果再消毒一次必须不变」的幂等守卫。
-
 use std::collections::HashMap;
 
 use crate::{MAX_HTML_BYTES, MAX_SANITIZE_INPUT_BYTES};
 
-/// 允许保留的标签（契约 §2.2）。
 const ALLOWED_TAGS: &[&str] = &[
     "a",
     "b",
@@ -71,30 +46,19 @@ const ALLOWED_TAGS: &[&str] = &[
     "dd",
 ];
 
-/// 连内容一起丢弃的标签（契约 §2.2）。
-///
-/// 其中 `input/link/meta/base/embed` 是 void 元素：没有「内容」可丢，整标签丢弃。
-/// 其余（`script/style/iframe/svg/math/template/...`）必须跳过其内部文本，否则
-/// `<script>alert(1)</script>` 会退化成输出 `alert(1)`（不是脚本，但也不是邮件内容）。
 const DROP_WITH_CONTENT_TAGS: &[&str] = &[
     "script", "style", "iframe", "frame", "frameset", "object", "embed", "applet", "form", "input",
     "button", "textarea", "select", "option", "link", "meta", "base", "svg", "math", "template",
     "noscript",
 ];
 
-/// 没有结束标签的 void 元素（输出时不入栈、不补闭合）。
 const VOID_TAGS: &[&str] = &["br", "hr", "img"];
 
-/// HTML 规范里的全部 void 元素（用于判断「丢弃标签时有没有内容可跳」）。
-///
-/// 把 `input/link/meta/base` 当成有内容的标签去跳，会一直跳到 EOF——
-/// 一个 `<input>` 就能让整封邮件后半段消失。这类标签本身就是空元素，丢标签即可。
 const VOID_ELEMENTS: &[&str] = &[
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track",
     "wbr",
 ];
 
-/// 允许保留的属性（契约 §2.2 + 消毒器自己产出的 `data-blocked-src`）。
 const ALLOWED_ATTRIBUTES: &[&str] = &[
     "href",
     "src",
@@ -112,10 +76,6 @@ const ALLOWED_ATTRIBUTES: &[&str] = &[
     "data-blocked-src",
 ];
 
-/// `style` 里允许保留的 CSS 属性（安全子集）。
-///
-/// 排除 `position/display/z-index/top/left/right/bottom/background(-image)`：
-/// 前一组能做出覆盖整个页面的钓鱼层，后一组能发起远程请求（追踪像素）。
 const SAFE_STYLE_PROPERTIES: &[&str] = &[
     "color",
     "background-color",
@@ -160,18 +120,14 @@ const SAFE_STYLE_PROPERTIES: &[&str] = &[
     "min-width",
 ];
 
-/// 单个属性值的最大字符数。
 const MAX_ATTRIBUTE_VALUE_CHARS: usize = 4_096;
 
-/// 单个标签的属性个数上限。
 const MAX_ATTRIBUTES_PER_TAG: usize = 64;
 
-/// 消毒选项。
 #[derive(Debug, Clone, Copy)]
 pub struct SanitizeOptions<'a> {
-    /// 是否保留远程图片（`?images=1`）。
     pub allow_remote_images: bool,
-    /// `cid` 归一化值 → 本站部件 URL 的映射。
+
     pub cid_urls: &'a HashMap<String, String>,
 }
 
@@ -184,22 +140,16 @@ impl Default for SanitizeOptions<'_> {
     }
 }
 
-/// 静态空映射（`Default` 需要 `'static` 引用）。
 static EMPTY_CID_URLS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
-/// 消毒结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SanitizeOutcome {
     pub html: String,
-    /// 被阻断的远程图片数（契约 `remoteImagesBlocked`）。
+
     pub remote_images_blocked: u32,
 }
 
-/// 消毒 HTML。
-///
-/// 输入先按字节上限截断（`MAX_HTML_BYTES`，见 [`MAX_SANITIZE_INPUT_BYTES`]），
-/// 输出也有上限；超限后停止输出并闭合已打开标签，保证结果仍是合法 HTML。
 pub fn sanitize_html(input: &str, options: &SanitizeOptions<'_>) -> SanitizeOutcome {
     let limit = MAX_SANITIZE_INPUT_BYTES.min(MAX_HTML_BYTES);
     let input = truncate_on_char_boundary(input, limit);
@@ -215,10 +165,6 @@ pub fn sanitize_html(input: &str, options: &SanitizeOptions<'_>) -> SanitizeOutc
             break;
         }
         if let Some(state) = skip.as_mut() {
-            // 跳过模式只关心「标签结构」，但 index 此刻可能停在标签之间的文本上
-            // （上一次 `tag.consumed_to` 指向 `>` 之后）。必须先推进到下一个 `<`，
-            // 否则 `next_tag` 的 `debug_assert!(index at '<')` 会命中 —— 这正是
-            // 本函数此前在「标签内嵌文本」输入上 panic 的原因。
             if bytes.get(index) != Some(&b'<') {
                 match input[index..].find('<') {
                     Some(offset) => index += offset,
@@ -256,7 +202,6 @@ pub fn sanitize_html(input: &str, options: &SanitizeOptions<'_>) -> SanitizeOutc
             continue;
         }
 
-        // 注释 / doctype / CDATA / 处理指令：整段丢弃。
         if input[index..].starts_with("<!--") {
             match input[index + 4..].find("-->") {
                 Some(end) => {
@@ -277,7 +222,6 @@ pub fn sanitize_html(input: &str, options: &SanitizeOptions<'_>) -> SanitizeOutc
         }
 
         let Some(tag) = parse_tag(input, index) else {
-            // 非标签的 `<`：按文本转义输出，越过这一个字符继续。
             push_text(&mut out, &input[index..index + 1]);
             index += 1;
             continue;
@@ -288,8 +232,7 @@ pub fn sanitize_html(input: &str, options: &SanitizeOptions<'_>) -> SanitizeOutc
             if VOID_TAGS.contains(&tag.name.as_str()) {
                 continue;
             }
-            // 只在栈里找匹配项：未打开过的结束标签直接丢；不匹配的尾随标签
-            // 一并关闭，避免输出 `<b><i></b>` 这种错嵌套。
+
             if let Some(position) = open.iter().rposition(|name| *name == tag.name) {
                 while open.len() > position {
                     if let Some(name) = open.pop() {
@@ -313,7 +256,6 @@ pub fn sanitize_html(input: &str, options: &SanitizeOptions<'_>) -> SanitizeOutc
         }
 
         if !ALLOWED_TAGS.contains(&tag.name.as_str()) {
-            // 非危险但不在 allowlist 的标签：剥离标签保留内容（不进入 skip）。
             continue;
         }
 
@@ -325,9 +267,6 @@ pub fn sanitize_html(input: &str, options: &SanitizeOptions<'_>) -> SanitizeOutc
             out.push('<');
             out.push_str(name);
             sanitize_attributes(name, &tag.attributes, options, &mut out, &mut blocked);
-            if tag.self_closing && !VOID_TAGS.contains(&name) {
-                // 非 void 标签的 `/>` 按普通开始标签处理（HTML 语义）。
-            }
             out.push('>');
         }
         if !VOID_TAGS.contains(&name) {
@@ -335,7 +274,6 @@ pub fn sanitize_html(input: &str, options: &SanitizeOptions<'_>) -> SanitizeOutc
         }
     }
 
-    // 截断/结束时把还开着的标签按逆序闭合，保证输出合法。
     while let Some(name) = open.pop() {
         if out.len() + name.len() + 3 < MAX_SANITIZE_OUTPUT_BYTES {
             out.push_str("</");
@@ -350,35 +288,27 @@ pub fn sanitize_html(input: &str, options: &SanitizeOptions<'_>) -> SanitizeOutc
     }
 }
 
-/// 输出上限（字节）。
 const MAX_SANITIZE_OUTPUT_BYTES: usize = MAX_SANITIZE_INPUT_BYTES + MAX_SANITIZE_INPUT_BYTES / 4;
 
-/// 正在跳过的「连内容一起丢」标签的嵌套状态。
 struct SkipState {
     name: String,
     depth: usize,
 }
 
-/// 一个解析出来的标签。
 struct Tag {
     is_end: bool,
     name: String,
     attributes: Vec<(String, String)>,
     self_closing: bool,
-    /// 该标签结束后的输入偏移。
+
     consumed_to: usize,
 }
 
-/// 从 `index` 起跳过一个完整的 HTML 标签（用于 skip 模式里只关心结构）。
 fn next_tag(input: &str, index: usize) -> Option<Tag> {
     debug_assert!(input.as_bytes().get(index) == Some(&b'<'));
     parse_tag(input, index)
 }
 
-/// 解析 `<name attr=value ...>` / `</name>`。
-///
-/// 返回 `None` 表示「这里不是可解析的标签」——调用方会把 `<` 当文本输出。
-/// 解析永远不会 panic：所有切片都在 ASCII 定界符上推进，遇到 EOF 就返回 `None`。
 fn parse_tag(input: &str, start: usize) -> Option<Tag> {
     let bytes = input.as_bytes();
     let mut index = start;
@@ -436,7 +366,6 @@ fn parse_tag(input: &str, start: usize) -> Option<Tag> {
             Some(_) => {}
         }
         if is_end {
-            // 结束标签允许出现多余属性（真实世界有），忽略直到 `>`。
             let end = input[index..].find('>')?;
             return Some(Tag {
                 is_end,
@@ -446,7 +375,7 @@ fn parse_tag(input: &str, start: usize) -> Option<Tag> {
                 consumed_to: index + end + 1,
             });
         }
-        // 属性名。
+
         let name_start = index;
         while let Some(byte) = bytes.get(index) {
             if byte.is_ascii_whitespace() || *byte == b'=' || *byte == b'>' || *byte == b'/' {
@@ -455,7 +384,6 @@ fn parse_tag(input: &str, start: usize) -> Option<Tag> {
             index += 1;
         }
         if index == name_start {
-            // 游离字符（如 `=`）：跳过它，避免死循环。
             index += 1;
             continue;
         }
@@ -517,7 +445,6 @@ fn parse_tag(input: &str, start: usize) -> Option<Tag> {
     }
 }
 
-/// 按标签名过滤属性并写进输出。
 fn sanitize_attributes(
     tag: &'static str,
     attributes: &[(String, String)],
@@ -530,13 +457,12 @@ fn sanitize_attributes(
         if !ALLOWED_ATTRIBUTES.contains(&name.as_str()) {
             continue;
         }
-        // 同名属性只保留第一个（后面的重名在浏览器里行为不一致，是绕过面）。
+
         if seen.contains(&name.as_str()) {
             continue;
         }
         seen.push(name.as_str());
 
-        // 只对真正有 URL 语义的标签保留 URL 属性。
         match (tag, name.as_str()) {
             ("img", "src") => {
                 let decoded = decode_entities_limited(raw_value);
@@ -556,7 +482,6 @@ fn sanitize_attributes(
                 }
             }
             ("img", "data-blocked-src") => {
-                // 幂等：消毒结果再次消毒时保留这个惰性属性（它没有 src 语义）。
                 let decoded = decode_entities_limited(raw_value);
                 out.push_str(" data-blocked-src=\"");
                 out.push_str(&escape_attribute(&decoded));
@@ -570,9 +495,7 @@ fn sanitize_attributes(
                     out.push('"');
                 }
             }
-            (_, "href") | (_, "src") => {
-                // 其它标签上的 href/src 一律丢弃（没有渲染语义，保留只会扩大攻击面）。
-            }
+            (_, "href") | (_, "src") => {}
             (_, "style") => {
                 let decoded = decode_entities_limited(raw_value);
                 if let Some(style) = sanitize_style(&decoded) {
@@ -668,23 +591,18 @@ fn sanitize_attributes(
     }
 
     if tag == "a" {
-        // 契约 §2.2：`<a>` 统一加 rel/target。放在最后，覆盖不了（同名属性
-        // 不在 allowlist 里，攻击者给的值已被丢弃）。
         out.push_str(" rel=\"noopener noreferrer nofollow\" target=\"_blank\"");
     }
 }
 
-/// 图片 `src` 的分类结果。
 enum ImageSource {
-    /// 保留原 URL。
     Keep(String),
-    /// 阻断（改成 `data-blocked-src`）。
+
     Blocked(String),
-    /// 直接丢弃（非法 scheme / 相对 URL / 未知 cid）。
+
     Drop,
 }
 
-/// 图片 URL 判定（契约 §2.2 第三条）。
 fn classify_image_url(value: &str, options: &SanitizeOptions<'_>) -> ImageSource {
     let trimmed = trim_unsafe(value);
     if trimmed.is_empty() {
@@ -707,11 +625,10 @@ fn classify_image_url(value: &str, options: &SanitizeOptions<'_>) -> ImageSource
         }
         return ImageSource::Blocked(trimmed.to_string());
     }
-    // 相对 URL、data:、javascript:、file: 等一律剥离。
+
     ImageSource::Drop
 }
 
-/// 链接 URL 判定：只允许 `http: https: mailto:`。
 fn safe_link_url(value: &str) -> Option<String> {
     let trimmed = trim_unsafe(value);
     if trimmed.is_empty() {
@@ -723,17 +640,14 @@ fn safe_link_url(value: &str) -> Option<String> {
     None
 }
 
-/// URL 是否以 `http:` / `https:` 开头（大小写不敏感）。
 fn is_http_url(value: &str) -> bool {
     has_scheme(value, "http://") || has_scheme(value, "https://")
 }
 
-/// 是否以指定 scheme 开头（大小写不敏感）。
 fn has_scheme(value: &str, scheme: &str) -> bool {
     value.len() >= scheme.len() && value[..scheme.len()].eq_ignore_ascii_case(scheme)
 }
 
-/// 若以指定 scheme 开头则返回去掉 scheme 的剩余部分。
 fn strip_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
     if has_scheme(value, scheme) {
         Some(&value[scheme.len()..])
@@ -742,9 +656,6 @@ fn strip_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
     }
 }
 
-/// URL 清理：去掉首尾空白与控制字符（含 `\t\r\n`——`java\nscript:` 这种绕过）。
-///
-/// 中间的控制字符不是合法 URL 的一部分，直接整体判为不安全（返回空串）。
 fn trim_unsafe(value: &str) -> &str {
     let value = value.trim();
     if value.chars().any(char::is_control) {
@@ -753,7 +664,6 @@ fn trim_unsafe(value: &str) -> &str {
     value
 }
 
-/// `style` 属性清洗：只保留安全属性子集。
 fn sanitize_style(value: &str) -> Option<String> {
     let mut declarations: Vec<String> = Vec::new();
     for declaration in value.split(';') {
@@ -769,7 +679,7 @@ fn sanitize_style(value: &str) -> Option<String> {
             continue;
         }
         let lowered = raw_value.to_ascii_lowercase();
-        // 远程请求 / 表达式 / 协议处理器：即使当前属性名安全，值里也不允许出现。
+
         if lowered.contains("url(")
             || lowered.contains("expression")
             || lowered.contains("javascript")
@@ -798,7 +708,6 @@ fn sanitize_style(value: &str) -> Option<String> {
     }
 }
 
-/// `width` / `height`：只接受纯数字或百分比。
 fn sanitize_dimension(value: &str) -> Option<String> {
     let trimmed = value.trim();
     let digits = trimmed.strip_suffix('%').unwrap_or(trimmed);
@@ -812,11 +721,6 @@ fn sanitize_dimension(value: &str) -> Option<String> {
     }
 }
 
-/// 文本节点转义。
-///
-/// 合法的 HTML 实体（`&amp;` 等）原样保留，其余 `&` 转义：否则输出会被浏览器
-/// 二次解码（把用户文本里的 `&lt;b&gt;` 变成真的 `<b>`）。实体在**文本上下文**
-/// 里没有 XSS 能力（`&#60;script&#62;` 仍是文本），因此保留是安全的。
 fn push_text(out: &mut String, text: &str) {
     let bytes = text.as_bytes();
     let mut index = 0;
@@ -848,7 +752,6 @@ fn push_text(out: &mut String, text: &str) {
     }
 }
 
-/// 若 `value` 以合法 HTML 实体开头，返回它的字节长度。
 fn entity_length(value: &str) -> Option<usize> {
     let bytes = value.as_bytes();
     if bytes.first() != Some(&b'&') {
@@ -873,7 +776,6 @@ fn entity_length(value: &str) -> Option<usize> {
     valid.then_some(semicolon + 2)
 }
 
-/// 属性值转义。
 fn escape_attribute(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -889,7 +791,6 @@ fn escape_attribute(value: &str) -> String {
     out
 }
 
-/// 解码常见 HTML 实体（判 scheme 之前必须做：`jav&#x61;script:` 是真实绕过）。
 fn decode_entities_limited(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let bytes = value.as_bytes();
@@ -936,7 +837,6 @@ fn decode_one_entity(entity: &str) -> Option<char> {
     }
 }
 
-/// 在 char 边界上截断到 `limit` 字节。
 fn truncate_on_char_boundary(value: &str, limit: usize) -> &str {
     if value.len() <= limit {
         return value;
@@ -993,7 +893,6 @@ mod tests {
         }
     }
 
-    /// 契约 §2.2 的 XSS 向量语料（也是不变量测试的语料来源）。
     const XSS_CORPUS: &[&str] = &[
         "<script>alert(1)</script>",
         "<SCRIPT SRC=//evil.example/x.js></SCRIPT>",
@@ -1028,13 +927,12 @@ mod tests {
         "<a href=\"https://ok.example\" rel=\"opener\">ok</a>",
     ];
 
-    /// 反例守卫：消毒器必须剥掉脚本与事件处理器（不变量测试语料在这里）。
     #[test]
     fn webmail_html_sanitizer_strips_scripts_and_event_handlers() {
         for vector in XSS_CORPUS {
             let outcome = sanitize(vector);
             assert_no_active_content(&outcome.html);
-            // 输出必须仍是合法 HTML：标签闭合、引号成对（简单结构性检查）。
+
             assert!(
                 outcome.html.matches('<').count() == outcome.html.matches('>').count(),
                 "输出标签不配平：{} ← {vector}",
@@ -1042,7 +940,6 @@ mod tests {
             );
         }
 
-        // 具体向量的可读断言：script 内容整段丢弃、事件属性丢弃、危险 scheme 丢弃。
         assert!(!sanitize("<script>alert(1)</script>").html.contains("alert"));
         assert!(!sanitize("<img src=x onerror=alert(1)>")
             .html
@@ -1060,7 +957,7 @@ mod tests {
             outcome.html,
             "<p>Hello <b>world</b> &amp; &lt;friends&gt;</p>"
         );
-        // 文本里的裸尖括号被转义。
+
         assert_eq!(sanitize("1 < 2 > 0").html, "1 &lt; 2 &gt; 0");
     }
 
@@ -1073,23 +970,19 @@ mod tests {
             .contains("rel=\"noopener noreferrer nofollow\""));
         assert!(outcome.html.contains("target=\"_blank\""));
 
-        // 相对 URL 按契约剥离，但保留链接文本。
         let relative = sanitize("<a href=\"/settings\">x</a>");
         assert!(!relative.html.contains("href="), "{}", relative.html);
         assert!(relative.html.contains(">x</a>"));
 
-        // mailto 允许。
         assert!(sanitize("<a href=\"mailto:a@b.c\">m</a>")
             .html
             .contains("href=\"mailto:a@b.c\""));
     }
 
-    /// 反例守卫：远程图片默认必须被阻断并计数（追踪像素防线）。
     #[test]
     fn webmail_html_sanitizer_blocks_remote_images_by_default() {
         let outcome = sanitize("<p><img src=\"https://evil.example/pixel.png\" alt=\"x\"></p>");
-        // 注意：`data-blocked-src="https://…"` 里天然含有子串 `src="https`，
-        // 因此断言必须带前导空格（真正的 ` src="` 才说明图片没被阻断）。
+
         assert!(
             !outcome.html.contains(" src=\"https://evil.example"),
             "默认必须阻断远程图片：{}",
@@ -1101,7 +994,6 @@ mod tests {
         assert!(outcome.html.contains("alt=\"x\""));
         assert_eq!(outcome.remote_images_blocked, 1);
 
-        // 显式允许（?images=1）时保留 src。
         let cid_urls = HashMap::new();
         let allowed = sanitize_html(
             "<img src=\"https://cdn.example/p.png\">",
@@ -1113,7 +1005,6 @@ mod tests {
         assert!(allowed.html.contains("src=\"https://cdn.example/p.png\""));
         assert_eq!(allowed.remote_images_blocked, 0);
 
-        // 内嵌 cid 图片改写为本站部件 URL。
         let mut cid_urls = HashMap::new();
         cid_urls.insert(
             "img1@example.com".to_string(),
@@ -1146,7 +1037,7 @@ mod tests {
     fn attribute_injection_cannot_break_out_of_the_quotes() {
         let outcome = sanitize("<p title=\"x&quot; onmouseover=&quot;alert(1)\">hi</p>");
         assert_no_active_content(&outcome.html);
-        // 值里的引号被转义，属性没有被提前闭合：整段内容仍在 title 的值里。
+
         assert!(outcome
             .html
             .contains("title=\"x&quot; onmouseover=&quot;alert(1)\""));

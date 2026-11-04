@@ -56,10 +56,20 @@ MailStack 以自研 Rust 栈**替代** Postfix / OpenDKIM / fail2ban / Dovecot �
 
 - React 19 + Vite 7 + Tailwind CSS 4 单页应用，由 `mailstack-web` 托管（默认只绑 `127.0.0.1:8443`）。
 - 全部管理 API 由 Rust 后端提供：初始化向导、域名/别名/邮箱用户、设置、2FA、DKIM 轮换、
-  ACME 证书、服务与队列动作、手工封禁、备份/恢复、日志、遥测、AI 出站配置。
+  ACME 证书、服务与队列动作、手工封禁、备份/恢复、日志、遥测。
 - 前端产物是**外部输入**：后端只负责路径安全、内容类型与「`/api` 兜底永远是 JSON 404」；
   省略 `--dist` 时只提供 API，页面请求回 **503**（不是空白 200）。
 - 中英双语、明暗主题（`data-theme`）。
+
+### 部署与服务器管理（v1.0.0）
+
+- **一行安装**：`curl ... | sudo bash -s -- --domain ... --admin-user ... --admin-password ... --access-mode ...`
+  完成系统用户/目录/权限/二进制/包装器/sudoers/systemd/前端/管理员/身份 DKIM/访问层全部前提。
+- **`mailstack-manage`**：服务器端 CLI + 交互菜单，改域名、加/删邮箱账号、重设口令、
+  签发/续期 TLS、切换访问方式；状态源 `/etc/mailstack/install-args.conf`。
+- **六种访问方式**：SSH 隧道（默认）、Caddy、nginx、公网 IP+ACME、独立面板域名
+  （`panel.example.com`，与 `mail/imap/smtp.example.com` 区分）、Cloudflare Tunnel。
+  8443/8444 恒只绑回环，公网 TLS 由反代/Tunnel 终结。
 
 ### Webmail（v1.0.0 新增）
 
@@ -110,79 +120,78 @@ MailStack 以自研 Rust 栈**替代** Postfix / OpenDKIM / fail2ban / Dovecot �
 > glibc < 2.39（如 Rocky/Oracle Linux 9）或 Alpine 请用全静态产物
 > （`deploy/build.sh --musl` 自行构建，见方式二）。
 
-### 方式一：一键脚本（推荐）
-
-```bash
-# 下载落盘后执行（推荐；缺省参数下会交互提示管理员口令）
-VERSION=1.0.0
-curl -fsSL "https://raw.githubusercontent.com/SectorPace/MailStack/v${VERSION}/deploy/install.sh" \
-  -o /tmp/mailstack-install.sh
-less /tmp/mailstack-install.sh
-
-sudo bash /tmp/mailstack-install.sh \
-  --domain mail.example.com \
-  --admin-user admin \
-  --admin-password-stdin
-
-# 无人值守/CI：口令经 stdin 传入（不落 argv，也不进 shell 历史）
-printf '%s\n' "$MAILSTACK_ADMIN_PASSWORD" | sudo bash /tmp/mailstack-install.sh \
-  --non-interactive --domain mail.example.com --admin-password-stdin
-```
-
-也支持直接一行（**管道模式 stdin 被脚本占用**，管理员口令经环境变量传入）：
+### 方式一：一行安装（推荐）
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh \
-  | MAILSTACK_ADMIN_PASSWORD='My-Admin-Pass-9' sudo -E bash -s -- \
-      --domain mail.example.com --admin-password-stdin --non-interactive
+  | sudo bash -s -- \
+      --domain mail.example.com \
+      --mail-host mail.example.com \
+      --admin-user admin \
+      --admin-password 'My-Admin-Pass-9' \
+      --access-mode caddy \
+      --acme-email ops@example.com
 ```
 
-脚本行为（以 `deploy/install.sh --help` 为准）：
+口令会经 argv 暴露，介意时先落盘再用 `--admin-password-stdin`（或环境变量
+`MAILSTACK_ADMIN_PASSWORD`）。安装器完成全部前提：系统用户/组、目录与权限、5 个二进制、
+特权包装器与 sudoers（`visudo -cf` 校验）、systemd unit、前端产物、管理员凭证引导、
+邮件身份与 DKIM、访问层（反向代理 / Tunnel / SSH 隧道说明），最后打印管理台/Webmail 地址。
 
-- 默认从 GitHub Release 下载 `mailstack-v1.0.0-x86_64-unknown-linux-gnu.tar.gz`
-  并**按 `SHA256SUMS` 校验**；
-- `--from-source`：从源码构建（需要 Rust 1.98.1 + C 编译器，见方式二）；
-- `--archive FILE|URL`：使用离线/显式指定的发布包；
-- `--binary-dir DIR`：使用已构建好的二进制（测试/离线安装）；
-- `--prefix DIR`：把整棵安装树装到指定根目录（staging/测试）；
-- `--no-systemd`：不安装 systemd unit（容器或无 systemd 环境），打印手工启动命令；
-- `--domain` / `--mail-host`：主域名与邮件主机名（身份与 DKIM 仍由 setup 向导完成）；
-- `--admin-user`（默认 `admin`）/ `--admin-password-stdin`：管理员引导（口令 12–256 位、含字母+数字）；
-- `--admin-port` / `--webmail-port`：默认 `8443` / `8444`；
-- `--imap yes|no`：是否安装并启用 IMAP/POP3（默认 `yes`）；
-- `--access-mode local|caddy|direct`：部署模式（写入 `install-args.conf` 的 `ACCESS_MODE`，
-  影响 Cookie `Secure`/公网限制等判定；重跑不显式给则保留原值）；
-- `--uninstall` / `--purge`：卸载（默认保留 `/etc/mailstack` 与 `/var/lib/mailstack`；
-  `--purge` 一并删除；也可用 `deploy/uninstall.sh`）。
+访问模式（`--access-mode`，默认 `ssh`；旧值 `local`/`caddy`/`direct` 仍兼容）：
 
-安装器会创建系统用户/组（`mailstack-admin`、`mailstack-webmail` 等）、目录与权限、
-`/usr/local/bin/` 下的二进制、**特权包装器** `/usr/local/libexec/mailstack-privileged` 与
-`/etc/sudoers.d/mailstack-admin`、systemd unit，并初始化管理员凭据；结束时打印管理台
-`http://127.0.0.1:8443/?login=1` 与 Webmail `http://127.0.0.1:8444` 地址。
+| 模式 | 入口方式 | 说明 |
+|---|---|---|
+| `ssh` | SSH 隧道 | 8443/8444 只绑回环，不装反代（默认，最安全） |
+| `caddy` | Caddy 反代 | 自动 ACME HTTPS（80/443 需公网可达） |
+| `nginx` | nginx 反代 | TLS 由 certbot/acme.sh 补；生成站点配置 |
+| `ip-acme` | 公网 IP + ACME | nginx 终止 TLS，证书走 `mailstackctl setup.cert.issue` |
+| `panel-domain` | 独立面板域名 | 如 `panel.example.com`，**必须**与 `mail/imap/smtp.example.com` 不同 |
+| `cloudflared` | Cloudflare Tunnel | 本机不开端口，cloudflared 连回环 8443/8444 |
 
-> 发布包同时提供 `mailstack-v1.0.0-x86_64-unknown-linux-musl.tar.gz`（全静态，适配
-> glibc < 2.39 与 Alpine）——用 `--archive <tarball>` 指定即可。
+```bash
+# 落盘执行（口令走 stdin，不落 argv）
+VERSION=1.0.0
+curl -fsSL "https://raw.githubusercontent.com/SectorPace/MailStack/v${VERSION}/deploy/install.sh" -o /tmp/mailstack-install.sh
+less /tmp/mailstack-install.sh
+printf '%s\n' "$MAILSTACK_ADMIN_PASSWORD" | sudo bash /tmp/mailstack-install.sh \
+  --non-interactive --domain mail.example.com --admin-user admin --admin-password-stdin --access-mode panel-domain --panel-host panel.example.com
+```
+
+其它参数：`--from-source`（源码构建）、`--archive FILE|URL`、`--binary-dir DIR`、`--prefix`
+（staging）、`--no-systemd`、`--no-access-provision`、`--admin-port`/`--webmail-port`、
+`--webmail-host`、`--server-ip`、`--uninstall`/`--purge`。完整说明见 `deploy/install.sh --help`
+与 [`docs/INSTALL.md`](docs/INSTALL.md)。
+
+### 服务器管理（`mailstack-manage`，3x-ui 风格）
+
+安装后提供 `sudo mailstack-manage`：无参数进入交互菜单，也可直接下命令（幂等、可脚本化）：
+
+```bash
+sudo mailstack-manage status
+sudo mailstack-manage domain set example.com --mail-host mail.example.com
+sudo mailstack-manage domain list
+sudo mailstack-manage account add alice@example.com --password-stdin
+sudo mailstack-manage account passwd alice@example.com --password-stdin
+sudo mailstack-manage tls issue mail.example.com --email ops@example.com
+sudo mailstack-manage access set caddy --panel-host panel.example.com --acme-email ops@example.com
+sudo mailstack-manage access set cloudflared     # 切访问方式，生成配置并 reload
+sudo mailstack-manage restart
+```
 
 ### 方式二：源码构建
 
 ```bash
-# 1) 依赖（示例：Debian/Ubuntu）：Rust 1.98.1（deploy/build.sh 与 CI 双重固定）、C 编译器
-#    rustup toolchain install 1.98.1
-
-# 2) 克隆并构建（产出 dist/：5 个二进制 + SHA256SUMS + SBOM）
+# 依赖：Rust 1.98.1（build.sh 与 CI 固定）、C 编译器；前端构建另需 Node.js
 git clone https://github.com/SectorPace/MailStack.git
 cd MailStack
-deploy/build.sh                # 可选 --musl 产出全静态二进制；--offline/--vendor 用于离线构建
-
-# 3) 构建前端产物（管理台 index.html + Webmail mail.html 同一次构建）
+deploy/build.sh                # 产出 dist/：5 个二进制 + 发布 tarball + SHA256SUMS + SBOM
 cd webui && npm ci && npm run build && cd ..
-
-# 4) 安装已构建产物
-sudo deploy/install.sh --binary-dir dist
+sudo deploy/install.sh --binary-dir dist --domain mail.example.com --admin-user admin \
+  --admin-password 'My-Admin-Pass-9' --access-mode ssh
 ```
 
-> 前端构建需要 Node.js（仅构建机需要；安装后生产运行时不需要 Node/npm）。
-> `deploy/install.sh --help` 会列出全部可用参数。
+> 发布资产同时提供全静态 musl tarball（glibc < 2.39 / Alpine）：`--archive <musl-tarball>`。
 
 ## 部署后首次配置
 
@@ -248,7 +257,7 @@ Webmail 与客户端都只读写 Maildir 与出站队列；所有变更动作经
 | crate | 包名 | 职责 |
 |---|---|---|
 | `crates/core` | `mailstack-core` | 领域模型、配置 schema、口令策略、审计哈希链、原子写/锁、命令原语、2FA、证书、`/proc` 采样、备份归档、手工封禁 |
-| `crates/priv` | `mailstack-priv` | 特权边界：动作门控（白名单/通道/confirm/AI 总闸）、RPC 帧、RO/RW socket 服务端、全部动作处理器 |
+| `crates/priv` | `mailstack-priv` | 特权边界：动作门控（白名单/通道/confirm）、RPC 帧、RO/RW socket 服务端、全部动作处理器 |
 | `crates/smtp` | `mailstack-smtp` | SMTP 客户端：IP 固定拨号、中继校验、分阶段测试、出站探测、MX 解析与直投目标、SSRF 地址策略、DNS 查询 |
 | `crates/smtpd` | `mailstack-smtpd` | 入站 SMTP 服务端：命令/会话状态机、DATA 字节流、TLS、限速与自动封禁、SASL、SPF/DKIM/DMARC 判定与入队 |
 | `crates/queue` | `mailstack-queue` | 出站队列：持久化、退避重试、投递租约、DSN 退信、并发限流、快速失败、DKIM 签名 |
@@ -284,8 +293,7 @@ Webmail 与客户端都只读写 Maildir 与出站队列；所有变更动作经
 - **Webmail 内容安全**：服务端 HTML parser 级 allowlist 消毒（脚本/样式/iframe/表单/
   事件属性全丢）、URL 协议白名单、远程图片默认阻断、附件强制 `nosniff` +
   `Content-Disposition`、`sandbox=""` iframe、CSP。
-- **SSRF 防线**：直投 MX 与 AI 出站都走地址策略白名单（环回/私网/link-local/CGNAT/
-  IPv6 内嵌 IPv4 一律拒绝），AI 端点强制 HTTPS。
+- **SSRF 防线**：直投 MX 走地址策略白名单（环回/私网/link-local/CGNAT/IPv6 内嵌 IPv4 一律拒绝）。
 - **供应链**：`cargo-deny`（漏洞/许可/通配/来源）+ `cargo audit` 在 CI 强制；
   GitHub Actions 全部 pin 到 commit SHA；发布包附 `SHA256SUMS`。
 
@@ -349,10 +357,10 @@ v1.0.0 发布门禁实测（Ubuntu 26.04 / WSL2 + Rust 1.98.1，2026-11-03）：
 
 | 指标 | 实测值 |
 |---|---|
-| `cargo test --workspace --all-targets` | **1701 通过 / 0 失败**（含真实 TLS/TCP/unix socket 集成测试） |
+| `cargo test --workspace --all-targets` | **1647 通过 / 0 失败**（含真实 TLS/TCP/unix socket 集成测试；AI 功能移除后减少 55 项） |
 | 前端 `npm test`（vitest） | **187 通过 / 0 失败** |
-| 特权动作白名单 | **59 条**（只读 21 + 变更 38） |
-| HTTP 契约路由 | **73 条**（含 2 条免认证） |
+| 特权动作白名单 | **52 条**（只读 20 + 变更 32；AI 功能已移除） |
+| HTTP 契约路由 | **62 条**（含 2 条免认证；AI 路由已移除） |
 | 安全不变量清单 | **293 条**（`deploy/verify-invariant-gate.sh` 全部通过） |
 
 v1.0.0 发布前通过的门禁（CI 与本地同一命令链，Ubuntu + Rust 1.98.1）：

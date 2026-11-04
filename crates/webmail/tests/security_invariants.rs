@@ -1,17 +1,3 @@
-//! Webmail 安全不变量测试（反例优先）。
-//!
-//! 这里的测试函数名与 `deploy/required-invariants.txt` 中的条**逐字一致**，
-//! 由 `deploy/verify-invariant-gate.sh` 校验「测试仍然存在、仍然是测试、
-//! 断言没有被掏空」。因此：
-//!
-//! * 每个函数都必须带 `#[test]` / `#[tokio::test]`；
-//! * 函数体内必须至少有一个 `assert*`；
-//! * 只写「成功路径」不算数——这里的每条用例都先构造攻击/坏输入，再断言拒绝。
-//!
-//! 覆盖：未认证 401、CSRF 403、会话纪元失效、folder 路径穿越、HTML XSS、
-//! 远程图片阻断、头注入、附件大小、非空文件夹删除、API 不回落 HTML、
-//! 队列入队失败语义、登录限流。
-
 mod common;
 
 use axum::http::{header, Method, StatusCode};
@@ -20,7 +6,6 @@ use mailstack_imappop3::maildir::{Flag, FlagSet, SystemFlag};
 use mailstack_webmail::compose::{build_message, AttachmentInput, ComposeRequest, Purpose};
 use mailstack_webmail::MAX_ATTACHMENT_TOTAL_BYTES;
 
-/// 12 条不变量测试之一：未认证请求必须 401。
 #[tokio::test]
 async fn webmail_session_requires_authentication() {
     let fixture = Fixture::new();
@@ -43,7 +28,6 @@ async fn webmail_session_requires_authentication() {
         assert_eq!(body["error"]["code"], "UNAUTHORIZED", "{uri}");
     }
 
-    // 伪造 cookie 同样是未认证（不是「带着 cookie 就算登录」）。
     let response = fixture
         .request(
             Method::GET,
@@ -55,13 +39,11 @@ async fn webmail_session_requires_authentication() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// 12 条不变量测试之一：写请求缺少 CSRF token 必须 403。
 #[tokio::test]
 async fn webmail_csrf_rejects_missing_token() {
     let fixture = Fixture::new();
     let (cookie, csrf) = fixture.login().await;
 
-    // 没有 x-csrf-token。
     let response = fixture
         .request(
             Method::POST,
@@ -73,7 +55,6 @@ async fn webmail_csrf_rejects_missing_token() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(body_json(response).await["error"]["code"], "CSRF_REJECTED");
 
-    // 错误的 token。
     let response = fixture
         .request(
             Method::POST,
@@ -87,7 +68,6 @@ async fn webmail_csrf_rejects_missing_token() {
         .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-    // PATCH / DELETE 同样必须校验。
     for method in [Method::PATCH, Method::DELETE] {
         let response = fixture
             .request(
@@ -100,7 +80,6 @@ async fn webmail_csrf_rejects_missing_token() {
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
     }
 
-    // 正确的 token 才放行（对照组：避免「全拒」把测试写绿）。
     let response = fixture
         .request(
             Method::POST,
@@ -112,7 +91,6 @@ async fn webmail_csrf_rejects_missing_token() {
     assert_eq!(response.status(), StatusCode::CREATED);
 }
 
-/// 12 条不变量测试之一：会话纪元 bump 之后旧会话立即失效。
 #[tokio::test]
 async fn webmail_session_epoch_bump_invalidates_existing_sessions() {
     let fixture = Fixture::new();
@@ -127,7 +105,6 @@ async fn webmail_session_epoch_bump_invalidates_existing_sessions() {
         .await;
     assert_eq!(response.status(), StatusCode::OK, "登录后会话应有效");
 
-    // 账号管理侧 bump 纪元（模拟改密/锁定）。
     std::fs::write(
         &fixture.paths.webmail_session_epoch,
         r#"{"version":1,"epochs":{"alice@example.com":1}}"#,
@@ -148,7 +125,6 @@ async fn webmail_session_epoch_bump_invalidates_existing_sessions() {
         "纪元 bump 之后旧会话必须 401"
     );
 
-    // 重新登录（记录新纪元）后恢复正常。
     let (cookie2, _csrf2) = fixture.login().await;
     let response = fixture
         .request(
@@ -161,14 +137,12 @@ async fn webmail_session_epoch_bump_invalidates_existing_sessions() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-/// 12 条不变量测试之一：folder 名路径穿越必须被拒绝。
 #[tokio::test]
 async fn webmail_folder_name_traversal_is_rejected() {
     let fixture = Fixture::new();
     let (cookie, csrf) = fixture.login().await;
     let headers = Fixture::auth_headers(&cookie, &csrf);
 
-    // 查询参数里的穿越。
     for folder in ["..", "../..", "../../etc", "a/b", "a\\b", "..%2f..%2fetc"] {
         let uri = format!("/mail/api/messages?folder={folder}");
         let response = fixture.request(Method::GET, &uri, &headers, None).await;
@@ -179,7 +153,6 @@ async fn webmail_folder_name_traversal_is_rejected() {
         );
     }
 
-    // 路径参数里的穿越（URL 编码的 `/` 由 Path 解码后仍要经 normalize）。
     let response = fixture
         .request(
             Method::DELETE,
@@ -190,7 +163,6 @@ async fn webmail_folder_name_traversal_is_rejected() {
         .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    // 重命名到穿越名同样拒绝。
     let response = fixture
         .request(
             Method::PATCH,
@@ -201,7 +173,6 @@ async fn webmail_folder_name_traversal_is_rejected() {
         .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    // Maildir 之外没有被创建任何东西：文件夹仍只有 INBOX。
     let response = fixture
         .request(Method::GET, "/mail/api/folders", &headers, None)
         .await;
@@ -215,7 +186,6 @@ async fn webmail_folder_name_traversal_is_rejected() {
     assert_eq!(names, vec!["INBOX"]);
 }
 
-/// 12 条不变量测试之一：HTML 消毒器必须剥掉脚本与事件处理器。
 #[tokio::test]
 async fn webmail_html_sanitizer_strips_scripts_and_event_handlers() {
     let fixture = Fixture::new();
@@ -259,7 +229,6 @@ async fn webmail_html_sanitizer_strips_scripts_and_event_handlers() {
     assert!(html.contains("hello"), "正常文本必须保留：{html}");
 }
 
-/// 12 条不变量测试之一：远程图片默认阻断，显式 images=1 才放行。
 #[tokio::test]
 async fn webmail_html_sanitizer_blocks_remote_images_by_default() {
     let fixture = Fixture::new();
@@ -288,7 +257,6 @@ async fn webmail_html_sanitizer_blocks_remote_images_by_default() {
     );
     assert_eq!(body["message"]["remoteImagesBlocked"], 1);
 
-    // 显式允许（?images=1）时保留。
     let response = fixture
         .request(
             Method::GET,
@@ -303,7 +271,6 @@ async fn webmail_html_sanitizer_blocks_remote_images_by_default() {
     assert_eq!(body["message"]["remoteImagesBlocked"], 0);
 }
 
-/// 12 条不变量测试之一：主题 / 地址里的 CRLF 必须拒绝（头注入）。
 #[tokio::test]
 async fn webmail_compose_rejects_header_injection() {
     let fixture = Fixture::new();
@@ -363,7 +330,6 @@ async fn webmail_compose_rejects_header_injection() {
         );
     }
 
-    // 关键：被拒绝的请求一封都没入队。
     let entries = fixture.queue_root().join("entries");
     let queued = entries
         .read_dir()
@@ -372,7 +338,6 @@ async fn webmail_compose_rejects_header_injection() {
     assert!(!queued, "头注入请求不得入队");
 }
 
-/// 12 条不变量测试之一：附件总量上限 25 MiB 必须被强制。
 #[tokio::test]
 async fn webmail_attachment_size_limit_is_enforced() {
     let account = common::test_account();
@@ -392,7 +357,6 @@ async fn webmail_attachment_size_limit_is_enforced() {
     assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(error.code, "PAYLOAD_TOO_LARGE");
 
-    // 上限之内的小附件可以通过（对照组）。
     let small = ComposeRequest {
         to: vec!["bob@example.org".to_string()],
         subject: "small".to_string(),
@@ -407,7 +371,6 @@ async fn webmail_attachment_size_limit_is_enforced() {
     assert!(build_message(&account, &small, Purpose::Send).is_ok());
 }
 
-/// 12 条不变量测试之一：非空文件夹禁止删除（防误删数据）。
 #[tokio::test]
 async fn webmail_non_empty_folder_delete_is_refused() {
     let fixture = Fixture::new();
@@ -448,7 +411,6 @@ async fn webmail_non_empty_folder_delete_is_refused() {
         "FOLDER_NOT_EMPTY"
     );
 
-    // 文件夹仍然在（没有被删掉）。
     let response = fixture
         .request(Method::GET, "/mail/api/folders", &headers, None)
         .await;
@@ -459,7 +421,6 @@ async fn webmail_non_empty_folder_delete_is_refused() {
         .iter()
         .any(|folder| folder["name"] == "Projects"));
 
-    // 清空之后才允许删除。
     let store = fixture.store();
     let projects = store.open_folder("Projects", false).expect("open");
     let project_uid = projects.messages[0].uid;
@@ -478,7 +439,6 @@ async fn webmail_non_empty_folder_delete_is_refused() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
-/// 12 条不变量测试之一：`/mail/api` 的兜底永远是 JSON，绝不回 HTML。
 #[tokio::test]
 async fn webmail_api_never_falls_back_to_html() {
     let dist = tempfile::tempdir().expect("dist");
@@ -504,18 +464,16 @@ async fn webmail_api_never_falls_back_to_html() {
     assert!(!text.contains("MAIL-ENTRY"), "API 兜底不得回入口 HTML");
     assert!(!text.contains("<html"));
 
-    // 对照：页面请求确实拿到 HTML（证明 dist 生效，而不是「全都 404」）。
     let response = fixture.request(Method::GET, "/", &[], None).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(String::from_utf8_lossy(&body_bytes(response).await).contains("MAIL-ENTRY"));
 }
 
-/// 12 条不变量测试之一：队列入队失败必须如实上报（不得假装已发送）。
 #[tokio::test]
 async fn webmail_queue_enqueue_failure_is_reported() {
     let fixture = Fixture::new();
     let (cookie, csrf) = fixture.login().await;
-    // 破坏队列目录：把 entries 的位置占成一个普通文件。
+
     let entries = fixture.queue_root().join("entries");
     std::fs::create_dir_all(entries.parent().expect("queue parent")).expect("queue dir");
     std::fs::write(&entries, b"not a directory").expect("sabotage queue");
@@ -542,7 +500,6 @@ async fn webmail_queue_enqueue_failure_is_reported() {
         "QUEUE_UNAVAILABLE"
     );
 
-    // 不得留下 Sent 副本（否则用户会看到「已发送」的假象）。
     let store = fixture.store();
     let sent_empty = store
         .open_folder("Sent", false)
@@ -551,7 +508,6 @@ async fn webmail_queue_enqueue_failure_is_reported() {
     assert!(sent_empty, "入队失败时不得产生 Sent 副本");
 }
 
-/// 12 条不变量测试之一：登录必须限流（429 + TOO_MANY_ATTEMPTS）。
 #[tokio::test]
 async fn webmail_login_is_rate_limited() {
     let fixture = Fixture::new();
@@ -597,8 +553,6 @@ async fn webmail_login_is_rate_limited() {
     assert_eq!(retry_after, Some(true));
 }
 
-/// 会话纪元文件存在时的解析与「过期会话不复活」在库层已覆盖；这里补一条
-/// 端到端：登出后旧 cookie 必须立即失效。
 #[tokio::test]
 async fn logging_out_invalidates_the_session_cookie() {
     let fixture = Fixture::new();
@@ -612,7 +566,7 @@ async fn logging_out_invalidates_the_session_cookie() {
         )
         .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    // 作废 Cookie 必须是配对的（名字与 Secure 由同一判定给出）。
+
     let set_cookie = response
         .headers()
         .get(header::SET_COOKIE)
@@ -631,7 +585,6 @@ async fn logging_out_invalidates_the_session_cookie() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// 未使用的 Flag 类型提醒：导入保持与契约标志映射一致的编译面。
 #[test]
 fn flag_imports_match_the_contract_names() {
     let mut flags = FlagSet::new();

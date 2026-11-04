@@ -1,21 +1,12 @@
-//! LMTP 收件人路由（替代 Dovecot LMTP 的 `userdb` 查询）。
-//!
-//! LMTP 只负责「把一封信投进哪个 Maildir」。本模块把这一步抽象成
-//! [`LmtpRouter`]：生产装配从 MailStack 的邮箱注册表装载，测试用
-//! [`MapRouter`]。路由是同步的（内存表），因为投递路径不应在收信事务里
-//! 做网络往返；需要外部目录时，应在启动时把结果缓存进来。
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::maildir::MailStore;
 
-/// 收件人 → 目标邮箱。
 pub trait LmtpRouter: Send + Sync {
     fn route(&self, recipient: &str) -> Option<Arc<MailStore>>;
 }
 
-/// 内存路由表（地址大小写不敏感，`<>` 会被剥掉）。
 #[derive(Default)]
 pub struct MapRouter {
     routes: HashMap<String, Arc<MailStore>>,

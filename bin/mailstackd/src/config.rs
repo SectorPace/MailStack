@@ -1,19 +1,3 @@
-//! 配置装配：`Paths` + CLI → [`RuntimeConfig`]。
-//!
-//! 本模块是**纯决策**：不绑定 socket、不读取证书内容、不发起网络请求。因此
-//! 「什么情况下拒绝启动」可以被完整单测 —— 而这些判定恰恰是最值得测的部分。
-//!
-//! ## 唯一的组织原则：区分「必须失败」与「安全降级」
-//!
-//! | 情形 | 处理 | 理由 |
-//! |---|---|---|
-//! | `setup.json` 缺失/损坏 | **失败** | 它决定问候名、`Reporting-MTA`、证书路径与 postmaster。猜一个等于冒认身份 |
-//! | 域名表为空 | **失败** | 库层会 fail-closed 拒收全部收件人（INV-17），但那是「静默变砖」；启动即失败才看得见 |
-//! | `relay.json` 损坏 | **失败** | 与「未配置」是两件事。当成未配置就会退回直投，违反 INV-18/INV-21 |
-//! | `relay.json` 不存在 | 降级为 `None` | 这是合法的「尚未配置中继」状态 |
-//! | `settings.json` 缺失/损坏 | 降级为默认值 | `read_settings` 已内置该语义，且默认值本身是安全的 |
-//! | 中继未启用加密 | **失败** | 会以明文投递（INV-13），且可能把 SASL 口令发出去 |
-
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
@@ -30,13 +14,8 @@ use mailstack_store::{LmtpEndpoint, TableStore};
 
 use crate::error::DaemonError;
 
-/// 默认监听端口：25（MX）、465（隐式 TLS）、587（提交）。
 pub const DEFAULT_PORTS: &[u16] = &[25, 465, 587];
 
-/// 被认为「确实启用了加密」的 `smtp_tls_security_level` 取值。
-///
-/// 刻意**排除** `none` 与 `may`：`may` 是机会性加密，允许在对方不支持时退回明文，
-/// 而我们要在这条链路上发送 SASL 口令 —— 退回明文等于把口令交出去。
 const ENCRYPTING_SECURITY_LEVELS: &[&str] = &[
     "encrypt",
     "secure",
@@ -46,28 +25,16 @@ const ENCRYPTING_SECURITY_LEVELS: &[&str] = &[
     "verify",
 ];
 
-/// 一个入站监听的计划。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListenerPlan {
     pub port: u16,
-    /// 465 是隐式 TLS（建连即握手），其余端口用 STARTTLS 升级。
+
     pub mode: TlsMode,
-    /// 是否在 EHLO 里通告 STARTTLS。隐式 TLS 上必须为 `false`。
+
     pub offer_starttls: bool,
-    /// 是否通告 SASL AUTH（§3.5）。
-    ///
-    /// 只在**提交端口**（465/587）上开：25 是 MX 收信口，客户端提交不该走它，
-    /// 在那里开放认证只是白白多出一个口令攻击面。
+
     pub offer_auth: bool,
-    /// 是否强制「提交先认证」（未认证 `MAIL` → `530 5.7.0`）。
-    ///
-    /// **465 与 587 都置位**：这两个端口都是 RFC 8314 §5 定义的 *submissions*
-    /// （提交口），规范要求其上的提交必须认证。不设防的提交口是垃圾邮件的免费
-    /// 通道 —— 认证前的会话仍然能投给本域收件人，等于给任何拨号进来的主机留了
-    /// 一个匿名入站口；而伪造的本地发件人还不经 SPF/DKIM/DMARC 判定，收件人
-    /// 看到的就是「内部同事发来的」信。
-    ///
-    /// 25 是 MX 义务（必须对全世界开放收信），维持 `false`。
+
     pub require_auth_for_submission: bool,
 }
 
@@ -79,8 +46,7 @@ impl ListenerPlan {
                 mode: TlsMode::Implicit,
                 offer_starttls: false,
                 offer_auth: true,
-                // 465 与 587 同属 submissions：隐式 TLS 只是传输层形态，
-                // 不改变「提交必须认证」这条规范要求。
+
                 require_auth_for_submission: true,
             },
             587 => Self {
@@ -101,18 +67,17 @@ impl ListenerPlan {
     }
 }
 
-/// 装配完成的运行期配置（纯数据）。
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub paths: Paths,
-    /// 本机对外的邮件主机名（`setup.json` 的 `mailHost`）。
+
     pub mail_host: String,
-    /// 主域（`setup.json` 的 `domain`），证书目录名。
+
     pub domain: String,
-    /// 证书/私钥路径（**尚未**装载 —— 装载在监听绑定阶段，见 `listeners`）。
+
     pub cert_paths: CertPaths,
     pub listeners: Vec<ListenerPlan>,
-    /// 会话基底配置；每个监听在其上按端口覆盖 `offer_starttls`/`tls_active`。
+
     pub session: SessionConfig,
     pub relay_policy: RelayPolicy,
     pub rate_limit: RateLimitConfig,
@@ -120,54 +85,41 @@ pub struct RuntimeConfig {
     pub queue_config: QueueConfig,
     pub queue_root: PathBuf,
     pub lmtp_endpoint: LmtpEndpoint,
-    /// 已校验的中继端点；`None` 表示尚未配置中继（直投）。
+
     pub relay_endpoint: Option<RelayEndpoint>,
-    /// **部署**是否允许私网目标（非公网档才允许）。决定拨号时的地址策略。
-    ///
-    /// 注意它和 `RelayValidationRequest::allow_private_network` 不是同一件事：后者表达
-    /// 「这个中继**本身**需不需要私网许可」。两者一起才构成 INV-15 的判定。
+
     pub allow_private_network: bool,
 }
 
-/// 据 `Paths` 与监听端口装配运行期配置。
-///
-/// 全部失败都是启动期失败（见模块说明）。
 pub fn assemble(paths: Paths, ports: &[u16]) -> Result<RuntimeConfig, DaemonError> {
     if ports.is_empty() {
         return Err(DaemonError::NoListeners);
     }
 
-    // ── 1) 身份：缺失即拒绝启动 ──
     let setup = read_setup_config(&paths)
         .ok_or_else(|| DaemonError::SetupMissing(paths.setup_config.clone()))?;
     let cert_paths = CertPaths::for_domain(&paths.etc, &setup.domain)?;
 
-    // ── 2) 设置：缺失/损坏回落到安全默认值 ──
     let settings = read_settings(&paths);
 
-    // ── 3) 域名表：空表会被库层 fail-closed，但那是静默变砖，这里直接拒绝 ──
     let domains = TableStore::new(paths.clone()).domains();
     if domains.is_empty() {
         return Err(DaemonError::DomainTableEmpty(paths.domains.clone()));
     }
 
-    // ── 4) 队列目录：启动时就把权限问题暴露出来 ──
     let queue_root = paths.var_lib.join("queue");
     prepare_queue_dir(&queue_root)?;
 
-    // ── 5) 中继：区分「未配置」与「配置坏了」 ──
     let allow_private_network = !mode::is_public_mode(&paths);
     let relay_endpoint = load_relay(&paths, allow_private_network)?;
 
-    // ── 6) 派生 ──
     let listeners: Vec<ListenerPlan> = ports.iter().copied().map(ListenerPlan::for_port).collect();
 
     let session = SessionConfig {
         hostname: settings.hostname.clone(),
         max_message_size: settings.max_message_size_mb as usize * 1024 * 1024,
         postmaster: Some(format!("postmaster@{}", setup.domain)),
-        // SASL 是否通告由**监听计划**按端口决定（只有提交端口 465/587 开），
-        // 这里只提供基底；`build_server` 会用 `plan.offer_auth` 覆盖。
+
         offer_auth: false,
         ..SessionConfig::default()
     };
@@ -179,8 +131,6 @@ pub fn assemble(paths: Paths, ports: &[u16]) -> Result<RuntimeConfig, DaemonErro
         ..QueueConfig::default()
     };
 
-    // 本地投递默认落箱到**自己的** LMTP 服务端（Sieve 在那里生效）；
-    // 显式设置 MAILSTACK_LMTP_SOCKET/ADDR 才指向别的实现（如仍在运行的 Dovecot）。
     let lmtp_endpoint =
         LmtpEndpoint::from_env_with_default(LmtpEndpoint::unix(paths.run_dir.join("lmtp.sock")));
 
@@ -202,11 +152,6 @@ pub fn assemble(paths: Paths, ports: &[u16]) -> Result<RuntimeConfig, DaemonErro
     })
 }
 
-/// 创建队列目录并**实际探测可写性**。
-///
-/// `QueueStore::enqueue` 内部走 `atomic_as`，它会 `create_dir_all(parent)`，所以缺目录
-/// 并不会让写入失败 —— 那样问题要等到第一封来信才暴露。启动时探测一次，让故障早于
-/// 「收到信却存不下」出现。
 fn prepare_queue_dir(dir: &Path) -> Result<(), DaemonError> {
     std::fs::create_dir_all(dir).map_err(|error| DaemonError::QueueDir {
         path: dir.to_path_buf(),
@@ -222,14 +167,6 @@ fn prepare_queue_dir(dir: &Path) -> Result<(), DaemonError> {
     Ok(())
 }
 
-/// 读取并校验中继配置。
-///
-/// 返回 `Ok(None)` **只**在「配置里根本没有 relayhost」时发生。文件损坏、relayhost
-/// 存在却无法通过校验，一律是错误 —— 静默退回直投会违反 INV-18/INV-21。
-///
-/// `deployment_allows_private` 是**部署策略**（非公网档才为真）；而请求里的
-/// `allow_private_network` 表达的是「这个中继**本身**需不需要私网许可」。两者一起才
-/// 构成 INV-15 的判定：`validate_relay` 只在「需要却没有」时拒绝。
 fn load_relay(
     paths: &Paths,
     deployment_allows_private: bool,
@@ -240,7 +177,6 @@ fn load_relay(
         .read_key(KEY_RELAYHOST)
         .map_err(DaemonError::RelayConfig)?;
     let Some(relayhost) = relayhost else {
-        // 文件不存在或没有该键 = 尚未配置中继，这是合法状态。
         return Ok(None);
     };
     let relayhost = relayhost.trim().to_string();
@@ -263,7 +199,6 @@ fn load_relay(
         Some(content) => {
             let matched = match_credentials(&content, &host, port);
             if matched.is_none() {
-                // 凭证映射存在但没有这一项：部分 smarthost 允许匿名，故只告警。
                 tracing::warn!(
                     relay = %relayhost,
                     "凭证映射中没有该中继的条目，将按无凭证连接"
@@ -275,7 +210,6 @@ fn load_relay(
     };
 
     let request = RelayValidationRequest {
-        // 请求侧的语义是「本中继需不需要私网许可」，**不是**部署策略。
         allow_private_network: host_needs_private_network(&host),
         host,
         port,
@@ -284,7 +218,6 @@ fn load_relay(
         password,
     };
     let endpoint = validate_relay(&request, deployment_allows_private).map_err(|error| {
-        // 私网被拒是配置问题，给一条能直接照做的提示，而不是让运维去猜。
         if matches!(error, mailstack_smtp::SmtpError::PrivateRelayDisabled) {
             tracing::error!(
                 relay = %request_host(&request),
@@ -297,14 +230,6 @@ fn load_relay(
     Ok(Some(endpoint))
 }
 
-/// 该中继主机是否**字面量就落在非公网地址段**。
-///
-/// 主机名一律返回 `false` —— 它解析成什么地址由拨号时的 [`AddressPolicy`] 约束，
-/// 配置阶段无从判断。
-///
-/// 判定直接复用出站侧的 `AddressPolicy::public_only()`：非公网可路由的地址集合
-/// （私网、环回、链路本地、CGNAT、198.18/15 基准段等）在那一处已有唯一定义，
-/// 在这里另写一份迟早会与它漂移。
 fn host_needs_private_network(host: &str) -> bool {
     match host.parse::<std::net::IpAddr>() {
         Ok(ip) => !AddressPolicy::public_only().accepts(ip),
@@ -316,20 +241,13 @@ fn request_host(request: &RelayValidationRequest) -> String {
     format!("[{}]:{}", request.host, request.port)
 }
 
-/// 解析 `relayhost`：接受 `[host]:port`、`host:port` 与裸 `host`（裸 host 按 Postfix 惯例取 25）。
-///
-/// 方括号表示「不做 MX 解析，直接连该主机」（§5.9.5）。
 fn parse_relayhost(value: &str) -> Result<(String, u16), DaemonError> {
     let value = value.trim();
-    // 裸 IPv6（如 `::1`）无法与 `host:port` 区分：按下面的 rsplit 规则它会被拆成
-    // host=`::`、port=1，静默得到一个错误的中继端点。多个冒号即视为 IPv6 字面量
-    // （普通 `host:port` 只有一个冒号，不受影响），直接拒绝并给出可照做的写法
-    // —— Postfix 自己也要求 IPv6 字面量加方括号。
+
     if value.matches(':').count() > 1 && !value.starts_with('[') {
         return Err(DaemonError::RelayHostBareIpv6(value.to_string()));
     }
     let (host_part, port) = match value.rsplit_once(':') {
-        // `[::1]:25` 的最后一段是端口；`[::1]` 的最后一段落在方括号内，须排除。
         Some((head, tail)) if !tail.contains(']') => {
             let port = tail
                 .parse::<u16>()
@@ -350,7 +268,6 @@ fn parse_relayhost(value: &str) -> Result<(String, u16), DaemonError> {
     Ok((host, port))
 }
 
-/// 由 Postfix 语义推导中继 TLS 模式字符串（供 `validate_relay` 校验）。
 fn relay_tls_mode(
     wrappermode: &str,
     port: u16,
@@ -366,7 +283,6 @@ fn relay_tls_mode(
     Err(DaemonError::RelayNotEncrypted(port))
 }
 
-/// 在 `sasl_passwd` 内容里找与 `(host, port)` 匹配的凭证。
 fn match_credentials(content: &str, host: &str, port: u16) -> Option<(String, String)> {
     parse_sasl_passwd(content).into_iter().find_map(|entry| {
         let (entry_host, entry_port) = parse_relayhost(&entry.relayhost).ok()?;
@@ -378,7 +294,6 @@ fn match_credentials(content: &str, host: &str, port: u16) -> Option<(String, St
     })
 }
 
-/// 监听地址：全部网卡的 IPv4。
 pub fn listen_addr(port: u16) -> std::net::SocketAddr {
     std::net::SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))
 }
@@ -395,7 +310,6 @@ mod tests {
   "updatedAt": "2026-10-01T00:00:00Z"
 }"#;
 
-    /// 搭一个最小可用的配置根：setup + 非空域名表。
     fn root() -> (tempfile::TempDir, Paths) {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::rooted(dir.path());
@@ -406,7 +320,6 @@ mod tests {
         (dir, paths)
     }
 
-    /// 修改进程级环境变量的测试串行执行用的锁（与 crates/core/src/warn.rs 测试同一模式）。
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -463,8 +376,7 @@ mod tests {
                 mode: TlsMode::Implicit,
                 offer_starttls: false,
                 offer_auth: true,
-                // 465 是 RFC 8314 的 submissions（隐式 TLS 提交口）：提交必须认证，
-                // 否则未认证会话可以用伪造的本地发件人直接投进本域邮箱。
+
                 require_auth_for_submission: true
             }
         );
@@ -475,7 +387,7 @@ mod tests {
                 mode: TlsMode::StartTls,
                 offer_starttls: true,
                 offer_auth: true,
-                // 587 是提交口：未认证会话不得开事务（530 5.7.0）。
+
                 require_auth_for_submission: true
             }
         );
@@ -485,7 +397,7 @@ mod tests {
                 port: 25,
                 mode: TlsMode::StartTls,
                 offer_starttls: true,
-                // 25 是 MX 收信口，不是提交口：在那里开放认证只是多一个口令攻击面。
+
                 offer_auth: false,
                 require_auth_for_submission: false
             }
@@ -523,7 +435,6 @@ mod tests {
 
     #[test]
     fn a_corrupt_relay_config_is_fatal_and_never_falls_back_to_direct() {
-        // 这是本模块最重要的一条：把「配置坏了」当成「没配置」会导致静默退回直投。
         let (_dir, paths) = root();
         std::fs::write(&paths.relay_config, "{ this is not json").unwrap();
 
@@ -582,7 +493,6 @@ mod tests {
 
     #[test]
     fn port_465_implies_wrappermode_even_without_the_explicit_key() {
-        // INV-20：465 必须走隐式 TLS，否则会以明文连 465、投递卡在队列。
         let (_dir, paths) = root();
         std::fs::write(
             &paths.relay_config,
@@ -597,12 +507,8 @@ mod tests {
 
     #[test]
     fn a_private_relay_is_only_allowed_when_the_deployment_opt_in_is_present() {
-        // 修改进程级环境变量的测试必须持有 env_lock：测试默认并行执行，
-        // 而环境变量是进程全局的，不加锁会与其他用例互踩（此前只在本用例里
-        // remove_var，与并行跑的其它测试存在竞态）。
         let _env_guard = env_lock();
-        // 公网档下私网中继必须被拒（INV-15 的部署策略侧）。
-        // 判定只由 ACCESS_MODE 决定：清掉可能影响结果的环境变量，避免测试随开发机漂移。
+
         std::env::remove_var("MAILSTACK_SECURITY_PROFILE");
 
         let (_dir, paths) = root();
@@ -615,12 +521,10 @@ mod tests {
         )
         .unwrap();
 
-        // `direct`（面向公网）⇒ 不得使用私网中继。
         std::fs::write(&paths.install_args_conf, "ACCESS_MODE=direct\n").unwrap();
         let error = assemble(paths.clone(), &[25]).expect_err("公网档不得使用私网中继");
         assert!(matches!(error, DaemonError::Relay(_)), "实际：{error:?}");
 
-        // `local`（仅内网）⇒ 允许私网 smarthost。
         std::fs::write(&paths.install_args_conf, "ACCESS_MODE=local\n").unwrap();
         let config = assemble(paths, &[25]).expect("本地档应允许私网中继");
         assert!(config.allow_private_network);
@@ -648,8 +552,7 @@ mod tests {
             "IPv6 字面量不得被当成端口"
         );
         assert_eq!(parse_relayhost("[::1]").unwrap(), ("::1".to_string(), 25));
-        // 裸 IPv6 无法与 `host:port` 区分，必须被拒并提示 [::1] 写法，
-        // 而不是被静默拆成 host="::"、port=1。
+
         assert!(
             matches!(
                 parse_relayhost("::1"),

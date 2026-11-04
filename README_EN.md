@@ -67,11 +67,23 @@ with its own Rust stack; running side by side with Postfix is supported during m
   default `127.0.0.1:8443`).
 - Every admin API is served by the Rust backend: setup wizard, domains/aliases/mailbox users, settings,
   2FA, DKIM rotation, ACME certificates, service and queue actions, manual bans, backup/restore, logs,
-  telemetry, and AI outbound configuration.
+  telemetry.
 - The frontend bundle is treated as **external input**: the backend only guarantees path safety,
   content types, and that the `/api` fallback is always a JSON 404. Without `--dist` the service
   exposes the API only and page requests return **503** (not a blank 200).
 - Bilingual UI (Chinese/English) with light and dark themes (`data-theme`).
+
+### Deployment and server management (v1.0.0)
+
+- **One-line install**: `curl ... | sudo bash -s -- --domain ... --admin-user ... --admin-password ... --access-mode ...`
+  provisions users/groups, directories, binaries, privileged wrapper, sudoers, systemd units,
+  frontend bundle, admin credentials, mail identity/DKIM, and the access layer.
+- **`mailstack-manage`**: server-side CLI + interactive menu for domains, mailbox accounts,
+  password resets, TLS issuance/renewal, and access-mode switching; state lives in
+  `/etc/mailstack/install-args.conf`.
+- **Six access modes**: SSH tunnel (default), Caddy, nginx, public IP + ACME, dedicated panel
+  hostname (must differ from `mail/imap/smtp` hosts), and Cloudflare Tunnel. 8443/8444 always
+  bind loopback only; TLS terminates at the proxy/tunnel.
 
 ### Webmail (new in v1.0.0)
 
@@ -135,83 +147,73 @@ with its own Rust stack; running side by side with Postfix is supported during m
 > On glibc < 2.39 (e.g. Rocky/Oracle Linux 9) or Alpine, use a fully static build
 > (build one yourself with `deploy/build.sh --musl`, see Option 2).
 
-### Option 1: one-liner installer (recommended)
+### Option 1: one-line install (recommended)
 
 ```bash
-# Download first, then run (recommended; prompts for the admin password by default)
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh \\
+  | sudo bash -s -- \\
+      --domain mail.example.com \\
+      --mail-host mail.example.com \\
+      --admin-user admin \\
+      --admin-password 'My-Admin-Pass-9' \\
+      --access-mode caddy \\
+      --acme-email ops@example.com
+```
+
+The installer sets up everything: system users/groups, directories and permissions, the five
+binaries, the privileged wrapper plus sudoers (`visudo -cf` validated), systemd units, frontend
+bundle, admin credentials, mail identity and DKIM, and the access layer (reverse proxy / tunnel /
+SSH-tunnel notes), then prints the admin and Webmail URLs.
+
+Access modes (`--access-mode`, default `ssh`; legacy `local`/`caddy`/`direct` still accepted):
+
+| Mode | Entry | Notes |
+|---|---|---|
+| `ssh` | SSH tunnel | 8443/8444 stay loopback-only, no proxy installed (default, safest) |
+| `caddy` | Caddy reverse proxy | automatic ACME HTTPS (80/443 public) |
+| `nginx` | nginx reverse proxy | TLS via certbot/acme.sh; site config generated |
+| `ip-acme` | public IP + ACME | nginx terminates TLS, cert via `mailstackctl setup.cert.issue` |
+| `panel-domain` | separate panel hostname | e.g. `panel.example.com`, must differ from `mail/imap/smtp.example.com` |
+| `cloudflared` | Cloudflare Tunnel | no local ports exposed; tunnel to loopback 8443/8444 |
+
+```bash
+# download-then-run (password via stdin, not argv)
 VERSION=1.0.0
 curl -fsSL "https://raw.githubusercontent.com/SectorPace/MailStack/v${VERSION}/deploy/install.sh" -o /tmp/mailstack-install.sh
 less /tmp/mailstack-install.sh
-
-sudo bash /tmp/mailstack-install.sh \
-  --domain mail.example.com \
-  --admin-user admin \
-  --admin-password-stdin
-
-# Unattended/CI: pass the password on stdin (never in argv or shell history)
-printf '%s\n' "$MAILSTACK_ADMIN_PASSWORD" | sudo bash /tmp/mailstack-install.sh \
-  --non-interactive --domain mail.example.com --admin-password-stdin
+printf '%s\\n' "$MAILSTACK_ADMIN_PASSWORD" | sudo bash /tmp/mailstack-install.sh \\
+  --non-interactive --domain mail.example.com --admin-user admin --admin-password-stdin \\
+  --access-mode panel-domain --panel-host panel.example.com
 ```
 
-A direct one-liner is also supported (**in pipe mode stdin is consumed by the script, so the
-password cannot be piped too**; create the admin via the setup wizard or run the `admin.set`
-command the installer prints):
+Other flags: `--from-source`, `--archive FILE|URL`, `--binary-dir DIR`, `--prefix` (staging),
+`--no-systemd`, `--no-access-provision`, `--admin-port`/`--webmail-port`, `--webmail-host`,
+`--server-ip`, `--uninstall`/`--purge`. See `deploy/install.sh --help`.
+
+### Server management (`mailstack-manage`)
+
+Interactive menu when run without arguments; idempotent subcommands otherwise:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh \
-  | sudo bash -s -- --domain mail.example.com
+sudo mailstack-manage status
+sudo mailstack-manage domain set example.com --mail-host mail.example.com
+sudo mailstack-manage account add alice@example.com --password-stdin
+sudo mailstack-manage tls issue mail.example.com --email ops@example.com
+sudo mailstack-manage access set caddy --panel-host panel.example.com --acme-email ops@example.com
+sudo mailstack-manage access set cloudflared
+sudo mailstack-manage restart
 ```
-
-What the script does (authoritative source: `deploy/install.sh --help`):
-
-- by default downloads `mailstack-v1.0.0-x86_64-unknown-linux-gnu.tar.gz` from GitHub Releases
-  and **verifies it against `SHA256SUMS`**;
-- `--from-source`: build from source (requires Rust 1.98.1 + a C compiler, see Option 2);
-- `--archive FILE|URL`: use an offline/explicit release archive;
-- `--binary-dir DIR`: use prebuilt binaries (testing/offline installs);
-- `--prefix DIR`: install the whole tree under a given root (staging/testing);
-- `--no-systemd`: skip systemd units (containers or non-systemd hosts) and print manual start commands;
-- `--domain` / `--mail-host`: primary domain and mail hostname (identity/DKIM are still completed
-  by the setup wizard);
-- `--admin-user` (default `admin`) / `--admin-password-stdin`: admin bootstrap (password 12–256 chars,
-  must contain letters and digits);
-- `--admin-port` / `--webmail-port`: defaults `8443` / `8444`;
-- `--imap yes|no`: install and enable IMAP/POP3 (default `yes`);
-- `--access-mode local|caddy|direct`: deployment mode (written as `ACCESS_MODE` into
-  `install-args.conf`; affects cookie `Secure` and public-mode restrictions; kept as-is when omitted
-  on re-runs);
-- `--uninstall` / `--purge`: uninstall (keeps `/etc/mailstack` and `/var/lib/mailstack` by default;
-  `--purge` removes them too; `deploy/uninstall.sh` is available as well).
-
-The installer creates the system users/groups (`mailstack-admin`, `mailstack-webmail`, …), directories
-and permissions, binaries under `/usr/local/bin/`, the **privileged wrapper**
-`/usr/local/libexec/mailstack-privileged` plus `/etc/sudoers.d/mailstack-admin`, systemd units, and
-bootstraps the admin credentials. It prints the admin console URL
-`http://127.0.0.1:8443/?login=1` and the Webmail URL `http://127.0.0.1:8444` when done.
-
-> Release assets also include `mailstack-v1.0.0-x86_64-unknown-linux-musl.tar.gz` (fully static;
-> for glibc < 2.39 and Alpine). Pass it with `--archive <tarball>`.
 
 ### Option 2: build from source
 
 ```bash
-# 1) Dependencies (Debian/Ubuntu example): Rust 1.98.1 (pinned by deploy/build.sh and CI), C compiler
-#    rustup toolchain install 1.98.1
-
-# 2) Clone and build (produces dist/: 5 binaries + SHA256SUMS + SBOM)
 git clone https://github.com/SectorPace/MailStack.git
 cd MailStack
-deploy/build.sh                # add --musl for static binaries; --offline/--vendor for offline builds
-
-# 3) Build the frontend bundles (admin index.html + Webmail mail.html in one build)
+deploy/build.sh
 cd webui && npm ci && npm run build && cd ..
-
-# 4) Install the built artifacts
-sudo deploy/install.sh --binary-dir dist
+sudo deploy/install.sh --binary-dir dist --domain mail.example.com --admin-user admin \\
+  --admin-password 'My-Admin-Pass-9' --access-mode ssh
 ```
-
-> Node.js is required only on the build host; the installed production system does not need Node/npm.
-> `deploy/install.sh --help` lists every available option.
 
 ## First-run configuration
 
@@ -281,7 +283,7 @@ Eleven crates:
 | Crate | Package | Responsibility |
 |---|---|---|
 | `crates/core` | `mailstack-core` | Domain model, config schema, password policy, audit hash chain, atomic writes/locks, command primitives, 2FA, certificates, `/proc` sampling, backup archives, manual bans |
-| `crates/priv` | `mailstack-priv` | Privilege boundary: action gate (allowlist/channel/confirm/AI master switch), RPC frames, RO/RW socket servers, all action handlers |
+| `crates/priv` | `mailstack-priv` | Privilege boundary: action gate (allowlist/channel/confirm), RPC frames, RO/RW socket servers, all action handlers |
 | `crates/smtp` | `mailstack-smtp` | SMTP client: pinned-IP dialing, relay validation, staged tests, outbound probe, MX resolution and direct targets, SSRF address policy, DNS queries |
 | `crates/smtpd` | `mailstack-smtpd` | Inbound SMTP server: command/session state machine, DATA byte stream, TLS, rate limiting and auto-ban, SASL, SPF/DKIM/DMARC evaluation and enqueueing |
 | `crates/queue` | `mailstack-queue` | Outbound queue: persistence, retry/backoff, delivery leases, DSN bounces, concurrency limits, fast-fail, DKIM signing |
@@ -318,8 +320,8 @@ Frontend (`webui/`): one `npm run build` produces two entry points — admin `in
 - **Webmail content security**: parser-level HTML allowlist sanitization on the server
   (scripts/styles/iframes/forms/event attributes are dropped), URL scheme allowlist, remote images
   blocked by default, attachments forced to `nosniff` + `Content-Disposition`, `sandbox=""` iframe, CSP.
-- **SSRF defense**: direct MX delivery and AI outbound both use an address-policy allowlist
-  (loopback/private/link-local/CGNAT/IPv4-mapped-IPv6 are rejected); AI endpoints require HTTPS.
+- **SSRF defense**: direct MX delivery uses an address-policy allowlist
+  (loopback/private/link-local/CGNAT/IPv4-mapped-IPv6 are rejected).
 - **Supply chain**: `cargo-deny` (advisories/licenses/wildcards/sources) + `cargo audit` enforced in CI;
   GitHub Actions are pinned to commit SHAs; release artifacts ship with `SHA256SUMS`.
 
@@ -389,10 +391,10 @@ Measured at the v1.0.0 release gate (Ubuntu 26.04 / WSL2 + Rust 1.98.1, 2026-11-
 
 | Metric | Measured |
 |---|---|
-| `cargo test --workspace --all-targets` | **1701 passed / 0 failed** (includes real TLS/TCP/unix-socket integration tests) |
+| `cargo test --workspace --all-targets` | **1647 passed / 0 failed** (includes real TLS/TCP/unix-socket integration tests; 55 AI tests removed) |
 | Frontend `npm test` (vitest) | **187 passed / 0 failed** |
-| Privileged action allowlist | **59** (21 read-only + 38 mutating) |
-| HTTP contract routes | **73** (2 unauthenticated) |
+| Privileged action allowlist | **52** (20 read-only + 32 mutating; AI feature removed) |
+| HTTP contract routes | **62** (2 unauthenticated; AI routes removed) |
 | Security invariant list | **293** (all checked by `deploy/verify-invariant-gate.sh`) |
 
 The gates passed before the v1.0.0 release (CI runs the same command chain on Ubuntu with Rust 1.98.1):

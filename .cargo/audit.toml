@@ -1,14 +1,3 @@
-# cargo-audit 项目配置（`cargo audit` 的漏洞门禁）。
-#
-# 与 `deny.toml` 的 [advisories] ignore 保持**同一份理由**：CI 里 `cargo deny check`
-# 与 `cargo audit` 是两道独立门禁，各读各的配置；此前只写了 deny.toml，于是
-# `cargo audit` 单独红在 RUSTSEC-2023-0071 上（CI 实测），而这不是新问题。
-#
-# RUSTSEC-2023-0071（rsa v0.9.x，Marvin Attack）**没有安全升级可用**（上游 0.9
-# 分支未修）。该通告针对 RSA **解密**路径的时序侧信道（攻击者提交密文，通过
-# 解密耗时逐字节恢复明文）。本项目的 rsa 只经由 `mail-auth` 用于 DKIM **签名**
-# （输入是本地信头哈希与本地私钥，不存在「攻击者提交任意密文给解密预言机」的
-# 路径），因此该漏洞在本项目中不可达。详细的依赖路径与理由见 deny.toml 同条目。
 [advisories]
 ignore = [
     "RUSTSEC-2023-0071",

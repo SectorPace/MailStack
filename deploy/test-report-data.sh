@@ -1,5 +1,3 @@
-#!/usr/bin/env bash
-# 汇总测试规模与不变量覆盖，产出 TEST_REPORT.md 所需的事实数据。
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
@@ -18,9 +16,6 @@ echo "TOTAL=$total"
 
 echo
 echo "### 不变量覆盖（INV → 测试函数）"
-# 早先这里还把全部函数名 sort -u 进固定的 /tmp/all_fns.txt —— 固定路径可被
-# 其他用户用符号链接预占（symlink race），而该文件随后从未被读过：整段是
-# 纯死写入，直接删除。
 grep -rhE 'INV-[0-9]+' crates/*/src/*.rs | grep -oE 'INV-[0-9]+' | sort -u -V | tr '\n' ' '
 echo
 

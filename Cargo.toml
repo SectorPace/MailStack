@@ -10,16 +10,11 @@ members = [
     "crates/auth",
     "crates/smtpd",
     "crates/imappop3",
-    # IMAP/POP3 装配层：把 imappop3 接到 MailStack 的账号/Maildir/证书上。
     "crates/imapd",
     "bin/mailstackd",
     "bin/mailstackctl",
-    # 管理控制台服务：把 crates/web 的 API 与前端产物组装成一个可运行的进程。
-    # 在此之前 `crates/web` 只有 `build_router`，没有任何二进制在跑它。
     "bin/mailstack-web",
-    # IMAP/POP3 守护进程：替代 Dovecot 的协议面入口。
     "bin/mailstack-imap",
-    # Webmail：邮箱用户的 Web 客户端（独立进程、独立会话，与管理台隔离）。
     "crates/webmail",
     "bin/mailstack-webmail",
 ]
@@ -27,18 +22,10 @@ members = [
 [workspace.package]
 version = "1.0.0"
 edition = "2021"
-# 依赖链的 MSRV 上界：time 0.3.55 / hickory-resolver 0.26.3 要求 1.88。
-# 写 1.85 会让 `cargo build` 在旧工具链上以「依赖要求更高版本」失败，
-# 而 CI 只测 1.98.1 又发现不了 —— 下限必须按真实依赖链标，不是按我们的偏好。
 rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/SectorPace/MailStack"
 authors = ["SectorPace"]
-# 6.1 配套：本项目的 crate **不发布到 crates.io**（自托管应用，不是库）。
-# 声明 `publish = false` 有两个实际作用：
-#   1. 语义上如实说明「这些包不对外分发」；
-#   2. 让 `cargo-deny` 的 `[licenses.private] ignore = true` 能正确跳过它们 ——
-#      自有一组 crate 由内部发布流程分发，不参与 crates.io 的许可白名单判定。
 publish = false
 
 [workspace.dependencies]
@@ -57,8 +44,6 @@ mailstack-webmail = { path = "crates/webmail" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
-# 邮件正文 charset 转换（GBK / ISO-8859-1 / Shift_JIS …）。已在 Cargo.lock 的
-# 传递依赖里，直接依赖不新增供应链面；webmail 的 MIME 渲染是唯一消费者。
 encoding_rs = "0.8"
 base64 = "0.22"
 regex = "1"
@@ -66,8 +51,6 @@ sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
 fs2 = "0.4"
-# IMAP COMPRESS=DEFLATE（RFC 4978）。刻意只用纯 Rust 后端（miniz_oxide），
-# 与 TLS 选 ring 同样的理由：构建不引入 C/cmake/nasm 依赖，可离线复现。
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -78,9 +61,6 @@ tower-http = { version = "0.5", features = ["trace", "limit"] }
 time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
 clap = { version = "4", features = ["derive"] }
 
-# TLS：全链路 rustls。刻意用 ring 作为 crypto provider 而不是 aws-lc-rs，
-# 因为后者需要 cmake/nasm，会让「构建可离线复现且无额外系统依赖」的要求落空（§3.4）。
-# 根证书用 webpki-roots（内置 Mozilla 根，纯 Rust，不依赖系统 CA 存储）。
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pki-types = "1"
@@ -90,22 +70,5 @@ webpki-roots = "0.26"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-# 6.9：`abort` → `unwind`（**有前置条件，见下**）。
-#
-# `abort` 会把**每一个** panic 放大成进程死亡，并让 `core/src/warn.rs` 的
-# `catch_unwind`（"warn 永不抛出"）在 release 下完全失效 —— 一句日志格式化里的
-# panic 就足以打死整个守护进程。
-#
-# 但单纯改成 `unwind` 同样不可接受：tokio 会在任务边界吞掉 panic，
-# 而 `bin/mailstackd` 原先忽略 `JoinError`，结果是「进程活着、出站调度永久死掉」，
-# 表现为静默停投。这正是本项此前一直未被处理的原因（`REVIEW_FIXES.md` §1.10）。
-#
-# 现在那个前置障碍已经修掉：批 5 的 **5.19** 把 `JoinSet` 的结果收成
-# `Result<(), String>`，任务 panic / 异常退出都会汇总并**非零退出**，
-# 由 supervisor 重启。于是一整块服务崩掉不再被吞 —— 这才使 `unwind` 成为正确选择：
-#   * 任务内 panic 被隔离在任务边界，不再瞬间带走收信与投递；
-#   * 隔离之后的「重启」由 5.19 的非零退出 + systemd 保证，而不是静默继续。
-#
-# ⚠️ 若将来有人把 5.19 的结果汇总改回「只记日志」，必须同时把这里改回 `abort`。
 panic = "unwind"
 strip = "symbols"

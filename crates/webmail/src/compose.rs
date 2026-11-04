@@ -1,25 +1,3 @@
-//! 写信：地址 / 头部校验与 RFC 5322 / MIME 构造。
-//!
-//! ## 为什么服务端要自己构造 MIME
-//!
-//! 前端给的是「主题 + 两种正文 + 附件」这样的业务数据；把它变成一封合法邮件
-//! 需要做一串**安全敏感**的决定：头部编码、折行、边界随机性、传输编码、Bcc 不进
-//! 头部、附件文件名编码。任何一处交给前端（或简单字符串拼接）都会打开头注入
-//! 或 MIME 走私的口子，所以这一层全部在服务端完成。
-//!
-//! ## 头注入防线
-//!
-//! * 主题 / 地址 / In-Reply-To / References **拒绝** CR/LF/NUL 与控制字符；
-//! * 主题走 RFC 2047 编码（非 ASCII 时），编码结果只含 base64 字符，不可能含 CRLF；
-//! * 地址走 RFC 5321 简化校验（非空、含 `@`、长度 ≤ 320、字符集白名单）；
-//! * Bcc 只进信封（队列收件人），**不进头部**——否则每个收件人都能看到密送名单。
-//!
-//! ## 大小边界
-//!
-//! 附件 base64 解码后总量 ≤ 25 MiB（契约 §2.2）；构造完成的报文 ≤ 32 MiB
-//! （否则队列条目会超出入站/出站链路的预期）。base64 会膨胀 33%，因此最终
-//! 报文大小必须再查一次，不能只查输入。
-
 use std::collections::BTreeSet;
 
 use base64::Engine;
@@ -34,29 +12,18 @@ use crate::{
     MAX_SUBJECT_CHARS,
 };
 
-/// 构造用途：发信还是存草稿。
-///
-/// 差别只有两处：草稿允许没有收件人，且草稿保留 `Bcc:` 头（用户重新打开草稿时
-/// 要看到自己填过的密送地址）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
     Send,
     Draft,
 }
 
-/// 单封邮件正文（text/html）的字符上限。
 const MAX_COMPOSE_BODY_CHARS: usize = 2_000_000;
 
-/// RFC 5322 行长度上限（不含 CRLF）；主题等头部超长会被 MUA 拒绝。
 const MAX_HEADER_LINE_BYTES: usize = 998;
 
-/// 收件人（To+Cc+Bcc）总数上限。
-///
-/// 契约没给数字，但不封顶时一封请求可以让队列条目塞进十万个收件人，出站投递
-/// 会被一条消息拖死。100 覆盖正常群发场景。
 pub const MAX_RECIPIENTS: usize = 100;
 
-/// 附件输入（前端 JSON）。
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentInput {
@@ -68,7 +35,6 @@ pub struct AttachmentInput {
     pub data_base64: String,
 }
 
-/// 写信请求（契约 §2.1 `ComposeRequest`）。
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ComposeRequest {
@@ -83,19 +49,17 @@ pub struct ComposeRequest {
     pub attachments: Vec<AttachmentInput>,
 }
 
-/// 草稿请求 = ComposeRequest + 目标邮箱 + 被替换的旧草稿 uid（契约 §2）。
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DraftRequest {
     #[serde(flatten)]
     pub compose: ComposeRequest,
-    /// 只允许 `Drafts`。
+
     pub mailbox: Option<String>,
-    /// 给出时，保存成功后 expunge 旧草稿。
+
     pub draft_uid: Option<u32>,
 }
 
-/// 解码后的附件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedAttachment {
     pub filename: String,
@@ -103,7 +67,6 @@ pub struct DecodedAttachment {
     pub data: Vec<u8>,
 }
 
-/// 通过校验、解码完成的写信数据。
 #[derive(Debug, Clone)]
 pub struct ValidatedCompose {
     pub to: Vec<String>,
@@ -115,24 +78,21 @@ pub struct ValidatedCompose {
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
     pub attachments: Vec<DecodedAttachment>,
-    /// To + Cc + Bcc 去重后的信封收件人（Bcc 只出现在这里）。
+
     pub recipients: Vec<String>,
 }
 
-/// 构造完成的报文。
 #[derive(Debug, Clone)]
 pub struct BuiltMessage {
-    /// RFC 5322 文本（CRLF 行结束，纯 ASCII：正文与附件都走 base64）。
     pub data: String,
-    /// 信封发件人（账号地址）。
+
     pub envelope_from: String,
-    /// 信封收件人（To+Cc+Bcc 去重）。
+
     pub recipients: Vec<String>,
-    /// 规范化后的主题（已验证无头注入）。
+
     pub subject: String,
 }
 
-/// 校验并解码写信请求。
 pub fn validate_compose(
     request: &ComposeRequest,
     purpose: Purpose,
@@ -141,7 +101,6 @@ pub fn validate_compose(
     let cc = validate_address_list(&request.cc, "cc")?;
     let bcc = validate_address_list(&request.bcc, "bcc")?;
 
-    // 信封收件人去重（大小写不敏感；不改变头部里各自列表的内容）。
     let mut recipients = Vec::new();
     let mut seen = BTreeSet::new();
     for address in to.iter().chain(cc.iter()).chain(bcc.iter()) {
@@ -190,7 +149,6 @@ pub fn validate_compose(
     })
 }
 
-/// 校验 + 构造报文。
 pub fn build_message(
     account: &Account,
     request: &ComposeRequest,
@@ -209,7 +167,6 @@ pub fn build_message(
         message.push_str(&format!("Cc: {}\r\n", validated.cc.join(", ")));
     }
     if purpose == Purpose::Draft && !validated.bcc.is_empty() {
-        // 只有草稿保留 Bcc 头；真正发信时 Bcc 仅存在于信封。
         message.push_str(&format!("Bcc: {}\r\n", validated.bcc.join(", ")));
     }
     message.push_str(&format!(
@@ -252,8 +209,6 @@ pub fn build_message(
         ));
     }
     if !message.is_ascii() {
-        // 全链路都应是 7bit 安全的 ASCII（正文/附件 base64、头部 RFC2047）；
-        // 出现非 ASCII 说明编码逻辑有漏，宁可拒绝也不能把未编码的 8bit 写进队列。
         return Err(WebmailError::internal(
             "compose",
             "composed message contains non-ascii bytes",
@@ -268,7 +223,6 @@ pub fn build_message(
     })
 }
 
-/// 构造正文部分，返回 `(Content-Type, 顶层 Content-Transfer-Encoding, body)`。
 fn build_body(
     validated: &ValidatedCompose,
     alt_boundary: &str,
@@ -278,7 +232,6 @@ fn build_body(
     let has_html = validated.html.is_some();
     let both = has_text && has_html;
 
-    // 正文实体：两种正文都有时是 multipart/alternative；否则是单个文本部件。
     let (body_content_type, body_body) = if both {
         let mut body = String::new();
         body.push_str(&format!(
@@ -317,8 +270,6 @@ fn build_body(
         );
     }
 
-    // multipart/mixed：第一个子部件是正文实体（带自己的 Content-Type 头），
-    // 其后是各附件。
     let mut body = String::new();
     body.push_str(&format!("--{mix_boundary}\r\n"));
     if both {
@@ -348,7 +299,6 @@ fn build_body(
     )
 }
 
-/// 一个带头的文本部件（用于 multipart 内部）。
 fn text_part(content_type: &str, content: &str) -> String {
     format!(
         "Content-Type: {content_type}; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",
@@ -356,12 +306,10 @@ fn text_part(content_type: &str, content: &str) -> String {
     )
 }
 
-/// 只有正文行（用于单部件顶层，头部在报文头里）。
 fn text_part_body(content: &str) -> String {
     base64_lines(content.as_bytes())
 }
 
-/// 一个附件部件。
 fn attachment_part(attachment: &DecodedAttachment) -> String {
     let filename = &attachment.filename;
     let mut disposition = String::from("attachment");
@@ -380,7 +328,6 @@ fn attachment_part(attachment: &DecodedAttachment) -> String {
     )
 }
 
-/// base64 编码并按 RFC 2045 折成 76 字符行（行间 CRLF，末尾不带 CRLF）。
 fn base64_lines(data: &[u8]) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(data);
     let mut out = String::with_capacity(encoded.len() + encoded.len() / 76 * 2 + 2);
@@ -393,21 +340,12 @@ fn base64_lines(data: &[u8]) -> String {
     out
 }
 
-/// 生成一个 MIME boundary。
-///
-/// 144 位随机（18 字节 hex）足以让「出现在正文里」的概率可忽略；boundary 只由
-/// 十六进制与固定前缀/后缀组成，不会引入头部注入字符。
 fn unique_boundary(prefix: &str) -> String {
     let mut bytes = [0u8; 18];
     rand::thread_rng().fill_bytes(&mut bytes);
     format!("{prefix}-{}-mailstack", hex::encode(bytes))
 }
 
-// ---------------------------------------------------------------------------
-// 校验
-// ---------------------------------------------------------------------------
-
-/// 地址列表校验（空元素视为非法：契约要求「非空」）。
 fn validate_address_list(addresses: &[String], field: &str) -> WebmailResult<Vec<String>> {
     let mut out = Vec::with_capacity(addresses.len());
     for raw in addresses {
@@ -416,7 +354,6 @@ fn validate_address_list(addresses: &[String], field: &str) -> WebmailResult<Vec
     Ok(out)
 }
 
-/// 单地址校验（RFC 5321 简化版，契约 §2.2）。
 pub fn validate_address(raw: &str, field: &str) -> WebmailResult<String> {
     let address = raw.trim();
     if address.is_empty() {
@@ -431,7 +368,7 @@ pub fn validate_address(raw: &str, field: &str) -> WebmailResult<String> {
             format!("{field} contains an address longer than {MAX_ADDRESS_LEN} characters"),
         ));
     }
-    // 头注入 / SMTP 命令注入的第一道闸：任何控制字符直接拒绝。
+
     if address.chars().any(char::is_control) {
         return Err(WebmailError::bad_request(
             "HEADER_INJECTION",
@@ -456,8 +393,7 @@ pub fn validate_address(raw: &str, field: &str) -> WebmailResult<String> {
             format!("{field} contains an address with multiple '@'"),
         ));
     }
-    // 本实现的地址白名单刻意窄（ASCII）：CJK/带引号的本地部分是 RFC 5321 的
-    // 边缘语法，简化实现明确拒绝而不是半支持。
+
     let local_valid = !local.starts_with('.')
         && !local.ends_with('.')
         && !local.contains("..")
@@ -512,7 +448,6 @@ pub fn validate_address(raw: &str, field: &str) -> WebmailResult<String> {
     Ok(address.to_string())
 }
 
-/// 主题校验：拒绝控制字符（头注入）并限制长度。
 fn validate_subject(raw: &str) -> WebmailResult<String> {
     let subject = raw.trim();
     if subject.chars().count() > MAX_SUBJECT_CHARS {
@@ -530,7 +465,6 @@ fn validate_subject(raw: &str) -> WebmailResult<String> {
     Ok(subject.to_string())
 }
 
-/// 正文校验：只限长度（HTML 在详情读取时消毒；草稿保存的是用户原始 HTML）。
 fn validate_body(raw: Option<&str>, field: &str) -> WebmailResult<Option<String>> {
     let Some(body) = raw else {
         return Ok(None);
@@ -543,7 +477,6 @@ fn validate_body(raw: Option<&str>, field: &str) -> WebmailResult<Option<String>
     Ok(Some(body.to_string()))
 }
 
-/// Message-ID / References 校验：必须是 `<...>` 形状且不含控制字符。
 fn validate_message_id(raw: Option<&str>, field: &str) -> WebmailResult<Option<String>> {
     let Some(value) = raw else {
         return Ok(None);
@@ -573,7 +506,6 @@ fn validate_message_id(raw: Option<&str>, field: &str) -> WebmailResult<Option<S
     Ok(Some(value.to_string()))
 }
 
-/// 解码/校验附件。
 fn decode_attachments(inputs: &[AttachmentInput]) -> WebmailResult<Vec<DecodedAttachment>> {
     if inputs.len() > MAX_ATTACHMENTS {
         return Err(WebmailError::bad_request(
@@ -618,10 +550,6 @@ fn decode_attachments(inputs: &[AttachmentInput]) -> WebmailResult<Vec<DecodedAt
     Ok(attachments)
 }
 
-/// Content-Type 校验：只接受 `type/subtype` 形状的 MIME token。
-///
-/// 拒绝参数、空格、控制字符：参数会带来 `name=` / `charset=` 的二次解析面，
-/// 而这里只需要一个静态类型；文件名走 Content-Disposition。
 pub fn validate_content_type(raw: &str) -> WebmailResult<String> {
     let trimmed = raw.trim();
     let (mime_type, subtype) = trimmed.split_once('/').ok_or_else(|| {
@@ -666,13 +594,7 @@ pub fn validate_content_type(raw: &str) -> WebmailResult<String> {
     ))
 }
 
-/// 附件文件名清洗：去掉 `/`、`\` 与控制字符，限长 200 字符。
-///
-/// 空结果回落为 `attachment`：没有文件名的附件在 Content-Disposition 里无法
-/// 表达，回落是唯一不会产生非法头的选择。
 pub fn sanitize_filename(raw: &str) -> String {
-    // `"` / `;` / `:` 是 Content-Disposition 的 quoted-string 与参数分隔符：
-    // 留着它们会构造出畸形的参数（虽然 CR/LF 已被滤掉、不构成头注入）。
     let cleaned: String = raw
         .chars()
         .filter(|ch| !matches!(ch, '/' | '\\' | '"' | ';' | ':') && !ch.is_control())
@@ -686,11 +608,6 @@ pub fn sanitize_filename(raw: &str) -> String {
     trimmed.chars().take(200).collect()
 }
 
-// ---------------------------------------------------------------------------
-// 头部编码
-// ---------------------------------------------------------------------------
-
-/// 构造 `From:` 头（显示名按需编码）。
 fn encode_from(account: &Account) -> String {
     let name = account.display_name.trim();
     if name.is_empty() {
@@ -716,7 +633,6 @@ fn encode_from(account: &Account) -> String {
     }
 }
 
-/// 头部值编码：ASCII 原样（已排除控制字符），非 ASCII 走 RFC 2047。
 fn encode_header_value(value: &str) -> String {
     if value.is_ascii() {
         value.to_string()
@@ -725,7 +641,6 @@ fn encode_header_value(value: &str) -> String {
     }
 }
 
-/// 文件名里的 ASCII 兜底表示（非 ASCII 字符替换为 `_`）。
 fn ascii_filename_fallback(filename: &str) -> String {
     let fallback: String = filename
         .chars()
@@ -744,7 +659,6 @@ fn ascii_filename_fallback(filename: &str) -> String {
     }
 }
 
-/// RFC 2231 的 UTF-8 百分号编码。
 fn rfc2231_encode(filename: &str) -> String {
     let mut out = String::with_capacity(filename.len() * 3);
     for byte in filename.as_bytes() {
@@ -762,7 +676,6 @@ fn rfc2231_encode(filename: &str) -> String {
     out
 }
 
-/// 引号内字符串转义（只用于 ASCII 兜底文件名与显示名）。
 fn escape_header_quoted(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -776,7 +689,6 @@ fn escape_header_quoted(value: &str) -> String {
     out
 }
 
-/// 生成 Message-ID：`<随机@域名>`。
 fn generate_message_id(email: &str) -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -833,7 +745,6 @@ mod tests {
             error.code
         );
 
-        // In-Reply-To 也不得被注入。
         let mut request = compose("ok", "body");
         request.in_reply_to = Some("<a@b>\r\nBcc: evil@example.com".to_string());
         assert!(build_message(&account(), &request, Purpose::Send).is_err());
@@ -872,7 +783,6 @@ mod tests {
         assert!(built.data.ends_with("\r\n"));
         assert!(built.data.is_ascii());
 
-        // 正文 base64 能解回原文。
         let body = built.data.split("\r\n\r\n").nth(1).unwrap();
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(body.replace("\r\n", ""))
@@ -929,7 +839,6 @@ mod tests {
 
     #[test]
     fn attachment_size_limit_is_enforced() {
-        // 25 MiB + 1 字节的附件（base64 解码后）。
         let payload = vec![b'x'; MAX_ATTACHMENT_TOTAL_BYTES + 1];
         let request = ComposeRequest {
             to: vec!["bob@example.org".to_string()],
@@ -955,7 +864,7 @@ mod tests {
         assert_eq!(sanitize_filename("a\r\nb.txt"), "ab.txt");
         assert_eq!(sanitize_filename("   "), "attachment");
         assert_eq!(sanitize_filename(&"x".repeat(500)).chars().count(), 200);
-        // 构造出的头部不能被文件名注入。
+
         let request = ComposeRequest {
             to: vec!["bob@example.org".to_string()],
             subject: "s".to_string(),
@@ -1026,7 +935,7 @@ mod tests {
         assert!(built.data.is_ascii(), "整体必须是 ASCII 安全的 7bit");
         assert!(built.data.contains("From: =?UTF-8?B?"));
         assert!(built.data.contains("Subject: =?UTF-8?B?"));
-        // 解码回来必须等于原文。
+
         let subject_line = built
             .data
             .lines()

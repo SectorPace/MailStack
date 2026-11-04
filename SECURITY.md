@@ -96,8 +96,7 @@ SMTP/TLS/SASL、SPF/DKIM/DMARC/ARC 判定、队列与 DSN、IMAP/POP3/ManageSiev
   CSRF token 与会话绑定；改密/2FA 变更按用户全量吊销会话（会话纪元）。
 - **Webmail**：服务端 HTML allowlist 消毒 + 前端 sandbox iframe 展示 + 远程图片默认阻断
   + CSRF + 会话纪元；发送只入出站队列，DKIM 由队列统一签名。
-- **SSRF 防线**：直投 MX 与 AI 出站都走地址策略白名单（私网/环回/link-local/
-  IPv6 内嵌 IPv4 一律拒绝），AI 端点强制 HTTPS。
+- **SSRF 防线**：直投 MX 走地址策略白名单（私网/环回/link-local/IPv6 内嵌 IPv4 一律拒绝）。
 - **供应链**：`Cargo.lock` 提交、`cargo-deny` + `cargo audit` 在 CI 强制；
   v1.0.0 发布前修掉了 7 条 RUSTSEC 通告（见 `CHANGELOG.md`）。
 

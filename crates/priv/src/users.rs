@@ -1,34 +1,3 @@
-//! 系统账号邮箱管理（`users.*`）。
-//!
-//! 从 `backend/mailstackctl/mail.py` 等价移植。这里回答了本项目一直悬而未决的
-//! 「vmail 布局 / Dovecot 口令方案」问题：
-//!
-//! * **不用 `/var/vmail` 布局**：基线用**系统账号**。`useradd -m` 建家目录
-//!   `/home/<u>`，Maildir 就是 `~/Maildir`（`cur`/`new`/`tmp`）。
-//! * **不写 Dovecot passwd-file**：口令走 **PAM / 系统口令**，用 `chpasswd`
-//!   （stdin `user:password\n`，失败退回 `passwd user` 并两次喂口令）；锁定/解锁用
-//!   `passwd -l` / `passwd -u`；锁定状态看 `passwd -S <u>` 的第 2 个字段。
-//!
-//! ## 三份注册表
-//!
-//! | 文件 | 内容 | 权限 |
-//! |---|---|---|
-//! | `/etc/mailstack/managed-users.json` | unix 用户名数组（排序） | 0640 root:mailstack-admin |
-//! | `/var/lib/mailstack/managed-mailboxes.json` | `{email, unixUser, displayName}` 数组 | 0640 root:mailstack-webmail |
-//! | `/var/lib/mailstack/webmail-session-epoch.json` | `{用户名: unix秒}` | 0640 root:mailstack-webmail |
-//!
-//! ## 顺序纪律
-//!
-//! `user_add` 的**全部校验必须发生在任何副作用之前**：被拒的请求不得留下半个
-//! 已建账号、不得碰注册表。副作用里唯一的例外是建 Maildir —— 它失败在基线里
-//! **只告警不中止**（账号已经建好了，此时回滚反而更糟）。
-//!
-//! ## 可测试性
-//!
-//! 系统账号查询（`pwd.getpwnam` / `grp.getgrall`）与程序探测（`shutil.which`）
-//! 都必须可注入：单测绝不能真的跑 `useradd` / `chpasswd`，也绝不能读写真实的
-//! `/etc`。`/etc/passwd` 与 `/etc/group` 用**纯 Rust 解析**，不引入 libc/nix。
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,7 +14,6 @@ use serde_json::{json, Value};
 use crate::handlers::HandlerError;
 use crate::readers::Clock;
 
-/// 绝不允许被 `users.delete` / `users.password` 触碰的账号。
 pub const PROTECTED_USERS: &[&str] = &[
     "root",
     "daemon",
@@ -60,38 +28,25 @@ pub const PROTECTED_USERS: &[&str] = &[
     "mailstack-web",
 ];
 
-/// 注册表与纪元文件的权限位。
 pub const REGISTRY_MODE: u32 = 0o640;
 
-/// webmail 进程所属组：`managed-mailboxes.json` 与 epoch 文件都归它。
 pub const WEBMAIL_GROUP: &str = "mailstack-webmail";
 
-/// 创建 Maildir 时用户家目录 / Maildir 目录 / 文件的权限位。
 const HOME_MODE: u32 = 0o750;
 const MAILDIR_DIR_MODE: u32 = 0o770;
 const MAILDIR_FILE_MODE: u32 = 0o660;
 
-/// 程序与路径探测。
-///
-/// 抽成 trait 是为了让 `useradd` / `adduser` / `chpasswd` / `userdel` / `deluser`
-/// 的可用性在测试里可控。基线的 `shutil.which` 只查 `PATH`；生产实现走
-/// [`mailstack_core::exec::resolve_program`]（`PATH` + 常见 sbin），因为特权助手
-/// 的 `PATH` 通常不含 `/usr/sbin`，那正是 `useradd` 的家。
 pub trait ProgramEnv: Send + Sync {
-    /// 等价 `shutil.which(program)`：命中返回解析后的完整路径。
     fn which(&self, program: &str) -> Option<PathBuf>;
 
-    /// 等价 `os.path.exists`（`nologin` 候选路径判定用）。
     fn path_exists(&self, path: &Path) -> bool;
 }
 
-/// 生产探测：真实 `PATH` / sbin 目录与文件系统。
 #[derive(Debug, Default)]
 pub struct SystemProgramEnv;
 
 impl ProgramEnv for SystemProgramEnv {
     fn which(&self, program: &str) -> Option<PathBuf> {
-        // `resolve_program` 找不到时原样返回入参，据此判断「是否真的命中」。
         let resolved = mailstack_core::exec::resolve_program(program);
         (resolved != program).then(|| PathBuf::from(resolved))
     }
@@ -101,18 +56,12 @@ impl ProgramEnv for SystemProgramEnv {
     }
 }
 
-/// `users.*` 的运行环境。
 #[derive(Clone)]
 pub struct UsersEnv {
-    /// 系统账号文件的根：生产 `/etc`，测试给临时目录。
     pub passwd_root: PathBuf,
-    /// 需要 `webmail` 可读的文件属组。生产 `mailstack-webmail`；
-    /// 测试可设 `None` 跳过 chown（chown 到不存在的组只会在每次调用时告警）。
-    ///
-    /// 名字沿用 epoch 语义，但 `managed-mailboxes.json` 与 epoch 文件在基线里
-    /// 同属 `root:mailstack-webmail`，故两处共用同一字段。
+
     pub session_epoch_owner: Option<String>,
-    /// 程序探测。
+
     pub programs: Arc<dyn ProgramEnv>,
 }
 
@@ -135,7 +84,6 @@ impl Default for UsersEnv {
     }
 }
 
-/// `/etc/passwd` 里的一行（只保留我们用得到的列）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PasswdEntry {
     name: String,
@@ -144,12 +92,11 @@ struct PasswdEntry {
     home: PathBuf,
 }
 
-/// 系统账号邮箱动作的执行体。
 pub struct Users {
     paths: Paths,
     env: UsersEnv,
     runner: Arc<dyn CommandRunner>,
-    /// 注入时钟（Unix 秒）：epoch bump 必须用注入时间，测试才能断言具体值。
+
     clock: Clock,
 }
 
@@ -163,7 +110,6 @@ impl Users {
         }
     }
 
-    /// 生产构造。
     pub fn system(paths: Paths) -> Self {
         Self::new(
             paths,
@@ -173,7 +119,6 @@ impl Users {
         )
     }
 
-    /// 覆盖运行环境（测试用）。
     pub fn with_env(mut self, env: UsersEnv) -> Self {
         self.env = env;
         self
@@ -183,12 +128,6 @@ impl Users {
         (self.clock)()
     }
 
-    // ───────────────────────── 系统账号文件解析 ─────────────────────────
-
-    /// 解析 `<passwd_root>/passwd`。字段顺序：`name:passwd:uid:gid:gecos:home:shell`。
-    ///
-    /// 用纯 Rust 解析而非 `pwd.getpwnam`：单测需要一个可注入的假 `/etc`，
-    /// 而 NSS 查询无法重定向到临时目录。
     fn parse_passwd(&self) -> Vec<PasswdEntry> {
         let Ok(text) = std::fs::read_to_string(self.env.passwd_root.join("passwd")) else {
             return Vec::new();
@@ -217,11 +156,6 @@ impl Users {
         self.parse_passwd().into_iter().find(|e| e.name == name)
     }
 
-    /// 「`mail` 组是否存在」。
-    ///
-    /// 这是对基线 `'mail' in [g.gr_name for g in grp.getgrall()]` 的**等价替换**：
-    /// `grp` 走 NSS，无法指向测试的假根；这里直接解析 `<passwd_root>/group`，
-    /// 语义相同（只看第一列组名）且完全可注入。
     fn group_exists(&self, name: &str) -> bool {
         let Ok(text) = std::fs::read_to_string(self.env.passwd_root.join("group")) else {
             return false;
@@ -232,10 +166,6 @@ impl Users {
         })
     }
 
-    /// 账号是否被锁定：`passwd -S <u>` 的第 2 个字段是 `L` 或 `LK`。
-    ///
-    /// 命令不可用/无输出时返回 `false`（「没证据说明被锁」），与基线的
-    /// `len(fields) > 1 and ...` 一致 —— 不会把查询失败误报成「已锁定」。
     fn account_locked(&self, name: &str) -> bool {
         match self.runner.run("passwd", &["-S", name]) {
             Ok(output) => output
@@ -248,20 +178,6 @@ impl Users {
         }
     }
 
-    /// 一次性读 `<passwd_root>/shadow`，按用户名给出「是否被锁定」。
-    ///
-    /// `users.list` 此前对**每个邮箱** fork 一次 `passwd -S`；受管邮箱一多，
-    /// 一次列表动作就是几十上百个子进程。daemon 以 root 运行（规格书 §2.3），
-    /// shadow 可读，一次读入即可。字段 2 与 `passwd -S` 第 2 字段的对应：
-    ///
-    /// * `!` 前缀（`!`、`!!`、`!$6$...`）= 锁定（`passwd -S` 的 `L`/`LK`）；
-    /// * 空 / `*` = NP（无口令），**不**视为锁定 —— 与 [`Self::account_locked`]
-    ///   「没证据说明被锁」的口径一致；
-    /// * 其余 = P（口令已设）。
-    ///
-    /// 读失败（权限、坏 UTF-8）返回 `None`，调用方回退到旧的逐行 `passwd -S`
-    /// 路径 —— 状态判定不能因为一次读失败而整体变错。shadow 里没有的账号
-    /// 视为未锁定（`passwd -S` 对不存在的账号同样不报「已锁」）。
     fn locked_map_from_shadow(&self) -> Option<BTreeMap<String, bool>> {
         let text = std::fs::read_to_string(self.env.passwd_root.join("shadow")).ok()?;
         let mut locked: BTreeMap<String, bool> = BTreeMap::new();
@@ -278,7 +194,6 @@ impl Users {
         Some(locked)
     }
 
-    /// nologin shell：`which(nologin)` → `/usr/sbin/nologin` → `/sbin/nologin` → `/bin/false`。
     fn nologin_shell(&self) -> String {
         if let Some(found) = self.env.programs.which("nologin") {
             return found.display().to_string();
@@ -291,14 +206,6 @@ impl Users {
         "/bin/false".to_string()
     }
 
-    // ───────────────────────── 注册表读写 ─────────────────────────
-
-    /// 读 `managed-users.json` 的**如实报错**版本（5.13：读不出来 ≠ 没有）。
-    ///
-    /// 文件缺失是合法状态（还没有任何受管用户）；读失败（EACCES / IO 错）与
-    /// 损坏（不是 JSON 数组）必须报错 —— 若把错误静默成空集合，`users.add` /
-    /// `users.delete` 的「读出 → 修改 → 写回」会把整份注册表清成只剩这一条，
-    /// 那是数据毁灭。
     fn try_read_managed_users(&self) -> Result<BTreeSet<String>, HandlerError> {
         let text = match std::fs::read_to_string(&self.paths.managed_users) {
             Ok(text) => text,
@@ -322,16 +229,10 @@ impl Users {
         }
     }
 
-    /// 宽松版本：**只读**路径（受管与否的守卫判断）在读失败时退回空集合。
-    ///
-    /// 守卫的语义是 fail-closed：读不到 ⇒ 视为「不受管」⇒ 拒绝操作，不会发生
-    /// 写回，因此不构成 5.13 的清空风险。**凡是要把读出的东西写回去的地方，
-    /// 必须用 [`Self::try_read_managed_users`]。**
     fn read_managed_users(&self) -> BTreeSet<String> {
         self.try_read_managed_users().unwrap_or_default()
     }
 
-    /// [`Self::try_read_managed_users`] 对应的 `managed-mailboxes.json` 版本。
     fn try_read_mailboxes(&self) -> Result<Vec<Value>, HandlerError> {
         let text = match std::fs::read_to_string(&self.paths.managed_mailboxes) {
             Ok(text) => text,
@@ -352,25 +253,10 @@ impl Users {
         }
     }
 
-    /// [`Self::try_read_mailboxes`] 的宽松版本：只读列表/反查用（见上）。
     fn read_mailboxes(&self) -> Vec<Value> {
         self.try_read_mailboxes().unwrap_or_default()
     }
 
-    /// 受管账号集合：`managed-users.json` ∪ `managed-mailboxes.json` 的 `unixUser`。
-    ///
-    /// ## 为什么是并集
-    ///
-    /// 两份注册表由 `users.add` 在**同一把锁**内一起写、由 `users.delete` 一起删，
-    /// 正常部署下内容一致。取并集是为了让备份/恢复在另一份注册表残缺（例如上一次
-    /// 写入被中断）时仍能看到账号 —— 少一个账号意味着少备份一个邮箱，或恢复时
-    /// 拒绝一个本应受管的家目录。
-    ///
-    /// ## 为什么读失败必须报错
-    ///
-    /// 这是备份来源与恢复允许清单**共用的**真相源。读失败静默成空集合的后果是
-    /// 「这次备份说包含邮件但一封都没打进去」以及「恢复拒绝全部 home/** 成员」，
-    /// 两者都是 5.13 那类「读不出来 ≠ 没有」的错误。
     pub fn managed_accounts(&self) -> Result<BTreeSet<String>, HandlerError> {
         let mut accounts = self.try_read_managed_users()?;
         for item in self.try_read_mailboxes()? {
@@ -382,15 +268,6 @@ impl Users {
         Ok(accounts)
     }
 
-    /// 受管邮箱的 `~/Maildir`（备份来源），家目录**只**从 passwd 解析。
-    ///
-    /// 与 `crates/imapd/src/resolver.rs` 同一口径：账号就是系统账号，Maildir 即
-    /// `<passwd 里的家目录>/Maildir`；不猜 `<vmail>/<domain>/<user>`，也不去扫
-    /// `/home` 猜哪个目录归 MailStack 管。
-    ///
-    /// 返回 `(存在的 Maildir, 告警)`。账号在注册表里却解析不到家目录 / 家目录下
-    /// 没有 Maildir，意味着**这次备份会漏掉这个邮箱** —— 必须让调用方看见并如实
-    /// 上报，不能静默少打包一个账号。
     pub fn managed_maildirs(&self) -> Result<(Vec<PathBuf>, Vec<String>), HandlerError> {
         let passwd = self.parse_passwd();
         let mut maildirs = Vec::new();
@@ -416,20 +293,13 @@ impl Users {
         Ok((maildirs, warnings))
     }
 
-    /// 原子写 `managed-users.json`：`sorted()` + `indent=2` + 末尾换行，0640。
     fn save_managed_users(&self, users: &BTreeSet<String>) -> Result<(), HandlerError> {
-        // BTreeSet 天然有序，等价基线的 `sorted(items)`。
         let list: Vec<&String> = users.iter().collect();
         let text = format!("{}\n", serde_json::to_string_pretty(&list)?);
         atomic::atomic(&self.paths.managed_users, text.as_bytes(), REGISTRY_MODE)?;
         Ok(())
     }
 
-    /// 写 `managed-mailboxes.json`：0640，并 chown 到 `mailstack-webmail`。
-    ///
-    /// 用 [`atomic::atomic_as`]（跳过默认的 `mailstack-admin` chown）后**显式**改属组，
-    /// 因为 baseline 是先 `atomic` 再 `os.chown(..., 0, mailstack-webmail)` ——
-    /// 最终属组以 webmail 为准。
     fn save_mailboxes(&self, boxes: &[Value]) -> Result<(), HandlerError> {
         let text = format!("{}\n", serde_json::to_string_pretty(boxes)?);
         atomic::atomic_as(
@@ -442,17 +312,13 @@ impl Users {
         Ok(())
     }
 
-    /// 尽力把文件属组改为 webmail 组；失败仅告警（基线同样只 `warn`）。
     fn chown_to_webmail(&self, path: &Path) {
         let Some(group) = self.env.session_epoch_owner.as_deref() else {
-            return; // 测试：显式跳过 chown。
+            return;
         };
         chown_group_best_effort(path, group);
     }
 
-    // ───────────────────────── 账号与 Maildir ─────────────────────────
-
-    /// `useradd` 的降级链（基线顺序，**不改变尝试顺序**）。
     fn create_account(&self, user: &str, group: &str, nologin: &str) -> Result<(), HandlerError> {
         if let Some(useradd) = self.env.programs.which("useradd") {
             let useradd = useradd.display().to_string();
@@ -493,19 +359,6 @@ impl Users {
         ))
     }
 
-    /// 设置系统口令：只走 `chpasswd`（非交互，口令经 stdin，单行 `user:password\n`）。
-    ///
-    /// ## 为什么**不**退回交互式 `passwd`
-    ///
-    /// `CommandRunner::run_with_input` 没有超时入口，而 `passwd` 在没有 tty 时的
-    /// 行为随 PAM 实现而异（`pam_unix` 的会话管理可能去读 `/dev/tty`，或等待旧
-    /// 口令提示）：一个等 tty 的子进程会让特权助手的一个 blocking 线程永久驻留
-    /// （900s 的 RPC 超时只能让**客户端**拿到失败应答，服务端线程不可取消）。
-    /// `chpasswd` 是 shadow-utils / util-linux 的固定组成部分，读 stdin 到 EOF
-    /// 即退出；找不到它时明确报错，而不是改走一条可能挂死的路径。
-    ///
-    /// 残余缺口：`run_with_input` 本身仍无超时（需要给 `core::exec` 加
-    /// `run_with_input_timeout`）。这里消除的是**会等 tty** 的那条路径。
     fn set_password(&self, user: &str, password: &str) -> Result<(), HandlerError> {
         let chpasswd = self.env.programs.which("chpasswd").ok_or_else(|| {
             HandlerError::new(
@@ -524,10 +377,6 @@ impl Users {
         Ok(())
     }
 
-    /// 建 `~/Maildir/{cur,new,tmp}` 并调整属主/权限。
-    ///
-    /// **失败只告警不中止**：账号与口令都已生效，此时把一个成功了一半的操作
-    /// 报成失败，只会让调用方以为账号没建出来。
     fn ensure_maildir(&self, entry: &PasswdEntry, user: &str) {
         let result = self.apply_maildir(entry);
         if let Err(error) = result {
@@ -547,7 +396,6 @@ impl Users {
         self.apply_maildir_ownership(&maildir, entry.uid, entry.gid)
     }
 
-    /// 递归把 Maildir 的目录置 0770、文件置 0660，并尽量改成该用户的属主/属组。
     fn apply_maildir_ownership(&self, maildir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
         let mut stack = vec![maildir.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -567,21 +415,6 @@ impl Users {
         Ok(())
     }
 
-    /// 失效某个用户的所有 webmail 在线会话。
-    ///
-    /// 改密与锁定/解锁都必须踢掉**已经在线**的会话，而不只是影响后续登录：
-    /// webmail 进程轮询这张 epoch 表，凡是早于该用户 epoch 的会话一律丢弃。
-    ///
-    /// epoch 表同样是 read-modify-write：与注册表同一理由，临界区必须持锁
-    /// （10），否则并发的 users.password 会互相丢 epoch。
-    ///
-    /// ## 读失败/表损坏 = 报错（5.13）
-    ///
-    /// 原先读不出来就 `unwrap_or_default()`，然后**整表覆盖写回**：表一旦损坏
-    /// （半写、磁盘错误、被别的进程截断），下一次改密/锁定会把其他用户此前被
-    /// bump 出来的失效水位全部抹掉 —— 那些本该被踢掉的 webmail 会话重新变成
-    /// 「合法」。这里改为：`NotFound` 才是空表，其余（EACCES/IO/坏 JSON）一律
-    /// 返回错误，由调用方把「会话未能失效」如实上报。
     fn bump_session_epoch(&self, user: &str) -> Result<(), HandlerError> {
         let path = &self.paths.webmail_session_epoch;
         let result = atomic::locked_with(path, || -> CoreResult<()> {
@@ -611,15 +444,6 @@ impl Users {
         }
     }
 
-    // ───────────────────────── 对外动作 ─────────────────────────
-
-    /// `users()`：受管邮箱列表。
-    ///
-    /// 系统里已不存在的账号**跳过该条**（不是报错）：注册表可能残留已手工删除的
-    /// 账号，把它当成错误会让整个列表不可用。
-    ///
-    /// 锁定状态优先用一次 [`Self::locked_map_from_shadow`]；读不到 shadow 时
-    /// 才退回逐行 `passwd -S`。输出形状两种路径完全一致。
     pub fn list(&self) -> Vec<Value> {
         let passwd = self.parse_passwd();
         let locked = self.locked_map_from_shadow();
@@ -666,34 +490,16 @@ impl Users {
             .collect()
     }
 
-    /// `username` 与 `email` 是否正好对应注册表里的同一个受管邮箱。
-    ///
-    /// 供 `setup.mail.test` 恢复基线的「sender 必须对应一个受管邮箱」检查。
-    ///
-    /// 比较是**区分大小写**的精确相等（等价基线
-    /// `item.get('unixUser') == username and item.get('email') == sender`）：
-    /// 注册表里存的是规范化后的小写值，调用方传进来的大小写若不符，应当判为
-    /// 「不是同一个邮箱」并拒绝，而不是被悄悄归一化后放行。
     pub fn managed_mailbox_matches(&self, username: &str, email: &str) -> bool {
         self.read_mailboxes().iter().any(|item| {
             mailbox_str(item, "unixUser") == username && mailbox_str(item, "email") == email
         })
     }
 
-    /// 账号是否被锁定（`passwd -S` 的第 2 个字段为 `L`/`LK`）。
-    ///
-    /// 包一层 [`Users::account_locked`]，供 `setup.mail.test` 的「邮箱被禁用」检查使用。
     pub fn is_locked(&self, username: &str) -> bool {
         self.account_locked(username)
     }
 
-    /// 写 IMAP/POP3 的口令记录（`mailbox-passwords.json`，INV-37）。
-    ///
-    /// 为什么必须与系统口令**并写**：系统口令给 PAM/Postfix 用，协议面
-    /// （`mailstack-imap`）用 PBKDF2 记录。只写一边的结果是「webmail 能登、
-    /// 客户端说密码错」，或被反过来；两种都属最难排障的故障。
-    ///
-    /// 记录键优先用**邮箱地址**（客户端登录名），拿不到地址时退回 unix 账号名。
     fn save_mailbox_password(&self, identity: &str, password: &str) -> Result<(), HandlerError> {
         let record = if identity.contains('@') {
             mailstack_core::password::mailbox_password_record(identity, password)
@@ -708,7 +514,6 @@ impl Users {
             })
     }
 
-    /// 按 unix 账号名找它的邮箱地址（`managed-mailboxes.json` 的反查）。
     fn address_of(&self, user: &str) -> Option<String> {
         self.read_mailboxes()
             .iter()
@@ -717,7 +522,6 @@ impl Users {
             .filter(|email| !email.is_empty())
     }
 
-    /// 删掉某个账号的口令记录；返回是否真的删掉了。
     fn drop_mailbox_password(&self, user: &str, address: Option<&str>) {
         let store = MailboxPasswords::at(&self.paths);
         if let Some(address) = address {
@@ -726,14 +530,12 @@ impl Users {
         let _ = store.remove(user);
     }
 
-    /// `users.add`：建系统账号、设口令、建 Maildir、登记两份注册表。
     pub fn add(&self, data: &Value) -> Result<Value, HandlerError> {
-        // `address` 是管理前端的字段名，`email` 是基线与控制台的字段名。
         let email = str_field_any(data, &["email", "address"])
             .trim()
             .to_lowercase();
         let username_field = str_field(data, "username").trim().to_lowercase();
-        // 基线：`data.get('username') or email.split('@')[0]`，空串视为缺失。
+
         let user = if username_field.is_empty() {
             email
                 .split_once('@')
@@ -750,7 +552,6 @@ impl Users {
             return Err(HandlerError::new("invalid mailbox identity"));
         }
 
-        // 上下文 = 用户名与完整地址：口令里出现两者任一即拒绝。
         let password = str_field(data, "password");
         validate_mailbox_password(password, [user.as_str(), email.as_str()])
             .map_err(|error| HandlerError::new(error.to_string()))?;
@@ -761,9 +562,6 @@ impl Users {
             .unwrap_or("");
         let managed_domains: BTreeSet<String> = atomic::try_rows(&self.paths.domains)
             .map_err(|error| {
-                // 5.13：读不出来 ≠ 没有受管域名。原先这里退化成空集合，
-                // 结果是「表读不了」被报成「这个域名不受管」—— 运维会去查域名配置，
-                // 而真正的问题在权限或磁盘上。
                 HandlerError::new(format!("managed domain table is unreadable: {error}"))
             })?
             .into_iter()
@@ -773,9 +571,6 @@ impl Users {
             return Err(HandlerError::new("mailbox domain is not managed"));
         }
 
-        // 5.13：这一步只是**快速预检**（省一次 useradd），权威的查重与登记在
-        // 下面锁内的临界区里再做一遍。注册表读不出来 ≠ 没有 —— 静默成空集合
-        // 会让后面的「读出 → 修改 → 写回」把整份注册表清空。
         if self
             .try_read_mailboxes()?
             .iter()
@@ -784,7 +579,6 @@ impl Users {
             return Err(HandlerError::new("mailbox already exists"));
         }
 
-        // ── 以下开始产生副作用 ──
         let group = if self.group_exists("mail") {
             "mail"
         } else {
@@ -792,13 +586,12 @@ impl Users {
         };
         let nologin = self.nologin_shell();
         self.create_account(&user, group, &nologin)?;
-        // 从这里起任何一步失败都要尽力回滚刚建的系统账号：不回滚的话，
-        // 「set_password 失败」会留下一个没口令、没人管的孤儿系统账号。
+
         if let Err(error) = self.set_password(&user, password) {
             self.rollback_created_account(&user, Some(&email));
             return Err(error);
         }
-        // 并写 IMAP/POP3 口令记录：协议面不读 /etc/shadow（见 INV-37）。
+
         if let Err(error) = self.save_mailbox_password(&email, password) {
             self.rollback_created_account(&user, Some(&email));
             return Err(error);
@@ -812,13 +605,6 @@ impl Users {
             ),
         }
 
-        // 两份注册表的登记是 read-modify-write，必须在 core 的排他锁内完成
-        // （10）：并发的 users.add / users.delete 不加锁会互相丢更新。
-        // add 与 delete 的临界区取**同一把**锁（managed-users 的 sidecar），
-        // 两份注册表才不会交错写。锁与 atomic 写的 sidecar 不同名，可安全嵌套
-        // （INV-31）。锁内失败同样要回滚刚建的账号。
-        //
-        // `name` 是管理前端的字段名（它把展示名直接叫 `name`）。
         let display_name: String = str_field_any(data, &["displayName", "name"])
             .chars()
             .take(80)
@@ -850,7 +636,6 @@ impl Users {
         Ok(Value::Array(self.list()))
     }
 
-    /// `users.delete`：删除系统账号并从两份注册表移除。
     pub fn delete(&self, data: &Value) -> Result<Value, HandlerError> {
         let user = user_ident(data);
         if !USER_RE.is_match(user)
@@ -868,15 +653,10 @@ impl Users {
             }
         }
 
-        // 降级链见 [`Self::remove_account`]。
         self.remove_account(user)?;
 
-        // 地址要在从注册表里删掉**之前**取，否则只能按 unix 账号名删记录，
-        // 而记录通常是以邮箱地址为键的 —— 会留下一份谁也删不掉的僵尸口令。
         let address = self.address_of(user);
-        // 注册表更新与 users.add 取**同一把**锁（10）：不加锁时并发的
-        // add/delete 会互相丢更新。锁内读失败必须报错（5.13）——此时账号已删，
-        // 但绝不能把「读不到」当成「空注册表」写回去。
+
         atomic::locked_with(&self.paths.managed_users, || -> Result<(), HandlerError> {
             let mut managed = self.try_read_managed_users()?;
             managed.remove(user);
@@ -895,11 +675,6 @@ impl Users {
         Ok(Value::Array(self.list()))
     }
 
-    /// 删除系统账号的降级链：`userdel -r` → `userdel` →
-    /// `deluser --remove-home` → `deluser`。
-    ///
-    /// 两个程序都不存在时基线**静默什么都不做**（不是错误），这里保持等价
-    /// （返回 `Err` 由调用方决定：`users.delete` 会报错，回滚路径只告警）。
     fn remove_account(&self, user: &str) -> Result<(), HandlerError> {
         if let Some(userdel) = self.env.programs.which("userdel") {
             let userdel = userdel.display().to_string();
@@ -933,20 +708,6 @@ impl Users {
         Ok(())
     }
 
-    /// 建号中途失败的回滚：删掉刚写的口令记录，再尽力删掉刚建的系统账号（连家目录）。
-    ///
-    /// 顺序纪律（模块头）：失败的请求不得留下半个账号 —— 不回滚的话，
-    /// 「set_password 失败」会留下一个没口令、不受任何注册表管辖的孤儿账号。
-    ///
-    /// ## 为什么必须先删口令记录（R2-002）
-    ///
-    /// `users.delete` 会 `drop_mailbox_password`，回滚路径原先不删。于是注册表登记
-    /// 失败时会出现「系统账号已删、`managed-users.json` 里没有它、但
-    /// `mailbox-passwords.json` 里仍有 `alice@example.com` 的 PBKDF2 记录」：
-    /// IMAP/POP3/SASL 只看记录、不看 unix 账号，那个「不存在」的邮箱仍能登录；
-    /// 而且事后**无法用 API 清理** —— `users.delete` 要求目标在注册表里。
-    ///
-    /// 删除在当前进程内不依赖账号是否存在，对「记录还没写成」的情形也是幂等的。
     fn rollback_created_account(&self, user: &str, address: Option<&str>) {
         self.drop_mailbox_password(user, address);
         match self.remove_account(user) {
@@ -960,13 +721,6 @@ impl Users {
         }
     }
 
-    /// `users.status`：锁定 / 解锁账号，并 bump 会话 epoch。
-    ///
-    /// **缺字段 = 参数错误**：同一份代码在 `queue.action` / `services.action` 里
-    /// 立下的纪律是「缺字段必须显式报错，绝不猜默认动词」。这里同样适用 ——
-    /// 原先 `unwrap_or(false)` 把「漏传 enabled」当成「锁定账号」，而锁号会中断
-    /// 收信/登录并踢掉全部在线会话，属于用户可见的破坏性副作用；字段类型写错
-    /// （`"active": "true"`）也会被静默当成 false。
     pub fn status(&self, data: &Value) -> Result<Value, HandlerError> {
         let user = user_ident(data);
         if is_protected(user) || !self.read_managed_users().contains(user) {
@@ -974,7 +728,7 @@ impl Users {
                 "user is protected or not managed by MailStack",
             ));
         }
-        // `active` 是管理前端的字段名（它就是「账号是否启用」）。
+
         let enabled = match data.get("enabled").or_else(|| data.get("active")) {
             Some(Value::Bool(value)) => *value,
             Some(other) => {
@@ -997,28 +751,13 @@ impl Users {
                 command_detail(&result)
             )));
         }
-        // 锁号/解锁只改了 PAM 侧；在线 webmail 会话必须靠 epoch 失效。失败不能
-        // 静默吞掉（那会让「已锁定」的账号在外部 webmail 里继续可用），但也要
-        // 说清「状态已经改了」——否则管理员会以为锁号失败并反复重试。
+
         self.bump_session_epoch(user).map_err(|error| {
             HandlerError::new(format!("account status was changed but {error}"))
         })?;
         Ok(Value::Array(self.list()))
     }
 
-    /// `users.password`：重设系统口令，并 bump 会话 epoch。
-    ///
-    /// ## 写入顺序（R2-003）：先协议面记录，再系统口令
-    ///
-    /// 两边必须**并写**（模块头：否则会出现「webmail 能登、客户端说密码错」）。
-    /// 原先的顺序是「系统口令 → 协议面记录」：第二步失败时第一步已生效，
-    /// 旧口令在新连接上失效、协议面仍在用旧记录，而且 epoch 不会 bump
-    /// （已经登录的 webmail 会话不被踢）—— 那是一次**静默半成功**，上层也没有
-    /// 任何回滚能力（`crates/web` 只会翻成 500）。
-    ///
-    /// 现在：① 写协议面记录（失败时系统口令与 epoch 都没动，可安全重试）；
-    /// ② 改系统口令，失败则把 ① 的记录还原（还原也失败才降级成「半成功」，
-    /// 那时必须 bump epoch 并如实报错）；③ 只有两边都成功才 bump epoch。
     pub fn password(&self, data: &Value) -> Result<Value, HandlerError> {
         let user = user_ident(data);
         if is_protected(user) || !self.read_managed_users().contains(user) {
@@ -1026,27 +765,24 @@ impl Users {
                 "mailbox is protected or not managed by MailStack",
             ));
         }
-        // 注意：基线这里 context 是**单个**用户名字符串，不是元组。
+
         let password = str_field(data, "password");
         validate_mailbox_password(password, [user])
             .map_err(|error| HandlerError::new(error.to_string()))?;
 
         let identity = self.address_of(user).unwrap_or_else(|| user.to_string());
         let store = MailboxPasswords::at(&self.paths);
-        // ①-0 先留一份旧记录，供 ② 失败时还原。读失败要上报：拿不到旧记录就
-        // 不知道「还原成什么」，不能假装它是 None 然后把记录删掉。
+
         let previous = store.get(&identity).map_err(|error| {
             HandlerError::new(format!(
                 "cannot read the current mailbox password record: {error}"
             ))
         })?;
-        // ① 写协议面记录。
+
         self.save_mailbox_password(&identity, password)?;
-        // ② 改系统口令；失败要把 ① 还原。
+
         if let Err(error) = self.set_password(user, password) {
             if let Err(rollback) = self.restore_mailbox_password(&identity, previous.as_ref()) {
-                // 还原也失败：系统口令仍是旧值、协议面已是新值。这个状态确实
-                // 半成功了，必须让旧会话失效并把两个失败一起说清楚。
                 let _ = self.bump_session_epoch(user);
                 return Err(HandlerError::new(format!(
                     "{error}; the IMAP/POP3 password record could not be rolled back either ({rollback}), so the protocol password now differs from the system password"
@@ -1054,13 +790,12 @@ impl Users {
             }
             return Err(error);
         }
-        // ③ 两边都成功才 bump —— 半成功的路径绝不能顺手把用户踢下线。
+
         self.bump_session_epoch(user)
             .map_err(|error| HandlerError::new(format!("password was updated but {error}")))?;
         Ok(json!({ "updated": true }))
     }
 
-    /// 把协议面记录还原成 `previous`（`None` = 原来没有记录，删掉刚写的那条）。
     fn restore_mailbox_password(
         &self,
         identity: &str,
@@ -1086,17 +821,10 @@ fn is_protected(user: &str) -> bool {
     PROTECTED_USERS.contains(&user)
 }
 
-/// 取字符串字段；缺失或非字符串返回空串（基线的 `str(data.get(k, ''))` 语义近似）。
 fn str_field<'a>(data: &'a Value, key: &str) -> &'a str {
     data.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-/// 按候选顺序取第一个**非空**字符串字段。
-///
-/// 为什么要多个候选名：管理前端用 `address` 称呼邮箱地址，而基线与控制台用
-/// `email` / `id`。两者指向同一个东西，但必须**显式列出**而不是靠猜 —— 例如
-/// `users.delete` 若只认 `id`，前端传 `address` 时会得到「不是受管用户」，
-/// 看上去像权限问题，实际只是字段名没对上，排查成本很高。
 fn str_field_any<'a>(data: &'a Value, keys: &[&str]) -> &'a str {
     keys.iter()
         .map(|key| str_field(data, key))
@@ -1104,13 +832,6 @@ fn str_field_any<'a>(data: &'a Value, keys: &[&str]) -> &'a str {
         .unwrap_or("")
 }
 
-/// 解析「用户标识」：优先 `id` / `username`，否则从前端传来的 `address` / `email`
-/// 取 `@` 之前的本地部分。
-///
-/// 为什么可以取本地部分：本产品的建号规则就是
-/// `username = email.split('@')[0]`（见 [`Users::add`]），两者由同一条规则绑定，
-/// 不是猜测。若前端传完整邮箱而这里只认 `id`，用户会看到「不是受管用户」，
-/// 情形和字段名没对上一样令人困惑。
 fn user_ident(data: &Value) -> &str {
     let direct = str_field_any(data, &["id", "username"]);
     if !direct.is_empty() {
@@ -1130,7 +851,6 @@ fn mailbox_str(item: &Value, key: &str) -> String {
         .to_string()
 }
 
-/// `stderr or stdout` —— 与基线给运维看的诊断文本一致。
 fn command_detail(output: &mailstack_core::exec::CommandOutput) -> String {
     if output.stderr.trim().is_empty() {
         output.stdout.trim().to_string()
@@ -1150,7 +870,6 @@ fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 尽力 chown；失败不中断（Maildir 的属主调整本来就可能因权限/uid 不存在而失败）。
 #[cfg(unix)]
 fn chown_best_effort(path: &Path, uid: u32, gid: u32) {
     if let Err(error) = std::os::unix::fs::chown(path, Some(uid), Some(gid)) {
@@ -1188,15 +907,13 @@ mod tests {
     use std::fs;
     use std::sync::Mutex;
 
-    /// 固定时钟：2026-01-01T00:00:00Z。
     const NOW: i64 = 1_767_225_600;
     const GOOD_PASSWORD: &str = "Zx7Qm2Vt9Kp4";
 
-    /// 记下每一次调用（含 stdin）的假运行器。
     #[derive(Default)]
     struct FakeRunner {
         calls: Mutex<Vec<Call>>,
-        /// `useradd` 按顺序返回的状态码；用尽后一律 0。
+
         useradd_statuses: Mutex<VecDeque<i32>>,
         command_statuses: Mutex<BTreeMap<String, VecDeque<i32>>>,
     }
@@ -1226,7 +943,6 @@ mod tests {
                 .push_back(status);
         }
 
-        /// 调用过某程序（按文件名后缀匹配）时收到的 stdin。
         fn input_for(&self, suffix: &str) -> Option<String> {
             self.calls()
                 .into_iter()
@@ -1301,7 +1017,6 @@ mod tests {
         }
     }
 
-    /// 可编排的程序探测。
     #[derive(Clone, Default)]
     struct FakePrograms {
         which: BTreeMap<String, PathBuf>,
@@ -1358,7 +1073,6 @@ mod tests {
             let home = root.join("home").join("alice");
             fs::create_dir_all(&home).unwrap();
 
-            // 受管域名表：`mailbox domain is not managed` 之外的用例都用得上。
             fs::create_dir_all(&paths.postfix).unwrap();
             fs::write(&paths.domains, "example.com OK\n").unwrap();
 
@@ -1368,7 +1082,7 @@ mod tests {
                 passwd_root,
                 home,
                 runner: Arc::new(FakeRunner::default()),
-                // 默认「装了 useradd / chpasswd / nologin」。
+
                 programs: FakePrograms::listing(&[
                     ("useradd", "/usr/sbin/useradd"),
                     ("chpasswd", "/usr/sbin/chpasswd"),
@@ -1444,7 +1158,6 @@ mod tests {
 
     #[test]
     fn unmanaged_domain_is_rejected_before_any_side_effect() {
-        // 副作用必须发生在全部校验之后：被拒的请求不得留下半个账号或注册表。
         let f = Fixture::new("unmanaged");
         let err = f
             .users()
@@ -1474,7 +1187,7 @@ mod tests {
     #[test]
     fn password_is_checked_against_the_username_and_email_context() {
         let f = Fixture::new("passwordctx");
-        // 含用户名的口令被拒。
+
         let err = f
             .users()
             .add(&json!({
@@ -1487,7 +1200,7 @@ mod tests {
             err.to_string(),
             "password must not contain the account name or email address"
         );
-        // 含完整地址域名的口令同样被拒。
+
         let err = f
             .users()
             .add(&json!({
@@ -1507,7 +1220,7 @@ mod tests {
     fn useradd_falls_back_and_chpasswd_receives_the_secret_on_stdin() {
         let f = Fixture::new("useraddchain");
         f.add_passwd("alice", 1001, &f.home);
-        // 第一次 useradd 失败，第二次（去掉 -N -g）成功。
+
         f.runner.useradd_statuses.lock().unwrap().push_back(1);
 
         let out = f
@@ -1529,7 +1242,6 @@ mod tests {
             vec!["-m", "-s", "/usr/sbin/nologin", "alice"]
         );
 
-        // 口令经 stdin，绝不进 argv。
         assert_eq!(
             f.runner.input_for("chpasswd").as_deref(),
             Some("alice:Zx7Qm2Vt9Kp4\n")
@@ -1695,7 +1407,7 @@ mod tests {
     #[test]
     fn delete_rejects_protected_and_system_accounts_but_removes_managed_ones() {
         let f = Fixture::new("delete");
-        // protected：即使被误写进注册表也必须拒绝。
+
         f.write_managed_users(&["root", "sysacct", "alice"]);
         f.write_mailboxes(&[("alice@example.com", "alice")]);
         f.add_passwd("sysacct", 500, &f.root.join("home/sysacct"));
@@ -1769,15 +1481,11 @@ mod tests {
 
     #[test]
     fn the_frontend_field_names_address_and_name_are_understood() {
-        // 管理前端用 `address` 称呼邮箱、用 `name` 称呼展示名、用 `active` 称呼启用位。
-        // 不认这些名字的后果不是「报错」而是「看起来像权限问题」：
-        // users.delete 只认 `id` 时会回「不是受管用户」，让人以为是授权出错。
         let f = Fixture::new("frontendnames");
         f.write_managed_users(&["alice"]);
         f.add_passwd("alice", 1001, &f.home);
         let users = f.users();
 
-        // status：`address` + `active` 等价于 `id` + `enabled`。
         users
             .status(&json!({ "address": "alice@example.com", "active": true }))
             .unwrap();
@@ -1789,7 +1497,6 @@ mod tests {
             "active=true 必须被当成 enabled=true → passwd -u"
         );
 
-        // password：`address` 也要能定位到 unix 用户名（本地部分）。
         users
             .password(&json!({ "address": "alice@example.com", "password": GOOD_PASSWORD }))
             .unwrap();
@@ -1807,7 +1514,7 @@ mod tests {
         let out = users
             .add(&json!({ "address": "alice@example.com", "name": "Alice", "password": GOOD_PASSWORD }))
             .unwrap();
-        // 用户名按建号规则从地址本地部分推出，展示名取 `name`。
+
         assert!(out.is_array());
         let boxes = users.read_mailboxes();
         assert_eq!(mailbox_str(&boxes[0], "email"), "alice@example.com");
@@ -1847,7 +1554,6 @@ mod tests {
         );
         assert_eq!(f.epoch_of("alice"), Some(NOW), "改密必须 bump epoch");
 
-        // protected / 未托管一律拒绝。
         for user in ["root", "ghost"] {
             assert_eq!(
                 users
@@ -1875,12 +1581,6 @@ mod tests {
         assert_eq!(listed[0]["role"], "mailbox");
     }
 
-    // ─────────── IMAP/POP3 口令记录（mailbox-passwords.json）───────────
-
-    /// 建号必须**同时**写系统口令与 IMAP 口令记录。
-    ///
-    /// 只写系统的后果：客户端（走协议面）永远登不上；只写记录的后果：
-    /// PAM/Postfix 侧认不出。两边都要有，且键是**邮箱地址**。
     #[test]
     fn add_also_writes_the_imap_password_record_keyed_by_address() {
         let f = Fixture::new("imaprecord");
@@ -1900,7 +1600,6 @@ mod tests {
         assert_eq!(record.username, "alice@example.com");
     }
 
-    /// 改密必须同时更新协议面的记录，否则客户端会继续用旧口令。
     #[test]
     fn password_change_updates_the_imap_record_too() {
         let f = Fixture::new("imaprecordpw");
@@ -1926,7 +1625,6 @@ mod tests {
         );
     }
 
-    /// 删号必须把记录一起删掉；否则那个地址会留一份「谁也管不到」的口令。
     #[test]
     fn delete_drops_the_imap_record() {
         let f = Fixture::new("imaprecorddel");
@@ -1954,19 +1652,13 @@ mod tests {
         );
     }
 
-    /// 反例（R2-003 ②）：协议面口令库读不出来时，**系统口令一动不动**。
-    ///
-    /// 修复前的顺序是「系统口令 → 记录」：记录这一步失败时系统口令已经改了，
-    /// 旧口令在新连接上失效、协议面仍是旧记录，而且 epoch 不会 bump（在线会话
-    /// 不被踢）—— 一次静默半成功。现在先读旧记录、再写新记录，读不出来就
-    /// 在动手之前失败。
     #[test]
     fn an_unreadable_imap_record_store_is_reported_instead_of_silently_half_done() {
         let f = Fixture::new("imaprecordfail");
         f.add_passwd("alice", 1001, &f.home);
         f.write_managed_users(&["alice"]);
         f.write_mailboxes(&[("alice@example.com", "alice")]);
-        // 把记录文件的位置变成一个目录 → 读写都不可能。
+
         fs::create_dir_all(&f.paths.mailbox_passwords).unwrap();
 
         let error = f
@@ -1980,7 +1672,7 @@ mod tests {
                 .contains("cannot read the current mailbox password record"),
             "必须明确指出协议面口令库读不出来：{error}"
         );
-        // 关键：系统口令不得被改过一次 —— 否则又回到"半成功"。
+
         assert!(
             !f.runner.programs().iter().any(|p| p.ends_with("chpasswd")),
             "协议面记录写不了时不得先改系统口令"
@@ -1988,11 +1680,6 @@ mod tests {
         assert_eq!(f.epoch_of("alice"), None, "什么都没成功，不得 bump epoch");
     }
 
-    /// 反例（R2-003 ②）：记录可读但写不进去时，同样不得碰系统口令。
-    ///
-    /// 做法：口令库文件本身合法可读，但它的锁 sidecar（`<file>.lock`）是个目录 →
-    /// `upsert` 必然失败，而 `get` 仍然成功 —— 正好落在「读到了旧记录、写新记录
-    /// 失败」这条路径上。
     #[test]
     fn a_failed_imap_record_write_never_touches_the_system_password() {
         let f = Fixture::new("imaprecordwrite");
@@ -2023,7 +1710,6 @@ mod tests {
         assert_eq!(f.epoch_of("alice"), None);
     }
 
-    /// 反例（R2-003 ①）：系统口令改失败时，必须把协议面记录还原成旧口令。
     #[test]
     fn a_failed_system_password_change_restores_the_previous_imap_record() {
         let f = Fixture::new("imaprecordrollback");
@@ -2069,11 +1755,6 @@ mod tests {
         );
     }
 
-    /// 反例（R2-002）：注册表登记失败时的回滚必须把刚写的口令记录一起删掉。
-    ///
-    /// 否则会留下「系统账号已删、注册表里没有、但 mailbox-passwords.json 里仍有
-    /// alice@example.com」的僵尸凭据：IMAP/POP3 只认记录，它还能登录，而
-    /// `users.delete` 又因为"不在注册表里"拒绝清理。
     #[test]
     fn a_rolled_back_add_leaves_no_imap_password_record() {
         let f = Fixture::new("imaprecordrollbackadd");
@@ -2100,10 +1781,6 @@ mod tests {
         );
     }
 
-    /// 反例（R2-004）：epoch 表损坏时必须报错，且**不得整表覆盖**。
-    ///
-    /// 原先读失败/坏 JSON 被当成空表，然后整表写回 —— 其他用户的失效水位全部
-    /// 消失，那些本该被踢掉的 webmail 会话重新变成"合法"。
     #[test]
     fn a_corrupt_session_epoch_table_is_reported_instead_of_overwritten() {
         let f = Fixture::new("epochcorrupt");
@@ -2130,7 +1807,6 @@ mod tests {
         );
     }
 
-    /// 正常路径仍然是 read-modify-write：bump 一个用户不得丢掉其他用户的水位。
     #[test]
     fn bumping_one_user_preserves_other_session_watermarks() {
         let f = Fixture::new("epochmerge");
@@ -2149,7 +1825,6 @@ mod tests {
         assert_eq!(table["alice"], NOW);
     }
 
-    /// 反例（R2-005）：缺 `enabled` / `active` 时必须报参数错误，**绝不猜默认锁定**。
     #[test]
     fn status_requires_an_explicit_enabled_flag_instead_of_locking_by_default() {
         let f = Fixture::new("statusmissing");
@@ -2164,7 +1839,6 @@ mod tests {
         );
         assert!(f.runner.calls().is_empty(), "缺字段时不得调用 passwd");
 
-        // 类型写错（字符串）也不算 false。
         let error = users
             .status(&json!({ "id": "alice", "active": "true" }))
             .unwrap_err();
@@ -2172,7 +1846,6 @@ mod tests {
         assert!(f.runner.calls().is_empty(), "类型错误时不得调用 passwd");
     }
 
-    /// R2-006：没有 `chpasswd` 时明确报错，不退回可能卡在 `/dev/tty` 的 `passwd`。
     #[test]
     fn a_missing_chpasswd_fails_closed_instead_of_using_interactive_passwd() {
         let f = Fixture::new("nochpasswd");
@@ -2202,12 +1875,8 @@ mod tests {
         );
     }
 
-    // ─────────── 5.13 / 10 / 11：注册表如实读、持锁写、中途回滚 ───────────
-
     #[test]
     fn a_corrupt_mailbox_registry_fails_add_before_any_side_effect() {
-        // 5.13：注册表损坏时 users.add 必须报错，而不是把「读到的空集合」
-        // 写回去 —— 那会把整份 managed-mailboxes.json 清掉。
         let f = Fixture::new("registrycorrupt");
         fs::create_dir_all(f.paths.managed_mailboxes.parent().unwrap()).unwrap();
         fs::write(&f.paths.managed_mailboxes, "{not json").unwrap();
@@ -2233,8 +1902,6 @@ mod tests {
 
     #[test]
     fn a_corrupt_managed_users_registry_rolls_the_add_back() {
-        // 注册表在**中途**读失败（账号已建、口令已设）：必须回滚刚建的账号，
-        // 且绝不能把损坏的注册表当成空集合覆盖掉。
         let f = Fixture::new("userscorrupt");
         f.write_mailboxes(&[("bob@example.com", "bob")]);
         fs::create_dir_all(f.paths.managed_users.parent().unwrap()).unwrap();
@@ -2267,12 +1934,9 @@ mod tests {
 
     #[test]
     fn a_failed_midway_step_rolls_back_the_created_account() {
-        // 11：set_password 之后的失败（此处：协议面口令记录写不进去）必须
-        // 尽力 userdel -r 刚建的账号 —— 不能留下一个没口令、不受注册表管辖
-        // 的孤儿系统账号。
         let f = Fixture::new("addrollback");
         f.add_passwd("alice", 1001, &f.home);
-        // 把记录文件的位置变成一个目录 → 原子写必然失败。
+
         fs::create_dir_all(&f.paths.mailbox_passwords).unwrap();
 
         let error = f
@@ -2299,8 +1963,6 @@ mod tests {
 
     #[test]
     fn list_derives_lock_status_from_a_single_shadow_read() {
-        // 12：逐行 fork `passwd -S` 换成一次 shadow 读取。`!` 前缀 = 锁定，
-        // 正常哈希 = 启用；输出形状与旧路径一致。
         let f = Fixture::new("shadowlocks");
         f.write_mailboxes(&[("alice@example.com", "alice"), ("bob@example.com", "bob")]);
         f.add_passwd("alice", 1001, &f.home);
@@ -2333,9 +1995,6 @@ mod tests {
 
     #[test]
     fn list_falls_back_to_passwd_s_when_shadow_is_unreadable() {
-        // shadow 读不到（缺文件 / 权限）时退回旧的逐行 `passwd -S` 路径，
-        // 状态判定不能因为一次读失败而整体变错。FakeRunner 的 stdout 恒为空 →
-        // `passwd -S` 无第 2 字段 → 未锁定（「没证据说明被锁」口径）。
         let f = Fixture::new("shadowfallback");
         f.write_mailboxes(&[("alice@example.com", "alice")]);
         f.add_passwd("alice", 1001, &f.home);
@@ -2343,7 +2002,7 @@ mod tests {
         let listed = f.users().list();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0]["status"], "enabled");
-        // 回退路径必须真的被走到：列表动作里出现了 `passwd -S`。
+
         assert!(
             f.runner
                 .calls()

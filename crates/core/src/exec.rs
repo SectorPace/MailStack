@@ -1,25 +1,8 @@
-//! 外部命令与服务控制原语（规格书 §5.7.4）。
-//!
-//! 存在的理由有两条：
-//!
-//! 1. **可测试**：让「调用 postconf / postmap / systemctl」的代码能在**没有装这些
-//!    东西的机器上**被测试（注入记录型 runner 与环境探测即可）。
-//! 2. **单一实现**：`postmap` 的语义（编译 hash 表 → `postfix check` → 重载）被
-//!    store 的表文件与 smtp 的中继凭证两处使用，不能各写一遍。
-//!
-//! ## `service_ctl` 的降级链为什么值得认真实现
-//!
-//! 目标发行版横跨 systemd 与非 systemd（安装矩阵含 Rocky Linux 9 与 Alpine）。
-//! 如果只认 `systemctl`，在非 systemd 主机上「重载 postfix」会静默失败 ——
-//! 表文件写好了、hash 表也编译了，但 Postfix 仍在用旧配置读。因此降级链必须
-//! **逐级按基线语义**实现，并且每一级都要有测试。
-
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::error::{CoreError, CoreResult};
 
-/// 外部命令的执行结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
     pub status: i32,
@@ -32,7 +15,6 @@ impl CommandOutput {
         self.status == 0
     }
 
-    /// 失败时拼接一段可读的诊断文本。
     pub fn diagnostic(&self, program: &str) -> String {
         let detail = if self.stderr.trim().is_empty() {
             self.stdout.trim()
@@ -43,18 +25,9 @@ impl CommandOutput {
     }
 }
 
-/// 外部命令运行器。
 pub trait CommandRunner: Send + Sync {
     fn run(&self, program: &str, args: &[&str]) -> CoreResult<CommandOutput>;
 
-    /// 通过 **stdin** 把 `stdin` 喂给子进程后取回结果。
-    ///
-    /// 只有需要保密的输入才走这条路：`chpasswd` 的口令绝不能出现在 argv 里
-    /// （`ps` 能看到整条命令行）。
-    ///
-    /// 默认实现**必须是明确报错**，不能静默丢弃输入：既有的测试 runner 大多只实现
-    /// `run`，一旦某个动作走了这条路，它们应当**响亮失败**，而不是让子进程收到空
-    /// 输入后以「口令设为空/格式错」这种误导性的方式失败。
     fn run_with_input(
         &self,
         program: &str,
@@ -67,14 +40,6 @@ pub trait CommandRunner: Send + Sync {
         )))
     }
 
-    /// 带超时地运行外部命令。
-    ///
-    /// 与 [`CommandRunner::run_with_input`] 同一风格：默认实现**明确报错**，
-    /// 既有的测试 runner 不必改动；一旦某个动作真的需要超时却用了没有超时能力的
-    /// runner，它会**响亮失败**，而不是悄悄地无限期挂住。
-    ///
-    /// 存在理由：`acme.sh` 的申请/续期可能耗时数分钟，基线用 180/300/120 秒超时。
-    /// 没有超时意味着一个卡住的 ACME 流程会永久占住调用方。
     fn run_with_timeout(
         &self,
         program: &str,
@@ -88,7 +53,6 @@ pub trait CommandRunner: Send + Sync {
     }
 }
 
-/// 真实运行器。
 #[derive(Debug, Default)]
 pub struct SystemCommandRunner;
 
@@ -125,16 +89,9 @@ impl CommandRunner for SystemCommandRunner {
             .spawn()
             .map_err(|e| CoreError::invalid(format!("cannot run {resolved}: {e}")))?;
 
-        // 死锁修复：原先在主线程上**先写完整个 stdin** 再读输出。子进程若把自己的
-        // stdout 管道填满（通常 64 KB）就会阻塞在 write 上，而主线程还堵在
-        // `write_all(stdin)` 上等它腾出管道空间 —— 两边互相等待，谁也动不了。
-        // 把 stdin 写入挪到独立线程与 `wait_with_output()` 并发：读输出的一方
-        // 不再被写输入的一方挡住。句柄在线程结束时 drop，管道随之关闭，
-        // 子进程自然看到 EOF。
         let writer = child.stdin.take().map(|mut pipe| {
             let payload = stdin.as_bytes().to_vec();
-            // 写入失败（含子进程提前退出导致的 EPIPE）由 join 结果带回；
-            // 无论成败，`pipe` 在线程结束时 drop，管道关闭即给出 EOF。
+
             std::thread::spawn(move || pipe.write_all(&payload).map_err(|e| e.to_string()))
         });
 
@@ -142,9 +99,6 @@ impl CommandRunner for SystemCommandRunner {
             .wait_with_output()
             .map_err(|e| CoreError::invalid(format!("cannot wait for {resolved}: {e}")))?;
 
-        // 子进程已退出，stdin 管道要么写完要么 EPIPE —— 写入线程此刻必然已结束，
-        // join 不会悬挂。写入失败仍要如实报错（chpasswd 收到半截口令不该被当成
-        // 「设置成功」），且此时子进程已被回收，不会留下孤儿。
         if let Some(Err(detail)) = writer.and_then(|handle| handle.join().ok()) {
             return Err(CoreError::invalid(format!(
                 "cannot write stdin to {resolved}: {detail}"
@@ -170,7 +124,6 @@ impl CommandRunner for SystemCommandRunner {
         let resolved = resolve_program_for_execution(program)?;
         let mut child = std::process::Command::new(&resolved)
             .args(args)
-            // 不继承调用方的 stdin：外部命令不该从助手进程偷读输入。
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -183,8 +136,6 @@ impl CommandRunner for SystemCommandRunner {
                 Ok(Some(_)) => break,
                 Ok(None) => {}
                 Err(e) => {
-                    // try_wait 出错同样要 kill 并回收，否则与超时路径一样会留下
-                    // 孤儿/僵尸进程。
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(CoreError::invalid(format!(
@@ -193,7 +144,6 @@ impl CommandRunner for SystemCommandRunner {
                 }
             }
             if Instant::now() >= deadline {
-                // 超时必须 kill 并回收，否则会留下僵尸进程。
                 let _ = child.kill();
                 let _ = child.wait();
                 return Ok(CommandOutput {
@@ -216,11 +166,6 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
-/// 解析可信可执行文件路径：先查 `PATH`，再查常见 sbin 目录。
-///
-/// 与 `core.py` 的 `run()` 行为一致 —— 特权助手的 `PATH` 通常不含 `/usr/sbin`。
-/// Unix 下只接受由 root 或当前进程用户拥有、且自身不可被组/其他用户改写的程序，
-/// 并跳过不可信目录，避免特权进程执行被 PATH 劫持的命令。
 pub fn resolve_program(program: &str) -> String {
     if program.contains('/') {
         return program.to_string();
@@ -249,14 +194,6 @@ fn find_in_path(program: &str, path: &OsStr) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// 解析**可执行**路径：只返回通过可信检查（属主 / 权限位 / 目录链）的程序。
-///
-/// 与 [`resolve_program`] 的区别：那个是「展示/兼容用」的宽松版本（找不到就原样
-/// 返回程序名）；本函数是**执行前**的唯一入口 —— 解析不出来就报错，绝不把裸名
-/// 交回给调用方（`Command::new("gpg")` 会让内核按 `PATH` 搜索，等于绕开全部检查）。
-///
-/// 公开它是因为特权路径上还有别的执行点（如 `backup::GpgCipher` 直接调 gpg），
-/// 它们必须复用同一条解析链，而不是各写一份。
 pub fn resolve_program_for_execution(program: &str) -> CoreResult<String> {
     let path = if program.contains('/') {
         PathBuf::from(program)
@@ -329,12 +266,6 @@ fn is_trusted_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-// ───────────────────────── 服务控制（§5.7.4） ─────────────────────────
-
-/// 服务控制动作。
-///
-/// 用枚举而不是裸字符串：基线的 `service_ctl` 收到未知 verb 会一路走到最后的
-/// `true`（静默什么都不做），那正是「配置改了但没人重载」这类问题的温床。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceVerb {
     Start,
@@ -345,13 +276,6 @@ pub enum ServiceVerb {
 
 const SERVICE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// 表文件同步序列（`postmap` / `postfix check`）的单步超时。
-///
-/// 这两步跑在 `store` 的 `locked()` 临界区内（flock 是**跨进程**的），而
-/// `postmap` 是外部二进制：它可能卡在 Berkeley DB 锁、网络文件系统、或一个挂死
-/// 的 `postfix` 上。没有超时的话，一次卡死会让此后所有 `domains.add/delete`
-/// 永久阻塞 —— 特权助手没有请求级超时，客户端超时只是让调用方看到失败，锁不会
-/// 释放。取 60s：正常表在毫秒级完成，再慢也远不到一分钟的量级。
 pub const POSTMAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl ServiceVerb {
@@ -364,12 +288,6 @@ impl ServiceVerb {
         }
     }
 
-    /// 解析动词。**未知动词返回 `None`** —— 绝不回落到某个默认值：
-    /// 基线的 `service_ctl` 收到未知 verb 会一路走到最后的 `true`（静默什么都不做），
-    /// 那正是「配置改了但没人重载」这类问题的温床。调用方拿到 `None` 必须报错。
-    ///
-    /// 只读动词 `status` 刻意**不**在这里：它没有任何副作用，调用方直接读状态即可，
-    /// 不需要经过这条「执行一条命令」的通道。
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "start" => Some(ServiceVerb::Start),
@@ -381,17 +299,12 @@ impl ServiceVerb {
     }
 }
 
-/// 服务控制所需的环境探测。抽出来是为了让**整条降级链**可测 ——
-/// 这条链一旦退化（例如永远命中第一级），在非 systemd 主机上就是静默不重载。
 pub trait ServiceEnv: Send + Sync {
-    /// 等价 `shutil.which(program).is_some()` —— **只查 `PATH`**，不查 sbin 目录。
     fn program_available(&self, program: &str) -> bool;
 
-    /// 路径是否存在（`/run/systemd/system` 是否为目录、`/etc/init.d/<unit>` 等）。
     fn path_exists(&self, path: &Path) -> bool;
 }
 
-/// 真实环境探测。
 #[derive(Debug, Default)]
 pub struct SystemServiceEnv;
 
@@ -405,49 +318,32 @@ impl ServiceEnv for SystemServiceEnv {
     }
 }
 
-/// 实际命中的后端（用于测试与日志）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceBackend {
     Systemctl,
     Service,
     RcService,
     InitScript(PathBuf),
-    /// `postfix <verb>` 专用分支。
+
     Postfix,
-    /// `dovecot <verb|reload>` 专用分支。
+
     Dovecot,
-    /// `fail2ban-client` 专用分支。
+
     Fail2ban,
-    /// 所有分支都不适用：基线执行 `true`（等价于成功但什么都没做）。
+
     Noop,
 }
 
-/// 一次服务控制的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceCtlOutcome {
     pub backend: ServiceBackend,
-    /// 真正执行的命令；[`ServiceBackend::Noop`] 时为 `None`。
+
     pub output: Option<CommandOutput>,
-    /// spawn 失败的原因（程序不存在 / 权限不足 / fork 失败）。
-    ///
-    /// 与 `output == None` 的区别见 [`ServiceCtlOutcome::success`]。
+
     pub spawn_error: Option<String>,
 }
 
 impl ServiceCtlOutcome {
-    /// 是否成功。
-    ///
-    /// ## 为什么 `Noop` 与「执行失败」不能同义
-    ///
-    /// 原实现是 `None => true`，而 `None` 同时表示两件**性质相反**的事：
-    ///
-    /// * [`ServiceBackend::Noop`] —— 该单元不适用任何后端（真的什么都不用做）；
-    /// * **spawn 失败** —— `systemctl` 存在但 fork/exec 失败、权限不足、OOM。
-    ///   这时 `success()` 返回 `true`，于是「配置改了但没人重载」——
-    ///   正是本模块文档 [`service_ctl`] 自己声明要根除的失败模式。
-    ///
-    /// 调用方（`reload_ok`、API 响应）都只看这个布尔值，所以必须区分。
-    /// spawn 失败用 [`ServiceCtlOutcome::spawn_error`] 承载，不再压成 `None`。
     pub fn success(&self) -> bool {
         match &self.output {
             Some(output) => output.success(),
@@ -455,15 +351,10 @@ impl ServiceCtlOutcome {
         }
     }
 
-    /// 是否是「命令根本没跑起来」。
-    ///
-    /// 与「跑了但失败」分开：前者通常是环境/权限问题（该叫人），
-    /// 后者是服务自己拒绝（可能是正常的）。
     pub fn spawn_failed(&self) -> bool {
         self.spawn_error.is_some()
     }
 
-    /// 人类可读的原因，供 API 层如实上报。
     pub fn failure_reason(&self) -> Option<String> {
         match (&self.output, &self.spawn_error) {
             (Some(output), _) if !output.success() => Some(output.stderr.clone()),
@@ -473,53 +364,44 @@ impl ServiceCtlOutcome {
     }
 }
 
-/// 服务控制：按基线的**首命中**降级链执行（`core.py:579-600`）。
-///
-/// 顺序（与基线逐条对应，且是 `elif` 而非「逐个尝试」）：
-///
-/// 1. `systemctl`（且 `/run/systemd/system` 存在）
-/// 2. `service`
-/// 3. `rc-service`（`reload` 退化为 `restart` —— OpenRC 没有 reload 概念）
-/// 4. `/etc/init.d/<unit>`
-/// 5. 专用分支：`postfix` / `dovecot`（`restart` 退化为 `reload`）/ `fail2ban-client`
-/// 6. 都不适用 → `Noop`
 pub fn service_ctl(
     env: &dyn ServiceEnv,
     runner: &dyn CommandRunner,
     unit: &str,
     verb: ServiceVerb,
 ) -> ServiceCtlOutcome {
-    let run = |program: &str, args: &[&str]| {
-        match runner.run_with_timeout(program, args, SERVICE_COMMAND_TIMEOUT) {
-            Ok(output) => ServiceCtlOutcome {
-                backend: match program {
-                    "systemctl" => ServiceBackend::Systemctl,
-                    "service" => ServiceBackend::Service,
-                    "rc-service" => ServiceBackend::RcService,
-                    "postfix" => ServiceBackend::Postfix,
-                    "dovecot" => ServiceBackend::Dovecot,
-                    "fail2ban-client" => ServiceBackend::Fail2ban,
-                    other => ServiceBackend::InitScript(PathBuf::from(other)),
-                },
-                output: Some(output),
-                spawn_error: None,
+    let run = |program: &str, args: &[&str]| match runner.run_with_timeout(
+        program,
+        args,
+        SERVICE_COMMAND_TIMEOUT,
+    ) {
+        Ok(output) => ServiceCtlOutcome {
+            backend: match program {
+                "systemctl" => ServiceBackend::Systemctl,
+                "service" => ServiceBackend::Service,
+                "rc-service" => ServiceBackend::RcService,
+                "postfix" => ServiceBackend::Postfix,
+                "dovecot" => ServiceBackend::Dovecot,
+                "fail2ban-client" => ServiceBackend::Fail2ban,
+                other => ServiceBackend::InitScript(PathBuf::from(other)),
             },
-            // 曾经是 `.ok()` —— spawn 失败被压成 `None`，而 `success()` 对 `None`
-            // 返回 `true`，于是「systemctl 根本没跑起来」被报成「重载成功」。
-            Err(error) => ServiceCtlOutcome {
-                backend: match program {
-                    "systemctl" => ServiceBackend::Systemctl,
-                    "service" => ServiceBackend::Service,
-                    "rc-service" => ServiceBackend::RcService,
-                    "postfix" => ServiceBackend::Postfix,
-                    "dovecot" => ServiceBackend::Dovecot,
-                    "fail2ban-client" => ServiceBackend::Fail2ban,
-                    other => ServiceBackend::InitScript(PathBuf::from(other)),
-                },
-                output: None,
-                spawn_error: Some(error.to_string()),
+            output: Some(output),
+            spawn_error: None,
+        },
+
+        Err(error) => ServiceCtlOutcome {
+            backend: match program {
+                "systemctl" => ServiceBackend::Systemctl,
+                "service" => ServiceBackend::Service,
+                "rc-service" => ServiceBackend::RcService,
+                "postfix" => ServiceBackend::Postfix,
+                "dovecot" => ServiceBackend::Dovecot,
+                "fail2ban-client" => ServiceBackend::Fail2ban,
+                other => ServiceBackend::InitScript(PathBuf::from(other)),
             },
-        }
+            output: None,
+            spawn_error: Some(error.to_string()),
+        },
     };
 
     if env.program_available("systemctl") && env.path_exists(Path::new("/run/systemd/system")) {
@@ -544,7 +426,6 @@ pub fn service_ctl(
         return run("postfix", &[verb.as_str()]);
     }
     if unit == "dovecot" && env.program_available("dovecot") {
-        // Dovecot 没有 `restart`：它的等价动作是 `reload`。
         let dovecot_verb = if verb == ServiceVerb::Restart {
             "reload"
         } else {
@@ -566,24 +447,11 @@ pub fn service_ctl(
     ServiceCtlOutcome {
         backend: ServiceBackend::Noop,
         output: None,
-        // 真的什么都不用做 —— 与上面「跑了但失败」相反的情形。
+
         spawn_error: None,
     }
 }
 
-/// 服务是否在运行：按基线的**逐级探测**（`core.py:602-619`）。
-///
-/// 注意这里是「逐个尝试、命中即真」，与 [`service_ctl`] 的首命中不同 ——
-/// 探测要尽量给出一致的结论，而执行必须只走一条路。
-///
-/// 探测**全部带超时**（与 [`service_ctl`] 用同一个 `SERVICE_COMMAND_TIMEOUT`）：
-/// `status` 子命令可能卡在挂死的 init 脚本上，没超时的探测会把调用方一起拖住。
-///
-/// 「running」判定刻意收窄：基线用 `contains("running")`，而 `postfix is not
-/// running` 这类失败输出同样包含它 —— 一台服务挂了的主机会被报成「在运行」。
-/// 现在的规则：命令成功即在运行；失败时只有输出明示 `active (running)` 且**不含**
-/// `inactive` / `not running` / `failed` 才算在运行。pgrep 兜底按退出码判定，
-/// 不受文本误匹配影响。
 pub fn is_service_active(env: &dyn ServiceEnv, runner: &dyn CommandRunner, unit: &str) -> bool {
     if env.program_available("systemctl") && env.path_exists(Path::new("/run/systemd/system")) {
         if let Ok(out) = runner.run_with_timeout(
@@ -647,35 +515,17 @@ pub fn is_service_active(env: &dyn ServiceEnv, runner: &dyn CommandRunner, unit:
     }
 }
 
-/// `postmap` 序列的每一步结果，供调用方与测试断言。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PostmapOutcome {
-    /// `postmap <table>` 是否成功。
     pub postmap_ok: bool,
-    /// `postfix check` 是否成功。
+
     pub check_ok: bool,
-    /// 重载 Postfix 是否成功。
+
     pub reload_ok: bool,
-    /// 本机**没有安装 Postfix**（`postmap` 可执行文件不存在）。
-    ///
-    /// 这不是失败：MailStack 是 Postfix 的替代品，表文件由 MailStack 自己按文本读取，
-    /// 只有「Postfix 仍在跑、需要重新编译 hash 表」时这一步才有意义。
-    /// 把「没装 Postfix」判成失败，会让管理台在**纯 MailStack 主机**上加域名/加别名
-    /// 一律报错 —— 而那正是 v1.0.0 的目标部署形态。
+
     pub postfix_absent: bool,
 }
 
-/// 把表文件编译成 Postfix 的 hash 数据库，并让 Postfix 重读配置
-/// （`core.py:765-772` 的 `postmap()`）。
-///
-/// 重载走 [`service_ctl`] 的降级链（基线用的就是 `service_ctl('postfix','reload')`），
-/// 因此非 systemd 主机（OpenRC / sysv init）同样能重载。
-///
-/// **每一步失败都是非致命的**：原实现一律 `check=False`，靠 `warn()` 上报。
-/// 这里保持同样的语义 —— 但把结果返回给调用方，因为「hash 表没编译成功」是一个
-/// 值得让上层知道的事实（写表成功但 Postfix 仍在读旧表）。
-///
-/// 刻意**不**返回 `Result`：写表本身已经成功，postmap 失败不该让整个操作报错回滚。
 pub fn postmap_and_reload(
     env: &dyn ServiceEnv,
     runner: &dyn CommandRunner,
@@ -683,14 +533,6 @@ pub fn postmap_and_reload(
 ) -> PostmapOutcome {
     let table_str = table.to_string_lossy().to_string();
 
-    // 「找不到 postmap 可执行文件」= 本机没有 Postfix，而不是这一步失败。
-    //
-    // 必须与「postmap 存在但执行失败」严格区分：
-    //   * 不存在 → 没有 Postfix 在消费 hash 表，跳过整条同步序列是正确行为；
-    //   * 存在但失败/db 编译失败 → 调用方必须知道（Postfix 可能还在读旧表）。
-    // 只看 `CoreError::NotFound`，不看错误文案 —— 文案是给人看的，判定必须基于类型。
-    // 超时是必须的：这一整段跑在 `store` 的跨进程 `locked()` 临界区里，
-    // 卡住的 `postmap` 会把之后所有域表操作一起拖死（见 `POSTMAP_TIMEOUT`）。
     let postmap_result = runner.run_with_timeout("postmap", &[table_str.as_str()], POSTMAP_TIMEOUT);
     if matches!(postmap_result, Err(CoreError::NotFound(_))) {
         crate::warn::warn_with_detail(
@@ -750,9 +592,6 @@ pub fn postmap_and_reload(
     }
 }
 
-/// 表文件对应的 hash 数据库路径（`postmap` 的产物）。
-///
-/// Postfix 在同目录下生成 `<name>.db`（Berkeley DB 默认后缀）。
 pub fn hash_db_path(table: &Path) -> PathBuf {
     let name = table
         .file_name()
@@ -766,7 +605,6 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// 记录调用并按脚本返回结果。
     struct RecordingRunner {
         calls: Mutex<Vec<(String, Vec<String>)>>,
         timeouts: Mutex<Vec<(String, std::time::Duration)>>,
@@ -846,7 +684,6 @@ mod tests {
         );
     }
 
-    /// 可编排的环境探测。
     #[derive(Default)]
     struct FakeEnv {
         programs: Vec<&'static str>,
@@ -956,7 +793,6 @@ mod tests {
             }
         }
 
-        /// 只提供 `postfix`，且没有 systemd —— 走专用分支。
         fn postfix_only() -> Self {
             Self::with(&["postfix"], &[])
         }
@@ -974,7 +810,6 @@ mod tests {
 
     #[test]
     fn postmap_sequence_matches_the_python_order() {
-        // core.py: postmap <table> → postfix check → 重载。顺序不能变。
         let runner = RecordingRunner::new();
         let env = FakeEnv::postfix_only();
         let outcome =
@@ -999,12 +834,6 @@ mod tests {
         );
     }
 
-    /// 反例守卫：`postmap` / `postfix check` 必须在**有界超时**下执行。
-    ///
-    /// 回归背景：这两步跑在 `store::tables` 的跨进程 `locked()` 临界区里，用的却是
-    /// 无超时的 `run()`。一个卡在 Berkeley DB 锁 / 网络文件系统 / 挂死的 `postfix`
-    /// 上的 `postmap` 会让之后所有 `domains.add/delete` **永久阻塞**（flock 不会因为
-    /// 调用方超时而释放）。这条测试断言两步都走 `run_with_timeout`，且超时值有界。
     #[test]
     fn the_postmap_sequence_is_bounded_by_a_timeout() {
         let runner = RecordingRunner::new();
@@ -1028,12 +857,6 @@ mod tests {
         );
     }
 
-    /// 本机没有 Postfix（找不到 `postmap`）时，整条同步序列必须被视为「无需同步」，
-    /// 而不是「同步失败」。
-    ///
-    /// 回归背景：v1.0.0 的纯 MailStack 主机（Postfix 已移除）上，`domains.add` /
-    /// `aliases.add` 会把「没有 postmap 可执行文件」判成 Postfix 更新失败并让整个
-    /// 动作报错 —— 新装的服务器上第一次加域名就会失败。
     #[test]
     fn missing_postmap_means_postfix_is_absent_not_a_failure() {
         struct NoPostfix;
@@ -1042,9 +865,6 @@ mod tests {
                 Err(CoreError::NotFound(PathBuf::from(program)))
             }
 
-            // 同步序列现在走**带超时**的入口：替身必须把同一语义透传下去，
-            // 否则默认实现会返回 `Invalid`（"未实现超时"），
-            // 「找不到 postmap」就再也识别不出来（会被当成同步失败）。
             fn run_with_timeout(
                 &self,
                 program: &str,
@@ -1070,7 +890,6 @@ mod tests {
 
     #[test]
     fn postmap_failure_is_non_fatal_but_reported() {
-        // 写表已经成功，postmap 失败不该让调用方以为整件事失败了。
         let mut runner = RecordingRunner::new();
         runner.postmap_status = 1;
         let env = FakeEnv::postfix_only();
@@ -1094,8 +913,6 @@ mod tests {
         assert!(!outcome.postmap_ok && !outcome.check_ok && !outcome.reload_ok);
     }
 
-    // ───────────────────── service_ctl 降级链逐级覆盖 ─────────────────────
-
     #[test]
     fn service_ctl_prefers_systemctl_when_systemd_is_present() {
         let runner = RecordingRunner::new();
@@ -1112,8 +929,6 @@ mod tests {
 
     #[test]
     fn service_ctl_does_not_use_systemctl_without_the_systemd_runtime_dir() {
-        // 容器里可能装着 systemctl 但没有 systemd 在跑；此时 `systemctl` 会失败，
-        // 必须继续降级。判据是「命令存在 **且** /run/systemd/system 存在」。
         let runner = RecordingRunner::new();
         let env = FakeEnv::with(&["systemctl", "service"], &[]);
         let outcome = service_ctl(&env, &runner, "postfix", ServiceVerb::Reload);
@@ -1124,7 +939,6 @@ mod tests {
 
     #[test]
     fn service_ctl_falls_back_to_rc_service_and_maps_reload_to_restart() {
-        // OpenRC 没有 reload 概念，基线把它退化为 restart。
         let runner = RecordingRunner::new();
         let env = FakeEnv::with(&["rc-service"], &[]);
         let outcome = service_ctl(&env, &runner, "postfix", ServiceVerb::Reload);
@@ -1158,7 +972,6 @@ mod tests {
 
     #[test]
     fn service_ctl_maps_dovecot_restart_to_reload() {
-        // Dovecot 没有 restart。
         let runner = RecordingRunner::new();
         let env = FakeEnv::with(&["dovecot"], &[]);
         let outcome = service_ctl(&env, &runner, "dovecot", ServiceVerb::Restart);
@@ -1186,7 +999,6 @@ mod tests {
 
     #[test]
     fn service_ctl_is_a_no_op_when_nothing_applies() {
-        // 基线执行 `true`（成功但什么都没做）。这里不 fork，语义相同。
         let runner = RecordingRunner::new();
         let env = FakeEnv::with(&[], &[]);
         let outcome = service_ctl(&env, &runner, "postfix", ServiceVerb::Reload);
@@ -1197,12 +1009,6 @@ mod tests {
         assert!(runner.calls().is_empty(), "Noop 不应产生任何 fork");
     }
 
-    /// 反例守卫：**命令没跑起来**不得报成功。
-    ///
-    /// 原实现把 spawn 失败 `.ok()` 成 `None`，而 `success()` 对 `None` 一律 `true`
-    /// —— 于是 `systemctl` 因权限不足 / fork 失败而根本没执行时，
-    /// `reload_ok` 仍然是 `true`，API 回答「已重载」。
-    /// 这正是本模块文档开头声明要根除的「配置改了但没人重载」。
     #[test]
     fn a_command_that_never_started_is_not_reported_as_success() {
         struct FailingRunner;
@@ -1215,7 +1021,6 @@ mod tests {
             }
         }
 
-        // 命中第一条降级链，于是确实会去 fork systemctl。
         let env = FakeEnv::with(&["systemctl"], &["/run/systemd/system"]);
         let outcome = service_ctl(&env, &FailingRunner, "postfix", ServiceVerb::Reload);
 
@@ -1234,18 +1039,14 @@ mod tests {
 
     #[test]
     fn service_ctl_only_applies_the_special_case_to_its_own_unit() {
-        // 有 dovecot 可执行文件时，控制 postfix 不该跑 dovecot。
         let runner = RecordingRunner::new();
         let env = FakeEnv::with(&["dovecot"], &[]);
         let outcome = service_ctl(&env, &runner, "postfix", ServiceVerb::Reload);
         assert_eq!(outcome.backend, ServiceBackend::Noop);
     }
 
-    // ───────────────────── ServiceVerb 解析 ─────────────────────
-
     #[test]
     fn service_verb_parsing_rejects_anything_it_does_not_know() {
-        // 未知动词必须是 `None`：调用方据此报错，而不是静默走一条「什么都不做」的路径。
         for (raw, expected) in [
             ("start", Some(ServiceVerb::Start)),
             ("STOP", Some(ServiceVerb::Stop)),
@@ -1259,8 +1060,6 @@ mod tests {
         }
     }
 
-    // ───────────────────── is_service_active 逐级探测 ─────────────────────
-
     #[test]
     fn is_service_active_accepts_systemctl_success() {
         let runner = RecordingRunner::new();
@@ -1271,7 +1070,6 @@ mod tests {
 
     #[test]
     fn is_service_active_keeps_probing_after_a_failed_backend() {
-        // 与 service_ctl 不同：探测是「逐个尝试、命中即真」。
         let runner = StatusRunner::new(&[("systemctl", 3, ""), ("pgrep", 0, "")]);
         let env = FakeEnv::with(
             &["systemctl", "service", "rc-service"],
@@ -1287,13 +1085,11 @@ mod tests {
 
     #[test]
     fn is_service_active_accepts_a_running_string_from_service_status() {
-        // systemd 风格的「active (running)」是唯一被认作在运行的失败输出。
         let runner = StatusRunner::new(&[("service", 3, "postfix is active (running)")]);
         let env = FakeEnv::with(&["service"], &[]);
         assert!(is_service_active(&env, &runner, "postfix"));
     }
 
-    /// 反例守卫：`contains("running")` 曾把 `is not running` 也当成在运行。
     #[test]
     fn is_service_active_rejects_a_not_running_string_from_service_status() {
         let runner = StatusRunner::new(&[("service", 3, "postfix is not running")]);
@@ -1343,7 +1139,6 @@ mod tests {
         assert!(!is_service_active(&env, &runner, "postfix"));
     }
 
-    /// 按程序名返回预设状态码的 runner。
     struct StatusRunner {
         calls: Mutex<Vec<(String, Vec<String>)>>,
         table: Vec<(&'static str, i32, &'static str)>,
@@ -1386,8 +1181,6 @@ mod tests {
             })
         }
 
-        // is_service_active 的探测现在全部走超时通道；替身必须同样应答，
-        // 否则默认实现会「响亮失败」而让整条探测链测不到。
         fn run_with_timeout(
             &self,
             program: &str,

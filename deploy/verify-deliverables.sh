@@ -1,5 +1,3 @@
-#!/usr/bin/env bash
-# 校验构建与 CI 交付物的语法，避免把明显坏掉的配置推进仓库。
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1

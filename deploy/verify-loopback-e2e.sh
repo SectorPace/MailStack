@@ -1,24 +1,5 @@
-#!/usr/bin/env bash
-# 真实环路验证：一条命令完成「建夹具 → 起 mailstackd → 验证 → 停机 → 报告」。
-#
-# ## 为什么必须是一条命令（这是本轮最大的教训）
-#
-# WSL 的 `/tmp` **在每次 `wsl` 命令启动时被清理** —— 实测：建标记文件后，下一条
-# 独立的 wsl 命令读同一路径已是 No such file or directory。因此
-# 「生成夹具」与「使用夹具」分成两条命令的做法**必然失败**。
-#
-# 此前连续三轮的失败看起来互不相关（启动失败 → 文件不见了 → 还是启动失败），
-# 根因却是同一个。教训：**跨 wsl 命令的临时状态必须落持久目录**（这里用
-# /root/mailstack-loopback），或者干脆让生成与消费在同一条命令内完成。
-#
-# ## 为什么这个验证只在「回环 + 受管域名」范围内
-#
-# `mail.test_loopback` 的提交端点是**硬编码常量** `127.0.0.1:25`（接受请求体里的
-# 主机等于开一个任意发信器）。所以：需要 mailstackd 监听 25，而本机 25 端口必须
-# 空闲（装了 Postfix 的话它会抢走）。本脚本会先探测并如实报告，不擅自停 Postfix。
 set -uo pipefail
 
-# ── 持久根目录（不可用 /tmp，理由见文件头） ──
 ROOT="${ROOT:-/root/mailstack-loopback}"
 BIN="${BIN:-/root/.cache/mailstack-target/debug/mailstackd}"
 CTL="${CTL:-/root/.cache/mailstack-target/debug/mailstackctl}"
@@ -42,9 +23,6 @@ echo "  25 空闲"
 echo "  磁盘: $(df -h / | tail -1 | awk '{print $4" 可用"}')"
 
 say "1. 生成 fail-closed 夹具（字段判据见 crates/core/src/config.rs 与 smtpd/src/tls.rs）"
-# ROOT 可被环境变量覆盖；rm -rf 之前守住：
-#   * 空值 / 根目录 / 常见系统目录一律拒绝（R7-011 实测：ROOT=/root 会 rm -rf /root）；
-#   * 必须看起来像本仓库根（有 Cargo.toml），否则拒绝。
 case "$ROOT" in
   ""|"/"|"/root"|"/home"|"/usr"|"/etc"|"/var"|"/opt"|"/srv"|"/tmp"|"/mnt"|"/boot"|"/bin"|"/sbin"|"/lib"|"/lib64"|"/dev"|"/proc"|"/sys"|"/run")
     echo "  **ROOT 非法（'$ROOT'），拒绝 rm -rf**" >&2; exit 1 ;;
@@ -68,30 +46,16 @@ cat > "$ROOT/etc/mailstack/setup.json" <<JSON
 JSON
 chmod 0600 "$ROOT/etc/mailstack/setup.json"
 
-# **不写 relay.json**：`load_relay` 读的是 `relayhost` 键，键不存在即 `Ok(None)`
-# ——「尚未配置中继」是合法状态（bin/mailstackd/src/config.rs:230）。写一个空对象
-# 反而会被解析成 `BTreeMap<String,String>` 失败（值必须是字符串），报出的错误指向
-# relay.json 损坏，读起来像是配置写错了，实际只是「多写了一个本不该存在的文件」。
-# 缺它 = 直投，正合本验证的意图：不中继、不出网。
 cat > "$ROOT/etc/mailstack/settings.json" <<JSON
 { "serverName": "$MAIL_HOST", "hostname": "mx1.$DOMAIN", "adminEmail": "postmaster@$DOMAIN" }
 JSON
 
-# 证书文件名是 **fullchain.pem / privkey.pem**（`CertPaths::for_domain`）。
-# 曾经命名成 cert.pem/key.pem，结果 TLS 装载失败而错误消息指向「证书缺失」，
-# 读起来像是配置写错了 —— 实际只是文件名不对。
-#
-# 别用 openssl 的 `-quiet`：本机 openssl 不认这个选项，会报 Unknown option 然后
-# 什么也不生成。它的点阵进度走 **stderr**，但那里同时还有真正的错误信息，
-# 所以只能丢 stdout（`1>/dev/null`），不能丢 stderr。
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout "$ROOT/etc/mailstack/tls/$DOMAIN/privkey.pem" \
   -out "$ROOT/etc/mailstack/tls/$DOMAIN/fullchain.pem" \
   -days 30 -subj "/CN=$MAIL_HOST" \
   -addext "subjectAltName=DNS:$MAIL_HOST" 1>/dev/null
 chmod 0600 "$ROOT/etc/mailstack/tls/$DOMAIN/privkey.pem"
-# 立刻验证证书真的生成了：否则报错会出现在后面「TLS 材料不可用」处，
-# 指向一个与真实原因毫无关系的方向。
 [ -s "$ROOT/etc/mailstack/tls/$DOMAIN/fullchain.pem" ] \
   || { echo "  **openssl 未生成证书**（上面应有它的错误输出）"; exit 1; }
 echo "  夹具就绪：$(find "$ROOT" -type f | wc -l) 个文件"
@@ -100,8 +64,6 @@ say "2. 启动 mailstackd（监听 $PORT_SMTP / $PORT_SUB），日志见 $ROOT/d
 "$BIN" --port "$PORT_SMTP" --port "$PORT_SUB" --config-dir "$ROOT" --log info \
   > "$ROOT/daemon.log" 2>&1 &
 DAEMON_PID=$!
-# 优雅停机：无论下面哪一步失败都要收掉它，否则端口会一直被占住，
-# 下一次运行就会以「25 已被占用」失败 —— 一个自造的死循环。
 cleanup() {
   if kill -0 "$DAEMON_PID" 2>/dev/null; then
     kill -TERM "$DAEMON_PID" 2>/dev/null
@@ -123,8 +85,6 @@ if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
 fi
 echo "  进程存活 (pid $DAEMON_PID)"
 sed 's/^/  | /' "$ROOT/daemon.log" | head -20
-# 把 daemon.log 的行数记下来：第 3 步之后再看新增的行，就能确切知道
-# 服务端对 DATA 到底做了什么判断，而不是只能从客户端的超时反推。
 LOG_BASE=$(wc -l < "$ROOT/daemon.log")
 
 say "3. 真实 SMTP 握手：EHLO → MAIL FROM → RCPT TO → DATA（收件方是受管域名）"
@@ -212,10 +172,6 @@ PY
 say "4. 队列状态（真实落盘：这封信应由 sink 入队，这是环路闭合的证据）"
 echo "  服务端在 DATA 阶段的判断（daemon.log 新增行）："
 tail -n +"$((LOG_BASE + 1))" "$ROOT/daemon.log" | sed 's/^/  | /' || true
-# 队列布局：条目在 **queue/entries/*.json**（`QueueStore::entries_dir`），
-# 队列根下只有 outbound-health.json 与它的锁。
-# 早先查的是 queue/*.json，于是永远得到 0 条 —— 看起来像「邮件没入队」，
-# 实际上只是**找错了目录**。这类假阴性比假阳性危险：它会让人以为功能没实现。
 ENTRIES=$(find "$ROOT/var/lib/mailstack/queue/entries" -type f -name '*.json' 2>/dev/null | wc -l)
 echo "  队列根内容：$(ls "$ROOT/var/lib/mailstack/queue" 2>/dev/null | tr '\n' ' ')"
 echo "  邮件条目数（queue/entries/*.json）: $ENTRIES"

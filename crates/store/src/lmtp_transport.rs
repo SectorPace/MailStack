@@ -1,14 +1,3 @@
-//! LMTP 投递的队列适配（把 [`LmtpClient`] 接到 `mailstack_queue::Transport` 上）。
-//!
-//! 关键语义：
-//!
-//! * 只处理 [`DeliveryTarget::Local`]；外域收件人走 SMTP 传输，不得混用
-//!   （否则本地收件人会被推到公网 SMTP）。
-//! * **部分成功必须如实上报**：把已落箱的收件人放进
-//!   [`DeliveryFailure::accepted`]，队列才不会在重试时重复投递。
-//! * 分类规则：失败集合里**只要有一个 4xx 就判可重试**，只有全部为 5xx 才判永久。
-//!   反过来会把临时失败（如超配额）当成永久失败退掉用户的邮件 —— 丢信比多试几次严重。
-
 use crate::lmtp::LmtpClient;
 
 use mailstack_queue::{
@@ -17,10 +6,6 @@ use mailstack_queue::{
 
 use crate::error::StoreError;
 
-/// 把逐收件人的 LMTP 结果折算成队列的失败分类。
-///
-/// `pub` 是为了让分类规则本身可被直接测试 —— 它是「丢信还是重试」的唯一判据。
-/// 返回 `None` 表示全部收件人都已投递成功。
 pub fn classify_partial(
     accepted: Vec<String>,
     failed: &[(String, u16, String)],
@@ -29,7 +14,6 @@ pub fn classify_partial(
         return None;
     }
 
-    // 只要有一个可重试的就整批可重试（保守方向：宁可多试，不可丢信）。
     let any_transient = failed.iter().any(|(_, code, _)| *code < 500);
     let first_code = failed.first().map(|(_, code, _)| *code).unwrap_or(0);
     let detail = failed
@@ -47,7 +31,6 @@ pub fn classify_partial(
     Some(failure.with_code(first_code).with_accepted(accepted))
 }
 
-/// 把 [`LmtpClient`] 适配成队列可用的本地投递传输。
 pub struct LmtpTransport {
     client: LmtpClient,
 }
@@ -71,7 +54,6 @@ impl Transport for LmtpTransport {
     ) -> DeliveryFuture<'a> {
         Box::pin(async move {
             if !matches!(target, DeliveryTarget::Local) {
-                // 结构性守卫：本地传输绝不能用来投外域收件人。
                 return Err(DeliveryFailure::permanent(
                     "WrongTransport",
                     "LMTP transport only handles local recipients",
@@ -120,10 +102,6 @@ impl Transport for LmtpTransport {
     }
 }
 
-/// 连接层失败（连不上 Dovecot、超时、协议错乱）→ **可重试**。
-///
-/// 这类错误的共同点是「结果未知」：邮件可能已落箱也可能没有。据此退信会让发件人
-/// 重复发送，所以只能重试。
 pub fn classify_lmtp_error(error: &StoreError) -> DeliveryFailure {
     DeliveryFailure::transient("LmtpUnavailable", error.to_string())
 }
@@ -140,8 +118,6 @@ mod tests {
 
     #[test]
     fn a_single_transient_failure_makes_the_whole_batch_retryable() {
-        // 一个 5xx 一个 4xx：必须整体判可重试。反过来会把超配额这类临时问题
-        // 当成永久失败，直接退掉本可投递的邮件 —— 丢信比多试几次严重。
         let failure = classify_partial(
             vec!["ok@x.test".to_string()],
             &[
@@ -183,7 +159,6 @@ mod tests {
 
     #[test]
     fn connection_failures_are_retryable_never_bounces() {
-        // 结果未知 → 只能重试。据此退信会造成重复发送。
         let failure = classify_lmtp_error(&StoreError::Lmtp("cannot connect".to_string()));
         assert_eq!(failure.class, FailureClass::Transient);
         assert_eq!(failure.kind, "LmtpUnavailable");

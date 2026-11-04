@@ -1,8 +1,3 @@
-//! LMTP 监听器：连接配额、超时、优雅停机。
-//!
-//! 生产部署应只绑定回环地址或 Unix socket（由上游 MTA 连接），不需要公网监听；
-//! 本模块提供 TCP 监听，Unix socket 由部署层按需要转发。
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,8 +39,7 @@ impl Default for LmtpServerConfig {
 pub struct LmtpServer {
     pub context: LmtpContext,
     pub config: LmtpServerConfig,
-    /// 传输层指标注册表。默认每个监听器一份；用 [`LmtpServer::with_metrics`] 可让
-    /// TCP 与 Unix 监听器汇总到同一份。
+
     pub metrics: Arc<Metrics>,
 }
 
@@ -61,7 +55,6 @@ impl LmtpServer {
         })
     }
 
-    /// 用一份共享的指标注册表替换默认的每实例注册表。
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = metrics;
         self
@@ -129,14 +122,6 @@ impl LmtpServer {
         Ok(())
     }
 
-    /// 在 Unix domain socket 上提供服务（上游 MTA 走本地套接字投递）。
-    ///
-    /// * 先清理**残留**的套接字文件：上次崩溃会留下它，否则 `bind` 直接
-    ///   `EADDRINUSE`。仅当同名路径确实是套接字时才删除；是普通文件/目录则报错，
-    ///   避免误删用户数据。
-    /// * `bind` 之后显式 `set_permissions(mode)`：套接字文件的默认权限受 umask 影响
-    ///   不可控，而 MTA 通常以另一个用户/组连接，需要明确的 `0660`/`0600`。
-    /// * 停机后删除套接字文件，保持运行目录干净。
     #[cfg(unix)]
     pub async fn serve_unix<P: AsRef<Path>>(
         self,
@@ -195,7 +180,7 @@ impl LmtpServer {
                     let metrics = Arc::clone(&metrics);
                     tasks.spawn(async move {
                         let _permit = permit;
-                        // Unix 套接字没有对端网络地址；用回环占位，日志里表现为本地投递。
+
                         let peer = SocketAddr::from(([127, 0, 0, 1], 0));
                         handle_connection(stream, peer, context, metrics).await;
                     });
@@ -214,7 +199,6 @@ impl LmtpServer {
     }
 }
 
-/// 停机时在 `grace` 内等待在途会话结束，超时则 abort。TCP 与 Unix 监听共用。
 async fn drain(tasks: &mut JoinSet<()>, grace: Duration) {
     if timeout(grace, async {
         while let Some(result) = tasks.join_next().await {
@@ -289,7 +273,6 @@ mod unix_tests {
         let path = socket.clone();
         let handle = tokio::spawn(async move { server.serve_unix(path, 0o600, rx).await });
 
-        // bind 在监听任务里异步完成，轮询套接字文件出现后再连接。
         for _ in 0..400 {
             if socket.exists() {
                 break;

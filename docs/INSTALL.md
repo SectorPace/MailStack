@@ -82,7 +82,7 @@ curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/in
 | `--admin-port PORT` | 管理台内部端口（默认 `8443`） |
 | `--webmail-port PORT` | Webmail 内部端口（默认 `8444`） |
 | `--imap yes\|no` | 是否安装/启用 IMAP/POP3 服务（默认 `yes`；也接受 `true/false/enable/disable`） |
-| `--access-mode local\|caddy\|direct` | 部署模式，写入 `/etc/mailstack/install-args.conf` 的 `ACCESS_MODE`（影响 Cookie `Secure`、public 模式限制等；重跑不显式给则保留原值；默认 `local`） |
+| `--access-mode ssh\|caddy\|nginx\|ip-acme\|panel-domain\|cloudflared` | 访问模式（默认 `ssh`；旧值 `local`/`caddy`/`direct` 仍接受），写入 `install-args.conf` 并生成反向代理/Tunnel/隧道文件；影响 Cookie `Secure` 与 public 模式限制。详见 §3.5 |
 | `--from-source` | 从源码构建（需要 Rust 1.98.1 + C 编译器；Node/npm 可选，用于构建前端产物） |
 | `--archive FILE\|URL` | 使用指定发布包（离线安装/指定版本） |
 | `--binary-dir DIR` | 使用已构建的二进制目录（测试/离线；不校验二进制内容） |
@@ -148,6 +148,49 @@ sudo bash deploy/install.sh --binary-dir ./dist --prefix /tmp/mailstack-test --n
 12. 结束时打印管理台 `http://127.0.0.1:8443/?login=1` 与 Webmail `http://127.0.0.1:8444`。
 
 > 本节按安装器设计定稿整理；最终以 `deploy/install.sh --help` 与脚本源码为准。
+
+### 3.5 访问模式（6 种，安装时或装完后切换）
+
+| 模式 | 入口 | 安装器/管理脚本动作 |
+|---|---|---|
+| `ssh`（默认） | SSH 隧道 `ssh -L 8443:127.0.0.1:8443 -L 8444:127.0.0.1:8444 user@host` | 不装反代；生成 `access/ssh/README.txt` 与 `tunnel.sh` |
+| `caddy` | `https://panel.example.com` | 生成 Caddyfile（ACME 自动证书），检测 caddy 安装并提示 reload |
+| `nginx` | `https://panel.example.com` | 生成 nginx site 配置与 TLS 下一步说明（certbot/acme.sh） |
+| `ip-acme` | 公网 IP + 域名 | nginx 终止 TLS，证书走 `mailstackctl setup.cert.issue`；打印精确 DNS 要求 |
+| `panel-domain` | 独立面板域名 | 强制校正面板域名与 `mail/imap/smtp/pop.example.com` 不同 |
+| `cloudflared` | Cloudflare Tunnel | 生成 `config.yml` + systemd unit，Tunnel 连回环 8443/8444，本机不开放端口 |
+
+```bash
+# 安装时
+--access-mode caddy --panel-host panel.example.com --acme-email ops@example.com
+# 安装后切换（幂等；会写 install-args.conf 与 /etc/mailstack/access/）
+sudo mailstack-manage access set panel-domain --panel-host panel.example.com --acme-email ops@example.com
+sudo mailstack-manage access show
+```
+
+约束：8443/8444 永远只绑 `127.0.0.1`；公网入口必须由 Caddy/nginx/Tunnel 终结 TLS。
+`panel-domain` 模式会拒绝与邮件主机同名的面板域名（邮件域 `mail.example.com`、
+面板域 `panel.example.com`）。
+
+### 3.6 服务器管理脚本（`mailstack-manage`）
+
+安装器会安装 `/usr/local/bin/mailstack-manage`（3x-ui 风格的 CLI + 交互菜单）：
+
+```bash
+sudo mailstack-manage                     # 交互菜单
+sudo mailstack-manage status               # 域名/管理员/访问模式/服务/TLS/入口
+sudo mailstack-manage domain set example.com --mail-host mail.example.com
+sudo mailstack-manage domain list|add|delete
+sudo mailstack-manage account add alice@example.com --password-stdin
+sudo mailstack-manage account list|passwd|delete
+sudo mailstack-manage tls issue mail.example.com --email ops@example.com
+sudo mailstack-manage access set caddy --panel-host panel.example.com --acme-email ops@example.com
+sudo mailstack-manage restart|logs
+```
+
+所有动作都经既有 `mailstackctl` 特权动作（RO 直连 / RW 经 sudo 包装器；
+`--privileged-stdin` 协议），脚本本身不做第二套权限逻辑。
+`MAILSTACK_PREFIX=/tmp/stage` 可用于 staging 测试（不操作宿主 systemd）。
 
 ## 4. 方式二：源码构建
 

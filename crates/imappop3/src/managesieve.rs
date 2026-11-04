@@ -1,23 +1,3 @@
-//! ManageSieve（RFC 5804）：脚本上传与管理协议（默认 4190，STARTTLS/隐式 TLS）。
-//!
-//! ## 协议面
-//!
-//! 支持 `CAPABILITY`、`NOOP`、`LOGOUT`、`STARTTLS`、`AUTHENTICATE PLAIN`、
-//! `LISTSCRIPTS`、`GETSCRIPT`、`PUTSCRIPT`、`CHECKSCRIPT`、`SETACTIVE`、
-//! `DELETESCRIPT`、`RENAMESCRIPT`、`HAVESPACE`。
-//!
-//! ## 安全与正确性
-//!
-//! * **先认证、后取存储**：认证通过后用部署层注入的 [`MailboxResolver`] 找到该用户
-//!   的 Maildir；未知用户拒绝。脚本只落在本人 Maildir 的 `sieve/` 下。
-//! * **认证必须走 TLS**：明文连接上的 `AUTHENTICATE` 直接 `NO`（RFC 5804 §2.1）；
-//!   隐式 TLS 与 STARTTLS 完成后的会话放行。口令不能走明文链路。
-//! * **上传即校验**：`PUTSCRIPT` / `CHECKSCRIPT` 用同一套 [`crate::sieve`] 编译器
-//!   验证；本服务端不支持的扩展（如 `vacation`）会在这里被明确拒绝，而不是存下一个
-//!   永不生效的脚本。
-//! * **脚本名校验**：仅字母数字与 `._-`、≤128、不以 `.` 开头，杜绝路径穿越。
-//! * 活动脚本由 `sieve/.active` 标记；LMTP 投递读取它（`sieve::load_script`）。
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,7 +88,6 @@ struct Session<'a, S> {
     store: Option<Arc<MailStore>>,
 }
 
-/// 在一条已建立的连接上跑 ManageSieve 会话（`secured` 表示已在 TLS 上）。
 pub async fn serve_connection<S>(
     stream: S,
     ctx: &ManageSieveContext,
@@ -207,8 +186,6 @@ where
     }
 
     async fn handle_authenticate(&mut self, command: &Command) -> Result<()> {
-        // RFC 5804 §2.1：TLS 之上才允许认证（隐式 TLS 与 STARTTLS 完成后的
-        // 会话 `secured` 都为 true；明文连接一律拒绝，防止口令裸奔）。
         if !self.secured {
             return self.no("TLS required for authentication").await;
         }
@@ -260,7 +237,7 @@ where
         let Some(store) = self.store.clone() else {
             return self.no("authenticate first").await;
         };
-        // 目录扫描是同步 fs I/O，交给 blocking 线程池，别卡住 Tokio worker。
+
         let scripts = blocking::maildir(&store, sieve::list_scripts).await?;
         for (name, active) in scripts {
             let quoted = quote(&name);
@@ -314,7 +291,7 @@ where
         let Some(name) = command.args.first().cloned() else {
             return self.no("PUTSCRIPT requires a name").await;
         };
-        // 落盘（临时文件 + fsync + rename）在 blocking 线程里完成。
+
         blocking::maildir(&store, move |store| {
             sieve::put_script(store, &name, &source)
         })
@@ -359,15 +336,6 @@ where
         self.ok("RENAMESCRIPT completed").await
     }
 
-    /// RFC 5804 §3.6：`HAVESPACE name size` —— 如实回答「这个名字、这个大小的
-    /// 脚本现在放不放得下」。
-    ///
-    /// 此前无条件回「space available」，而 `PUTSCRIPT` 实际受单脚本 64 KiB
-    /// （[`sieve::MAX_SCRIPT_BYTES`]）与脚本数量（[`sieve::MAX_SCRIPTS`]）双重
-    /// 约束：客户端依据虚假的肯定回答上传，只会在 `PUTSCRIPT` 阶段撞墙。
-    /// 回答语义与 `PUTSCRIPT` 的执行路径完全对齐：预算内（或同名脚本已存在、
-    /// 属于覆盖不占新名额）回 OK，否则 NO 并说明原因。`name` 本身只用于判定
-    /// 「是否覆盖」；大小预算按单脚本上限计（没有跨脚本的共享配额）。
     async fn handle_havespace(&mut self, command: &Command) -> Result<()> {
         let Some(store) = self.store.clone() else {
             return self.no("authenticate first").await;
@@ -381,7 +349,7 @@ where
         if size > sieve::MAX_SCRIPT_BYTES {
             return self.no("script exceeds 64 KiB").await;
         }
-        // 目录扫描是同步 fs I/O，交给 blocking 线程池（与 LISTSCRIPTS 同一纪律）。
+
         let scripts = blocking::maildir(&store, sieve::list_scripts).await?;
         let name = command.args[0].as_str();
         let is_overwrite = scripts.iter().any(|(present, _)| present == name);
@@ -451,7 +419,6 @@ where
     }))
 }
 
-/// 解析 `{n+}` / `{n}` 字面量标记。
 fn literal_marker(token: &str) -> Option<usize> {
     let inner = token.strip_prefix('{')?.strip_suffix('}')?;
     let inner = inner.strip_suffix('+').unwrap_or(inner);
@@ -461,7 +428,6 @@ fn literal_marker(token: &str) -> Option<usize> {
     inner.parse().ok()
 }
 
-/// 把一行拆成 token：双引号字符串（支持 `\"`、`\\` 转义）与裸 token。
 fn tokenize(line: &str) -> Result<Vec<String>> {
     let mut tokens = Vec::new();
     let mut chars = line.chars().peekable();
@@ -533,10 +499,6 @@ fn escape(value: &str) -> String {
         .trim()
         .to_string()
 }
-
-// ---------------------------------------------------------------------------
-// 监听器
-// ---------------------------------------------------------------------------
 
 pub struct ManageSieveServer {
     pub context: ManageSieveContext,
@@ -826,8 +788,6 @@ mod tests {
         spawn_with(context, true)
     }
 
-    /// `secured` 决定会话是否视为已在 TLS 上：认证只在 TLS 上放行，所以
-    /// 完整生命周期测试走 secured=true；明文拒绝用 secured=false。
     fn spawn_with(
         context: ManageSieveContext,
         secured: bool,
@@ -852,8 +812,6 @@ mod tests {
 
     #[tokio::test]
     async fn authenticate_is_rejected_on_plaintext_connections() {
-        // RFC 5804 §2.1：明文连接上的 AUTHENTICATE 必须 NO，会话保持可用
-        // （STARTTLS 之后可以重试）。
         let (_dir, _store, context) = setup();
         let (mut client, handle) = spawn_with(context, false);
 
@@ -865,7 +823,6 @@ mod tests {
         assert!(reply[0].starts_with("NO"), "{reply:?}");
         assert!(reply[0].contains("TLS required"), "{reply:?}");
 
-        // 连接没有被断开：NOOP 仍然应答。
         client.send("NOOP").await;
         assert!(client.until_terminal().await[0].starts_with("OK"));
 
@@ -883,31 +840,26 @@ mod tests {
         assert!(greeting[0].contains("IMPLEMENTATION"), "{greeting:?}");
         assert!(greeting.last().unwrap().starts_with("OK"), "{greeting:?}");
 
-        // 未认证访问脚本命令 → NO。
         client.send("LISTSCRIPTS").await;
         assert!(client.until_terminal().await[0].starts_with("NO"));
 
-        // 错误口令 → NO。
         let bad = base64::engine::general_purpose::STANDARD.encode("\0bob@example.com\0wrong");
         client
             .send(&format!("AUTHENTICATE \"PLAIN\" \"{bad}\""))
             .await;
         assert!(client.until_terminal().await[0].starts_with("NO"));
 
-        // 正确口令 → 能力行 + OK。
         client
             .send(&format!("AUTHENTICATE \"PLAIN\" \"{}\"", plain_b64()))
             .await;
         let authed = client.until_terminal().await;
         assert!(authed.last().unwrap().starts_with("OK"), "{authed:?}");
 
-        // 无效脚本 → NO。
         client
             .send_literal("CHECKSCRIPT", "this is not sieve")
             .await;
         assert!(client.until_terminal().await[0].starts_with("NO"));
 
-        // 上传有效脚本，设为活动。
         client
             .send_literal(
                 "PUTSCRIPT \"filters\"",
@@ -918,11 +870,9 @@ mod tests {
         client.send("SETACTIVE \"filters\"").await;
         assert!(client.until_terminal().await[0].starts_with("OK"));
 
-        // 活动脚本被 LMTP 读取。
         let loaded = sieve::load_script(&store).unwrap().unwrap();
         assert!(loaded.contains("fileinto"), "{loaded}");
 
-        // LISTSCRIPTS 标记 ACTIVE。
         client.send("LISTSCRIPTS").await;
         let listed = client.until_terminal().await;
         assert!(
@@ -930,7 +880,6 @@ mod tests {
             "{listed:?}"
         );
 
-        // GETSCRIPT 返回字面量内容。
         client.send("GETSCRIPT \"filters\"").await;
         let header = client.line().await;
         assert!(header.starts_with('{') && header.ends_with('}'), "{header}");
@@ -953,7 +902,6 @@ mod tests {
             .unwrap()
             .starts_with("OK"));
 
-        // 重命名，活动标记跟随。
         client.send("RENAMESCRIPT \"filters\" \"main\"").await;
         assert!(client.until_terminal().await[0].starts_with("OK"));
         assert_eq!(
@@ -961,7 +909,6 @@ mod tests {
             Some("main")
         );
 
-        // 删除活动脚本 → 活动清空。
         client.send("DELETESCRIPT \"main\"").await;
         assert!(client.until_terminal().await[0].starts_with("OK"));
         assert!(sieve::active_script_name(&store).unwrap().is_none());
@@ -977,8 +924,6 @@ mod tests {
         client.io.read(buffer).await.unwrap()
     }
 
-    /// `HAVESPACE` 必须按 `PUTSCRIPT` 的真实预算作答：大小上限、脚本数量上限、
-    /// 覆盖已有脚本不占新名额。
     #[tokio::test]
     async fn havespace_answers_honestly_within_the_putscript_budgets() {
         let (_dir, _store, context) = setup();
@@ -990,24 +935,19 @@ mod tests {
             .await;
         let _ = client.until_terminal().await;
 
-        // 预算内 → OK。
         client.send("HAVESPACE \"new\" 1024").await;
         assert!(client.until_terminal().await[0].starts_with("OK"));
 
-        // 超过单脚本上限 → NO（与 PUTSCRIPT 的 64 KiB 红线一致）。
         client.send("HAVESPACE \"new\" 65537").await;
         let reply = client.until_terminal().await;
         assert!(reply[0].starts_with("NO"), "{reply:?}");
         assert!(reply[0].contains("64 KiB"), "{reply:?}");
 
-        // 缺参 / 非数字 → NO。
         client.send("HAVESPACE \"new\"").await;
         assert!(client.until_terminal().await[0].starts_with("NO"));
         client.send("HAVESPACE \"new\" \"many\"").await;
         assert!(client.until_terminal().await[0].starts_with("NO"));
 
-        // 灌满脚本数：新名字的 HAVESPACE 转 NO，PUTSCRIPT 同样拒绝；
-        // 已有名字（覆盖）仍然 OK —— 两边必须给出一致的答案。
         for i in 0..sieve::MAX_SCRIPTS {
             client
                 .send_literal(&format!("PUTSCRIPT \"s{i:02}\""), "keep;")

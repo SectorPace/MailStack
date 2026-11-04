@@ -1,20 +1,3 @@
-#!/usr/bin/env bash
-# 端到端验证向导第 5 步「建管理员邮箱 → 发送测试信」在**真实后端**上走得通。
-#
-# ## 为什么必须真的跑一遍
-#
-# 这条链路横跨三个动作（`domains.add` → `users.add` → `setup.mail.test`），每一步都有
-# 前置条件，且**失败方式是「返回错误」而不是「功能不存在」** —— 界面能渲染、按钮能点，
-# 只有真发请求才知道通不通。其中最容易漏的一环：
-#
-#   `setup.mail.test` 要求 `(username, sender)` 命中受管邮箱注册表，
-#   而那张表**只有 `users.add` 会写**。跳过建号直接发信，必然得到
-#   "mail test requires an explicit managed mailbox matching sender"。
-#
-# 与 verify-loopback-e2e.sh 共享同一个陷阱：**/tmp 每次 wsl 启动都会被清**，
-# 所以夹具根目录放在 /root，且生成与消费在同一条命令内完成。
-#
-# 前置条件：25 端口空闲（setup.mail.test 的提交端点是硬编码常量 127.0.0.1:25）。
 set -uo pipefail
 
 ROOT="${ROOT:-/root/mailstack-wizard}"
@@ -22,12 +5,7 @@ BIN="${BIN:-/root/.cache/mailstack-target/debug/mailstackd}"
 CTL="${CTL:-/root/.cache/mailstack-target/debug/mailstackctl}"
 DOMAIN="${DOMAIN:-example.com}"
 ACCOUNT="admin"
-# 刻意选一个**不含 admin、不含完整邮箱、含连续字符要小心**的口令：
-# 后端 validate_mailbox_password 会拒「包含用户名/邮箱」与「3 个连续或重复字符」。
-# 用 Zx7Qm2Vt9Kp4（12 位、字母数字混合、无连续、无上下文词）作为合格样本。
 GOOD_PASS="${GOOD_PASS:-Zx7Qm2Vt9Kp4}"
-# 不合格样本：含用户名 admin，且只有 4 位——用来证明后端**真的会拒**，
-# 而不是我们前端单方面拦了一道。
 BAD_PASS="admin1234"
 
 say() { printf '\n=== %s ===\n' "$1"; }
@@ -42,24 +20,6 @@ if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -qE ':25[[:space:
 fi
 echo "  25 空闲；磁盘: $(df -h / | tail -1 | awk '{print $4}') 可用"
 
-# ── RW 通道的前置条件 ──
-#
-# `domains.add`（RO）与 `snapshot` 直连 helper-ro.sock，而**所有** RW 动作恒经
-# `sudo /usr/local/libexec/mailstack-privileged`（DEPLOYMENT §3.1）。
-#
-# 本机那个包装器是**重写之前**留下的，它 exec 的是旧的 Python 助手：
-#
-#   exec "$PY" /opt/mailstack/backend/mailstackctl.py
-#
-# 那个文件**确实还存在**（所以包装器不是「指向已删除文件」，它会正常执行），
-# 但它只认识旧的动作集与旧的响应形状：我们的动作名它一个都不认，于是对任何
-# RW 动作都以 exit 1 结束，客户端看到 PRIVILEGED_OPERATION_FAILED。
-#
-# 这**不是**本仓库的缺陷，恰恰证明特权边界在工作：RW 动作确实无法绕过包装器。
-#
-# 判据：包装器是否 exec 本仓库的 mailstackctl（而不是 Python 助手）。
-# 判不出来时按「不可用」处理 —— 宁可少验证一段，也不要把「权限/包装器问题」
-# 报成「链路不通」，那会让排查方向完全跑偏。
 WRAPPER="${WRAPPER:-/usr/local/libexec/mailstack-privileged}"
 RW_OK=0
 if [ ! -r "$WRAPPER" ]; then
@@ -78,9 +38,6 @@ else
 fi
 
 say "1. 生成夹具（fail-closed 启动所需）"
-# ROOT 可被环境变量覆盖；rm -rf 之前守住：
-#   * 空值 / 根目录 / 常见系统目录一律拒绝（R7-011 实测：ROOT=/root 会 rm -rf /root）；
-#   * 必须看起来像本仓库根（有 Cargo.toml），否则拒绝。
 case "$ROOT" in
   ""|"/"|"/root"|"/home"|"/usr"|"/etc"|"/var"|"/opt"|"/srv"|"/tmp"|"/mnt"|"/boot"|"/bin"|"/sbin"|"/lib"|"/lib64"|"/dev"|"/proc"|"/sys"|"/run")
     echo "  **ROOT 非法（'$ROOT'），拒绝 rm -rf**" >&2; exit 1 ;;
@@ -96,20 +53,12 @@ cat > "$ROOT/etc/mailstack/setup.json" <<JSON
   "updatedAt": "2026-10-03T00:00:00+00:00" }
 JSON
 chmod 0600 "$ROOT/etc/mailstack/setup.json"
-# 不写 relay.json：relayhost 键不存在即等于「尚未配置中继」= 直投（合法状态）。
-#
-# 注意别用 openssl 的 `-quiet`：本机 openssl（3.x 早期构建）**不认这个选项**，
-# 会报 "Unknown option ... quiet" 然后什么也不生成。而它的点阵进度走 **stderr**，
-# 所以 `2>` 不能整体丢掉 —— 那里同时还有真正的错误信息。做法是分两路：
-# stdout 丢掉、stderr 留下，出错时至少能看到原因。
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout "$ROOT/etc/mailstack/tls/$DOMAIN/privkey.pem" \
   -out  "$ROOT/etc/mailstack/tls/$DOMAIN/fullchain.pem" \
   -days 30 -subj "/CN=mail.$DOMAIN" -addext "subjectAltName=DNS:mail.$DOMAIN" \
   1>/dev/null
 chmod 0600 "$ROOT/etc/mailstack/tls/$DOMAIN/privkey.pem"
-# 证书必须真的生成了 —— 与其让后面某处报「TLS 材料不可用」（指向完全无关的原因），
-# 不如在这里就把「openssl 没生成」说清楚。
 [ -s "$ROOT/etc/mailstack/tls/$DOMAIN/fullchain.pem" ] \
   || { echo "  **openssl 未生成证书**（上面应有它的错误输出）"; exit 1; }
 echo "  夹具就绪"
@@ -134,8 +83,6 @@ kill -0 "$DAEMON_PID" 2>/dev/null || { echo "  **启动失败**"; cat "$ROOT/dae
 echo "  已就绪：$(grep -o '服务已就绪' "$ROOT/daemon.log" | head -1)"
 
 say "3. 先证明「受管邮箱表是空的」—— 此时发信必然失败"
-# 这一步不是多余：它验证第 5 步的**失败原因**确实是「邮箱没建」，
-# 而不是我们猜的。只有复现出失败，后面的成功才有说服力。
 if [ "$RW_OK" -eq 0 ]; then
   echo "  跳过：RW 通道不可用（见步骤 0）。这一步需要经包装器下发。"
 else
@@ -169,7 +116,6 @@ esac
 say "6. 第 5 步 ①：users.add 用合格口令建号"
 OUT=$(rpc users.add "{\"address\":\"$ACCOUNT@$DOMAIN\",\"username\":\"$ACCOUNT\",\"password\":\"$GOOD_PASS\"}")
 echo "  响应类型：$(echo "$OUT" | head -1)"
-# 后端返回**裸数组**（Users::list 的结果），不是 {ok,data} 外壳。
 FIRST=$(echo "$OUT" | head -1)
 case "$FIRST" in
   \[*) echo "  => 是裸数组（与 Users::list 的返回一致）" ;;

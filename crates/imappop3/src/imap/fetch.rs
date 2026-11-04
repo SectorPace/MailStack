@@ -1,19 +1,3 @@
-//! FETCH 解析与渲染（RFC 3501 §6.4.5、§7.4.2）。
-//!
-//! ## 为什么 FETCH 参数不走通用 tokenizer
-//!
-//! `BODY[HEADER.FIELDS (SUBJECT FROM)]<0.1024>` 里的括号、空格、`]`、`<` 都属于
-//! **section 语法**；通用 tokenizer 会把 `(SUBJECT FROM)` 当成 IMAP 列表并丢掉
-//! 原始大小写，回显时无法逐字还原 `BODY[HEADER.FIELDS (SUBJECT FROM)]` 这个标签。
-//! 客户端会把标签当字符串匹配，标签不一致就看不到内容。因此 FETCH 用**原始参数
-//! 文本**做专门的递归下降解析（见 [`crate::imap::parser::Command::raw_args`]）。
-//!
-//! ## `\Seen` 的副作用
-//!
-//! `BODY[...]`（不带 `.PEEK`）、`RFC822`、`RFC822.TEXT` 会置 `\Seen`。本模块只
-//! 返回 `mark_seen`，由会话层落盘并补发一条 untagged FETCH（RFC 建议服务器主动
-//! 通知标志变化）。把副作用留在模块外，是为了让 FETCH 渲染保持纯函数、可穷举测试。
-
 use std::borrow::Cow;
 
 use crate::date;
@@ -34,7 +18,6 @@ pub enum Section {
 }
 
 impl Section {
-    /// 回显标签（不含 `BODY[` 与 `]`）。
     pub fn label(&self) -> String {
         match self {
             Section::Full => String::new(),
@@ -91,9 +74,9 @@ pub enum FetchItem {
     Rfc822,
     Rfc822Header,
     Rfc822Text,
-    /// RFC 3516：解码后的部件内容。`peek` 为 `false` 时与 BODY 一样置 `\Seen`。
+
     Binary(BodySpec),
-    /// RFC 3516：解码后的部件字节数。空路径表示整封。
+
     BinarySize(Vec<u32>),
 }
 
@@ -110,11 +93,6 @@ pub fn needs_message(items: &[FetchItem]) -> bool {
     })
 }
 
-/// 是否只需要邮件头（可只读取文件前缀）。
-///
-/// `ENVELOPE`、`BODY[HEADER]`、`BODY[HEADER.FIELDS]`、`RFC822.HEADER` 都只依赖
-/// 头部；把它们与 `BODYSTRUCTURE` / `BODY[TEXT]` 一起处理会让一封 50 MiB 的邮件
-/// 在客户端只想看标题时也被整封读入。
 pub fn needs_full_message(items: &[FetchItem]) -> bool {
     items.iter().any(|item| match item {
         FetchItem::Flags | FetchItem::InternalDate | FetchItem::Size | FetchItem::Uid => false,
@@ -130,10 +108,6 @@ pub fn needs_full_message(items: &[FetchItem]) -> bool {
     })
 }
 
-/// 从 FETCH 参数尾部拆出 CONDSTORE 的 `(CHANGEDSINCE n)` 修饰符。
-///
-/// 语法只允许一个修饰符列表，且它排在所有 fetch-att 之后；因此检查**最后**
-/// 一对括号即可，不会把 `(FLAGS UID)` 这样的 item 列表误判成修饰符。
 pub fn split_changedsince(items: &str) -> Result<(&str, Option<u64>)> {
     let trimmed = items.trim();
     let Some(close) = trimmed.rfind(')') else {
@@ -231,7 +205,7 @@ pub fn parse_items(raw: &str) -> Result<Vec<FetchItem>> {
                         "BINARY supports only body part sections",
                     ));
                 }
-                // RFC 3516：BINARY 与 BODY 一样会置 \Seen；BINARY.PEEK 才不动。
+
                 items.push(FetchItem::Binary(BodySpec {
                     section,
                     peek: upper == "BINARY.PEEK",
@@ -272,7 +246,7 @@ fn strip_outer_parentheses(value: &str) -> Result<&str> {
     if !value.ends_with(')') {
         return Err(MailError::invalid("unbalanced FETCH item list"));
     }
-    // 外侧括号必须真的包住全部内容（`(UID) (FLAGS)` 不是合法语法，直接拒绝）。
+
     let mut depth = 0i32;
     for (index, byte) in value.bytes().enumerate() {
         match byte {
@@ -409,8 +383,7 @@ fn parse_section(content: &str) -> Result<Section> {
                 if !valid {
                     return Err(MailError::invalid("invalid header field name"));
                 }
-                // 回显大小写与请求一致：客户端按标签字符串匹配 section。
-                // 匹配本身由 `Headers::get_all` 做大小写无关比较。
+
                 names.push(name.to_string());
             }
             if names.is_empty() {
@@ -425,7 +398,6 @@ fn parse_section(content: &str) -> Result<Section> {
         _ => {}
     }
 
-    // 形如 "1.2.MIME" / "2.HEADER" / "1"。
     let mut path: Vec<u32> = Vec::new();
     let mut suffix: Option<&str> = None;
     for (index, segment) in upper.split('.').enumerate() {
@@ -461,16 +433,11 @@ fn parse_section(content: &str) -> Result<Section> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// 渲染
-// ---------------------------------------------------------------------------
-
 pub fn format_flags(flags: &FlagSet) -> String {
     let names: Vec<String> = flags.iter().map(|flag| flag.imap_name()).collect();
     format!("({})", names.join(" "))
 }
 
-/// 渲染一条 FETCH 的括号内内容。返回值第二项表示「本次 FETCH 是否改变了 \Seen」。
 pub fn render(
     items: &[FetchItem],
     meta: &MessageMeta,
@@ -570,7 +537,6 @@ pub fn render(
                 let message =
                     message.ok_or_else(|| MailError::storage("message body is unavailable"))?;
                 if !spec.peek {
-                    // 与 BODY（非 PEEK）一致：非 PEEK 的 BINARY 也要置 \Seen。
                     mark_seen = true;
                 }
                 push_separator(&mut out);
@@ -673,13 +639,6 @@ fn push_owned_literal(out: &mut Vec<u8>, label: &str, data: &[u8]) {
     out.extend_from_slice(data);
 }
 
-/// 提取 section。不存在返回 `None`（渲染成 NIL）。
-///
-/// 返回 [`Cow`]：整封（Full）、正文段（Text）与部件正文可以直接借用原消息
-/// 字节 —— 百 MiB 级邮件 FETCH BODY[] 时省掉一整份中间拷贝（拼进响应缓冲
-/// 的那一次拷贝是字面量语法本身要求的，省不掉）；头部块由 `raw_block` 重新
-/// 组装，保持 `Owned`。Cow 只借用 `message`（Owned 分支不携带 `section`
-/// 的任何借用数据），生命周期因此只挂在 message 上。
 pub fn extract_section<'a>(message: &'a [u8], section: &Section) -> Option<Cow<'a, [u8]>> {
     let (_, body) = mime::split_headers_body(message);
     let headers = mime::parse_headers(message);
@@ -734,7 +693,6 @@ fn resolve_part<'a>(message: &'a [u8], path: &[u32]) -> Option<&'a [u8]> {
             let position = (*index).checked_sub(1)? as usize;
             current = *parts.get(position)?;
         } else if depth == 0 && *index == 1 {
-            // 非 multipart 的消息：RFC 3501 把它的正文当作「部件 1」。
             return Some(current);
         } else {
             return None;
@@ -743,7 +701,6 @@ fn resolve_part<'a>(message: &'a [u8], path: &[u32]) -> Option<&'a [u8]> {
     Some(current)
 }
 
-/// 解码指定部件（空路径 = 整封）的内容。部件不存在返回 `None`。
 fn decode_binary_part(message: &[u8], path: &[u32]) -> Option<Vec<u8>> {
     let part = resolve_part(message, path)?;
     let headers = mime::parse_headers(part);
@@ -756,7 +713,6 @@ fn decode_binary_part(message: &[u8], path: &[u32]) -> Option<Vec<u8>> {
     Some(mime::decode_transfer_encoding(body, &encoding))
 }
 
-/// BINARY 只接受「整封或部件路径」；返回对应的 MIME 路径。
 fn binary_path(section: &Section) -> Option<Vec<u32>> {
     match section {
         Section::Full => Some(Vec::new()),
@@ -938,8 +894,6 @@ Content-Type: text/html\r\n\r\n\
 
     #[test]
     fn full_text_and_part_sections_borrow_the_message_without_copying() {
-        // 整封与正文段直接借用消息字节（MEMORY 缺陷修复：FETCH BODY[] 不得
-        // 再复制一份百 MiB 级消息）；重新组装的头部块保持 Owned。
         let message: &[u8] = b"Subject: hello\r\n\r\nbody here\r\n";
         assert!(matches!(
             extract_section(message, &Section::Full),
@@ -1005,7 +959,6 @@ Content-Type: text/html\r\n\r\n\
 
     #[test]
     fn binary_items_parse_and_decode_transfer_encoding() {
-        // BINARY（非 PEEK）与 BINARY.PEEK 是两个不同的 item，peek 标志必须分开。
         assert_eq!(
             parse_items("BINARY[1]").unwrap(),
             vec![FetchItem::Binary(BodySpec {
@@ -1028,7 +981,6 @@ Content-Type: text/html\r\n\r\n\
         assert_eq!(items[2], FetchItem::BinarySize(vec![1]));
         assert!(needs_message(&items));
 
-        // HEADER/TEXT 之类的 section 不允许用于 BINARY。
         assert!(parse_items("(BINARY[HEADER])").is_err());
         assert!(parse_items("BINARY.PEEK").is_err());
 
@@ -1040,7 +992,6 @@ Content-Type: text/html\r\n\r\n\
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.starts_with("BINARY[] {5}\r\nhello"), "{text:?}");
 
-        // 不带 .PEEK 的 BINARY 与 BODY 一样置 \Seen。
         let items = parse_items("(BINARY[])").unwrap();
         let (_, seen) = render(&items, &meta(), Some(message), false).unwrap();
         assert!(seen);

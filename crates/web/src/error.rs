@@ -1,8 +1,3 @@
-//! API 错误模型（规格书 §4.4）。
-//!
-//! 响应体形状：`{ ok: false, error: { code, message } }`。
-//! 前端提取 `error.message` 与 `error.code`，故这两个字段名是契约。
-
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -12,13 +7,12 @@ use crate::ratelimit::{
     ERR_RATE_LIMITED,
 };
 
-/// API 错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
     pub status: StatusCode,
     pub code: String,
     pub message: String,
-    /// 可选的 `Retry-After`（秒）。
+
     pub retry_after_secs: Option<i64>,
 }
 
@@ -42,7 +36,6 @@ impl ApiError {
         self
     }
 
-    /// 401 未认证（INV-7：用 401 而不是 403，以免泄露资源存在性）。
     pub fn auth_required() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -52,7 +45,6 @@ impl ApiError {
         }
     }
 
-    /// 403 CSRF 校验失败。
     pub fn csrf_invalid() -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
@@ -62,7 +54,6 @@ impl ApiError {
         }
     }
 
-    /// 429 限流。
     pub fn rate_limited(retry_after_secs: i64) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -72,7 +63,6 @@ impl ApiError {
         }
     }
 
-    /// 413 请求体过大。
     pub fn payload_too_large() -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
@@ -82,7 +72,6 @@ impl ApiError {
         }
     }
 
-    /// 503 特权助手不可达（INV-8：**不得**降级为无特权执行）。
     pub fn helper_unavailable(message: impl Into<String>) -> Self {
         Self::with_status(
             Self::new(crate::ratelimit::ERR_PRIVILEGED_HELPER_UNAVAILABLE, message),
@@ -124,31 +113,14 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// 成功响应：**裸对象**，不套 `{ ok: true, data }`。
-///
-/// 为什么：基线 `backend/server.production.ts` 的业务路由是 `res.json(result)` ——
-/// 裸对象。管理前端（mailstack-admin-frontend）对非列表动作直接读 `body.<field>`，
-/// 套壳会让 `snapshot` / `settings.get` / `users.status` 这类动作**读不到任何字段**。
-/// 列表动作之所以没暴露这个问题，是它自己的 `pickList` 兜底了 `o.data ?? o`。
-///
-/// 错误响应形状不受影响，仍是 `{ ok: false, error: { code, message } }`。
 pub fn ok_json(data: serde_json::Value) -> Response {
     Json(data).into_response()
 }
 
-/// RPC 桥（`POST /api/rpc`）的成功响应：`{ ok: true, data }`。
-///
-/// 与 [`ok_json`] **故意不同**：桥是前端唯一的 fallback 传输层，其返回值由前端
-/// `bridge()` 统一拆包（`body.ok` / `body.data`），不能裸对象 —— 前端会把整个
-/// 响应体当成 `data`。REST 路由与桥并存两套形状，是前端传输层设计的结果。
 pub fn rpc_ok_json(data: serde_json::Value) -> Response {
     Json(serde_json::json!({ "ok": true, "data": data })).into_response()
 }
 
-/// RPC 桥的失败响应：`{ ok: false, error: "<可读消息>" }`。
-///
-/// `error` 是**字符串**而非对象：前端 `bridge()` 把它直接当 message 展示。
-/// 若沿用 [`ApiError`] 的嵌套形状，界面只会显示 `HTTP 5xx`，丢掉可读原因。
 pub fn rpc_err_json(status: StatusCode, message: impl Into<String>) -> Response {
     (
         status,
@@ -157,7 +129,6 @@ pub fn rpc_err_json(status: StatusCode, message: impl Into<String>) -> Response 
         .into_response()
 }
 
-/// `/api/*` 兜底 404（**必须**返回 JSON，不是 404 HTML，规格书 §5.1）。
 pub fn api_not_found() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -196,7 +167,6 @@ mod tests {
 
     #[tokio::test]
     async fn auth_required_is_401_not_403() {
-        // INV-7：401 避免泄露资源存在性。
         let response = ApiError::auth_required().into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = body_json(response).await;
@@ -212,7 +182,6 @@ mod tests {
 
     #[tokio::test]
     async fn helper_unavailable_is_503_and_never_silently_succeeds() {
-        // INV-8：不可达必须是 503，不得降级为无特权执行。
         let response = ApiError::helper_unavailable("socket gone").into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = body_json(response).await;
@@ -221,7 +190,6 @@ mod tests {
 
     #[tokio::test]
     async fn success_body_is_the_bare_object_without_an_ok_wrapper() {
-        // 套壳会让前端的非列表动作（snapshot / settings.get / users.status…）读空。
         let response = ok_json(serde_json::json!({ "name": "example.com" }));
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
@@ -235,7 +203,6 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_bridge_shapes_are_the_opposite_of_the_rest_routes() {
-        // 桥的返回值由前端 bridge() 拆包，必须带外壳；error 必须是字符串。
         let ok = body_json(rpc_ok_json(serde_json::json!({ "name": "x" }))).await;
         assert_eq!(ok["ok"], true);
         assert_eq!(ok["data"]["name"], "x");
@@ -249,7 +216,6 @@ mod tests {
 
     #[tokio::test]
     async fn api_not_found_is_json_not_html() {
-        // §5.1：/api 兜底必须是 JSON 响应，不能回落到 SPA 的 index.html。
         let response = api_not_found();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(

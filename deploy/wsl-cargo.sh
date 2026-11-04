@@ -1,17 +1,3 @@
-#!/usr/bin/env bash
-# 在 WSL Ubuntu 中构建/测试 MailStack（生产目标平台即 Linux）。
-#
-# 用法：
-#   deploy/wsl-cargo.sh test  -p mailstack-core
-#   deploy/wsl-cargo.sh clippy --all-targets -- -D warnings
-#   deploy/wsl-cargo.sh check --target x86_64-unknown-linux-gnu
-#
-# 设计要点：
-#   * 源码留在 /mnt/e（Windows 侧唯一真相源），避免双份源码漂移；
-#   * 但 CARGO_TARGET_DIR 指向 WSL 原生文件系统 —— /mnt/e 走 9p 协议，
-#     把 target/ 放在上面会让每次增量构建慢一个数量级；
-#   * 代理：本机 WSL 必须走 Clash 混合端口 7890（7897 会接受连接但不可代理）。
-#     仅在需要访问网络时导出，且 NO_PROXY 覆盖本地，避免本地回环请求被劫持。
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,32 +7,13 @@ NATIVE_TARGET="${HOME}/.cache/mailstack-target"
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR="$NATIVE_TARGET"
 
-# WSL 根分区只有 9.8G（`df -h /` 可见），而本工作区的测试目标有 10 个。
-# 完整 debuginfo 会把 target/debug 撑到 4.5G 以上，直接导致链接器
-# `ld terminated with signal 7 [Bus error]`（写盘失败），表现为莫名其妙的
-# 「链接失败」而不是「磁盘满」。
-#
-# 默认降到 line-tables-only：**保留回溯里的文件与行号**，只丢掉变量/类型信息。
-# 需要完整调试信息时设 MAILSTACK_FULL_DEBUG=1（记得先确认剩余空间）。
-# release profile 不受影响（deploy/build.sh 走 --release，且已 strip）。
 if [ "${MAILSTACK_FULL_DEBUG:-0}" != "1" ]; then
   export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-line-tables-only}"
 fi
 
-# 增量编译默认**关闭**。
-#
-# 实测（2026-10-30）：一次依赖升级（rustls/tokio 等）触发的全量重建让
-# `target/debug/incremental` 单独涨到 **3.3G**，把 9.8G 的根分区直接撑满，
-# 报错是 `No space left on device (os error 28)` —— 同样是「报错不指向真因」。
-# 增量编译对这台机器（每次门禁都是全量跑 completement）收益很小，
-# 代价却是把本已紧张的磁盘再吃掉三分之一。
-#
-# 需要增量编译时显式设 CARGO_INCREMENTAL=1。
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 
-# 仅当显式需要网络时启用代理（vendor 构建/离线场景不应依赖它）。
 if [ "${MAILSTACK_USE_PROXY:-0}" = "1" ]; then
-  # 6.7：代理不再写死开发机地址，默认值可被 MAILSTACK_PROXY 覆盖。
   export HTTP_PROXY="${MAILSTACK_PROXY:-http://127.0.0.1:7890}"
   export HTTPS_PROXY="$HTTP_PROXY"
   export http_proxy="$HTTP_PROXY"

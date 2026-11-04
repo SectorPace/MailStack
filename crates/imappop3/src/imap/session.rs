@@ -1,32 +1,3 @@
-//! IMAP4rev1 会话状态机。
-//!
-//! ## 三态模型
-//!
-//! ```text
-//! NotAuthenticated ──LOGIN/AUTHENTICATE──► Authenticated ──SELECT/EXAMINE──► Selected
-//!        │                                     │                              │
-//!        └─STARTTLS（就地升级后回到原状态）     └─CREATE/LIST/APPEND...       └─FETCH/STORE/SEARCH...
-//! ```
-//!
-//! 状态检查在 `dispatch` 里逐命令完成：在错误的状态调用命令返回 `BAD`，而不是
-//! 静默忽略 —— 后者会让客户端以为命令生效。
-//!
-//! ## UID 与序号的边界
-//!
-//! 同一个 `FETCH` 实现被 `FETCH` 与 `UID FETCH` 共用，靠 `uid_mode` 决定集合
-//! 按 UID 还是序号解析，并在应答里自动补 `UID` 项（RFC 3501 §6.4.8 要求 UID
-//! 命令的 FETCH 应答包含 UID）。EXAMINE 只把所选邮箱设为只读，不影响其它邮箱的
-//! APPEND/COPY。
-//!
-//! ## 会话内的竞态
-//!
-//! 其他客户端（以及投递进程）会同时改同一个 Maildir。会话不缓存「文件内容」，
-//! 只缓存**元数据快照**；NOOP / IDLE / 写入类命令之后用 [`refresh_selected`]
-//! 对比新旧快照并发出 `EXPUNGE` / `EXISTS` / `FETCH FLAGS`。顺序是刻意的：
-//! 先按**旧序号**发 EXPUNGE（从大到小），再发 EXISTS，最后用**新序号**发标志变化。
-//!
-//! [`refresh_selected`]: ImapSession::refresh_selected
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -55,18 +26,14 @@ use crate::render;
 use crate::resolver::MailboxResolver;
 use crate::seqset::SequenceSet;
 
-/// 共享邮箱命名空间前缀：`shared/<user>/<folder>`（命名空间分隔符 `/`）。
 const SHARED_PREFIX: &str = "shared/";
 
-/// 一个解析后的邮箱目标；`owner` 为 `Some` 表示这是别人的共享邮箱。
 struct ResolvedMailbox {
     store: Arc<MailStore>,
     folder: String,
     owner: Option<String>,
 }
 
-/// 共享邮箱的 ACL 授权判断：本人邮箱恒通过；共享邮箱要求目标 ACL 授予全部所需权限。
-/// `read_acl` 是同步文件 I/O，放 blocking 池执行，避免卡住 async worker。
 async fn check_shared_rights(
     store: &Arc<MailStore>,
     folder: &str,
@@ -101,27 +68,25 @@ async fn check_shared_rights(
 
 #[derive(Debug, Clone)]
 pub struct ImapConfig {
-    /// 问候语与 `* OK` 里出现的服务器名。
     pub server_name: String,
-    /// 为 `true` 时，明文连接不得 LOGIN/AUTHENTICATE（通告 `LOGINDISABLED`）。
+
     pub require_tls: bool,
-    /// 单条连接允许的连续认证失败次数；达到后发 BYE 断开。
+
     pub max_auth_failures: u32,
     pub max_line: usize,
-    /// APPEND literal 上限（字节）。同时是读命令的硬上限。
+
     pub max_literal: usize,
-    /// 单封邮件读取上限（FETCH/SEARCH 用）。
+
     pub max_message_size: u64,
-    /// 是否允许普通用户执行 SETQUOTA（配额管理通常只应由管理面执行）。
+
     pub allow_setquota: bool,
-    /// 读命令超时。
+
     pub read_timeout: Duration,
-    /// AUTHENTICATE 交互式应答（等待继续行）的超时，比普通命令短得多：
-    /// 半途停住的认证不应占用一条连接直到全局读超时。
+
     pub auth_timeout: Duration,
-    /// IDLE 轮询间隔（发现其他会话/投递写入的邮件）。
+
     pub idle_poll: Duration,
-    /// 单次 IDLE 的最长时间（RFC 建议 ≤ 29 分钟）。
+
     pub idle_timeout: Duration,
 }
 
@@ -129,8 +94,7 @@ impl Default for ImapConfig {
     fn default() -> Self {
         Self {
             server_name: "mailstack".to_string(),
-            // 安全默认：未显式配置 TLS 的部署不应在明文连接上接受口令。
-            // 开发/内网环境必须显式设 `require_tls: false`。
+
             require_tls: true,
             max_auth_failures: 5,
             max_line: 8 * 1024,
@@ -145,30 +109,23 @@ impl Default for ImapConfig {
     }
 }
 
-/// 每个监听器（143 / 993）各拿一份上下文。
-///
-/// `resolver` 同时承担两件事：
-/// 1. `shared/<user>/<folder>` 的跨用户共享邮箱；
-/// 2. **多用户装配**——认证成功后按登录名把会话切到本人 Maildir
-///    （见 [`AuthOutcome::Success`] 分支）。`None` 表示单用户部署。
 #[derive(Clone)]
 pub struct ImapSessionContext {
     pub store: Arc<MailStore>,
     pub auth: AuthBackend,
     pub config: ImapConfig,
-    /// 命令级与认证级指标。监听器可通过 `with_metrics` 与传输层指标共享同一份。
+
     pub metrics: Arc<Metrics>,
-    /// 跨用户共享邮箱的解析器（`shared/<user>/<folder>`）。`None` 表示单用户部署。
+
     pub resolver: Option<Arc<dyn MailboxResolver>>,
 }
 
-/// 连接参数由监听器决定（同一份配置既服务明文也服务 TLS）。
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectionOptions {
     pub secured: bool,
-    /// 明文连接上是否通告/接受 STARTTLS。
+
     pub starttls_available: bool,
-    /// 是否发送问候语（STARTTLS 升级后的第二次进入不发）。
+
     pub greet: bool,
 }
 
@@ -227,9 +184,9 @@ struct View {
     uidnext: u32,
     highest_modseq: u64,
     messages: Vec<MessageMeta>,
-    /// 上次扫描后的目录指纹；用于 NOOP/IDLE 的免扫描快速路径。
+
     stamp: Option<FolderStamp>,
-    /// 连续跳过的扫描次数。到 10 次强制全量扫描一次，防止时间戳精度漏变化。
+
     skipped_stamps: u8,
 }
 
@@ -259,7 +216,7 @@ enum Control {
     Logout,
     StartTls,
     Close,
-    /// `COMPRESS` 已被接受：先把明文 OK flush 出去，再启用 DEFLATE。
+
     Compress,
 }
 
@@ -267,21 +224,21 @@ struct ImapSession<'a, S> {
     io: LineIo<S>,
     ctx: &'a ImapSessionContext,
     peer: SocketAddr,
-    /// 当前生效的存储：默认是本人邮箱；SELECT 共享邮箱后指向目标用户的存储。
+
     store: Arc<MailStore>,
-    /// 本人邮箱（不随共享邮箱选择而变），用于 `deselect_to_personal` 还原。
+
     own_store: Arc<MailStore>,
-    /// 当前选中邮箱的所有者（`None` = 本人）。用于共享邮箱的 ACL 授权判断。
+
     selected_owner: Option<String>,
     secured: bool,
     starttls: bool,
     state: State,
     failures: u32,
-    /// 会话是否启用了 CONDSTORE（ENABLE 或 SELECT 参数）。
+
     condstore: bool,
-    /// 会话是否启用了 QRESYNC（隐含 CONDSTORE）。
+
     qresync: bool,
-    /// RFC 5182：最近一次 `SEARCH RETURN (SAVE)` 保存的结果（按 UID 存，模式无关）。
+
     saved_search: Option<Vec<u32>>,
 }
 
@@ -320,7 +277,6 @@ where
                     return Ok(ImapExit::Closed(self.io.into_inner()));
                 }
                 Ok(Err(error)) => {
-                    // 解析失败意味着字节流已经不可信；直接断开而不是继续猜。
                     let message = format!("* BYE [ALERT] {}", sanitize(&error.to_string()));
                     self.write_all(message.as_bytes()).await?;
                     self.write_all(b"\r\n").await?;
@@ -349,7 +305,6 @@ where
                     return Ok(ImapExit::StartTls(self.io.into_inner()));
                 }
                 Ok(Control::Compress) => {
-                    // 切换应答是明文：先把它 flush 出去，之后所有字节才走 DEFLATE。
                     self.flush().await?;
                     self.io.enable_compression()?;
                 }
@@ -364,7 +319,7 @@ where
                         self.flush().await?;
                         return Ok(ImapExit::Closed(self.io.into_inner()));
                     }
-                    // 服务器故障计为失败；NO/BAD 这类协议层拒绝仍算「已处理」。
+
                     if error.is_server_error() {
                         self.ctx.metrics.command_failed();
                     } else {
@@ -494,10 +449,6 @@ where
         }
     }
 
-    // -----------------------------------------------------------------
-    // 认证
-    // -----------------------------------------------------------------
-
     async fn handle_login(&mut self, command: &Command) -> Result<Control> {
         let tag = command.tag.clone();
         if !matches!(self.state, State::NotAuthenticated) {
@@ -537,9 +488,7 @@ where
                 .await;
         }
         let mechanism = string_arg(&command.args[0])?.to_ascii_uppercase();
-        // SASL-IR（RFC 4959）：第二个参数是 base64 初始应答；单独的 "=" 表示空应答。
-        // 解不开的 base64 与口令错误一样计入失败次数：否则攻击者可以只发永远
-        // 解不开的输入，无限尝试也不触发 max_auth_failures。
+
         let initial = match command.args.get(1) {
             Some(token) => {
                 let text = token
@@ -575,7 +524,6 @@ where
                 let authcid = String::from_utf8_lossy(fields[1]).to_string();
                 let password = String::from_utf8_lossy(fields[2]).to_string();
                 if authcid.is_empty() || password.is_empty() {
-                    // 空凭据与口令错误走同一条失败计数路径（应答文本相同）。
                     return self.auth_failure(&tag).await;
                 }
                 if !authzid.is_empty() && !authzid.eq_ignore_ascii_case(&authcid) {
@@ -721,10 +669,6 @@ where
         Ok(Control::Continue)
     }
 
-    /// 畸形 SASL 输入（base64 解不开、字段数量不对、凭据不是 UTF-8 等）：
-    /// 失败计数与口令错误走同一条路，应答文本沿用 [`ImapSession::send_failure`]
-    /// 的分类（解码错误 → NO、字段缺失 → BAD），与改动前完全一致；差别只是
-    /// 同时累计 `max_auth_failures`，防止用永远解不开的输入绕过爆破保护。
     async fn malformed_auth(&mut self, tag: &str, error: &MailError) -> Result<Control> {
         self.failures += 1;
         self.ctx.metrics.auth_failed();
@@ -788,7 +732,6 @@ where
                     enabled.push("QRESYNC");
                 }
             }
-            // 未支持的扩展（如 QRESYNC）按 RFC 5161 静默忽略。
         }
         if !enabled.is_empty() {
             self.line(&format!("* ENABLED {}", enabled.join(" ")))
@@ -830,11 +773,6 @@ where
             AuthOutcome::Success { user } => {
                 self.failures = 0;
 
-                // 多用户装配：声明了 `resolver` 就按**登录名**把会话切到该用户的
-                // Maildir。`ctx.store` 只是单用户部署（无 resolver）的默认值。
-                //
-                // 解析失败必须**拒绝登录**，不能退回 `ctx.store` —— 那等于把
-                // 默认账号的邮箱交给任何一个口令正确但没开邮箱的用户。
                 if let Some(resolver) = self.ctx.resolver.as_ref() {
                     let Some(store) = resolver.resolve(&user) else {
                         self.ctx.metrics.auth_failed();
@@ -844,7 +782,7 @@ where
                             .await;
                     };
                     self.store = Arc::clone(&store);
-                    // 记下本人邮箱：共享邮箱选择结束后要还原到它，而不是 `ctx.store`。
+
                     self.own_store = store;
                 }
 
@@ -902,7 +840,7 @@ where
             "ACL",
             "BINARY",
         ];
-        // COMPRESS 只在认证后有效（RFC 4978 §4），所以也只在认证后才通告。
+
         if !matches!(self.state, State::NotAuthenticated) {
             capabilities.push("COMPRESS=DEFLATE");
         }
@@ -931,10 +869,6 @@ where
         .map_err(|_| MailError::Timeout)??;
         read.ok_or_else(|| MailError::protocol("client closed during authentication"))
     }
-
-    // -----------------------------------------------------------------
-    // 邮箱选择与命名空间
-    // -----------------------------------------------------------------
 
     async fn handle_select(&mut self, command: &Command) -> Result<Control> {
         let tag = command.tag.clone();
@@ -988,7 +922,7 @@ where
             }
         }
         let writable = command.name == "SELECT";
-        // 解析目标：共享邮箱按 ACL 授权（需 l+r），个人邮箱恒通过。
+
         let resolved = match self.resolve_mailbox(&name) {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -1008,18 +942,15 @@ where
             match blocking::maildir(&store, move |store| store.open_folder(&mailbox, true)).await {
                 Ok(state) => state,
                 Err(error) => {
-                    // RFC 3501 §6.3.1：SELECT/EXAMINE 在尝试新邮箱之前自动 deselect；
-                    // 新邮箱选择失败时应处于「无选中」状态，而不是继续指向旧邮箱。
                     self.deselect_to_personal();
                     self.send_failure(&tag, &error).await?;
                     return Ok(Control::Continue);
                 }
             };
-        // 选择成功：把当前存储切到目标（共享或本人）。
+
         self.store = Arc::clone(&resolved.store);
         self.selected_owner = resolved.owner.clone();
-        // RFC 5182：邮箱切换后，上一个邮箱的 SEARCH RETURN (SAVE) 结果（按
-        // UID 存）不再有意义；留在原地会让新邮箱里的 `$` 解析到旧邮箱的 UID。
+
         self.saved_search = None;
         let user = self.user().unwrap_or_default().to_string();
         let folder_for_stamp = state.name.clone();
@@ -1175,7 +1106,7 @@ where
                 }
                 command.args.get(2)
             }
-            // 宽容：允许省略 USE 关键字直接跟列表。
+
             Some(Token::List(_)) if command.args.len() == 2 => command.args.get(1),
             Some(_) => {
                 return self
@@ -1243,8 +1174,7 @@ where
         match blocking::maildir(&store, move |store| store.rename(&source, &destination)).await {
             Ok(()) => {
                 self.ok(&tag, "RENAME completed").await?;
-                // 重命名当前选中的邮箱后，视图里的文件夹名必须跟着变；
-                // 否则后续 FETCH 会去找一个已经不存在的名字。
+
                 let selected = matches!(&self.state, State::Selected { view, .. } if view.folder.eq_ignore_ascii_case(&from));
                 if selected {
                     let new_name = if crate::maildir::is_inbox(&from) {
@@ -1295,7 +1225,6 @@ where
         self.require_authenticated(&tag)?;
         let (selection, reference, pattern) = parse_list_args(command)?;
         if pattern.is_empty() && reference.is_empty() {
-            // RFC 3501 §6.3.8：空模式用于探测层级分隔符，必须回一条 LIST。
             self.line(&format!(
                 "* {} (\\Noselect) \"{DELIMITER}\" \"\"",
                 if command.name == "LSUB" {
@@ -1350,7 +1279,6 @@ where
         names.sort();
         names.dedup();
 
-        // 一次遍历算出所有「有子文件夹」的父名：逐名字再做前缀扫描是 O(n²)。
         let mut parents: HashSet<String> = HashSet::new();
         for folder in &folders {
             let mut name = folder.as_str();
@@ -1573,10 +1501,6 @@ where
         Ok(Control::Continue)
     }
 
-    // -----------------------------------------------------------------
-    // 写入
-    // -----------------------------------------------------------------
-
     async fn handle_append(&mut self, command: Command) -> Result<Control> {
         let tag = command.tag.clone();
         self.require_authenticated(&tag)?;
@@ -1594,8 +1518,6 @@ where
                 .await;
         }
 
-        // MULTIAPPEND（RFC 3502）：mailbox [flags] [date] literal ...
-        // literal 直接 move 进 NewMessage，避免为 32 MiB 正文再做一次复制。
         let mut messages: Vec<NewMessage> = Vec::new();
         let mut flags = FlagSet::new();
         let mut date = None;
@@ -1663,8 +1585,6 @@ where
         .await?;
         if matches!(&self.state, State::Selected { view, .. } if view.folder.eq_ignore_ascii_case(&resolved.folder))
         {
-            // 本地追加后必须绕过 mtime 快速路径：粗粒度时间戳可能让「刚写入」
-            // 与上次扫描落在同一刻度，客户端就收不到 EXISTS。
             self.invalidate_view_stamp();
             self.refresh_selected().await?;
         }
@@ -1721,17 +1641,14 @@ where
                 .no_code(&tag, "READ-ONLY", "mailbox is read-only")
                 .await;
         }
-        // 共享邮箱需要删除权限（t）。
+
         self.require_selected_rights("t").await?;
 
         let restrict = match restrict {
             Some(set) => set.clone(),
-            None => {
-                // 全量 EXPUNGE 的集合语义由「所有 \Deleted」表达。
-                SequenceSet::parse("1:*").unwrap_or_default()
-            }
+            None => SequenceSet::parse("1:*").unwrap_or_default(),
         };
-        let mut targets: Vec<(u32, u32)> = Vec::new(); // (sequence, uid)
+        let mut targets: Vec<(u32, u32)> = Vec::new();
         if let Some(view) = self.view() {
             for (index, message) in view.messages.iter().enumerate() {
                 let deleted = message.flags.iter().any(Flag::is_deleted);
@@ -1772,10 +1689,6 @@ where
         self.ok(&tag, "EXPUNGE completed").await?;
         Ok(Control::Continue)
     }
-
-    // -----------------------------------------------------------------
-    // 读取
-    // -----------------------------------------------------------------
 
     async fn handle_uid(&mut self, command: &Command) -> Result<Control> {
         let tag = command.tag.clone();
@@ -1871,8 +1784,7 @@ where
         };
 
         let mut matched: Vec<(u32, sort::SortValues)> = Vec::new();
-        // 元数据预筛：只看 Meta 就能判定的条件直接出结果；其余邮件收集起来
-        // 分批读正文（每批一次 blocking::maildir，取代逐封一次的 spawn 往返）。
+
         let mut pending: Vec<usize> = Vec::new();
         for (index, meta) in messages.iter().enumerate() {
             if needs_message && meta.size > self.ctx.config.max_message_size {
@@ -1889,12 +1801,12 @@ where
             };
             match search::matches_meta(&parsed.key, &context) {
                 Some(false) => {}
-                // 已命中且排序值不需要邮件头：无需正文，直接取值。
+
                 Some(true) if !needs_sort_headers => matched.push((
                     if uid_mode { meta.uid } else { index as u32 + 1 },
                     sort::values(meta, &[], &criteria),
                 )),
-                // 判定未定，或排序值需要邮件头 —— 统一进批读正文。
+
                 _ => pending.push(index),
             }
         }
@@ -1986,9 +1898,7 @@ where
         };
 
         let mut threads = Vec::new();
-        // THREAD 的分组值（主题 / 引用链）始终取自邮件头：预筛只排除在搜索
-        // 阶段仅凭 Meta 就已确定不命中的邮件，其余的分批读正文 —— 之前是
-        // 每封先读后判，不命中的邮件也付了一次磁盘 I/O。
+
         let mut pending: Vec<usize> = Vec::new();
         for (index, meta) in messages.iter().enumerate() {
             if meta.size > self.ctx.config.max_message_size {
@@ -2117,7 +2027,6 @@ where
                 Some(if needs_full_message {
                     blocking::maildir(&store, move |store| store.read(&meta_for_read)).await?
                 } else {
-                    // 只要头部时读前缀，避免把 50 MiB 的正文也读进内存。
                     blocking::maildir(&store, move |store| {
                         store.read_prefix(&meta_for_read, header_limit)
                     })
@@ -2176,7 +2085,7 @@ where
                 .no_code(&tag, "READ-ONLY", "mailbox is read-only")
                 .await;
         }
-        // 共享邮箱需要写标志权限（w）。
+
         self.require_selected_rights("w").await?;
         if command.args.len() != 3 && command.args.len() != 4 {
             return self.bad(&tag, "STORE requires set, item, flags").await;
@@ -2367,8 +2276,7 @@ where
             self.ok(&tag, "COPY completed").await?;
             return Ok(Control::Continue);
         }
-        // 一次打开源邮箱、一次索引；逐封调用 `store.copy` 会为每封信重新扫描
-        // 整个文件夹（k 封复制 = O(k·n)）。
+
         let store = Arc::clone(&self.store);
         let source_folder = folder.clone();
         let destination_folder = destination.folder.clone();
@@ -2394,7 +2302,6 @@ where
         Ok(Control::Continue)
     }
 
-    /// RFC 6851 MOVE：复制到目标、删除源邮件，并以 untagged EXPUNGE 汇报。
     async fn handle_move(&mut self, command: &Command, uid_mode: bool) -> Result<Control> {
         let tag = command.tag.clone();
         let (folder, writable, max_uid) = match &self.state {
@@ -2503,7 +2410,6 @@ where
         })
         .await
         {
-            // 源删除失败：尽量撤回目标副本，避免同一封邮件两份都留下。
             let store = Arc::clone(&self.store);
             let destination_folder = destination.folder.clone();
             let rollback = destination_uids.clone();
@@ -2566,7 +2472,6 @@ where
         let map =
             blocking::maildir(&store, move |store| store.read_metadata(scope.as_deref())).await?;
 
-        // 值按 literal 输出：meta 值可含任意字节，quoted 会破坏含 CR/LF 的应答。
         let mut out: Vec<u8> = Vec::new();
         out.extend_from_slice(
             format!("* METADATA {} (", crate::render::quoted(&response_name)).as_bytes(),
@@ -2814,7 +2719,7 @@ where
             self.send_failure(&tag, &error).await?;
             return Ok(Control::Continue);
         }
-        // read_acl 同时做邮箱存在性检查。
+
         let store = Arc::clone(&resolved.store);
         let name = resolved.folder.clone();
         let _ = blocking::maildir(&store, move |store| store.read_acl(&name)).await?;
@@ -2861,7 +2766,7 @@ where
             self.send_failure(&tag, &error).await?;
             return Ok(Control::Continue);
         }
-        // read_acl 顺带校验邮箱存在性；结果直接交给 my_rights，避免再读一次。
+
         let store = Arc::clone(&resolved.store);
         let name = resolved.folder.clone();
         let acl = blocking::maildir(&store, move |store| store.read_acl(&name)).await?;
@@ -2876,7 +2781,6 @@ where
         Ok(Control::Continue)
     }
 
-    /// 解析 METADATA 的目标：`None` 用当前选中的邮箱，`Some("")` 是服务器级。
     fn resolve_metadata_scope(&self, mailbox: &Option<String>) -> Result<(Option<String>, String)> {
         match mailbox {
             None => {
@@ -2920,13 +2824,10 @@ where
         };
 
         let mut matched = vec![false; messages.len()];
-        // 元数据预筛：只看 Meta 就能判定的条件直接出结果；需要正文的邮件
-        // 分批读取（每批一次 blocking::maildir，取代逐封一次的 spawn 往返）。
+
         let mut pending: Vec<usize> = Vec::new();
         for (index, meta) in messages.iter().enumerate() {
             if needs_message && meta.size > self.ctx.config.max_message_size {
-                // 静默跳过会让 SEARCH 给出「看起来完整、其实缺了几封」的结果。
-                // 宁可明确失败，让客户端知道这次搜索不完整。
                 return Err(MailError::invalid(
                     "a message is too large to search; use a narrower search",
                 ));
@@ -2978,12 +2879,11 @@ where
 
         if let Some(options) = parsed.options {
             if options.save {
-                // RFC 5182：保存结果，且不回任何 untagged SEARCH/ESEARCH。
                 self.saved_search = Some(matched_uids);
                 self.ok(&tag, "SEARCH completed").await?;
                 return Ok(Control::Continue);
             }
-            // RFC 4731 ESEARCH：只回客户端请求的字段；空结果只回 COUNT 0。
+
             let mut response = format!("* ESEARCH (TAG \"{}\")", sanitize(&tag));
             if uid_mode {
                 response.push_str(" UID");
@@ -3018,10 +2918,6 @@ where
         Ok(Control::Continue)
     }
 
-    // -----------------------------------------------------------------
-    // IDLE 与刷新
-    // -----------------------------------------------------------------
-
     async fn handle_idle(&mut self, command: &Command) -> Result<Control> {
         let tag = command.tag.clone();
         self.require_selected(&tag)?;
@@ -3042,7 +2938,6 @@ where
             .await;
             match read {
                 Err(_) => {
-                    // 轮询窗口内没有 DONE：检查邮箱变化并继续。
                     self.refresh_selected().await?;
                     self.flush().await?;
                 }
@@ -3054,9 +2949,7 @@ where
                         self.ok(&tag, "IDLE terminated").await?;
                         return Ok(Control::Continue);
                     }
-                    // IDLE 期间只允许 DONE。其它命令以 tagged BAD 结束 IDLE，
-                    // 而不是「回了 BAD 却继续 idling」——后者会让客户端误以为
-                    // 已退出 IDLE，后续命令被当作 IDLE 内文本处理。
+
                     self.bad(&tag, "expected DONE").await?;
                     return Ok(Control::Continue);
                 }
@@ -3073,8 +2966,6 @@ where
         let stamp =
             blocking::maildir(&store, move |store| store.folder_stamp(&folder_for_stamp)).await?;
 
-        // 目录指纹未变 → 跳过整次扫描。每 10 次仍强制全量扫描，避免文件系统
-        // 时间戳精度过低导致永久漏检。
         if self
             .view()
             .is_some_and(|view| view.stamp == Some(stamp) && view.skipped_stamps < 9)
@@ -3098,7 +2989,6 @@ where
         .await?;
 
         if new_state.uidvalidity != old_uidvalidity {
-            // 邮箱被重建：旧 UID 语义全部失效，只能整体重报。
             self.line(&format!(
                 "* OK [UIDVALIDITY {}] UIDs valid",
                 new_state.uidvalidity
@@ -3220,16 +3110,11 @@ where
         }
     }
 
-    /// 本地写入后清空指纹，确保下一次刷新走全量扫描。
     fn invalidate_view_stamp(&mut self) {
         if let State::Selected { view, .. } = &mut self.state {
             view.stamp = None;
         }
     }
-
-    // -----------------------------------------------------------------
-    // 应答与工具
-    // -----------------------------------------------------------------
 
     fn view(&self) -> Option<&View> {
         match &self.state {
@@ -3255,9 +3140,6 @@ where
         Ok(())
     }
 
-    /// 解析序列集合。`$`（RFC 5182 SEARCHRES）先展开成已保存结果的**完整**
-    /// 集合（如 `3,7:9`），而不是只取最高编号 —— 否则 SAVE 了多条结果后
-    /// `$` 会静默漏掉除最大编号外的所有邮件。
     fn parse_sequence_set(&self, text: &str, uid_mode: bool) -> Result<SequenceSet> {
         let resolved = if text.contains('$') {
             let saved = self
@@ -3282,7 +3164,6 @@ where
         SequenceSet::parse(&resolved)
     }
 
-    /// 解析邮箱名：`shared/<user>/<folder>` 指向目标用户存储，其余为本人存储。
     fn resolve_mailbox(&self, name: &str) -> Result<ResolvedMailbox> {
         if let Some(rest) = name.strip_prefix(SHARED_PREFIX) {
             let Some(resolver) = &self.ctx.resolver else {
@@ -3307,8 +3188,6 @@ where
             })
         } else {
             Ok(ResolvedMailbox {
-                // 个人邮箱：用会话当前的 store（多用户装配下它已是本人邮箱，
-                // 而 `ctx.store` 只是单用户部署的占位）。
                 store: Arc::clone(&self.store),
                 folder: name.to_string(),
                 owner: None,
@@ -3316,7 +3195,6 @@ where
         }
     }
 
-    /// 回到「无选中 + 本人存储」：SELECT 失败或 CLOSE 时用。
     fn deselect_to_personal(&mut self) {
         if matches!(self.state, State::Selected { .. }) {
             let user = self.user().unwrap_or_default().to_string();
@@ -3326,8 +3204,6 @@ where
         self.selected_owner = None;
     }
 
-    /// 当前用户对目标邮箱的有效权限：本人/所有者全权；共享邮箱取 ACL 授予集。
-    /// `acl` 由调用方通过 blocking 池读取（见 [`blocking::maildir`]）。
     fn my_rights(&self, resolved: &ResolvedMailbox, acl: &BTreeMap<String, String>) -> String {
         let Some(owner) = &resolved.owner else {
             return crate::acl::ALL_RIGHTS.to_string();
@@ -3343,11 +3219,6 @@ where
             .unwrap_or_default()
     }
 
-    /// 枚举共享命名空间下当前用户可见（有 `l` 权限）的邮箱。
-    ///
-    /// `folders()` / `read_acl()` / `list_users()` 都是同步文件 I/O，统一丢给
-    /// blocking 池（[`blocking::maildir`]；resolver 用裸 `spawn_blocking`），
-    /// 慢盘只会堆积 blocking 池，不会卡住 async worker。
     async fn shared_mailbox_listing(&self, pattern: &str) -> Result<Vec<(String, Vec<String>)>> {
         let Some(resolver) = &self.ctx.resolver else {
             return Ok(Vec::new());
@@ -3388,8 +3259,6 @@ where
                 match tokio::task::spawn_blocking(move || resolver.list_users()).await {
                     Ok(users) => users,
                     Err(error) => {
-                        // JoinError 代表 blocking 任务 panic 或 runtime 关闭；
-                        // 与 blocking::maildir 的处理保持一致。
                         tracing::warn!(%error, "resolver blocking task failed");
                         return Err(MailError::storage(format!(
                             "resolver worker failed: {error}"
@@ -3435,7 +3304,6 @@ where
         .await
     }
 
-    /// 对「当前选中邮箱」做权限检查（个人邮箱恒通过）。
     async fn require_selected_rights(&self, required: &str) -> Result<()> {
         let State::Selected { view, .. } = &self.state else {
             return Err(MailError::protocol("no selected mailbox"));
@@ -3450,7 +3318,6 @@ where
         .await
     }
 
-    /// 共享邮箱上的结构性操作（建/删/改名/订阅）暂不支持。
     fn deny_shared(&self, name: &str) -> Result<()> {
         if name.starts_with(SHARED_PREFIX) {
             Err(MailError::Invalid(
@@ -3566,7 +3433,6 @@ fn string_arg(token: &Token) -> Result<String> {
         .ok_or_else(|| MailError::protocol("expected a string argument"))
 }
 
-/// 解析 GETMETADATA/SETMETADATA 的 `[mailbox] (entries)`：首参是列表即无邮箱名。
 fn parse_metadata_args(command: &Command) -> Result<(Option<String>, Vec<Token>)> {
     match command.args.first().and_then(|token| token.list()) {
         Some(entries) => Ok((None, entries.to_vec())),
@@ -3587,7 +3453,6 @@ fn parse_metadata_args(command: &Command) -> Result<(Option<String>, Vec<Token>)
     }
 }
 
-/// RFC 5464 条目名：`/private/<name>` 或 `/shared/<name>`，可见 ASCII、≤512 字节。
 fn validate_metadata_entry(entry: &str) -> Result<()> {
     if entry.len() > 512 || !entry.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(MailError::invalid("invalid metadata entry name"));
@@ -3650,10 +3515,6 @@ fn sanitize(text: &str) -> String {
         .collect()
 }
 
-/// 解析 `QRESYNC (uidvalidity modseq [known-uids [(known-seqs known-uids)]])`。
-///
-/// 只使用前两个参数做增量同步；已知 UID 列表用于裁剪 VANISHED 范围，属于
-/// 优化项，当前忽略。
 fn parse_qresync_params(items: &[Token]) -> Result<(u32, u64)> {
     if items.len() < 2 || items.len() > 4 {
         return Err(MailError::invalid(
@@ -3693,10 +3554,6 @@ fn resolve_pattern(reference: &str, pattern: &str) -> String {
     }
 }
 
-/// RFC 5182：把已保存的 UID 结果展开成编号列表。uid 模式直接用 UID；序号
-/// 模式把 UID 映射成当前视图里的序号。结果已排序去重（`SequenceSet::
-/// from_values` 会做区间压缩）。已保存的 UID 在当前邮箱里一封都对不上时
-/// 明确报错，绝不静默当作空集。
 fn saved_result_numbers(
     saved: &[u32],
     uid_mode: bool,
@@ -3742,8 +3599,6 @@ fn quota_resource_list(status: &crate::maildir::QuotaStatus) -> String {
     format!("({})", resources.join(" "))
 }
 
-/// 解析 LIST/LSUB 的 `(selection-options) reference pattern [(return-options)]`
-/// （RFC 5258 的常用子集：CHILDREN / SPECIAL-USE / SUBSCRIBED）。
 fn parse_list_args(command: &Command) -> Result<(HashSet<String>, String, String)> {
     let mut index = 0usize;
     let mut selection: HashSet<String> = HashSet::new();
@@ -3800,17 +3655,8 @@ fn parse_list_args(command: &Command) -> Result<(HashSet<String>, String, String
     Ok((selection, string_arg(reference)?, string_arg(pattern)?))
 }
 
-/// LIST 模式的长度上限。模式来自客户端（literal 语法能传到 max_literal），
-/// 而匹配耗时随模式长度增长；超长模式直接回 BAD，不做匹配。
 const MAX_LIST_PATTERN: usize = 512;
 
-/// IMAP LIST 通配符匹配：`*` 跨层级，`%` 不跨层级（RFC 3501 §6.3.8）。
-///
-/// 经典的双指针回溯：记录最近一个 `*` 与最近一个 `%`（含它开始消耗的名字
-/// 位置），失配时优先让 `%` 多吞一个字符（不能是层级分隔符），吞不动再回退
-/// 到更早的 `*`。时间 O(模式×名字)、空间 O(1) —— 之前的 O(模式×名字) DP 表
-/// 会为 32 MiB 的 literal 模式一次性分配数 GB 内存。按字节比较即可：模式与
-/// 名字都是合法 UTF-8，通配符吞半个多字节字符不可能匹配上任何字面量。
 fn matches_pattern(pattern: &str, name: &str) -> bool {
     if !pattern.contains(['*', '%']) {
         return if name == INBOX {
@@ -3822,7 +3668,7 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
     let pattern_bytes = pattern.as_bytes();
     let name_bytes = name.as_bytes();
     let delimiter = DELIMITER as u8;
-    // (模式里的下标, 它开始消耗的名字位置)。回溯 = 多吞一个字符并重试其后缀。
+
     let mut star: Option<(usize, usize)> = None;
     let mut percent: Option<(usize, usize)> = None;
     let mut i = 0usize;
@@ -3830,7 +3676,6 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
     while j < name_bytes.len() {
         if i < pattern_bytes.len() && (pattern_bytes[i] == b'*' || pattern_bytes[i] == b'%') {
             if pattern_bytes[i] == b'*' {
-                // 新的 '*' 支配它之前的所有回溯点。
                 star = Some((i, j));
                 percent = None;
             } else {
@@ -3842,12 +3687,10 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
             j += 1;
         } else if let Some((percent_index, percent_mark)) = percent {
             if percent_mark < name_bytes.len() && name_bytes[percent_mark] != delimiter {
-                // 让这个 % 多消耗一个字符，重新匹配它后面的部分。
                 percent = Some((percent_index, percent_mark + 1));
                 i = percent_index + 1;
                 j = percent_mark + 1;
             } else {
-                // '%' 不能跨层级：这个回溯点作废，下一轮退到更早的 '*'。
                 percent = None;
             }
         } else if let Some((star_index, star_mark)) = star {
@@ -3863,7 +3706,7 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
             return false;
         }
     }
-    // 名字耗尽后，模式尾部只剩通配符才能匹配（它们都可以匹配空）。
+
     while i < pattern_bytes.len() && (pattern_bytes[i] == b'*' || pattern_bytes[i] == b'%') {
         i += 1;
     }
@@ -3888,18 +3731,9 @@ fn decode_base64_text(payload: &[u8]) -> Result<String> {
     String::from_utf8(bytes).map_err(|_| MailError::invalid("credential is not valid UTF-8"))
 }
 
-// ---------------------------------------------------------------------------
-// SORT / THREAD / SEARCH 共用的正文批量读取
-// ---------------------------------------------------------------------------
-
-/// 正文批量读取的批次上限。批大小同时受封数与累计字节约束：数量上限防小
-/// 邮件海把单批返回值撑爆，字节上限防大邮件占过多内存；一封超过字节上限的
-/// 邮件自成一批（否则它永远进不了任何批次）。
 const CONTENT_BATCH_MESSAGES: usize = 16;
 const CONTENT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 
-/// 按（封数、累计字节）双上限把待读正文的消息切批，返回每批在 `pending`
-/// 里的 `[start, end)` 区间。批内首封无条件入批，超大邮件因此能自成一批。
 fn content_batch_ranges(pending: &[usize], messages: &[MessageMeta]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -3923,8 +3757,6 @@ fn content_batch_ranges(pending: &[usize], messages: &[MessageMeta]) -> Vec<(usi
     ranges
 }
 
-/// 一次 blocking::maildir 读出一批正文。批内任何一封失败就返回该错误 ——
-/// 与逐封读取一致：正文读不出来时整条命令失败，绝不静默返回残缺结果。
 async fn read_content_batch(
     store: &Arc<MailStore>,
     batch: Vec<MessageMeta>,
@@ -3956,7 +3788,7 @@ mod tests {
         assert!(matches_pattern("inbox", "INBOX"));
         assert!(!matches_pattern("sent", "Sent"), "非 INBOX 区分大小写");
         assert!(matches_pattern("*.2026", "Sent.2026"));
-        // 双指针回溯覆盖的混合通配符场景（与原 DP 语义一致）。
+
         assert!(matches_pattern("Sent.*", "Sent."));
         assert!(matches_pattern("*%", "anything"));
         assert!(matches_pattern("*a%", "xa"));
@@ -3986,12 +3818,12 @@ mod tests {
     #[test]
     fn dollar_placeholder_expands_to_every_saved_uid() {
         let messages: Vec<MessageMeta> = [3u32, 7, 9].into_iter().map(meta_with_uid).collect();
-        // uid 模式：展开为全部已保存 UID（排序去重），不只是最大值。
+
         assert_eq!(
             saved_result_numbers(&[9, 3, 7], true, &messages).unwrap(),
             vec![3, 7, 9]
         );
-        // 序号模式：UID 映射成当前视图里的序号（uid 7 → 序号 2）。
+
         assert_eq!(
             saved_result_numbers(&[7], false, &messages).unwrap(),
             vec![2]
@@ -4000,7 +3832,7 @@ mod tests {
             saved_result_numbers(&[3, 9], false, &messages).unwrap(),
             vec![1, 3]
         );
-        // 已保存的 UID 一封都对不上 → 明确报错，绝不静默当作空集。
+
         assert!(saved_result_numbers(&[99], false, &messages).is_err());
     }
 
@@ -4052,21 +3884,21 @@ mod tests {
             flags: FlagSet::new(),
             recent: false,
         };
-        // 40 封 1 KiB：只受封数上限约束 → 16 + 16 + 8。
+
         let pending: Vec<usize> = (0..40).collect();
         let messages: Vec<MessageMeta> = (0..40).map(|_| meta(1024)).collect();
         assert_eq!(
             content_batch_ranges(&pending, &messages),
             vec![(0, 16), (16, 32), (32, 40)]
         );
-        // 10 封 8 MiB：字节上限先到 → 4 + 4 + 2。
+
         let pending: Vec<usize> = (0..10).collect();
         let messages: Vec<MessageMeta> = (0..10).map(|_| meta(8 << 20)).collect();
         assert_eq!(
             content_batch_ranges(&pending, &messages),
             vec![(0, 4), (4, 8), (8, 10)]
         );
-        // 单封超过字节上限：自成一批，不与相邻邮件混批。
+
         let pending: Vec<usize> = (0..3).collect();
         let messages: Vec<MessageMeta> = [1024u64, 64 << 20, 2048]
             .iter()
@@ -4076,17 +3908,12 @@ mod tests {
             content_batch_ranges(&pending, &messages),
             vec![(0, 1), (1, 2), (2, 3)]
         );
-        // 空邮箱：无批次。
+
         assert_eq!(content_batch_ranges(&[], &[]), Vec::new());
     }
 
-    // -----------------------------------------------------------------
-    // SORT / THREAD / SEARCH：分批读取与逐封读取的等价性
-    // -----------------------------------------------------------------
-
     const BATCH_TEST_PASSWORD: &str = "Correct-Horse-9-Battery";
-    /// 夹具邮件数：超过 [`CONTENT_BATCH_MESSAGES`]，SORT/THREAD/SEARCH 的
-    /// 正文路径都会跨多个读取批次（16 + 16 + 8）。
+
     const BATCH_TEST_MESSAGES: u32 = 40;
 
     struct BatchFixture {
@@ -4098,7 +3925,7 @@ mod tests {
     fn batch_fixture() -> BatchFixture {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(MailStore::new(directory.path(), Arc::new(SystemClock)).unwrap());
-        // 与 tests/e2e.rs 同构：用户名带域，登录名即用户名。
+
         let mut record =
             mailstack_core::password::password_record("bob", BATCH_TEST_PASSWORD).unwrap();
         record.username = "bob@example.com".to_string();
@@ -4126,17 +3953,6 @@ mod tests {
         }
     }
 
-    /// 写入 [`BATCH_TEST_MESSAGES`] 封确定性邮件（与旧的逐封读取产出完全相同
-    /// 的结果集，便于用常量断言）：
-    ///
-    /// * 奇数主题 `thread`，偶数 `Re: thread` 且 `In-Reply-To` 第 1 封 ——
-    ///   ORDEREDSUBJECT / REFERENCES 的分组可手工推导；
-    /// * 填充行长度逐封递减 100 字节，SIZE 严格递减（排序无并列）；
-    /// * 内部日期逐封 +1 天（ARRIVAL 严格递增）；
-    /// * 第 5i 封带 `\Seen`（SEEN / UNSEEN 路径）；
-    /// * 正文 `body-{i}`（BODY / TEXT 路径，且互不为对方的子串）。
-    ///
-    /// 追加顺序即序号：第 i 封 = 序号 i = UID i。
     fn append_batch_fixture(store: &MailStore) {
         for i in 1..=BATCH_TEST_MESSAGES {
             let mut flags = FlagSet::new();
@@ -4226,9 +4042,8 @@ mod tests {
         (BatchClient::new(client_io), handle)
     }
 
-    /// 登录并选中 INBOX。
     async fn login_and_select_inbox(client: &mut BatchClient) {
-        let _ = client.line().await; // 问候语
+        let _ = client.line().await;
         client
             .send(&format!("f1 LOGIN bob@example.com {BATCH_TEST_PASSWORD}"))
             .await;
@@ -4248,7 +4063,6 @@ mod tests {
         let (mut client, handle) = spawn_batch_session(batch_context(&fixture));
         login_and_select_inbox(&mut client).await;
 
-        // 纯 Meta 条件：预筛后无需读任何正文。
         client.send("s1 SEARCH ALL").await;
         let lines = joined_lines(client.until_tag("s1").await);
         assert!(
@@ -4263,12 +4077,10 @@ mod tests {
             "{lines}"
         );
 
-        // 正文条件：所有邮件进批读正文，逐封判定。
         client.send("s3 SEARCH BODY \"body-7\"").await;
         let lines = joined_lines(client.until_tag("s3").await);
         assert!(lines.contains("* SEARCH 7"), "{lines}");
 
-        // OR 混合：SEEN 侧靠 Meta 直接命中（跳过正文读取），其余邮件才进批。
         client.send("s4 SEARCH OR BODY \"body-7\" SEEN").await;
         let lines = joined_lines(client.until_tag("s4").await);
         assert!(
@@ -4276,7 +4088,6 @@ mod tests {
             "{lines}"
         );
 
-        // 头部条件 + UID 模式。
         client
             .send("s5 UID SEARCH HEADER SUBJECT \"Re: thread\"")
             .await;
@@ -4298,8 +4109,6 @@ mod tests {
         let (mut client, handle) = spawn_batch_session(batch_context(&fixture));
         login_and_select_inbox(&mut client).await;
 
-        // 纯 Meta 排序 + 纯 Meta 搜索：全程不读正文；SIZE 严格递减，
-        // REVERSE SIZE 即 1..=40。
         client.send("o1 SORT (REVERSE SIZE) UTF-8 ALL").await;
         let lines = joined_lines(client.until_tag("o1").await);
         assert!(
@@ -4307,8 +4116,6 @@ mod tests {
             "{lines}"
         );
 
-        // 头部排序：命中的邮件都要读正文取主题；"re: thread" < "thread"，
-        // 偶数组在前，组内按序号稳定。
         client.send("o2 SORT (SUBJECT) UTF-8 ALL").await;
         let lines = joined_lines(client.until_tag("o2").await);
         assert!(
@@ -4316,12 +4123,10 @@ mod tests {
             "{lines}"
         );
 
-        // 正文搜索 + 头部排序：只有命中的邮件参与排序值计算。
         client.send("o3 SORT (SUBJECT) UTF-8 BODY \"body-7\"").await;
         let lines = joined_lines(client.until_tag("o3").await);
         assert!(lines.contains("* SORT 7"), "{lines}");
 
-        // UID 模式 + 纯 Meta 搜索（ARRIVAL = 内部日期，逐封递增）。
         client
             .send("o4 UID SORT (ARRIVAL) UTF-8 UNSEEN LARGER 100")
             .await;
@@ -4343,9 +4148,6 @@ mod tests {
         let (mut client, handle) = spawn_batch_session(batch_context(&fixture));
         login_and_select_inbox(&mut client).await;
 
-        // 全量 ORDEREDSUBJECT：夹具偶数主题是 "Re: thread"，基主题归一化会
-        // 剥掉 "Re:" —— 40 封共享同一基主题，按日期序构成**一个**组
-        //（RFC 5256 §7：分组键是 base subject，不是原始 Subject 字段）。
         client.send("d1 THREAD ORDEREDSUBJECT UTF-8 ALL").await;
         let lines = joined_lines(client.until_tag("d1").await);
         assert!(
@@ -4360,8 +4162,6 @@ mod tests {
             "{lines}"
         );
 
-        // Meta 搜索：预筛直接排除未命中的邮件，只读命中部分。
-        // SEEN = 5/10/15/20/25/30/35/40，基主题同上全部相同 → 单组、日期序。
         client.send("d3 THREAD ORDEREDSUBJECT UTF-8 SEEN").await;
         let lines = joined_lines(client.until_tag("d3").await);
         assert!(
@@ -4369,7 +4169,6 @@ mod tests {
             "{lines}"
         );
 
-        // UID 模式：序号 = UID，输出与 d2 相同。
         client
             .send("d4 UID THREAD REFERENCES UTF-8 SUBJECT \"thread\"")
             .await;

@@ -3,8 +3,6 @@ Description=MailStack Webmail (independent web client for mailbox users)
 Documentation=https://github.com/SectorPace/MailStack
 After=network-online.target
 Wants=network-online.target
-# Webmail 与管理台是**两个进程、两套会话**（同一份前端产物，不同进程与端口）。
-# 它直接读写 Maildir 并经 queue 落盘投递，不依赖 mailstackd 是否已启动。
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -12,18 +10,12 @@ StartLimitBurst=5
 Type=simple
 User=root
 Group=root
-# 为什么是 root：webmail 要为**所有**邮箱用户服务，而每个用户的 Maildir 在
-# 自己家目录下（useradd -m 的 /home/<u>，0750 属主本人）。非 root 进程无法
-# 跨用户读信 —— 那正是「一个邮箱一个 unix 账号」布局的代价。
-# 只绑回环：对外暴露与 TLS 终止交给反向代理 / SSH 隧道。
 ExecStart=@BIN_DIR@/mailstack-webmail --bind 127.0.0.1:@WEBMAIL_PORT@ --dist @DIST_DIR@ --log info@CONFIG_ARG@
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=20s
 LimitNOFILE=16384
 
-# ── 沙箱 ──
-# 写 Maildir（/home）与队列（/var/lib/mailstack/queue）；其余只读。
 ProtectSystem=strict
 ReadWritePaths=/home /var/lib/mailstack
 ProtectHome=no

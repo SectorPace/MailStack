@@ -540,6 +540,33 @@ WantedBy=multi-user.target
 
 ---
 
+### 3.10 访问模式与 `mailstack-manage`（v1.0.0 交付）
+
+`deploy/install.sh` 一条命令即可完成安装并应用访问模式；安装后由
+`/usr/local/bin/mailstack-manage` 维护（域/账号/TLS/访问方式），状态唯一真相源为
+`/etc/mailstack/install-args.conf` 与 `/etc/mailstack/access/`。
+
+| 访问模式 | 产物 | 说明 |
+|---|---|---|
+| `ssh` | `access/ssh/{README.txt,tunnel.sh}` | 默认；8443/8444 只绑回环 |
+| `caddy` | `access/caddy/Caddyfile`（并尝试写入 `/etc/caddy/`） | 自动 ACME HTTPS |
+| `nginx` | `access/nginx/mailstack-panel.conf`、`README.txt` | TLS 由 certbot/acme.sh 补 |
+| `ip-acme` | `access/ip-acme/DNS-REQUIREMENTS.txt`、nginx 配置 | 证书走 `setup.cert.issue` |
+| `panel-domain` | 同 caddy/nginx + 域名冲突校验 | 面板域必须 != `mail/imap/smtp` 域 |
+| `cloudflared` | `access/cloudflared/{config.yml,mailstack-cloudflared.service,README.txt}` | Tunnel 到回环，本机不开端口 |
+
+```bash
+sudo mailstack-manage status
+sudo mailstack-manage access set nginx --panel-host panel.example.com
+sudo mailstack-manage access set cloudflared
+sudo mailstack-manage domain set example.com --mail-host mail.example.com
+sudo mailstack-manage account add alice@example.com --password-stdin
+sudo mailstack-manage tls issue mail.example.com --email ops@example.com
+```
+
+动作统一经 `mailstackctl`（RO 直连 / RW sudo 包装器，`--privileged-stdin`）；
+`MAILSTACK_PREFIX` 仅用于 staging，此时跳过 systemctl 操作。
+
 ## 4. 回滚
 
 `mailstackd`、`mailstack-web`、`mailstack-imap`、`mailstack-webmail` 都是独立进程：
@@ -561,11 +588,11 @@ v1.0.0 安装可用 `deploy/uninstall.sh` 卸载（默认保留 `/etc/mailstack`
 
 | Phase | 状态 | 说明 |
 |---|---|---|
-| Phase 0 契约冻结 | ✅ 基础 | 路由表 `crates/web/src/contract.rs`（当前 **73 条**，Phase 0 基线 62 条）、动作三集 `crates/core/src/actions.rs`（**59 条**：RO 21 + RW 38）、口令/审计/原语移植 |
+| Phase 0 契约冻结 | ✅ 基础 | 路由表 `crates/web/src/contract.rs`（当前 **62 条**，Phase 0 基线 62 条）、动作三集 `crates/core/src/actions.rs`（**52 条**：RO 20 + RW 32）、口令/审计/原语移植 |
 | Phase 1 只读面 | ✅ 完成 | 只读聚合面、特权 RPC 协议与门控、管理面基础全部落地 |
 | Phase 2 SMTP 核心 | 🟡 机制层完成，进程已可运行 | 自研 SMTP / 队列 / DKIM / TLS（1.2 起）/ 连接限速 / IP 封禁 / **提交端口 SASL（口令库 `mailbox-passwords.json`）** / **直投（MX 解析，逐域按优先级）** / 入站认证（SPF+DKIM+DMARC）/ **ARC 校验与封印** 全部落地并有测试；`mailstackd` 已能收信、投递（本地 LMTP 或中继/直投）、承载 RO/RW 特权 RPC 与优雅停机。**尚未**：真实公网 MX 联调、直投的机会式 TLS（见 TEST_REPORT §5） |
 | Phase 3 前端切换 | ✅ 已接入 | 管理台为独立前端产物（Vite + React 19 单页应用，hash 路由），由 `bin/mailstack-web` 托管：`--dist <DIR>`、SPA 回退、`/api/*` 兜底保持 JSON 404、遥测后台采样（2 秒）。**Webmail 为 v1.0.0 新增**：独立进程 `bin/mailstack-webmail`（`127.0.0.1:8444`，见 §3.9），前端入口 `mail.html` 与管理台同一次构建产出 |
-| Phase 4 写面切换 | ✅ 动作面完成 | 2FA 全生命周期、写面动作（`admin.set`/`settings.set`/域名/别名/`dkim.rotate`）、只读聚合面、控制台写面、备份、初始化向导（含 `setup.wizard.complete`）、ACME、AI 出站（含 SSRF / DNS-rebinding 防护，见 TEST_REPORT §3.9）、8 个只读列表动作（见 TEST_REPORT §3.10）。白名单动作**已全部实现（59/59，RO 21/21 + RW 38/38）**；契约路由**已全部注册（73/73）**，没有任何路由落到 `/api` 兜底，由 `every_implemented_action_route_is_wired_and_behind_auth` 守门。**未完成**：真实环境验证与审计链的真实升级演练 |
+| Phase 4 写面切换 | ✅ 动作面完成 | 2FA 全生命周期、写面动作（`admin.set`/`settings.set`/域名/别名/`dkim.rotate`）、只读聚合面、控制台写面、备份、初始化向导（含 `setup.wizard.complete`）、ACME、8 个只读列表动作（见 TEST_REPORT §3.10）。白名单动作**已全部实现（52/52，RO 20/20 + RW 32/32）**；契约路由**已全部注册（62/62）**，没有任何路由落到 `/api` 兜底，由 `every_implemented_action_route_is_wired_and_behind_auth` 守门。**未完成**：真实环境验证与审计链的真实升级演练 |
 | Phase 5 组件下线 | 🟡 协议面已接管；组件下线为迁移期可选 | Dovecot 的 imap/pop3、提交端口 SASL 与本地投递已由自研栈接管（`mailstack-imap` + `mailstackd` 自有 LMTP）。停用 Postfix/OpenDKIM/fail2ban/Dovecot 属迁移期**可选收尾步骤**，不是 v1.0.0 自动完成项；迁移期允许与 Postfix 双跑，纯 MailStack 主机（未装 Postfix）同样可完整工作 |
 
 ## 6. 发行包的 libc 兼容性（2026-10-30 实测）

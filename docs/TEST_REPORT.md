@@ -7,13 +7,13 @@
 >
 > | 指标 | 实测值 |
 > |---|---|
-> | `cargo test --workspace --all-targets` | **1701 passed / 0 failed** |
+> | `cargo test --workspace --all-targets` | **1647 passed / 0 failed**（AI 功能移除后减少 55 项） |
 > | 前端 `npm test`（vitest，`webui/`） | **187 passed / 0 failed** |
 > | `cargo fmt --all -- --check` | 通过 |
 > | `cargo clippy --workspace --all-targets -- -D warnings` | 通过 |
 > | `deploy/verify-invariant-gate.sh` | `INVARIANT_GATE_OK`（293 条不变量） |
 > | `deploy/verify-deliverables.sh` | `DELIVERABLES_OK` |
-> | 特权动作白名单 / HTTP 契约路由 | 59 条（RO 21 + RW 38）/ 73 条 |
+> | 特权动作白名单 / HTTP 契约路由 | 52 条（RO 20 + RW 32）/ 62 条（AI 功能已移除） |
 >
 > v1.0.0 新增 `crates/webmail` + `bin/mailstack-webmail`（Webmail 独立进程）、
 > `deploy/install.sh`（curl 一键 / 源码构建两种形态）、完整中英文 README 与
@@ -41,7 +41,7 @@ deploy/verify-invariant-gate.sh   # 确认 CI 列出的不变量测试名都真�
 | crate | 测试数 | 职责 |
 |---|---:|---|
 | `mailstack-core` | 208 | 动作三集、口令策略（**含记录形状校验：空摘要/截断摘要 fail-closed**）、审计哈希链、`atomic`/`locked`（**权限在首字节落盘前生效**）、`warn`、**`exec`（命令原语 + postmap 序列 + `service_ctl` 降级链，含 spawn 失败不再报成功）**、配置 schema、部署模式、**`totp`（2FA：AES-256-GCM 信封、RFC 6238、**重放记账**、恢复码持锁消费）**、**`certs`（证书到期解析）**、**`sysinfo`（`/proc` 只读采样）**、**`security`（敏感文件权限体检）**、**`backup`（归档打包/恢复：成员白名单、链接与设备拒绝、校验和先验）**、**`bans`（手工封禁文件）** |
-| `mailstack-priv` | 230 | 动作门控、RPC 帧、RO/RW socket 服务端、**全部 58 个动作的处理器**（只读面、2FA 全生命周期、域名/别名/设置/管理员/DKIM 轮换、只读聚合面、服务与队列动作、手工封禁、备份、初始化向导 `setup.*`、**ACME 证书 `setup.cert.issue`/`certs.renew`**、邮件环路自检、邮箱用户 `users.*`、**AI 出站子系统 `ai.*`（SSRF/DNS-rebinding 防护）**、**为管理前端新增的 8 个只读列表动作**）、fallback 规则、**特权调用客户端**（通道推导 + 失败分类） |
+| `mailstack-priv` | 230 | 动作门控、RPC 帧、RO/RW socket 服务端、**全部 58 个动作的处理器**（只读面、2FA 全生命周期、域名/别名/设置/管理员/DKIM 轮换、只读聚合面、服务与队列动作、手工封禁、备份、初始化向导 `setup.*`、**ACME 证书 `setup.cert.issue`/`certs.renew`**、邮件环路自检、邮箱用户 `users.*`、**为管理前端新增的 8 个只读列表动作**）、fallback 规则、**特权调用客户端**（通道推导 + 失败分类） |
 | `mailstack-smtp` | 141 + 7 | IP 固定拨号器、中继校验、分阶段测试、出站探测、反中继策略、落地与回滚、真实落盘载体、**MX 解析与直投目标选择**、**`dns_query`（A/MX/TXT 查询，TXT 分片拼接）**、**`AddressPolicy`（SSRF 地址筛选：IPv6 走 `2000::/3` 白名单）**、**出站响应限长 / CRLF 注入拒绝 / 裸 LF 点填充 / 解析超时**（7 个为真实 TLS 集成测试） |
 | `mailstack-queue` | 80 | 队列持久化与原子性、指数退避与去共振、DSN 退信、并发限流、快速失败与出站判据、**出站必签 DKIM**、**直投（逐域 MX，绝不回退中继）** |
 | `mailstack-store` | 42 + 10 | Postfix 表文件（域名/别名）、**本地收件人名录**（`recipients.rs`：三态判定，「查不了」≠「不存在」）、**LMTP 客户端**（含尾部 CRLF 与裸 LF 点填充） （10 个为真实 unix socket 端到端） |

@@ -1,92 +1,19 @@
-//! 会话与 CSRF（规格书 §5.3；INV-6、INV-7）。
-//!
-//! * 会话为**服务端内存表**，非 JWT
-//! * 会话 ID 只在 HttpOnly Cookie（名字**条件性**：加 `Secure` 的部署为
-//!   `__Host-mailstack_session`，默认 HTTP 部署为 `mailstack_session`，见
-//!   [`session_cookie_context`]）
-//! * CSRF token 仅存于前端内存变量，经 `x-csrf-token` 头回传
-//! * 8 小时滑动过期 + 7 天绝对上限；`MAX_SESSIONS` 上限
-//!
-//! 会话在列表中**仅以 16 位 hex 指纹暴露 ID** —— 即使会话表本身泄露，
-//! 也无法直接拿去冒用。
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 
-/// 会加 `Secure` 的部署（HTTPS / 公网模式 / 显式 `MAILSTACK_COOKIE_SECURE=1`）
-/// 下的会话 Cookie 名。
-///
-/// **`__Host-` 前缀**：浏览器强制它的三条规则（必须 `Secure`、必须 `Path=/`、
-/// **不得**有 `Domain`）正好把「同站子域写入同名 cookie 覆盖会话」这条攻击路径
-/// 彻底关掉 —— 攻击者控制的 `evil.example.com` 无法给 `example.com` 写 cookie。
 pub const SESSION_COOKIE_SECURE_NAME: &str = "__Host-mailstack_session";
 
-/// 默认 HTTP 部署（**不加** `Secure`）下的会话 Cookie 名。
-///
-/// **不得**带 `__Host-` 前缀：前缀的「必须 `Secure`」是浏览器硬规则，无
-/// `Secure` 的 `__Host-` cookie 会被**所有浏览器拒收** —— 而本进程默认部署是
-/// HTTP（`DEFAULT_BIND = 127.0.0.1:8443`，TLS 属部署层），此时强行用前缀名
-/// 等于让登录开箱即坏（「密码输对了却提示未登录」）。
 pub const SESSION_COOKIE_PLAIN_NAME: &str = "mailstack_session";
 
-/// 全部条件性名字，**按解析优先级排列**（`__Host-` 名在前）。
-///
-/// Cookie 的**下发/作废**从 [`session_cookie_context`] 按 `Secure` 判定取其一；
-/// **解析**侧（`crate::session_cookie`）两个都认 —— 只认其一，另一种部署的
-/// 浏览器会被全体判成未认证。
-///
-/// 但「两个都认」必须配合**固定优先级**：无前缀名可以被同站子域（`Domain=...`）
-/// 写入，若解析按 `Cookie` 头里的出现顺序取值，攻击者那枚（创建更早、通常排在
-/// 前面）就能顶掉受害者自己的 `__Host-` 会话 —— 前缀保护在读取侧被抵消。
-/// 因此顺序在这里钉死：先 `__Host-`，找不到才退到无前缀名。
 pub const SESSION_COOKIE_NAMES: &[&str] = &[SESSION_COOKIE_SECURE_NAME, SESSION_COOKIE_PLAIN_NAME];
 
-/// 兼容别名：保留既有导出名（HTTPS 部署下的名字）。
-///
-/// 代价是改名会让**所有人重新登录**（浏览器会把新名字当成从未见过的 cookie），
-/// 这在一次安全修复里是可接受的：强制重登恰好也是我们想顺手做掉的事。
-/// 部署模式切换（HTTP ↔ HTTPS）同样会换名重登，见 [`session_cookie_context`]。
 pub const SESSION_COOKIE: &str = SESSION_COOKIE_SECURE_NAME;
 
-/// 显式覆盖会话 Cookie `Secure` 标志的环境变量。
-///
-/// 取值语义与基线 `COOKIE_SECURE` 一致：`1` 强制开、`0` 强制关、
-/// 未设置则按 [`session_cookie_secure`] 自动判定。
 pub const SESSION_COOKIE_SECURE_ENV: &str = "MAILSTACK_COOKIE_SECURE";
 
-/// 会话 Cookie 是否应带 `Secure`。
-///
-/// ## 判定顺序
-///
-/// 1. `MAILSTACK_COOKIE_SECURE=1/0` —— 运维的显式裁决，最高优先级。
-/// 2. **公网模式**（`ACCESS_MODE=caddy|direct`）⇒ `true`。这两种模式的部署
-///    前提就是「有 TLS 终结」，此时不加 `Secure` 等于允许明文携带会话。
-/// 3. 请求来自**可信回环对端**且带 `X-Forwarded-Proto: https` ⇒ `true`。
-///    这是「反代终止 TLS」这一主流拓扑的正向判定，也是本进程唯一能**可靠**
-///    得知外部是 HTTPS 的途径。
-/// 4. 其余一切 ⇒ **`false`（不加 `Secure`）**。
-///
-/// ## 为什么第 3 条只信回环
-///
-/// `X-Forwarded-Proto` 是请求可控的明文：只有来源可信时才能读，否则等于把
-/// 决定权交给攻击者（这与 [`crate::routes::client_key`] 不读 `X-Forwarded-For`
-/// 是同一个理由的两面）。本进程默认只绑 `127.0.0.1:8443`，生产靠反代 / SSH
-/// 隧道终止 TLS，于是对端**必然**是回环；而远程攻击者无法把自己的源地址
-/// 变成 `127.0.0.1`。因此「对端是回环」是一个可以本地判定、无需额外配置的
-/// 可信信号。拿不到传输层对端时（in-process 调用）一律视为不可信。
-///
-/// ## 为什么第 4 条是「不加」而不是 fail-closed
-///
-/// 加了 `Secure` 而实际是 HTTP 时，浏览器**根本不会**把这个 cookie 发回来 ——
-/// 登录会直接坏掉，用户看到的现象是「密码输对了却提示未登录」。
-/// 本进程默认就只提供 HTTP（`DEFAULT_BIND = 127.0.0.1:8443`，TLS 属部署层），
-/// 在这种默认部署里强制 `Secure` 等于让产品**开箱即坏**。
-/// 两种后果严重度不对称：漏加 `Secure` 是「明文多传一跳」，误加 `Secure` 是
-/// 「所有人都登不进去」—— 后者严重得多且只有用户能发现，前者需要抓包才能发现。
-/// 因此选择**保守可用**，并把收紧路径做成显式配置项（部署到 TLS 后置 `=1`）。
 pub fn session_cookie_secure(
     env_flag: Option<&str>,
     public_mode: bool,
@@ -106,16 +33,6 @@ pub fn session_cookie_secure(
     forwarded_proto(headers).as_deref() == Some("https")
 }
 
-/// 一次会话 Cookie 的上下文：`(名字, 是否 Secure)` —— **唯一**判定入口。
-///
-/// 登录下发（`routes::build_session_cookie`）与登出 / 吊销作废
-/// （`routes::clear_session_cookie`）都必须从这里取值。名字必须跟随
-/// `Secure` 的判定：`__Host-` 前缀在浏览器侧强制要求 `Secure`，无 `Secure`
-/// 时用前缀名等于让登录开箱即坏；反过来加 `Secure` 时不用前缀名则丢掉
-/// 前缀保护。两条路径分开判定的历史教训：作废路径拿不到请求上下文，用了
-/// 另一套 `Secure` 判定 —— HTTPS 部署下作废 Cookie 缺 `Secure`，浏览器拒绝
-/// 删除 `__Host-` cookie，表现为「登出了但立刻又自动登录」。从同一入口取
-/// （名字，`Secure`）对之后，下发与作废**必然**配对。
 pub fn session_cookie_context(
     env_flag: Option<&str>,
     public_mode: bool,
@@ -131,15 +48,10 @@ pub fn session_cookie_context(
     (name, secure)
 }
 
-/// 是否是可信代理的回环来源。
 fn is_trusted_proxy(peer: Option<&std::net::SocketAddr>) -> bool {
-    // 拿不到传输层对端（测试里的 in-process 调用）：**不**认定可信。
-    // 保守方向必须一致 —— 否则一个伪造 `X-Forwarded-Proto` 的调用
-    // 就能在非 TLS 部署里骗到 `Secure`。
     peer.map(|addr| addr.ip().is_loopback()).unwrap_or(false)
 }
 
-/// 从请求头取出 `x-forwarded-proto` 的首个值（小写、去空白）。
 pub fn forwarded_proto(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get("x-forwarded-proto")
@@ -154,46 +66,28 @@ pub fn forwarded_proto(headers: &axum::http::HeaderMap) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// 会话 TTL：8 小时（滑动）。
 pub const SESSION_TTL_SECONDS: i64 = 28_800;
 
-/// 绝对上限：7 天，自建立起算，不因活动而延长。
-///
-/// 同时也是会话 Cookie 的 `Max-Age`（见 `routes::build_session_cookie`）：
-/// 活跃会话的续期在**服务端**滑动，cookie 寿命若短于绝对上限（旧值 8 小时）
-/// 会把活跃用户也提前强制登出 —— 两者必须对齐。
 pub const SESSION_ABSOLUTE_MAX_SECONDS: i64 = 7 * 24 * 3600;
 
-/// 会话数上限。
 pub const MAX_SESSIONS: usize = 5_000;
 
-/// 一条会话记录。
-///
-/// ## 为什么不用 `#[derive(Debug)]`
-///
-/// `id` 与 `csrf` 是**两个 bearer 凭据**：拿到任何一个都能直接冒用该会话
-/// （`id` 走 HttpOnly Cookie，`csrf` 由前端在请求头回传）。派生 `Debug` 会让
-/// `tracing` 的任何一条 `?session` / `%session` 把两者原样打进日志，
-/// 与本文件头部「会话 ID 只在 HttpOnly Cookie」的约定直接冲突。
-/// 因此这里手写 `Debug`，只暴露指纹与不含凭据的元信息。
 #[derive(Clone)]
 pub struct Session {
-    /// 会话 ID（随机 32 字节 hex）。**绝不**通过 API 暴露。
     pub id: String,
-    /// CSRF token（返回给前端）。
+
     pub csrf: String,
     pub username: String,
-    /// 最近活动时刻。
+
     pub last_seen: OffsetDateTime,
-    /// 建立时刻（用于绝对上限）。
+
     pub created_at: OffsetDateTime,
-    /// 会话指纹（ID 的 SHA256 前 16 位 hex），对外暴露的就是它。
+
     pub fingerprint: String,
 }
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // 刻意不输出 `id` 与 `csrf`，连长度都不给。
         f.debug_struct("Session")
             .field("fingerprint", &self.fingerprint)
             .field("username", &self.username)
@@ -206,7 +100,6 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
-    /// 是否已过期（滑动 TTL 或绝对上限任一超限）。
     pub fn is_expired(&self, now: OffsetDateTime) -> bool {
         let idle = now - self.last_seen;
         let age = now - self.created_at;
@@ -215,21 +108,18 @@ impl Session {
     }
 }
 
-/// 会话指纹：`sha256(id)` 的前 16 个 hex 字符。
 pub fn fingerprint_of(id: &str) -> String {
     let mut h = Sha256::new();
     h.update(id.as_bytes());
     hex::encode(h.finalize())[..16].to_string()
 }
 
-/// 生成一个高熵随机 token（32 字节 hex）。
 pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
     hex::encode(bytes)
 }
 
-/// 会话表。
 #[derive(Debug, Default)]
 pub struct SessionStore {
     inner: Mutex<HashMap<String, Session>>,
@@ -240,22 +130,10 @@ impl SessionStore {
         Self::default()
     }
 
-    /// 建立新会话，返回 `(会话 ID, CSRF token)`（调用方负责写入 Cookie）。
-    ///
-    /// ## 为什么必须一次返回两个值
-    ///
-    /// 原先登录路径是「建会话 → 再 `touch()` 一次把 csrf 读回来 →
-    /// `unwrap_or_default()`」。`touch()` 会**返回 `None`**（表被并发清理 /
-    /// 容量淘汰 / 未来引入的过期判定），而 `unwrap_or_default()` 会把 `None`
-    /// 变成**空串 CSRF token** —— 响应仍是 `200 {"ok":true}`，但这个会话的
-    /// CSRF 是空串。前端随后每一个写请求都会被 CSRF 校验拒绝，而用户看到的
-    /// 只是一句「missing or invalid CSRF token」，永远查不到是登录那一步就已经坏了。
-    /// 一次返回两个值让「取不到 csrf」变成**不可能发生**，而不是被默认值吞掉。
     pub fn create_session(&self, username: &str) -> (String, String) {
         self.create_session_at(username, OffsetDateTime::now_utc())
     }
 
-    /// [`Self::create_session`] 的可注入时钟版本。
     pub fn create_session_at(&self, username: &str, now: OffsetDateTime) -> (String, String) {
         let id = random_token();
         let csrf = random_token();
@@ -269,7 +147,7 @@ impl SessionStore {
         };
 
         let mut map = self.lock();
-        // 先清理过期项，再在必要时淘汰最旧会话，保证容量上限不被突破。
+
         map.retain(|_, s| !s.is_expired(now));
         if map.len() >= MAX_SESSIONS {
             evict_oldest(&mut map);
@@ -278,12 +156,10 @@ impl SessionStore {
         (id, csrf)
     }
 
-    /// 建立新会话。返回会话 ID（调用方负责写入 Cookie）。
     pub fn create(&self, username: &str) -> String {
         self.create_at(username, OffsetDateTime::now_utc())
     }
 
-    /// 可注入时钟的版本，便于测试过期语义。
     pub fn create_at(&self, username: &str, now: OffsetDateTime) -> String {
         let id = random_token();
         let session = Session {
@@ -296,7 +172,7 @@ impl SessionStore {
         };
 
         let mut map = self.lock();
-        // 先清理过期项，再在必要时淘汰最旧会话，保证容量上限不被突破。
+
         map.retain(|_, s| !s.is_expired(now));
         if map.len() >= MAX_SESSIONS {
             evict_oldest(&mut map);
@@ -305,7 +181,6 @@ impl SessionStore {
         id
     }
 
-    /// 校验会话并刷新滑动过期。返回 `None` 表示未认证（INV-7：调用方须回 401）。
     pub fn touch(&self, id: &str) -> Option<Session> {
         self.touch_at(id, OffsetDateTime::now_utc())
     }
@@ -317,23 +192,17 @@ impl SessionStore {
             map.remove(id);
             return None;
         }
-        // 5.7：时钟回拨（NTP 校正、运维 `date -s`、虚拟机快照恢复）会让 `now`
-        // 小于上一次记录的 `last_seen`。直接赋值等于把活动时刻**往回拨**，
-        // 于是 `idle = now - last_seen` 变成负数，直到墙钟追上旧值为止，
-        // 这条会话**永不过期** —— 滑动 TTL 被彻底废掉。
-        // 正确做法是把活动时刻钳到单调不减：回拨不刷新寿命，也不倒退。
+
         if now > session.last_seen {
             session.last_seen = now;
         }
         Some(session.clone())
     }
 
-    /// 主动登出。
     pub fn remove(&self, id: &str) -> bool {
         self.lock().remove(id).is_some()
     }
 
-    /// 按指纹吊销指定会话。
     pub fn revoke_by_fingerprint(&self, fingerprint: &str) -> bool {
         let mut map = self.lock();
         let target = map
@@ -346,7 +215,6 @@ impl SessionStore {
         }
     }
 
-    /// 吊销除 `keep_id` 外的全部会话，返回吊销数量。
     pub fn revoke_others(&self, keep_id: &str) -> usize {
         let mut map = self.lock();
         let before = map.len();
@@ -354,9 +222,6 @@ impl SessionStore {
         before - map.len()
     }
 
-    /// 吊销某个用户的全部会话（改密 / 2FA 重绑后使用）。
-    ///
-    /// 返回吊销数量，调用方可据此告诉用户「其它 N 个设备已登出」。
     pub fn revoke_user(&self, username: &str) -> usize {
         let mut map = self.lock();
         let before = map.len();
@@ -364,7 +229,6 @@ impl SessionStore {
         before - map.len()
     }
 
-    /// 列出活跃会话的**对外视图**（仅指纹，绝不暴露 ID）。
     pub fn list_public(&self, now: OffsetDateTime) -> Vec<serde_json::Value> {
         let mut map = self.lock();
         map.retain(|_, s| !s.is_expired(now));
@@ -383,7 +247,6 @@ impl SessionStore {
         out
     }
 
-    /// 当前会话数（测试用）。
     pub fn len(&self) -> usize {
         self.lock().len()
     }
@@ -397,7 +260,6 @@ impl SessionStore {
     }
 }
 
-/// 淘汰最早建立的会话（容量上限触发时）。
 fn evict_oldest(map: &mut HashMap<String, Session>) {
     let oldest = map
         .iter()
@@ -408,12 +270,10 @@ fn evict_oldest(map: &mut HashMap<String, Session>) {
     }
 }
 
-/// 常量时间比较 CSRF token（防时序侧信道）。
 pub fn csrf_matches(expected: &str, provided: &str) -> bool {
     mailstack_core::password::constant_time_eq(expected.as_bytes(), provided.as_bytes())
 }
 
-/// 该方法是否需要 CSRF 校验（所有非 GET/HEAD，INV-6）。
 pub fn method_requires_csrf(method: &str) -> bool {
     !matches!(
         method.to_ascii_uppercase().as_str(),
@@ -425,18 +285,12 @@ pub fn method_requires_csrf(method: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// 5.7：时钟回拨不得让会话**永不过期**，也不得让活动时刻倒退。
-    ///
-    /// 原实现无条件 `session.last_seen = now`。墙钟往回拨之后，`idle = now -
-    /// last_seen` 变成负数，直到墙钟追上旧值为止这条会话都不会被判定过期 ——
-    /// 滑动 TTL 被彻底废掉。
     #[test]
     fn a_clock_rollback_cannot_extend_a_session_past_its_ttl() {
         let store = SessionStore::new();
         let t0 = OffsetDateTime::now_utc();
         let id = store.create_at("admin", t0);
 
-        // 正常使用 1 小时后，墙钟被拨回 3 小时。
         let used = t0 + Duration::hours(1);
         let touched = store.touch_at(&id, used).expect("正常活动应有效");
         assert_eq!(touched.last_seen, used);
@@ -452,7 +306,6 @@ mod tests {
             after.last_seen
         );
 
-        // 回拨之后照常按 TTL 过期：距「最后一次可信活动」满 TTL 即失效。
         let past = after.last_seen + Duration::seconds(SESSION_TTL_SECONDS + 1);
         assert!(
             store.touch_at(&id, past).is_none(),
@@ -460,7 +313,6 @@ mod tests {
         );
     }
 
-    /// 5.7：`Debug` 绝不能把两个 bearer 凭据打出来。
     #[test]
     fn debug_output_redacts_the_session_id_and_the_csrf_token() {
         let store = SessionStore::new();
@@ -482,7 +334,6 @@ mod tests {
         );
     }
 
-    /// 5.5：`create_session` 一次返回 id 与 csrf，且两者都不是空串。
     #[test]
     fn create_session_returns_a_usable_id_and_a_non_empty_csrf() {
         let store = SessionStore::new();
@@ -507,7 +358,6 @@ mod tests {
 
     #[test]
     fn unknown_session_is_not_authenticated() {
-        // INV-7：未知会话一律视为未认证。
         let store = SessionStore::new();
         assert!(store.touch("nonexistent").is_none());
     }
@@ -526,11 +376,9 @@ mod tests {
         let t0 = OffsetDateTime::now_utc();
         let id = store.create_at("admin", t0);
 
-        // 过了 TTL 的一半，仍有效，且滑动过期被刷新。
         let t1 = t0 + Duration::seconds(SESSION_TTL_SECONDS / 2);
         assert!(store.touch_at(&id, t1).is_some());
 
-        // 再过 TTL 的一半：若无滑动刷新，此刻已超时。
         let t2 = t1 + Duration::seconds(SESSION_TTL_SECONDS / 2);
         assert!(store.touch_at(&id, t2).is_some(), "滑动过期应在活动后顺延");
     }
@@ -548,19 +396,17 @@ mod tests {
 
     #[test]
     fn absolute_lifetime_caps_activity_refresh() {
-        // 7 天绝对上限：持续活动的会话也必须被强制失效。
         let store = SessionStore::new();
         let t0 = OffsetDateTime::now_utc();
         let id = store.create_at("admin", t0);
 
         let mut t = t0;
-        // 每小时活动一次，持续 6 天 23 小时——仍在绝对上限内。
+
         for _ in 0..(6 * 24) {
             t += Duration::hours(1);
             assert!(store.touch_at(&id, t).is_some());
         }
 
-        // 越过 7 天绝对上限后，即使一直在活动，也必须失效。
         t = t0 + Duration::seconds(SESSION_ABSOLUTE_MAX_SECONDS + 1);
         assert!(store.touch_at(&id, t).is_none(), "绝对上限必须压过滑动刷新");
     }
@@ -626,7 +472,7 @@ mod tests {
     fn capacity_is_bounded_by_max_sessions() {
         let store = SessionStore::new();
         let t0 = OffsetDateTime::now_utc();
-        // 依次建立 MAX_SESSIONS + 10 个会话：容量必须被压住。
+
         for i in 0..(MAX_SESSIONS + 10) {
             store.create_at(&format!("u{i}"), t0 + Duration::seconds(i as i64));
         }
@@ -647,7 +493,6 @@ mod tests {
 
     #[test]
     fn mutating_methods_require_csrf_but_reads_do_not() {
-        // INV-6。
         for m in ["POST", "PUT", "PATCH", "DELETE", "post", "delete"] {
             assert!(method_requires_csrf(m), "{m} 必须校验 CSRF");
         }
@@ -670,23 +515,18 @@ mod tests {
         let b = fingerprint_of("session-b");
         assert_eq!(a.len(), 16);
         assert_ne!(a, b);
-        // 已知向量：确认算法是 sha256 前缀而不是别的哈希。
+
         let expected = &hex::encode(Sha256::digest(b"session-a"))[..16];
         assert_eq!(&a, expected);
     }
 
-    /// Cookie 名必须跟随 `Secure` 判定（下发与作废的配对关系由此产生）：
-    /// `__Host-` 前缀在浏览器侧强制要求 `Secure`，无 `Secure` 时用前缀名
-    /// 等于让登录开箱即坏；反过来加 `Secure` 时不用前缀名则丢掉前缀保护。
     #[test]
     fn the_cookie_name_follows_the_secure_decision() {
-        // 默认 HTTP 部署（无可信对端、无显式配置）：不加 Secure ⇒ 无前缀名。
         let (name, secure) =
             session_cookie_context(None, false, None, &axum::http::HeaderMap::new());
         assert_eq!(name, SESSION_COOKIE_PLAIN_NAME);
         assert!(!secure);
 
-        // 可信回环对端 + X-Forwarded-Proto: https ⇒ `__Host-` 名 + Secure。
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             "x-forwarded-proto",
@@ -697,7 +537,6 @@ mod tests {
         assert_eq!(name, SESSION_COOKIE_SECURE_NAME);
         assert!(secure);
 
-        // 公网模式（部署前提就是 TLS 终结）⇒ 同上。
         let (name, secure) =
             session_cookie_context(None, true, None, &axum::http::HeaderMap::new());
         assert_eq!(name, SESSION_COOKIE_SECURE_NAME);

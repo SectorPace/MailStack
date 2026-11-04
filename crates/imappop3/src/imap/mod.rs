@@ -1,5 +1,3 @@
-//! IMAP4rev1 服务端（协议解析、FETCH/SEARCH、会话状态机、监听器）。
-
 pub mod fetch;
 pub mod parser;
 pub mod scram;

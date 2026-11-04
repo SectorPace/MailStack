@@ -1,19 +1,3 @@
-//! DKIM 签名与验签（RFC 6376）。
-//!
-//! ## 签名
-//!
-//! [`sign`] 用 PKCS#1 DER 私钥对整封邮件签名，并把 `DKIM-Signature` 头**前置**到
-//! 原报文之前（`DkimSigner` 的 `write(_, true)` 自带行尾 CRLF，所以直接拼接即可）。
-//! 规范化默认 relaxed/relaxed —— 这是转发链路上最不容易被破坏的一种。
-//!
-//! ## 验签自检
-//!
-//! [`verify_with`] 用一个**注入的 TXT 缓存**在完全离线的情况下跑完整的 DKIM 验签。
-//! 这是本阶段的验收要求之一：同一密钥对发出的邮件必须能验过。它同时是
-//! 「`p=` 是否为 SPKI」的守门测试 —— mail-auth 的验签侧对 PKCS#1/SPKI **两种都容忍**
-//! （`try_strip_rsa_prefix(..).unwrap_or(bytes)`），所以单靠验签通过**不能**证明
-//! 记录形态正确；`keys.rs` 里另有前缀断言负责那一半。
-
 use mail_auth::common::crypto::{RsaKey, Sha256};
 use mail_auth::common::headers::HeaderWriter;
 use mail_auth::dkim::DkimSigner;
@@ -23,10 +7,6 @@ use rustls_pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer};
 use crate::cache::TxtCache;
 use crate::error::{AuthError, AuthResult};
 
-/// 默认签名的头集合。
-///
-/// `From` 是 RFC 6376 强制要求；其余是邮件生态里最常被篡改或用于展示的字段。
-/// 列表里不存在于报文中的头会被自动跳过，因此不需要按邮件裁剪。
 pub const DEFAULT_SIGNED_HEADERS: &[&str] = &[
     "From",
     "To",
@@ -42,7 +22,6 @@ pub const DEFAULT_SIGNED_HEADERS: &[&str] = &[
     "Content-Transfer-Encoding",
 ];
 
-/// 单条 DKIM 签名的判定结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DkimStatus {
     Pass,
@@ -50,7 +29,7 @@ pub enum DkimStatus {
     PermissionError(String),
     TemporaryError(String),
     Neutral(String),
-    /// 报文里根本没有 DKIM 签名。
+
     None,
 }
 
@@ -59,7 +38,6 @@ impl DkimStatus {
         matches!(self, DkimStatus::Pass)
     }
 
-    /// `Authentication-Results` 里用的关键字（RFC 8601）。
     pub fn keyword(&self) -> &'static str {
         match self {
             DkimStatus::Pass => "pass",
@@ -72,7 +50,6 @@ impl DkimStatus {
     }
 }
 
-/// 一条 DKIM 签名的验签结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DkimVerdict {
     pub domain: String,
@@ -98,9 +75,6 @@ impl DkimVerdict {
     }
 }
 
-/// 把 mail-auth 的逐签名输出折算成稳定结论。
-///
-/// 只有这一个折算点：验签自检与 DMARC 编排都走它，避免两处各写一份映射。
 pub(crate) fn verdicts_from(outputs: &[DkimOutput<'_>]) -> Vec<DkimVerdict> {
     outputs
         .iter()
@@ -114,21 +88,6 @@ pub(crate) fn verdicts_from(outputs: &[DkimOutput<'_>]) -> Vec<DkimVerdict> {
         .collect()
 }
 
-/// 取 RFC 5322 `From` 头的域（小写）。
-///
-/// 用来判断「这一封该不该由本机签名」：只有发件域落在本机策略覆盖范围内才签，
-/// 否则就是拿自己的密钥去替别人的域背书。
-///
-/// 复用 mail-auth 的报文解析，而不是自己写一个取头正则 —— 头折叠、显示名里带
-/// `@`、地址被 `<>` 包住、注释，这些坑它都已经处理过了。
-///
-/// ## 多个不同 From 域时返回 `None`（不签）
-///
-/// 原实现只取 `parsed.from.first()`：认证用户提交
-/// `From: me@example.com, ceo@bank.com` 时，本机只对 `example.com` 签名，而接收方
-/// 会因「多 From 域」把 DMARC 判成 `none`（上游豁免）—— 等于本机主动参与了一次
-/// 针对第三个域的伪造报文。这里改成：**只要出现两个不同域就不签**，让上层按
-/// 「不在签名策略覆盖范围内」处理；签名器不负责决定这种报文该不该发出。
 pub fn from_domain(message: &[u8]) -> Option<String> {
     let parsed = AuthenticatedMessage::parse(message)?;
     let mut domains: Vec<String> = Vec::new();
@@ -136,7 +95,7 @@ pub fn from_domain(message: &[u8]) -> Option<String> {
         let Some((_, domain)) = address.rsplit_once('@') else {
             continue;
         };
-        // addr-spec 可能被 `>`、空白或注释包着，只取合法的域名字符。
+
         let domain: String = domain
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
@@ -151,12 +110,11 @@ pub fn from_domain(message: &[u8]) -> Option<String> {
     }
     match domains.len() {
         1 => domains.pop(),
-        // 0 个域 = 没有可背书的身份；>1 个域 = 无法确定该为谁背书。都不签。
+
         _ => None,
     }
 }
 
-/// 用 PKCS#1 DER 私钥签名，返回「`DKIM-Signature` 头 + 原报文」。
 pub fn sign(
     private_key_der: &[u8],
     domain: &str,
@@ -181,7 +139,6 @@ pub fn sign(
     Ok(signed)
 }
 
-/// 用 [`DEFAULT_SIGNED_HEADERS`] 签名。
 pub fn sign_with_default_headers(
     private_key_der: &[u8],
     domain: &str,
@@ -197,9 +154,6 @@ pub fn sign_with_default_headers(
     )
 }
 
-/// 用给定的解析器 + TXT 缓存验签（离线可复现）。
-///
-/// 返回**逐签名**的结论；报文里没有任何 DKIM 头时返回空向量。
 pub async fn verify_with(
     resolver: &MessageAuthenticator,
     cache: &TxtCache,
@@ -214,9 +168,6 @@ pub async fn verify_with(
     Ok(verdicts_from(&outputs))
 }
 
-/// 用系统解析器验签。
-///
-/// 与 [`verify_with`] 的区别只在解析器来源：收信时校验对端必须走真实 DNS。
 pub async fn verify(message: &[u8]) -> AuthResult<Vec<DkimVerdict>> {
     let resolver = crate::cache::system_resolver()?;
     verify_with(&resolver, &TxtCache::new(), message).await
@@ -243,7 +194,6 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    /// 2048 位生成较慢，整个测试模块共用一套。
     fn fixture() -> &'static Fixture {
         static FIXTURE: OnceLock<Fixture> = OnceLock::new();
         FIXTURE.get_or_init(|| Fixture {
@@ -261,11 +211,9 @@ mod tests {
     }
 
     fn resolver() -> MessageAuthenticator {
-        // 缓存命中后不会真的发 DNS 查询，但解析器本身需要构造出来。
         crate::cache::system_resolver().expect("构造系统解析器")
     }
 
-    /// 把 fixture 的公钥记录装进缓存，键必须是 mail-auth 会去查的 FQDN。
     fn cache_with_public_key(material: &crate::keys::DkimKeyMaterial) -> TxtCache {
         let cache = TxtCache::new();
         let value = dkim_txt_value(&material.public_key_spki_b64);
@@ -280,7 +228,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_message_signed_with_a_key_pair_verifies_with_the_same_pair() {
-        // 本阶段的验收要求：自己签的邮件必须能自己验过。
         let material = &fixture().material;
         let der = private_key_der(material);
 
@@ -318,7 +265,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_tampered_body_fails_verification() {
-        // 反例守卫：验签必须真的在做事，而不是「有签名就返回 pass」。
         let material = &fixture().material;
         let der = private_key_der(material);
         let signed = sign_with_default_headers(
@@ -330,7 +276,7 @@ mod tests {
         .expect("签名");
 
         let mut tampered = signed.clone();
-        // 注意按字节切片时窗口宽度必须是 need 的长度 —— 中文是多字节。
+
         let needle = "自检".as_bytes();
         let position = tampered
             .windows(needle.len())
@@ -372,7 +318,6 @@ mod tests {
 
     #[test]
     fn from_domain_handles_display_names_brackets_and_folding() {
-        // 这几种写法在真实邮件里都常见；写错任何一种都会让「该签的没签」。
         for (header, expected) in [
             ("From: alice@example.com\r\n", Some("example.com")),
             ("From: <alice@example.com>\r\n", Some("example.com")),
@@ -380,9 +325,7 @@ mod tests {
                 "From: \"Alice\" <alice@Example.COM>\r\n",
                 Some("example.com"),
             ),
-            // 显示名里带 @ 时，最后一个 @ 才是分隔符。
             ("From: \"a@b\" <alice@example.com>\r\n", Some("example.com")),
-            // 折叠头：续行以空白开头。
             (
                 "From: \"Alice\r\n Anderson\"\r\n <alice@sub.example.com>\r\n",
                 Some("sub.example.com"),
@@ -396,17 +339,11 @@ mod tests {
             );
         }
 
-        // 没有 From 或没有 @ 时不得凭空猜一个域出来。
         assert_eq!(from_domain(b"Subject: t\r\n\r\nbody\r\n"), None);
         assert_eq!(from_domain(b"From: not-an-address\r\n\r\nbody\r\n"), None);
         assert_eq!(from_domain(b""), None);
     }
 
-    /// 出站侧的多 From 域守卫：不能「只对第一个域签名」。
-    ///
-    /// 认证用户提交 `From: me@example.com, ceo@bank.com` 时，旧实现只取第一个
-    /// 地址 ⇒ 本机只为 `example.com` 背书，而报文里还挂着 `bank.com`；接收方又会
-    /// 因多 From 域把 DMARC 判成 none。签名器必须拒绝替这种报文选边。
     #[test]
     fn from_domain_refuses_messages_with_multiple_from_domains() {
         for header in [
@@ -422,7 +359,6 @@ mod tests {
             );
         }
 
-        // 同域多地址仍应正常返回该域（对照，防止误杀）。
         assert_eq!(
             from_domain(b"From: a@example.com, b@EXAMPLE.com\r\n\r\nbody\r\n").as_deref(),
             Some("example.com")

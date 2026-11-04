@@ -1,17 +1,3 @@
-//! 多用户集成测试：**一个监听器**服务多个账号，各自看到自己的 Maildir。
-//!
-//! 这是 `crates/imapd` 的核心验收点。装配链路的每一环都在这里被真实穿过：
-//!
-//! ```text
-//! mailbox-passwords.json ─► AuthBackend ─┐
-//! /etc/passwd（家目录） ─► MailboxResolver ┴─► imappop3 会话 ─► 真实 TCP ─► Maildir 磁盘
-//! ```
-//!
-//! 反例保护（去掉对应实现这些断言就会失败）：
-//! * 去掉 `resolver` 注入 → 两个用户会看到**同一个**默认邮箱（断言内容不符）；
-//! * 认证成功后不切 store → 同上；
-//! * 解析不到邮箱却退回默认 store → 第 3 个用例会拿到别人的信。
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,11 +20,6 @@ struct Fixture {
     bob_home: std::path::PathBuf,
 }
 
-/// 造一个两个账号的世界：
-///
-/// * `<root>/etc/mailstack/mailbox-passwords.json` —— 两条 PBKDF2 记录；
-/// * `<root>/etc/passwd` —— alice/bob 两个系统账号（`Config::passwd_root` 指过去）；
-/// * `<root>/home/alice/Maildir`、`<root>/home/bob/Maildir` —— 各放一封不同的信。
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -87,11 +68,6 @@ fn fixture() -> Fixture {
     }
 }
 
-/// 往某账号的 Maildir 里投一封原始邮件。
-///
-/// 走 `MailStore::append` 而不是直接写 `new/`：UID 映射由 Maildir 层负责，
-/// 手写文件名会让「文件在不在」与「UID 分没分配」变成两件事，
-/// 测试就可能变成「文件明明在、却 FETCH 不到」的假阴性。
 fn write_message(home: &std::path::Path, subject: &str, body: &str) {
     use mailstack_imappop3::maildir::{FlagSet, MailStore, SystemClock, INBOX};
     let store = MailStore::new(home.join("Maildir"), Arc::new(SystemClock)).unwrap();
@@ -104,14 +80,13 @@ MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n"
         .expect("投递测试邮件");
 }
 
-/// 起一个真实的 IMAP 监听器（随机端口），返回地址与停机句柄。
 async fn start_server(
     paths: &mailstack_core::Paths,
     passwd_root: &std::path::Path,
 ) -> (SocketAddr, watch::Sender<bool>) {
     let config = Config {
         server_name: "mail.test".into(),
-        require_tls: false, // 测试走明文；生产由 require_tls 门控
+        require_tls: false,
         passwd_root: passwd_root.to_path_buf(),
         ..Config::default()
     };
@@ -154,12 +129,7 @@ impl Session {
 
     async fn read_line(&mut self) -> String {
         let mut line = String::new();
-        // 60s 而不是 5s：这是**测试客户端**的读超时，覆盖的是「服务端在 debug
-        // 构建里跑一次 PBKDF2（310k 轮）并完成认证」的时间。debug PBKDF2 比
-        // release 慢一个数量级，而 GitHub Actions 的 4 vCPU runner 还会被同一
-        // 二进制里的其它测试并发抢占 —— 实测 5s 在 CI 上会假失败（本地 WSL
-        // 核多且快，5s 足够）。超时的语义是「服务端彻底不回」，60s 仍能捕获
-        // 死锁/挂死，不会掩盖真实缺陷。
+
         tokio::time::timeout(Duration::from_secs(60), self.reader.read_line(&mut line))
             .await
             .expect("读超时")
@@ -172,7 +142,7 @@ impl Session {
             .write_all(format!("{tag} {command}\r\n").as_bytes())
             .await
             .unwrap();
-        // 读到最后一行以 tag 开头的响应。
+
         let mut collected = String::new();
         loop {
             let line = self.read_line().await;
@@ -188,7 +158,7 @@ impl Session {
 #[tokio::test]
 async fn two_accounts_on_one_listener_each_see_their_own_maildir() {
     let fixture = fixture();
-    // 先确认夹具真的把信写到了磁盘（否则下面的失败会指向错误的层）。
+
     let alice_new = fixture.alice_home.join("Maildir").join("new");
     let alice_files = std::fs::read_dir(&alice_new)
         .map(|entries| entries.count())
@@ -257,11 +227,10 @@ async fn a_wrong_password_is_rejected() {
     let _ = shutdown.send(true);
 }
 
-/// 口令对、但系统账号不存在（或家目录没了）→ 拒绝登录，**不退回默认邮箱**。
 #[tokio::test]
 async fn an_account_without_a_mailbox_is_refused_rather_than_served_the_default_one() {
     let fixture = fixture();
-    // carol 有口令记录，但 /etc/passwd 里没有她。
+
     mailstack_core::mailbox_passwords::MailboxPasswords::at(&fixture.paths)
         .upsert(
             &mailstack_core::password::mailbox_password_record(
@@ -285,7 +254,6 @@ async fn an_account_without_a_mailbox_is_refused_rather_than_served_the_default_
     let _ = shutdown.send(true);
 }
 
-/// 家目录存在但没有 Maildir：应自动建出空 INBOX（与 Dovecot 行为一致）。
 #[tokio::test]
 async fn a_fresh_account_gets_an_empty_inbox_created() {
     let fixture = fixture();
@@ -322,7 +290,6 @@ async fn a_fresh_account_gets_an_empty_inbox_created() {
     let _ = shutdown.send(true);
 }
 
-/// 顺带确认装配层没把 `~` 写死成 `/root`：解析只依赖 `passwd_root` 参数。
 #[tokio::test]
 async fn the_fixture_roots_are_the_only_thing_being_touched() {
     let fixture = fixture();
@@ -340,7 +307,6 @@ async fn the_fixture_roots_are_the_only_thing_being_touched() {
     assert!(Arc::strong_count(&assembly.imap.store) >= 1);
 }
 
-/// 直接验证解析器是否解析到"有信的那一个" Maildir —— 把失败定位到层。
 #[test]
 fn the_resolver_resolves_the_maildir_that_actually_has_the_message() {
     use mailstack_imappop3::maildir::INBOX;

@@ -1,19 +1,9 @@
-//! IMAP 日期语法（RFC 3501 §9）与 civil calendar 换算。
-//!
-//! 刻意不引入 `chrono` / `time` 的格式化路径：IMAP 的 INTERNALDATE 与 SEARCH 日期
-//! 格式**只有一种**，而本地时区参与会让「同一天的边界」随服务器 TZ 漂移。这里的
-//! 换算全部是整数运算，输入相同则输出相同，测试不需要设置 `TZ`。
-//!
-//! 公历换算采用 Howard Hinnant 的 `days_from_civil` / `civil_from_days`
-//! （proleptic Gregorian，1970-01-01 为第 0 天）。
-
 use crate::error::{MailError, Result};
 
 pub const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-/// 公历年月日 → Unix 天数（1970-01-01 = 0）。不做范围校验，调用方先校验。
 pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -24,7 +14,6 @@ pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// Unix 天数 → 公历年月日。
 pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -62,7 +51,6 @@ fn days_in_month(year: i64, month: u32) -> u32 {
     }
 }
 
-/// 解析 `d-Mon-yyyy`（允许 1–2 位日、允许前后空白），返回 Unix 天数。
 pub fn parse_date_only(value: &str) -> Result<i64> {
     let trimmed = value.trim();
     let mut parts = trimmed.split('-');
@@ -92,8 +80,6 @@ fn validate_date(year: i64, month: u32, day: u32, original: &str) -> Result<()> 
     Ok(())
 }
 
-/// 解析 IMAP `date-time`：`d-Mon-yyyy HH:MM:SS +ZZZZ`（时区缺省按 UTC 处理，
-/// 这是对不守规矩客户端的宽容，而不是规范允许的省略）。
 pub fn parse_date_time(value: &str) -> Result<i64> {
     let trimmed = value.trim().trim_matches('"').trim();
     let mut fields = trimmed.split_whitespace();
@@ -155,11 +141,6 @@ fn parse_zone(zone: &str) -> Option<i64> {
     Some(sign * (hours * 3_600 + minutes * 60))
 }
 
-/// `INTERNALDATE` 的规范渲染（RFC 3501 §7.3.3）。始终用 `+0000`。
-///
-/// 为什么固定 UTC：INTERNALDATE 允许带服务器本地时区，但同一封邮件在不同 TZ 的
-/// 服务器间迁移时，「本地时间」会变、绝对时刻不变。固定 UTC 让这个字段成为
-/// 绝对时刻的稳定投影，客户端只是展示它。
 pub fn format_date_time(timestamp: i64) -> String {
     let days = timestamp.div_euclid(86_400);
     let seconds = timestamp.rem_euclid(86_400);
@@ -176,7 +157,6 @@ pub fn format_date_time(timestamp: i64) -> String {
     )
 }
 
-/// `d-Mon-yyyy`（SEARCH 的日期字面量格式）。
 pub fn format_date(timestamp: i64) -> String {
     let (year, month, day) = civil_from_days(timestamp.div_euclid(86_400));
     let month_name = MONTHS
@@ -186,15 +166,11 @@ pub fn format_date(timestamp: i64) -> String {
     format!("{day:02}-{month_name}-{year:04}")
 }
 
-/// 从 Date 头里宽松地抠出 `d Mon yyyy HH:MM:SS`（允许前导星期与末尾时区/注释）。
-///
-/// SENTBEFORE / SENTON / SENTSINCE 只需要「哪一天」。解析失败返回 `None`，
-/// 搜索判定随后按「不匹配」处理 —— 不把坏头的邮件当成「今天」。
 pub fn parse_header_date(value: &str) -> Option<i64> {
     let cleaned = value.split('(').next().unwrap_or(value).trim();
     let mut fields = cleaned.split_whitespace();
     let first = fields.next()?;
-    // 有的客户端把日期写成 "Mon, 3 Oct 2026 ..."（逗号紧跟星期）。
+
     let day_field = if first
         .trim_end_matches(',')
         .chars()
@@ -221,8 +197,7 @@ pub fn parse_header_date(value: &str) -> Option<i64> {
         }
         None => (0, 0, 0),
     };
-    // Date 头的时区必须参与换算；否则「23 Oct 14:30 +0800」会被当成 UTC，
-    // SENTON 在跨时区邮件上会落到相邻一天。
+
     let offset = fields
         .find_map(|token| {
             if token.starts_with(['+', '-']) {
@@ -250,7 +225,7 @@ mod tests {
         assert_eq!(days_from_civil(2000, 2, 29), 11_016);
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         assert_eq!(days_from_civil(2026, 10, 30), 20_756);
-        // 已知锚点：2024-01-01 的 Unix 天数是 19723（与外部工具核对过）。
+
         assert_eq!(days_from_civil(2024, 1, 1), 19_723);
     }
 
@@ -268,7 +243,6 @@ mod tests {
 
     #[test]
     fn date_time_honours_the_zone_offset() {
-        // 2026-10-23 14:30:00 +0800 == 06:30:00 UTC
         let ts = parse_date_time("23-Oct-2026 14:30:00 +0800").unwrap();
         assert_eq!(
             ts,

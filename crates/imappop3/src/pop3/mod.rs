@@ -1,5 +1,3 @@
-//! POP3 服务端（RFC 1939 + CAPA/STLS/TOP/UIDL）。
-
 pub mod server;
 pub mod session;
 

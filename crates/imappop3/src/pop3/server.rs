@@ -1,8 +1,3 @@
-//! POP3 监听器：连接配额、限速、隐式 TLS 与 STLS 升级。
-//!
-//! 结构上与 IMAP 监听器同构（见 [`crate::imap::server`]），差异只有两处：
-//! POP3 没有问候语能力列表（CAPA 单独发），以及 STLS 之后**不重发**问候语。
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,8 +41,7 @@ pub struct Pop3Server {
     pub context: Pop3SessionContext,
     pub config: Pop3ServerConfig,
     pub tls: Option<TlsAcceptor>,
-    /// 传输层指标注册表。默认每个监听器一份；用 [`Pop3Server::with_metrics`] 可让
-    /// 多个监听器（如 110 与 995）汇总到同一份。
+
     pub metrics: Arc<Metrics>,
 }
 
@@ -76,11 +70,6 @@ impl Pop3Server {
         })
     }
 
-    /// 用一份共享的指标注册表替换默认的每实例注册表。
-    ///
-    /// 与 [`crate::imap::server::ImapServer::with_metrics`] 不同：这里不设置
-    /// `self.context.metrics` —— `Pop3SessionContext` 没有 metrics 字段（POP3
-    /// 会话不产生命令级指标），因此传输层注册表就是全部。
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = metrics;
         self
@@ -186,7 +175,6 @@ async fn handle_connection(
     tls: Option<TlsAcceptor>,
     metrics: Arc<Metrics>,
 ) {
-    // 活动量表在会话结束（含 panic/提前返回）时由 guard 减回去。
     let _active = Metrics::track_active(&metrics);
     if config.implicit_tls {
         let Some(acceptor) = tls else {

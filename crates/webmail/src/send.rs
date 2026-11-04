@@ -1,27 +1,3 @@
-//! 发信与草稿落盘。
-//!
-//! ## 两步失败语义（契约 §2.2，冻结）
-//!
-//! ```text
-//! 1. QueueStore::enqueue_new(EntryKind::Outbound)   —— 失败 ⇒ 整封拒绝（什么都没发生）
-//! 2. MailStore::append("Sent", …, \Seen)            —— 失败 ⇒ 202 + sentUid:null + warning
-//! ```
-//!
-//! 关键取舍：**宁可 Sent 少一份，不可丢信**。第 2 步失败时绝不回滚第 1 步——
-//! 回滚已入队的邮件就是丢信（用户以为发出去了，实际队列里也没有）。因此
-//! 队列成功之后返回的一定是 202，Sent 副本问题只作为 warning 如实告知。
-//!
-//! ## DKIM 不在这里做
-//!
-//! Webmail 只负责把报文放进队列；DKIM 由队列 runner 出站前统一签名
-//! （`mailstack_queue::QueueRunner::new` 无条件套 `SigningTransport`）。在这里
-//! 再签一次会产生两条签名路径，而「哪条漏签」是最难发现的邮件伪造面。
-//!
-//! ## 草稿
-//!
-//! 草稿只允许落到 `Drafts`（契约 §2）；给出 `draftUid` 时先追加新草稿、成功后
-//! 才 expunge 旧草稿——顺序反了会让「保存失败」把用户正在编辑的旧草稿删掉。
-
 use std::sync::Arc;
 
 use mailstack_imappop3::maildir::{Flag, FlagSet, MailStore, SystemClock, SystemFlag};
@@ -32,20 +8,15 @@ use crate::compose::{self, ComposeRequest, DraftRequest, Purpose};
 use crate::error::{WebmailError, WebmailResult};
 use crate::WebmailConfig;
 
-/// 发信结果（契约 §2 `POST /mail/api/send` → 202）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendOutcome {
-    /// 队列条目 id。
     pub queue_id: String,
-    /// Sent 副本的 uid；副本保存失败时为 `None`（队列已入队，**不回滚**）。
+
     pub sent_uid: Option<u32>,
-    /// Sent 副本失败时给用户看的如实说明（不得包含内部路径）。
+
     pub warning: Option<String>,
 }
 
-/// 发信：校验 → 构造 → 入队列 → 保存 Sent 副本。
-///
-/// 同步函数（队列与 Maildir 都是 `std::fs`），调用方必须放在 `spawn_blocking`。
 pub fn send(
     config: &WebmailConfig,
     account: &Account,
@@ -59,15 +30,10 @@ pub fn send(
         built.data.clone(),
         mailstack_queue::now_unix(),
     )
-    .map_err(|error| {
-        // QueueEntry::new 的校验失败只可能来自我们自己的构造（地址/报文/收件人），
-        // 属于「请求数据不合法」而不是队列故障。
-        WebmailError::bad_request("INVALID_MESSAGE", error.to_string())
-    })?;
+    .map_err(|error| WebmailError::bad_request("INVALID_MESSAGE", error.to_string()))?;
 
     let store = QueueStore::from_paths(&config.paths);
-    // 第 1 步：入队。失败 ⇒ 整封拒绝。这里必须回 5xx（可重试）而不是 4xx：
-    // 队列落盘失败与服务端故障同义，客户端重试是安全的（此时没有产生任何状态）。
+
     store.enqueue_new(&mut entry).map_err(|error| {
         tracing::error!(
             target: "mailstack_webmail",
@@ -89,7 +55,6 @@ pub fn send(
         "webmail message queued"
     );
 
-    // 第 2 步：Sent 副本。失败只记 warning，绝不回滚队列。
     match append_to_sent(account, built.data.as_bytes()) {
         Ok(sent_uid) => Ok(SendOutcome {
             queue_id,
@@ -107,7 +72,7 @@ pub fn send(
             Ok(SendOutcome {
                 queue_id,
                 sent_uid: None,
-                // 刻意不回显内部错误（路径/OS 细节）：给用户一句能理解、可行动的话。
+
                 warning: Some(
                     "the message was queued for delivery, but a copy could not be saved to Sent"
                         .to_string(),
@@ -117,7 +82,6 @@ pub fn send(
     }
 }
 
-/// 保存草稿（契约 §2 `POST /mail/api/messages`），返回 `(uid, folder)`。
 pub fn save_draft(account: &Account, request: &DraftRequest) -> WebmailResult<(u32, String)> {
     let mailbox = request.mailbox.as_deref().unwrap_or("Drafts").trim();
     let normalized = mailstack_imappop3::maildir::normalize_folder_name(mailbox)
@@ -139,8 +103,6 @@ pub fn save_draft(account: &Account, request: &DraftRequest) -> WebmailResult<(u
         .append("Drafts", built.data.as_bytes(), &flags, None)
         .map_err(WebmailError::from_mail)?;
 
-    // 先落新草稿、再删旧草稿：顺序反了会让一次保存失败把用户正在编辑的旧草稿
-    // 删掉。旧草稿删除失败只记录（新草稿已在，多个旧版本比丢内容好）。
     if let Some(old_uid) = request.draft_uid {
         if old_uid != uid {
             match store.expunge("Drafts", &[old_uid]) {
@@ -159,7 +121,6 @@ pub fn save_draft(account: &Account, request: &DraftRequest) -> WebmailResult<(u
     Ok((uid, "Drafts".to_string()))
 }
 
-/// 把报文追加到 Sent（带 `\Seen`）。
 fn append_to_sent(account: &Account, data: &[u8]) -> WebmailResult<u32> {
     let store = open_store(account)?;
     ensure_folder(&store, "Sent")?;
@@ -171,16 +132,10 @@ fn append_to_sent(account: &Account, data: &[u8]) -> WebmailResult<u32> {
     Ok(uid)
 }
 
-/// 打开账号的 MailStore。
 fn open_store(account: &Account) -> WebmailResult<MailStore> {
     MailStore::new(&account.maildir, Arc::new(SystemClock)).map_err(WebmailError::from_mail)
 }
 
-/// 「Sent / Drafts 不存在就创建」。
-///
-/// 标准文件夹由安装流程创建；这里兜底一次是因为「第一次发信」必须能留下副本。
-/// 创建失败不在这里报错（随后 append 会给出真实的失败原因），避免把「已入队」
-/// 的邮件因为一个可选的副本目录问题误报成全失败。
 fn ensure_folder(store: &MailStore, name: &str) -> WebmailResult<()> {
     match store.exists(name) {
         Ok(true) => return Ok(()),
@@ -189,7 +144,7 @@ fn ensure_folder(store: &MailStore, name: &str) -> WebmailResult<()> {
     }
     match store.create(name) {
         Ok(()) => Ok(()),
-        // 并发请求同时创建：已存在不是错误。
+
         Err(mailstack_imappop3::error::MailError::AlreadyExists(_)) => Ok(()),
         Err(error) => {
             tracing::warn!(
@@ -261,7 +216,6 @@ mod tests {
         assert!(outcome.warning.is_none());
         assert!(!outcome.queue_id.is_empty());
 
-        // 队列里确实有一条出站条目，内容是构造好的 MIME。
         let store = QueueStore::new(fixture.queue_root());
         let entries = store.load_all().unwrap();
         assert_eq!(entries.len(), 1);
@@ -270,7 +224,6 @@ mod tests {
         assert_eq!(entries[0].recipients, vec!["bob@example.org".to_string()]);
         assert!(entries[0].data.contains("Subject: hi"));
 
-        // Sent 里有一份带 \Seen 的副本。
         let mail = MailStore::new(&fixture.account.maildir, Arc::new(SystemClock)).unwrap();
         let sent = mail.open_folder("Sent", false).unwrap();
         assert_eq!(sent.messages.len(), 1);
@@ -283,11 +236,10 @@ mod tests {
         );
     }
 
-    /// 反例守卫：队列入队失败 ⇒ 整封拒绝，且**不得**留下 Sent 副本。
     #[test]
     fn webmail_queue_enqueue_failure_is_reported() {
         let fixture = Fixture::new();
-        // 把 entries 目录的位置占成一个普通文件：enqueue_new 必然失败。
+
         let entries = fixture.queue_root().join("entries");
         std::fs::create_dir_all(entries.parent().unwrap()).unwrap();
         std::fs::write(&entries, b"not a directory").unwrap();
@@ -297,7 +249,6 @@ mod tests {
         assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(error.code, "QUEUE_UNAVAILABLE");
 
-        // 关键断言：失败时没有 Sent 副本（否则用户会看到「已发送」的假象）。
         let mail = MailStore::new(&fixture.account.maildir, Arc::new(SystemClock)).unwrap();
         let sent_empty = mail
             .open_folder("Sent", false)
@@ -306,11 +257,10 @@ mod tests {
         assert!(sent_empty, "入队失败时不得留下 Sent 副本");
     }
 
-    /// 反例守卫：队列成功、Sent 失败 ⇒ 202 语义（warning），**不回滚队列**。
     #[test]
     fn a_sent_copy_failure_keeps_the_queued_message() {
         let fixture = Fixture::new();
-        // 让 Sent 无法被创建：在 Maildir 根下占一个同名普通文件。
+
         std::fs::write(fixture.account.maildir.join(".Sent"), b"not a dir").unwrap();
 
         let outcome =
@@ -348,7 +298,6 @@ mod tests {
             "草稿必须带 \\Draft"
         );
 
-        // 用 draftUid 替换旧草稿：新 uid 出现、旧 uid 消失。
         let draft = DraftRequest {
             compose: ComposeRequest {
                 subject: "v2".to_string(),

@@ -1,62 +1,6 @@
-#!/usr/bin/env bash
-# =============================================================================
-# MailStack v1.0.0 一键安装脚本
-# =============================================================================
-#
-# 两种用法等价：
-#
-#   # ① curl 一行（从 GitHub Release 下载官方产物并做 SHA256 校验）
-#   curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh \
-#     | bash -s -- [选项]
-#
-#   # ② 仓库 checkout / 已解压的发布包里
-#   bash deploy/install.sh [选项]
-#
-# 安装模式（四选一，默认 release）：
-#   * 默认              —— 从 GitHub Release 下载
-#                          mailstack-v1.0.0-x86_64-unknown-linux-gnu.tar.gz，
-#                          并用同目录 SHA256SUMS 校验后安装；
-#   * --from-source     —— 用当前 checkout（或下载 tag v1.0.0 源码包）调
-#                          deploy/build.sh 现构建；要求 rustc 1.98.1 + C 编译器；
-#                          node/npm 可选（用于构建前端产物）；
-#   * --archive FILE|URL —— 显式指定发布包（离线安装 / 内网镜像）；
-#   * --binary-dir DIR  —— 直接使用预编译二进制目录（测试 / 离线旁路；不校验内容）。
-#
-# 目录布局与权限（与 crates/core/src/paths.rs、docs/DEPLOYMENT.md §3.4 一致）：
-#   /etc/mailstack                       0750 root:mailstack-admin
-#   /var/lib/mailstack                   0750 root:mailstack-webmail
-#   /var/backups/mailstack               0700 root:root
-#   /run/mailstack                       0750 root:mailstack-admin（systemd 托管）
-#   /usr/local/bin/mailstack*            0755 root:root
-#   /usr/local/libexec/mailstack-privileged  0750 root:root
-#   /etc/sudoers.d/mailstack-admin       0440 root:root（安装前 visudo -cf 校验）
-#   /usr/share/mailstack/admin           0755 root:root（index.html 管理台 + mail.html Webmail）
-#
-# 特权包装器**必须**是下面这样（R2-001 / R7-002 的关键修复点）：
-#
-#   #!/usr/bin/env bash
-#   set -Eeuo pipefail
-#   export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-#   exec /usr/local/bin/mailstackctl --privileged-stdin
-#
-# 原因：`PrivilegedCaller::call_via_sudo` 用 `sudo <wrapper>`（**不带 argv**）启动
-# 包装器，把 {"action","data"} JSON 写进 stdin、从 stdout 读 {"ok",...}。
-# 若包装器写成 `exec ... mailstackctl "$@"`，动作名只能来自 argv，而客户端不传
-# argv —— 全部变更动作会以「缺少动作名」失败；同时 argv 转发还引入参数注入面。
-# 因此这里**绝不**转发 "$@"。
-#
-# 安全性质：
-#   * 全程 set -Eeuo pipefail；所有 rm -rf 前都做路径守卫；
-#   * 口令只经 stdin 进入包装器，不写 argv / 不写环境变量 / 不打日志；
-#   * 可重入（幂等）：已存在的管理员凭证不会被重置；installed 目录内容按新包替换。
-#
-# 退出码：0 成功；1 安装失败；2 参数错误；77 环境不满足而跳过（不用于本脚本）。
-# =============================================================================
 
 set -Eeuo pipefail
 umask 022
-
-# ─────────────────────────── 常量 ───────────────────────────
 
 MAILSTACK_VERSION="1.0.0"
 REPO_SLUG="SectorPace/MailStack"
@@ -64,7 +8,6 @@ REPO_URL="https://github.com/${REPO_SLUG}"
 RAW_BRANCH="main"
 TARGET_TRIPLE="x86_64-unknown-linux-gnu"
 TARBALL_NAME="mailstack-v${MAILSTACK_VERSION}-${TARGET_TRIPLE}.tar.gz"
-# 发布包与 SHA256SUMS 的同级目录（可用 MAILSTACK_RELEASE_BASE_URL 指向镜像）。
 RELEASE_BASE="${MAILSTACK_RELEASE_BASE_URL:-${REPO_URL}/releases/download/v${MAILSTACK_VERSION}}"
 SOURCE_TARBALL_URL="${REPO_URL}/archive/refs/tags/v${MAILSTACK_VERSION}.tar.gz"
 EXPECTED_RUST="1.98.1"
@@ -73,8 +16,8 @@ BIN_NAMES=(mailstackd mailstackctl mailstack-web mailstack-imap mailstack-webmai
 UNIT_NAMES=(mailstackd mailstack-web mailstack-imap mailstack-webmail)
 WRAPPER_NAME="mailstack-privileged"
 SUDOERS_NAME="mailstack-admin"
-
-# ─────────────────────────── 默认选项 ───────────────────────────
+MANAGE_NAME="mailstack-manage"
+ACCESS_MODES_ALL=(ssh caddy nginx ip-acme panel-domain cloudflared)
 
 MODE="release"            # release | source | archive | binary-dir
 ARCHIVE=""
@@ -86,17 +29,21 @@ MAIL_HOST_GIVEN=0
 ADMIN_USER="admin"
 ADMIN_PASSWORD=""
 ADMIN_PASSWORD_STDIN=0
+ADMIN_PASSWORD_ARGV=0
 ADMIN_PORT="8443"
 WEBMAIL_PORT="8444"
+PANEL_HOST=""
+WEBMAIL_HOST=""
+ACME_EMAIL=""
+SERVER_IP=""
 IMAP_ENABLE=1
 NON_INTERACTIVE=0
 NO_SYSTEMD=0
-ACCESS_MODE=""
+NO_ACCESS_PROVISION=0
+ACCESS_MODE=""            # 归一后的「详细访问模式」（ssh/caddy/nginx/ip-acme/panel-domain/cloudflared）
 ACCESS_MODE_GIVEN=0
 UNINSTALL=0
 PURGE=0
-
-# ─────────────────────────── 运行时状态 ───────────────────────────
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-}"
 SCRIPT_DIR=""
@@ -106,13 +53,13 @@ TMP_DIRS=()
 WORK_DIR=""
 SUDO_CMD=""
 ADMIN_BOOTSTRAP="unknown" # ok | kept | skipped | unverified
-# curl|bash / bash -s 时脚本输入就是 stdin：此时绝不能在脚本里 read stdin
-# （会吞掉后继脚本行，轻则口令变成源码、重则语法错乱）。见 read_admin_password_stdin。
+IDENTITY_APPLIED="not-requested" # ok | failed | not-requested
+ACCESS_PROVISIONED="not-requested" # ok | failed | skipped
 STDIN_IS_SCRIPT=0
 ADMIN_PW_PIPE_MISSING=0
 
-# 由 derive_paths() 填充
 ETC_DIR=""
+ACCESS_DIR=""
 VAR_LIB_DIR=""
 BACKUP_DIR=""
 RUN_DIR=""
@@ -124,15 +71,15 @@ CONFIG_ROOT_ARG=""
 INSTALL_UNITS=()
 RUN_UNITS=()
 
-# 由 acquire_*() 填充
 BIN_SRC_DIR=""
 UNIT_SRC_DIR=""
 DIST_SRC_DIR=""
 PKG_ROOT=""
 PKG_DOC_DIR=""
 INSTALL_UNINSTALL_SRC=""
-
-# ─────────────────────────── 输出与错误 ───────────────────────────
+MANAGE_SRC=""
+MANAGE_DOWNLOADED=0
+STATE_REL_PATH="etc/mailstack/install-args.conf"
 
 say()  { printf '\n==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -160,7 +107,6 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令 $1（安装前置依赖）"
 }
 
-# 记录一个临时目录，退出时统一清理。
 new_tmp() {
   local d
   d="$(mktemp -d "${TMPDIR:-/tmp}/mailstack-install.XXXXXXXX")" || die "无法创建临时目录"
@@ -168,19 +114,20 @@ new_tmp() {
   printf '%s' "$d"
 }
 
-# 输入校验用的整数判断
 is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
-
-# ─────────────────────────── 参数解析 ───────────────────────────
 
 usage() {
   cat <<'EOF'
 MailStack v1.0.0 安装脚本
 
-用法:
+推荐用法（一条命令，非交互；安装完成后可直接用 sudo mailstack-manage 管理）:
   curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh \
-    | bash -s -- [选项]
+    | sudo bash -s -- --domain mail.example.com --admin-user admin \
+        --admin-password '<口令>' --access-mode <模式> [--mail-host mail.example.com]
+
+等价用法:
   bash deploy/install.sh [选项]
+  sudo bash deploy/install.sh --from-source [选项]
 
 安装来源（四选一，默认从 GitHub Release 下载）:
   (默认)                 下载 mailstack-v1.0.0-x86_64-unknown-linux-gnu.tar.gz，
@@ -193,18 +140,34 @@ MailStack v1.0.0 安装脚本
   --prefix DIR           把全部路径安装到 DIR 下（默认 /；staging 测试用）
 
 身份与端口:
-  --domain DOMAIN        邮件主域名（写入 IMAP unit 的证书路径；身份其余部分留给管理台向导）
-  --mail-host HOST       对外邮件主机名（默认 mail.<domain>；用于 IMAP 的证书与问候名）
+  --domain DOMAIN        邮件主域名（写入 setup.json / 域名表 / 部署状态）
+  --mail-host HOST       对外邮件主机名（默认 mail.<domain>；MX 目标）
   --admin-port PORT      管理台监听端口（默认 8443，只绑 127.0.0.1）
   --webmail-port PORT    Webmail 监听端口（默认 8444，只绑 127.0.0.1）
   --imap yes|no          安装并启用 IMAP/POP3/ManageSieve unit（默认 yes）
-  --access-mode MODE     local|caddy|direct（默认 local；写入 ACCESS_MODE，决定公网档安全策略）
+  --server-ip IP         setup.json 里的服务器 IP（默认自动探测；仅写 DNS 提示用）
+  --panel-host HOST      面板主机名（默认按访问模式推导；可省略）
+  --webmail-host HOST    Webmail 主机名（默认 webmail.<domain>；可省略）
+  --acme-email EMAIL     ACME 证书账户邮箱（ip-acme/panel-domain/caddy 用）
+
+访问模式（--access-mode，默认 ssh；旧值 local/caddy/direct 仍接受）:
+  ssh            管理台/Webmail 只绑回环 + SSH 隧道；不安装反向代理（默认，最安全）
+  caddy          Caddy 反代 panel/webmail 主机名，自动 ACME HTTPS
+  nginx          nginx 反代（80），TLS 由 certbot --nginx / acme.sh 补
+  ip-acme        公网 IP 路径：nginx 终止 TLS，证书由 mailstackctl setup.cert.issue 签发
+  panel-domain   独立面板域名（禁止与 mail./imap./smtp. 冲突）反代 TLS
+  cloudflared    Cloudflare Tunnel → 127.0.0.1:8443/8444（本机不开放端口）
+  旧值：local→ssh，caddy→caddy，direct→ip-acme（install-args.conf 里仍写这三个旧值之一，
+       详细模式写在 ACCESS_MODE_DETAIL，保证老读方 crates/core/src/mode.rs 可读）。
+  --no-access-provision  只写部署状态，不调用 mailstack-manage 生成反代/Tunnel 文件
 
 管理员引导:
   --admin-user NAME      管理员用户名（默认 admin）
+  --admin-password PW    直接给管理员口令（会经 argv 暴露，仅建议 curl 一行安装时用；
+                         更安全的方式是 --admin-password-stdin）
   --admin-password-stdin 从标准输入读一行作为管理员口令（不落 argv）。
                          注意：curl|bash 管道模式下 stdin 是脚本本身，**不能**再读，
-                         此时口令只接受环境变量 MAILSTACK_ADMIN_PASSWORD（见示例）。
+                         此时口令接受 --admin-password 或环境变量 MAILSTACK_ADMIN_PASSWORD。
 
 运行方式:
   --non-interactive      不交互（不会提示任何输入；缺省口令时跳过引导并打印手工命令）
@@ -214,35 +177,56 @@ MailStack v1.0.0 安装脚本
   -h, --help             显示本帮助
   --version              显示安装器版本
 
+安装器做的事情（顺序）:
+  1) root/平台/依赖检查（不满足即失败，不做部分安装）
+  2) 获取二进制（Release+SHA256 / --from-source / --archive / --binary-dir）
+  3) 建系统用户/组、目录与权限
+  4) 装 5 个二进制 + 特权包装器（--privileged-stdin）+ sudoers（visudo -cf 校验）
+  5) 装前端产物 + systemd unit + 卸载脚本
+  6) 装 /usr/local/bin/mailstack-manage（服务器管理脚本）
+  7) 写部署状态（domain/admin/ports/access mode/panel host… 到 install-args.conf）
+  8) 管理员凭证引导（admin.set，经特权包装器；已存在则跳过）
+  9) 应用邮件身份（有 --domain 时：setup.identity.apply，原生 DKIM）
+ 10) 应用访问模式（mailstack-manage access set：Caddyfile/nginx/cloudflared/ssh 文件）
+ 11) enable/start systemd unit，打印摘要与一行安装用法
+
 示例:
-  # ① 先落盘再执行（推荐：口令可以走 stdin）
+  # ① 一条命令完整安装（推荐；口令走 argv，注意 shell 历史）
+  curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh \
+    | sudo bash -s -- --domain mail.example.com --admin-user admin \
+        --admin-password 'My-Admin-Pass-9' --access-mode caddy
+
+  # ② 先落盘再执行（口令可以走 stdin，不留在 argv/历史）
   curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh \
     -o /tmp/mailstack-install.sh
   sudo bash /tmp/mailstack-install.sh --domain example.com --admin-password-stdin <<< 'My-Admin-Pass-9'
 
-  # ② curl 管道模式：stdin 已被脚本占用，口令只能走环境变量
+  # ③ 管道 + 环境变量（stdin 已被脚本占用时）
   curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh \
-    | MAILSTACK_ADMIN_PASSWORD='My-Admin-Pass-9' sudo -E bash -s -- --admin-password-stdin
+    | MAILSTACK_ADMIN_PASSWORD='My-Admin-Pass-9' sudo -E bash -s -- \
+        --domain example.com --admin-password-stdin
 
-  # ③ staging 安装（不碰 systemd、不联网；测试用）
-  bash deploy/install.sh --binary-dir ./dist --prefix /tmp/mailstack-stage \
-    --non-interactive --no-systemd --admin-password-stdin <<< 'Bootstrap-Pass-9'
+  # ④ staging 安装（不碰 systemd、不联网；测试用）
+  sudo bash deploy/install.sh --binary-dir ./dist --prefix /tmp/mailstack-stage \
+    --non-interactive --no-systemd --domain example.com \
+    --admin-password-stdin --access-mode ssh <<< 'Bootstrap-Pass-9'
 
-  # ④ 从当前 checkout 源码构建后安装
+  # ⑤ 从当前 checkout 源码构建后安装
   sudo bash deploy/install.sh --from-source --domain example.com --admin-password-stdin
 
-  # ⑤ 卸载（默认保留 /etc/mailstack 与 /var/lib/mailstack；--purge 才删）
+  # ⑥ 卸载（默认保留 /etc/mailstack 与 /var/lib/mailstack；--purge 才删）
   sudo bash deploy/uninstall.sh
+
+安装后管理（3x-ui 风格 CLI + 交互菜单）:
+  sudo mailstack-manage                  # 交互菜单
+  sudo mailstack-manage status
+  sudo mailstack-manage access set caddy
+  sudo mailstack-manage domain set example.com --mail-host mail.example.com
+  sudo mailstack-manage account add alice@example.com --password-stdin
+  sudo mailstack-manage tls issue mail.example.com --email ops@example.com
 EOF
 }
 
-# 读一行口令（不落 argv、不回显）。
-#
-# ⚠️ `curl ... | bash -s -- --admin-password-stdin` 时 **stdin 就是脚本本身**：
-# 在这里 read 会吞掉脚本的下一行（实测会把后面的源码读成「口令」），既拿不到
-# 口令又破坏执行。因此管道模式下必须**不读 stdin**、只接受环境变量
-# MAILSTACK_ADMIN_PASSWORD；环境变量也没有时记为缺失，由 validate_options
-# 提早报错（不做任何安装副作用）。
 read_admin_password_stdin() {
   if [ "$STDIN_IS_SCRIPT" -eq 1 ]; then
     if [ -n "${MAILSTACK_ADMIN_PASSWORD:-}" ]; then
@@ -262,6 +246,59 @@ read_admin_password_stdin() {
   ADMIN_PASSWORD="$value"
 }
 
+normalize_access_mode_detail() {
+  local lowered
+  lowered="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$lowered" in
+    ssh|local|loopback|tunnel)      printf 'ssh' ;;
+    caddy)                          printf 'caddy' ;;
+    nginx)                          printf 'nginx' ;;
+    ip-acme|ip_acme|ipacme|ip)      printf 'ip-acme' ;;
+    panel-domain|panel_domain|panel) printf 'panel-domain' ;;
+    cloudflared|cloudflare|cf-tunnel) printf 'cloudflared' ;;
+    direct)                         printf 'ip-acme' ;;   # 旧值 direct → 公网直连档
+    *) return 1 ;;
+  esac
+}
+
+canonical_access_mode() {
+  case "$1" in
+    ssh)                            printf 'local' ;;
+    caddy|nginx|panel-domain|cloudflared) printf 'caddy' ;;
+    ip-acme)                        printf 'direct' ;;
+    local)                          printf 'local' ;;
+    direct)                         printf 'direct' ;;
+    *)                              printf 'local' ;;
+  esac
+}
+
+detail_mode_from_state() {
+  local conf="$ETC_DIR/install-args.conf" detail="" canonical=""
+  [ -s "$conf" ] || return 0
+  detail="$(state_get "$conf" ACCESS_MODE_DETAIL)"
+  if [ -n "$detail" ]; then
+    normalize_access_mode_detail "$detail" && return 0
+  fi
+  canonical="$(state_get "$conf" ACCESS_MODE)"
+  case "$canonical" in
+    local|"") printf 'ssh' ;;
+    caddy)    printf 'caddy' ;;
+    direct)   printf 'ip-acme' ;;
+    *)        : ;;
+  esac
+}
+
+state_get() {
+  local conf="$1" key="$2" raw=""
+  raw="$(sed -n "s/^${key}=//p" "$conf" 2>/dev/null | head -1)"
+  [ -n "$raw" ] || return 1
+  case "$raw" in
+    \'*\') raw="${raw#\'}"; raw="${raw%\'}" ;;
+    \"*\") raw="${raw#\"}"; raw="${raw%\"}" ;;
+  esac
+  printf '%s' "$raw"
+}
+
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -278,11 +315,23 @@ parse_args() {
       --mail-host=*) MAIL_HOST="${1#*=}"; MAIL_HOST_GIVEN=1; shift ;;
       --admin-user)  [ "$#" -ge 2 ] || die "--admin-user 需要一个参数"; ADMIN_USER="$2"; shift 2 ;;
       --admin-user=*) ADMIN_USER="${1#*=}"; shift ;;
+      --admin-password)
+        [ "$#" -ge 2 ] || die "--admin-password 需要一个参数（口令本身；建议改用 --admin-password-stdin）"
+        ADMIN_PASSWORD="$2"; ADMIN_PASSWORD_ARGV=1; shift 2 ;;
+      --admin-password=*) ADMIN_PASSWORD="${1#*=}"; ADMIN_PASSWORD_ARGV=1; shift ;;
       --admin-password-stdin) ADMIN_PASSWORD_STDIN=1; read_admin_password_stdin; shift ;;
       --admin-port)  [ "$#" -ge 2 ] || die "--admin-port 需要一个参数"; ADMIN_PORT="$2"; shift 2 ;;
       --admin-port=*) ADMIN_PORT="${1#*=}"; shift ;;
       --webmail-port) [ "$#" -ge 2 ] || die "--webmail-port 需要一个参数"; WEBMAIL_PORT="$2"; shift 2 ;;
       --webmail-port=*) WEBMAIL_PORT="${1#*=}"; shift ;;
+      --panel-host)  [ "$#" -ge 2 ] || die "--panel-host 需要一个参数"; PANEL_HOST="$2"; shift 2 ;;
+      --panel-host=*) PANEL_HOST="${1#*=}"; shift ;;
+      --webmail-host) [ "$#" -ge 2 ] || die "--webmail-host 需要一个参数"; WEBMAIL_HOST="$2"; shift 2 ;;
+      --webmail-host=*) WEBMAIL_HOST="${1#*=}"; shift ;;
+      --acme-email)  [ "$#" -ge 2 ] || die "--acme-email 需要一个参数"; ACME_EMAIL="$2"; shift 2 ;;
+      --acme-email=*) ACME_EMAIL="${1#*=}"; shift ;;
+      --server-ip)   [ "$#" -ge 2 ] || die "--server-ip 需要一个参数"; SERVER_IP="$2"; shift 2 ;;
+      --server-ip=*) SERVER_IP="${1#*=}"; shift ;;
       --imap)
         [ "$#" -ge 2 ] || die "--imap 需要 yes|no"
         case "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" in
@@ -299,9 +348,10 @@ parse_args() {
         esac
         shift ;;
       --access-mode)
-        [ "$#" -ge 2 ] || die "--access-mode 需要 local|caddy|direct"
+        [ "$#" -ge 2 ] || die "--access-mode 需要模式（${ACCESS_MODES_ALL[*]}；旧值 local/caddy/direct 仍接受）"
         ACCESS_MODE="$2"; ACCESS_MODE_GIVEN=1; shift 2 ;;
       --access-mode=*) ACCESS_MODE="${1#*=}"; ACCESS_MODE_GIVEN=1; shift ;;
+      --no-access-provision) NO_ACCESS_PROVISION=1; shift ;;
       --non-interactive) NON_INTERACTIVE=1; shift ;;
       --no-systemd)  NO_SYSTEMD=1; shift ;;
       --uninstall)   UNINSTALL=1; shift ;;
@@ -314,17 +364,20 @@ parse_args() {
 }
 
 validate_options() {
-  # curl|bash 管道模式下要了 --admin-password-stdin 却没给环境变量：此时 stdin 是
-  # 脚本本身，无处可读。宁可**在安装任何东西之前**失败并给出两种正确写法，
-  # 也不要装到一半再报错或静默跳过引导。
   if [ "$ADMIN_PW_PIPE_MISSING" -eq 1 ]; then
     die "curl|bash 管道模式无法从 stdin 读口令（stdin 就是脚本本身）。两种写法：
   ① 先落盘再执行：curl -fsSL .../deploy/install.sh -o /tmp/i.sh && sudo bash /tmp/i.sh --admin-password-stdin <<< '口令'
-  ② 管道 + 环境变量：curl -fsSL .../deploy/install.sh | MAILSTACK_ADMIN_PASSWORD='口令' sudo -E bash -s -- --admin-password-stdin"
+  ② 管道 + 环境变量：curl -fsSL .../deploy/install.sh | MAILSTACK_ADMIN_PASSWORD='口令' sudo -E bash -s -- --admin-password-stdin
+  ③ 或直接用 --admin-password '<口令>'（会经 argv 暴露，见 --help 的安全提示）"
   fi
 
-  # 安装来源互斥：MODE 只由最后一个来源参数决定，但 --archive 与 --binary-dir 同时给
-  # 属于明确的使用错误，直接拒绝。
+  if [ -z "$ADMIN_PASSWORD" ] && [ -n "${MAILSTACK_ADMIN_PASSWORD:-}" ]; then
+    ADMIN_PASSWORD="$MAILSTACK_ADMIN_PASSWORD"
+  fi
+  if [ "$ADMIN_PASSWORD_ARGV" -eq 1 ]; then
+    warn "--admin-password 会经 argv/进程列表暴露（curl 一行安装的便利写法）；更安全的是 --admin-password-stdin"
+  fi
+
   if [ -n "$ARCHIVE" ] && [ -n "$BINARY_DIR" ]; then
     die "--archive 与 --binary-dir 只能选一个"
   fi
@@ -356,18 +409,63 @@ validate_options() {
     die "邮件主机名不合法：$MAIL_HOST"
   fi
   if [ -n "$MAIL_HOST" ] && [ -z "$DOMAIN" ]; then
-    # 允许只给 --mail-host；域名留给管理台向导。证书目录按 mail-host 推导。
-    info "只给出 --mail-host（$MAIL_HOST）：域名身份留给管理台向导"
+    info "只给出 --mail-host（$MAIL_HOST）：域名身份留给 mailstack-manage domain set / 管理台向导"
   fi
 
-  if [ -n "$ACCESS_MODE" ]; then
-    case "$(printf '%s' "$ACCESS_MODE" | tr '[:upper:]' '[:lower:]')" in
-      local|caddy|direct) ACCESS_MODE="$(printf '%s' "$ACCESS_MODE" | tr '[:upper:]' '[:lower:]')" ;;
-      *) die "--access-mode 只接受 local|caddy|direct（实际：$ACCESS_MODE）" ;;
-    esac
+  if [ -n "$PANEL_HOST" ] && ! printf '%s' "$PANEL_HOST" | grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'; then
+    die "面板主机名不合法：$PANEL_HOST"
+  fi
+  if [ -n "$WEBMAIL_HOST" ] && ! printf '%s' "$WEBMAIL_HOST" | grep -Eq '^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'; then
+    die "Webmail 主机名不合法：$WEBMAIL_HOST"
+  fi
+  if [ -n "$ACME_EMAIL" ] && ! printf '%s' "$ACME_EMAIL" | grep -Eq '^[A-Za-z0-9._%+-]+@([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'; then
+    die "--acme-email 不合法：$ACME_EMAIL"
+  fi
+  if [ -n "$SERVER_IP" ] && ! printf '%s' "$SERVER_IP" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+    die "--server-ip 不是合法 IPv4：$SERVER_IP"
   fi
 
-  # ── 口令策略（与 crates/core/src/password.rs 对齐；后端还会做「弱连续串/身份 token」检查）──
+  if [ "$ACCESS_MODE_GIVEN" -eq 1 ]; then
+    local requested_mode="$ACCESS_MODE"
+    ACCESS_MODE="$(normalize_access_mode_detail "$requested_mode")" \
+      || die "--access-mode 只有 ${ACCESS_MODES_ALL[*]}（旧值 local/caddy/direct 也接受）（实际：$requested_mode）"
+  else
+    ACCESS_MODE="$(detail_mode_from_state)"
+  fi
+  if [ -z "$ACCESS_MODE" ]; then
+    ACCESS_MODE="ssh"
+  fi
+
+  if [ "$ACCESS_MODE" != "ssh" ]; then
+    if [ -z "$PANEL_HOST" ]; then
+      if [ -n "$DOMAIN" ]; then
+        case "$ACCESS_MODE" in
+          ip-acme) PANEL_HOST="${MAIL_HOST:-$DOMAIN}" ;;
+          *)       PANEL_HOST="panel.$DOMAIN" ;;
+        esac
+      else
+        die "访问模式 $ACCESS_MODE 需要面板主机名：加 --panel-host <host>（或先给 --domain）"
+      fi
+    fi
+    if [ -z "$WEBMAIL_HOST" ]; then
+      if [ -n "$DOMAIN" ]; then
+        WEBMAIL_HOST="webmail.$DOMAIN"
+      else
+        die "访问模式 $ACCESS_MODE 需要 Webmail 主机名：加 --webmail-host <host>（或先给 --domain）"
+      fi
+    fi
+  fi
+  if [ "$ACCESS_MODE" = "panel-domain" ]; then
+    local h
+    for h in "$DOMAIN" "$MAIL_HOST" "mail.$DOMAIN" "imap.$DOMAIN" "smtp.$DOMAIN" "pop.$DOMAIN"; do
+      [ -n "$h" ] || continue
+      if [ "$PANEL_HOST" = "$h" ]; then
+        die "panel-domain 要求独立面板主机名：$PANEL_HOST 与邮件主机 $h 冲突（改用 --panel-host panel.<domain> 或 --access-mode caddy）"
+      fi
+    done
+    [ "$PANEL_HOST" != "$WEBMAIL_HOST" ] || die "--panel-host 与 --webmail-host 不能相同"
+  fi
+
   if [ -n "$ADMIN_PASSWORD" ]; then
     if printf '%s' "$ADMIN_PASSWORD" | LC_ALL=C grep -q '[[:cntrl:]]'; then
       die "管理员口令不得包含控制字符（换行/制表符等）"
@@ -386,15 +484,12 @@ validate_options() {
   fi
 }
 
-# ─────────────────────────── 路径推导 ───────────────────────────
-
 normalize_prefix() {
   [ -n "$PREFIX" ] || PREFIX="/"
   case "$PREFIX" in
     /*) : ;;
     *) die "--prefix 必须是绝对路径（实际：$PREFIX）" ;;
   esac
-  # 去掉尾斜杠（但保留 / 本身）
   while [ "$PREFIX" != "/" ] && [ "${PREFIX%/}" != "$PREFIX" ]; do
     PREFIX="${PREFIX%/}"
   done
@@ -402,7 +497,6 @@ normalize_prefix() {
   if [ "$PREFIX" = "/" ]; then
     PREFIX_NORM=""
   else
-    # 前缀会被拼进 sed 替换与 systemd unit，字符集必须可预期。
     if ! printf '%s' "$PREFIX" | grep -Eq '^/[A-Za-z0-9._/-]+$'; then
       die "--prefix 只允许字母/数字/_/./-//（实际：$PREFIX）"
     fi
@@ -422,6 +516,7 @@ prefix_path() { printf '%s%s' "$PREFIX_NORM" "$1"; }
 
 derive_paths() {
   ETC_DIR="$(prefix_path /etc/mailstack)"
+  ACCESS_DIR="$ETC_DIR/access"
   VAR_LIB_DIR="$(prefix_path /var/lib/mailstack)"
   BACKUP_DIR="$(prefix_path /var/backups/mailstack)"
   RUN_DIR="$(prefix_path /run/mailstack)"
@@ -430,7 +525,6 @@ derive_paths() {
   DIST_DIR="$(prefix_path /usr/share/mailstack/admin)"
   UNIT_DIR="$(prefix_path /etc/systemd/system)"
   if [ -n "$PREFIX_NORM" ]; then
-    # --config-dir DIR 把 /etc/mailstack、/var/lib/mailstack 等视为 DIR/...
     CONFIG_ROOT_ARG=" --config-dir ${PREFIX_NORM}"
   else
     CONFIG_ROOT_ARG=""
@@ -440,9 +534,6 @@ derive_paths() {
   RUN_UNITS=("${INSTALL_UNITS[@]}")
 }
 
-# ─────────────────────────── 基础文件系统工具 ───────────────────────────
-
-# 目录：不存在则创建；存在则收敛 mode/owner（幂等）。
 install_dir() {
   local dir="$1" mode="$2" owner="$3" group="$4"
   [ -n "$dir" ] || die "install_dir: 空路径"
@@ -451,8 +542,6 @@ install_dir() {
   chmod "$mode" "$dir" || die "无法设置 $dir 权限 $mode"
 }
 
-# 文件原子替换：先写同目录临时文件（含权限/属主），再 rename 覆盖。
-# 直接 `install` 到正在运行的目标会 ETXTBSY（进程还在跑），rename 则不会。
 put_file() {
   local src="$1" dst="$2" mode="$3" owner="$4" group="$5"
   local tmp="${dst}.new.$$"
@@ -461,7 +550,6 @@ put_file() {
   mv -f -- "$tmp" "$dst" || die "无法替换 $dst"
 }
 
-# 删除前守卫：只允许删除“非根、非系统目录、且位于安装前缀之下”的路径。
 safe_rm_rf() {
   local target="$1"
   [ -n "$target" ] || die "safe_rm_rf: 空路径"
@@ -482,8 +570,6 @@ safe_rm_rf() {
   fi
   rm -rf -- "$real"
 }
-
-# ─────────────────────────── 环境检查 ───────────────────────────
 
 check_environment() {
   [ "$(id -u)" -eq 0 ] || die "请用 root 运行（sudo bash $0 ...）"
@@ -537,7 +623,6 @@ check_environment() {
     fi
   fi
 
-  # 版本一致性：从 checkout 运行时确认安装器与仓库版本一致（防止拿旧安装器装新仓库）。
   if [ -n "$CHECKOUT_ROOT" ] && [ -f "$CHECKOUT_ROOT/VERSION" ]; then
     local repo_version
     repo_version="$(tr -d '[:space:]' < "$CHECKOUT_ROOT/VERSION")"
@@ -545,8 +630,6 @@ check_environment() {
       || warn "安装器版本 $MAILSTACK_VERSION 与 checkout 版本 $repo_version 不一致"
   fi
 }
-
-# ─────────────────────────── 下载与发布包获取 ───────────────────────────
 
 download() {
   local url="$1" dest="$2"
@@ -564,9 +647,6 @@ verify_sha256() {
   [ -s "$sums" ] || die "SHA256SUMS 不存在或为空：$sums"
   local base expected
   base="$(basename -- "$file")"
-  # `sha256sum ./*` 生成的行是 `<hash>  ./<name>`（build.sh 的输出）；
-  # 直接用 `"${file}$"` 匹配会把 `./` 前缀判成缺失（实测踩过：包与校验和都在，
-  # 却报「SHA256SUMS 中没有条目」）。按「去掉 `*` 与 `./` 后的 basename」比较。
   expected="$(awk -v want="$base" '
     {
       name = $2
@@ -581,7 +661,6 @@ verify_sha256() {
   info "SHA256 校验通过：$base"
 }
 
-# 解包并返回包根目录（唯一顶层目录，或直接就是压缩包内容）。
 extract_tarball() {
   local tarball="$1" dest="$2"
   mkdir -p "$dest"
@@ -598,7 +677,6 @@ extract_tarball() {
   fi
 }
 
-# 校验包内产物清单，定位 bin/ 与 unit 模板目录。
 resolve_package() {
   local pkg="$1"
   [ -n "$pkg" ] && [ -d "$pkg" ] || die "发布包目录不存在：$pkg"
@@ -626,9 +704,11 @@ resolve_package() {
   if [ -f "$pkg/deploy/uninstall.sh" ]; then
     INSTALL_UNINSTALL_SRC="$pkg/deploy/uninstall.sh"
   fi
+  if [ -f "$pkg/deploy/mailstack-manage.sh" ]; then
+    MANAGE_SRC="$pkg/deploy/mailstack-manage.sh"
+  fi
 }
 
-# 从 checkout 里定位模板 / 前端产物 / 卸载脚本（--binary-dir 与源码构建共用）。
 locate_checkout_assets() {
   local base="${CHECKOUT_ROOT:-}"
   if [ -n "$base" ]; then
@@ -639,13 +719,16 @@ locate_checkout_assets() {
       DIST_SRC_DIR="$base/dist/webui-dist"
     fi
     [ -f "$base/deploy/uninstall.sh" ] && INSTALL_UNINSTALL_SRC="$base/deploy/uninstall.sh"
+    [ -f "$base/deploy/mailstack-manage.sh" ] && MANAGE_SRC="$base/deploy/mailstack-manage.sh"
   fi
-  # 脚本同目录（deploy/）是最后的兜底：允许把 install.sh 拷到发布包外单独用。
   if [ -z "$UNIT_SRC_DIR" ] && [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/systemd" ]; then
     UNIT_SRC_DIR="$SCRIPT_DIR/systemd"
   fi
   if [ -z "$INSTALL_UNINSTALL_SRC" ] && [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
     INSTALL_UNINSTALL_SRC="$SCRIPT_DIR/uninstall.sh"
+  fi
+  if [ -z "$MANAGE_SRC" ] && [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/mailstack-manage.sh" ]; then
+    MANAGE_SRC="$SCRIPT_DIR/mailstack-manage.sh"
   fi
 }
 
@@ -677,7 +760,6 @@ acquire_archive() {
       [ -f "$file" ] || die "发布包文件不存在：$file"
       file="$(realpath -- "$file")" ;;
   esac
-  # 本地/同目录若有 SHA256SUMS 就校验（离线镜像推荐同时分发它）；没有则明确说明不校验。
   local sums_dir sums
   sums_dir="$(dirname "$file")"
   sums="$sums_dir/SHA256SUMS"
@@ -749,7 +831,6 @@ acquire_source() {
 
   check_toolchain_for_source
 
-  # 前端产物（可选）：checkout 里已有 dist 就直接用；否则 npm 可用时现构建。
   if [ ! -d "$src/webui/dist" ] && [ -d "$src/webui" ] \
      && command -v npm >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
     say "构建前端产物（webui：npm ci + npm run build）"
@@ -770,11 +851,33 @@ acquire_source() {
     DIST_SRC_DIR="$src/webui/dist"
   fi
   [ -f "$src/deploy/uninstall.sh" ] && INSTALL_UNINSTALL_SRC="$src/deploy/uninstall.sh"
+  [ -f "$src/deploy/mailstack-manage.sh" ] && MANAGE_SRC="$src/deploy/mailstack-manage.sh"
   [ -f "$src/deploy/install.sh" ] && [ -z "$INSTALL_UNINSTALL_SRC" ] && INSTALL_UNINSTALL_SRC=""
   resolve_bin_dir_only "$BIN_SRC_DIR"
 }
 
-# 源码模式下 BIN_SRC_DIR 指向 dist/（没有 bin/ 子目录），做一次轻量归一。
+acquire_manage_script() {
+  [ -n "$MANAGE_SRC" ] && [ -f "$MANAGE_SRC" ] && return 0
+  if [ -n "$CHECKOUT_ROOT" ] && [ -f "$CHECKOUT_ROOT/deploy/mailstack-manage.sh" ]; then
+    MANAGE_SRC="$CHECKOUT_ROOT/deploy/mailstack-manage.sh"
+    return 0
+  fi
+  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/mailstack-manage.sh" ]; then
+    MANAGE_SRC="$SCRIPT_DIR/mailstack-manage.sh"
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    die "发布包里没有 deploy/mailstack-manage.sh，且本机没有 curl/wget 可下载。请改用仓库 checkout 安装，或升级到包含该脚本的发布包"
+  fi
+  local dl
+  dl="$(new_tmp)"
+  say "发布包未携带管理脚本：从 ${RAW_BRANCH} 分支下载 mailstack-manage.sh"
+  download "https://raw.githubusercontent.com/${REPO_SLUG}/${RAW_BRANCH}/deploy/mailstack-manage.sh" "$dl/mailstack-manage.sh"
+  bash -n "$dl/mailstack-manage.sh" || die "下载的 mailstack-manage.sh 语法校验失败（拒绝安装）"
+  MANAGE_SRC="$dl/mailstack-manage.sh"
+  MANAGE_DOWNLOADED=1
+}
+
 resolve_bin_dir_only() {
   local dir="$1"
   [ -d "$dir" ] || die "构建产物目录不存在：$dir"
@@ -791,7 +894,6 @@ validate_artifacts() {
       continue
     fi
     [ -x "$path" ] || die "二进制不可执行：$path（权限应含 x）"
-    # --binary-dir 是测试/离线旁路：只验存在与可执行，不执行内容。
     if [ "$MODE" != "binary-dir" ]; then
       if ! "$path" --version >/dev/null 2>&1; then
         die "二进制无法执行：$path（架构/glibc 不匹配？或文件损坏）"
@@ -820,8 +922,6 @@ validate_artifacts() {
   fi
 }
 
-# ─────────────────────────── 账号 / 目录 / 文件安装 ───────────────────────────
-
 group_exists() {
   if command -v getent >/dev/null 2>&1; then
     getent group "$1" >/dev/null 2>&1
@@ -849,9 +949,6 @@ nologin_shell() {
 ensure_users_and_groups() {
   say "创建运行账号与用户组"
 
-  # mailstack-admin：管理台进程身份，也是 RO socket 的属组。
-  # RO socket 是 0660 root:mailstack-admin，daemon bind 时解析不到该组会直接失败，
-  # 所以这个组是「部署硬前置条件」，不是可选项。
   if group_exists mailstack-admin; then
     info "组已存在：mailstack-admin"
   else
@@ -868,7 +965,6 @@ ensure_users_and_groups() {
   fi
   user_exists mailstack-admin || die "mailstack-admin 用户创建后校验失败"
 
-  # mailstack-webmail：/var/lib/mailstack 下非机密注册表的属组（0640 root:mailstack-webmail）。
   if group_exists mailstack-webmail; then
     info "组已存在：mailstack-webmail"
   else
@@ -876,9 +972,6 @@ ensure_users_and_groups() {
     info "已创建组：mailstack-webmail"
   fi
 
-  # opendkim：DKIM 私钥 /etc/opendkim/keys/<domain>/<selector>.private 的契约属组
-  # 是 root:opendkim（docs/DEPLOYMENT.md §3.4）。签名在进程内完成，但文件的组契约
-  # 仍要满足，否则运维按旧手册检查权限会看到「不对」。
   if group_exists opendkim; then
     info "组已存在：opendkim"
   else
@@ -890,17 +983,18 @@ ensure_users_and_groups() {
 create_directories() {
   say "创建目录与权限（幂等收敛）"
   install_dir "$ETC_DIR" 0750 root mailstack-admin
+  install_dir "$ACCESS_DIR" 0750 root root
   install_dir "$VAR_LIB_DIR" 0750 root mailstack-webmail
   install_dir "$BACKUP_DIR" 0700 root root
   install_dir "$RUN_DIR" 0750 root mailstack-admin
   install_dir "$LIBEXEC_DIR" 0755 root root
-  # `/usr/local/bin` 必须显式创建：真实主机上它通常已存在，但 `--prefix` staging
-  # 是一棵全新的树 —— 漏了这一步，随后的 `install ... tmp` 会报
-  # "invalid target ... No such file or directory"（实测踩过）。
   install_dir "$BIN_DIR" 0755 root root
   install_dir "$(prefix_path /usr/share/mailstack)" 0755 root root
   install_dir "$(prefix_path /etc/opendkim)" 0750 root opendkim
   install_dir "$(prefix_path /etc/opendkim/keys)" 0750 root opendkim
+  if [ ! -d "$(prefix_path /etc/postfix)" ]; then
+    install -d -m 0755 "$(prefix_path /etc/postfix)" || die "无法创建 $(prefix_path /etc/postfix)"
+  fi
 }
 
 install_binaries() {
@@ -917,19 +1011,20 @@ install_wrapper() {
   local wrapper="$LIBEXEC_DIR/$WRAPPER_NAME"
   local wrapper_src
   wrapper_src="$(new_tmp)/$WRAPPER_NAME"
-  # 注意：**没有** "$@"。客户端 sudo 调用不带 argv，动作名只来自 stdin JSON。
-  # 转发 argv 会让动作名缺失（全部 RW 动作失败），并引入参数注入面。
+  local cfg_arg=""
+  if [ -n "$PREFIX_NORM" ]; then
+    cfg_arg=" --config-dir $PREFIX_NORM"
+  fi
   cat > "$wrapper_src" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-exec $BIN_DIR/mailstackctl --privileged-stdin
+exec $BIN_DIR/mailstackctl --privileged-stdin$cfg_arg
 EOF
   chmod 0755 "$wrapper_src"
   put_file "$wrapper_src" "$wrapper" 0750 root root
   info "已安装：$wrapper（0750 root:root，--privileged-stdin，无 argv 转发）"
 
-  # 安装后自检：包装器必须指向 --privileged-stdin，且不得转发 "$@"。
   grep -q -- 'exec .*mailstackctl --privileged-stdin' "$wrapper" \
     || die "包装器内容自检失败：没有 --privileged-stdin"
   if grep -qF -- 'exec' "$wrapper" && grep -qF '"$@"' "$wrapper"; then
@@ -954,7 +1049,6 @@ EOF
   put_file "$sudoers_src" "$sudoers" 0440 root root
   info "已安装：$sudoers"
 
-  # 宿主机 sudoers 的生效路径与 staging 前缀不同：真实安装要放进 /etc/sudoers.d。
   if [ -n "$PREFIX_NORM" ]; then
     warn "staging 前缀模式：sudoers 写入 $sudoers，不会影响宿主 /etc/sudoers.d"
   fi
@@ -970,8 +1064,6 @@ install_dist() {
   rm -rf -- "$staging"
   mkdir -p "$(dirname "$DIST_DIR")"
   cp -a "$DIST_SRC_DIR/." "$staging/" || die "复制前端产物失败：$DIST_SRC_DIR"
-  # 只读、可遍历、不可写：产物来自构建机（`cp -a` 会原样保留其权限），
-  # 而构建目录在 9p/共享盘上可能报 0777 —— 装到 /usr/share 下必须是 0755/0644。
   chmod -R a+rX "$staging"
   chmod -R go-w "$staging"
   chmod 0755 "$staging"
@@ -980,8 +1072,6 @@ install_dist() {
   mv -- "$staging" "$DIST_DIR" || die "替换前端产物目录失败：$DIST_DIR"
   info "已安装：$DIST_DIR（index.html=管理台，mail.html=Webmail，同一份 dist）"
 }
-
-# ─────────────────────────── systemd unit 渲染 ───────────────────────────
 
 render_unit() {
   local template="$1" dest="$2"
@@ -992,10 +1082,8 @@ render_unit() {
     imap_cert_args=" --cert $cert_dir/fullchain.pem --key $cert_dir/privkey.pem"
     imap_condition="ConditionPathExists=$cert_dir/fullchain.pem"
   else
-    # 没有 --domain/--mail-host 就不知道证书路径：unit 仍写出供检查，但不启用。
     imap_condition="# （未提供 --domain/--mail-host：证书路径未固化，本次不启用本 unit；请重跑 install.sh --domain <mail-host>）"
   fi
-  # sed 替换字符集受 validate_options/normalize_prefix 约束（不含 | 与 &）。
   sed -e "s|@BIN_DIR@|$BIN_DIR|g" \
       -e "s|@ETC_DIR@|$ETC_DIR|g" \
       -e "s|@DIST_DIR@|$DIST_DIR|g" \
@@ -1021,7 +1109,6 @@ install_units() {
     info "已安装：$UNIT_DIR/${unit}.service"
   done
 
-  # --imap no：清掉上一次安装遗留的 unit（否则 disable 之后再装回来会误导）。
   if [ "$IMAP_ENABLE" -eq 0 ] && [ -f "$UNIT_DIR/mailstack-imap.service" ]; then
     if [ "$NO_SYSTEMD" -eq 0 ] && [ -z "$PREFIX_NORM" ] && [ -d /run/systemd/system ] \
        && command -v systemctl >/dev/null 2>&1; then
@@ -1032,36 +1119,167 @@ install_units() {
   fi
 }
 
-# ─────────────────────────── 安装元数据 ───────────────────────────
+install_manage_script() {
+  say "安装服务器管理脚本：$BIN_DIR/$MANAGE_NAME"
+  acquire_manage_script
+  install_dir "$BIN_DIR" 0755 root root
+  put_file "$MANAGE_SRC" "$BIN_DIR/$MANAGE_NAME" 0755 root root
+  info "已安装：$BIN_DIR/$MANAGE_NAME（sudo $MANAGE_NAME 进入交互菜单）"
+}
 
-write_install_args() {
-  say "写入部署模式配置（ACCESS_MODE）"
-  local conf="$ETC_DIR/install-args.conf"
-  local mode="$ACCESS_MODE"
-  if [ -z "$mode" ]; then
-    # 重跑不显式给 --access-mode 时保留既有值：安装脚本不应把公网档静默降回 local。
-    if [ -s "$conf" ]; then
-      mode="$(sed -n 's/^ACCESS_MODE=//p' "$conf" | head -1 | tr -d '\"' | tr -d "'")"
-      case "$mode" in
-        local|caddy|direct) : ;;
-        *) mode="" ;;
-      esac
-    fi
+apply_identity() {
+  IDENTITY_APPLIED=not-requested
+  if [ -z "$DOMAIN" ]; then
+    info "未提供 --domain：邮件身份留给管理台向导或 mailstack-manage domain set"
+    return 0
   fi
-  [ -n "$mode" ] || mode="local"
-  ACCESS_MODE="$mode"
+  local mail_host="${MAIL_HOST:-mail.$DOMAIN}"
+  say "应用邮件身份与 DKIM（$DOMAIN / $mail_host）"
+  local ctl="$BIN_DIR/mailstackctl"
+  local cfg=()
+  [ -n "$PREFIX_NORM" ] && cfg=(--config-dir "$PREFIX_NORM")
+  [ -x "$ctl" ] || { IDENTITY_APPLIED=failed; warn "mailstackctl 不可执行，跳过身份应用"; return 0; }
+
+  if [ -z "${SERVER_IP:-}" ] && command -v ip >/dev/null 2>&1; then
+    SERVER_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' || true)"
+  fi
+  if [ -z "${SERVER_IP:-}" ]; then
+    SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  if [ -z "${SERVER_IP:-}" ]; then
+    IDENTITY_APPLIED=failed
+    warn "无法自动探测服务器 IP：稍后 sudo mailstack-manage domain set $DOMAIN --server-ip <IP>"
+    return 0
+  fi
+  local ip_part=",\"serverIp\":\"$SERVER_IP\""
+  local payload
+  payload="{\"action\":\"setup.identity.apply\",\"data\":{\"domain\":\"$DOMAIN\",\"mailHost\":\"$mail_host\",\"dkimSelector\":\"mail\"$ip_part}}"
+  local out rc
+  out="$(printf '%s' "$payload" | "$ctl" --privileged-stdin "${cfg[@]}" 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"ok":true'; then
+    IDENTITY_APPLIED=ok
+    info "身份已写入：$ETC_DIR/setup.json（DKIM selector=mail）"
+  else
+    IDENTITY_APPLIED=failed
+    warn "身份应用失败（可稍后 sudo mailstack-manage domain set $DOMAIN）：$out"
+    return 0
+  fi
+
+  local domain_payload
+  domain_payload="{\"action\":\"domains.add\",\"data\":{\"domain\":\"$DOMAIN\"}}"
+  out="$(printf '%s' "$domain_payload" | "$ctl" --privileged-stdin "${cfg[@]}" 2>&1)"
+  if printf '%s' "$out" | grep -q '"ok":true'; then
+    info "邮件域名已写入域名表：$DOMAIN"
+  else
+    warn "域名表写入失败（可稍后 sudo mailstack-manage domain add $DOMAIN）：$out"
+  fi
+}
+
+provision_access() {
+  if [ "$NO_ACCESS_PROVISION" -eq 1 ]; then
+    ACCESS_PROVISIONED=skipped
+    info "按 --no-access-provision 跳过访问模式应用（之后可 sudo $MANAGE_NAME access set <mode>）"
+    return 0
+  fi
+
+  local mode="${ACCESS_MODE:-ssh}"
+  case "$mode" in
+    local|loopback|tunnel) mode="ssh" ;;
+    direct) mode="ip-acme" ;;
+    caddy|nginx|ip-acme|panel-domain|cloudflared|ssh) : ;;
+    *) mode="ssh" ;;
+  esac
+
+  say "应用访问模式：$mode"
+  local mgr="$BIN_DIR/$MANAGE_NAME"
+  if [ ! -x "$mgr" ]; then
+    ACCESS_PROVISIONED=failed
+    warn "管理脚本不可执行：$mgr（跳过访问模式应用）"
+    return 0
+  fi
+
+  local args=(access set "$mode")
+  [ -n "${PANEL_HOST:-}" ] && args+=(--panel-host "$PANEL_HOST")
+  [ -n "${WEBMAIL_HOST:-}" ] && args+=(--webmail-host "$WEBMAIL_HOST")
+  [ -n "${ACME_EMAIL:-}" ] && args+=(--acme-email "$ACME_EMAIL")
+  [ -n "${SERVER_IP:-}" ] && args+=(--server-ip "$SERVER_IP")
+
+  if MAILSTACK_PREFIX="$PREFIX_NORM" bash "$mgr" "${args[@]}"; then
+    ACCESS_PROVISIONED=ok
+    info "访问模式已应用：$mode"
+  else
+    ACCESS_PROVISIONED=failed
+    warn "访问模式应用失败（可重跑：sudo $MANAGE_NAME access set $mode）"
+  fi
+}
+
+write_deployment_state() {
+  say "写入部署状态（$STATE_REL_PATH）"
+  local conf="$ETC_DIR/install-args.conf"
+
+  if [ -z "$DOMAIN" ]; then DOMAIN="$(state_get "$conf" DOMAIN || true)"; fi
+  if [ -z "$MAIL_HOST" ]; then MAIL_HOST="$(state_get "$conf" MAIL_HOST || true)"; fi
+  if [ -z "$PANEL_HOST" ]; then PANEL_HOST="$(state_get "$conf" PANEL_HOST || true)"; fi
+  if [ -z "$WEBMAIL_HOST" ]; then WEBMAIL_HOST="$(state_get "$conf" WEBMAIL_HOST || true)"; fi
+  if [ -z "$ACME_EMAIL" ]; then ACME_EMAIL="$(state_get "$conf" ACME_EMAIL || true)"; fi
+  if [ -z "$SERVER_IP" ]; then SERVER_IP="$(state_get "$conf" SERVER_IP || true)"; fi
+  if [ -z "$MAIL_HOST" ] && [ -n "$DOMAIN" ]; then MAIL_HOST="mail.$DOMAIN"; fi
+
+  local detail="$ACCESS_MODE"
+  local canonical
+  canonical="$(canonical_access_mode "$detail")"
+  if [ -z "$detail" ]; then
+    detail="$(detail_mode_from_state)"
+    [ -n "$detail" ] || detail="ssh"
+    canonical="$(canonical_access_mode "$detail")"
+  fi
+  ACCESS_MODE="$detail"
+
+  local panel_url="" webmail_url=""
+  case "$detail" in
+    ssh)
+      panel_url="http://127.0.0.1:${ADMIN_PORT}/"
+      webmail_url="http://127.0.0.1:${WEBMAIL_PORT}/"
+      ;;
+    *)
+      [ -n "$PANEL_HOST" ] && panel_url="https://$PANEL_HOST/"
+      [ -n "$WEBMAIL_HOST" ] && webmail_url="https://$WEBMAIL_HOST/"
+      ;;
+  esac
+
+  mkdir -p "$ETC_DIR"
+  local tmp="$conf.tmp.$$"
   {
-    printf '# 由 deploy/install.sh 写入；crates/core/src/mode.rs 读取 ACCESS_MODE 判定公网档\n'
-    printf '# 合法值：local | caddy | direct（缺失=local；非法/多值按 direct 从严处理）\n'
-    printf 'ACCESS_MODE=%q\n' "$mode"
+    printf '# 由 deploy/install.sh / deploy/mailstack-manage.sh 写入；crates/core/src/mode.rs 读取 ACCESS_MODE 判定公网档\n'
+    printf '# 合法 ACCESS_MODE：local | caddy | direct（缺失=local；非法/多值按 direct 从严处理）\n'
+    printf '# 详细访问模式见 ACCESS_MODE_DETAIL；机器可读副本在 <etc>/access/access.env。\n'
+    printf 'ACCESS_MODE=%q\n' "$canonical"
+    printf 'ACCESS_MODE_DETAIL=%q\n' "$detail"
     printf 'MAILSTACK_VERSION=%q\n' "$MAILSTACK_VERSION"
     printf 'INSTALLED_AT=%q\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'DOMAIN=%q\n' "${DOMAIN:-}"
     printf 'MAIL_HOST=%q\n' "${MAIL_HOST:-}"
-  } > "$conf.tmp.$$"
-  chmod 0600 "$conf.tmp.$$"
-  chown root:root "$conf.tmp.$$" 2>/dev/null || true
-  mv -f -- "$conf.tmp.$$" "$conf" || die "写入 $conf 失败"
-  info "ACCESS_MODE=$mode（$conf，0600 root:root）"
+    printf 'ADMIN_USER=%q\n' "$ADMIN_USER"
+    printf 'ADMIN_PORT=%q\n' "$ADMIN_PORT"
+    printf 'WEBMAIL_PORT=%q\n' "$WEBMAIL_PORT"
+    printf 'PANEL_HOST=%q\n' "${PANEL_HOST:-}"
+    printf 'PANEL_HOST_AUTO=%q\n' "$([ -n "$PANEL_HOST" ] && printf 0 || printf 1)"
+    printf 'WEBMAIL_HOST=%q\n' "${WEBMAIL_HOST:-}"
+    printf 'WEBMAIL_HOST_AUTO=%q\n' "$([ -n "$WEBMAIL_HOST" ] && printf 0 || printf 1)"
+    printf 'PANEL_URL=%q\n' "$panel_url"
+    printf 'WEBMAIL_URL=%q\n' "$webmail_url"
+    printf 'ACME_EMAIL=%q\n' "${ACME_EMAIL:-}"
+    printf 'SERVER_IP=%q\n' "${SERVER_IP:-}"
+    printf 'IMAP_ENABLE=%q\n' "$IMAP_ENABLE"
+  } > "$tmp"
+  chmod 0600 "$tmp"
+  chown root:root "$tmp" 2>/dev/null || true
+  mv -f -- "$tmp" "$conf" || die "写入 $conf 失败"
+  info "ACCESS_MODE=$canonical（DETAIL=$detail；$conf，0600 root:root）"
+  if [ -n "${PANEL_HOST:-}" ]; then
+    info "面板主机：$PANEL_HOST → ${panel_url:-（未计算）}"
+  fi
 }
 
 write_install_marker() {
@@ -1074,8 +1292,6 @@ write_install_marker() {
   chmod 0644 "$marker.tmp.$$"
   mv -f -- "$marker.tmp.$$" "$marker" || die "写入安装标记失败：$marker"
 }
-
-# ─────────────────────────── 管理员引导（RW 通道自证） ───────────────────────────
 
 json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
@@ -1128,8 +1344,6 @@ bootstrap_admin() {
   if [ -n "$SUDO_CMD" ]; then
     out="$(printf '%s' "$json" | "$SUDO_CMD" "$wrapper" 2>&1)" || rc=$?
   else
-    # 没有 sudo 的容器/staging：root 直接执行包装器，语义等价（包装器内部仍走
-    # 同一份 ActionGate）。真实安装已在 check_environment 拒绝无 sudo 的主机。
     out="$(printf '%s' "$json" | "$wrapper" 2>&1)" || rc=$?
   fi
   json=""  # 尽快丢弃含口令的中间量
@@ -1160,8 +1374,6 @@ bootstrap_admin() {
       fi ;;
   esac
 }
-
-# ─────────────────────────── 服务启停 ───────────────────────────
 
 print_manual_start_commands() {
   say "手工启动命令"
@@ -1216,7 +1428,6 @@ services_start() {
     fi
   fi
 
-  # 如实报告状态。mailstackd 在身份向导完成前启动失败是**预期**的 fail-closed。
   for unit in "${INSTALL_UNITS[@]}"; do
     if systemctl is-active --quiet "$unit" 2>/dev/null; then
       info "状态：$unit = active"
@@ -1232,10 +1443,7 @@ services_start() {
   done
 }
 
-# ─────────────────────────── 收尾摘要 ───────────────────────────
-
 adopt_uninstaller() {
-  # 安装一份卸载脚本，便于离线/无仓库时 sudo bash /usr/local/libexec/mailstack-uninstall。
   if [ -n "$INSTALL_UNINSTALL_SRC" ] && [ -f "$INSTALL_UNINSTALL_SRC" ]; then
     put_file "$INSTALL_UNINSTALL_SRC" "$LIBEXEC_DIR/mailstack-uninstall" 0755 root root
     info "已安装卸载脚本：$LIBEXEC_DIR/mailstack-uninstall"
@@ -1289,8 +1497,6 @@ print_summary() {
   echo "          默认保留 $ETC_DIR 与 $VAR_LIB_DIR（--purge 才删除）。"
 }
 
-# ─────────────────────────── 卸载转交 ───────────────────────────
-
 run_uninstaller() {
   local args=(--non-interactive)
   [ -n "$PREFIX_NORM" ] && args+=(--prefix "$PREFIX_NORM")
@@ -1308,15 +1514,12 @@ run_uninstaller() {
     exec bash "$candidate" "${args[@]}"
   fi
 
-  # curl 管道模式：本地没有卸载脚本，从仓库下载一份到临时目录再执行。
   local dl
   dl="$(new_tmp)"
   download "https://raw.githubusercontent.com/${REPO_SLUG}/${RAW_BRANCH}/deploy/uninstall.sh" "$dl/uninstall.sh"
   say "转交下载的卸载脚本（${RAW_BRANCH} 分支）"
   exec bash "$dl/uninstall.sh" "${args[@]}"
 }
-
-# ─────────────────────────── main ───────────────────────────
 
 main() {
   if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
@@ -1326,9 +1529,6 @@ main() {
     fi
   fi
 
-  # `bash -s` / `curl | bash` 时脚本命令从 stdin 逐行读入：BASH_SOURCE 为空（或不是
-  # 普通文件）。此时脚本内**任何** read 都会把后面的脚本行当输入吞掉，必须在最早
-  # 处判定并禁止读 stdin（口令只能走环境变量）。
   if [ -z "$SCRIPT_PATH" ] || [ ! -f "$SCRIPT_PATH" ]; then
     STDIN_IS_SCRIPT=1
   fi
@@ -1358,12 +1558,15 @@ main() {
   create_directories
   install_binaries
   install_wrapper
+  install_manage_script
   install_dist
-  write_install_args
+  write_deployment_state
   write_install_marker
   install_units
   adopt_uninstaller
   bootstrap_admin
+  apply_identity
+  provision_access
   services_start
   print_summary
 }

@@ -1,24 +1,3 @@
-//! 邮件头、ENVELOPE 与 BODYSTRUCTURE（RFC 3501 §7.4.2 / §7.4.3）。
-//!
-//! ## 为什么不用现成的 MIME 库
-//!
-//! FETCH 的 `BODY[HEADER.FIELDS (...)]` 要求**按原始字节**回吐指定的头（客户端会
-//! 拿它做 DKIM 之外的二次校验）；`BODYSTRUCTURE` 则要求部件大小、行数、参数与嵌套
-//! 结构，而完整 MIME 库通常会把「解码后的正文」当成第一公民。两套语义对不上时，
-//! 用现成库反而要再拆出原始字节。这里只实现 IMAP 需要的**结构视图**：
-//!
-//! * 头：保留原始行（含折行），另外给出去折行的值；
-//! * 结构：递归 multipart，部件大小/行数/编码/参数；
-//! * 传输解码只服务 `BINARY`（RFC 3516，[`decode_transfer_encoding`]）；普通
-//!   `BODY[...]` 仍回**原始字节**，RFC 2047 也不解 —— 客户端的 MUA 本来就会解。
-//!
-//! ## 边界
-//!
-//! 解析是**纯函数**，输入上限写死（[`MAX_HEADER_BYTES`]、[`MAX_HEADER_LINES`]、
-//! [`MAX_PARTS`]、[`MAX_DEPTH`]）。恶意邮件不能通过 10 万层嵌套或 1 GB 头把
-//! IMAP worker 拖垮；超过上限时按「无结构」降级为 `application/octet-stream`，
-//! 而不是 panic。
-
 use base64::Engine;
 
 use crate::render;
@@ -30,11 +9,10 @@ pub const MAX_DEPTH: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct HeaderLine {
-    /// 小写头名（比较用）。
     pub name: String,
-    /// 原始行（含折行与行尾 CRLF），`BODY[HEADER.FIELDS]` 原样回吐。
+
     pub raw: Vec<u8>,
-    /// 去折行后的值（多个空白压成一个空格）。
+
     pub value: String,
 }
 
@@ -58,8 +36,6 @@ impl Headers {
             .map(|line| line.value.as_str())
     }
 
-    /// 回吐原始头块。`filter` 为 `Some((names, not))` 时按字段名筛选；
-    /// 末尾补一个空行（BODY[HEADER] 的定义包含结束头的那个 CRLF）。
     pub fn raw_block(&self, filter: Option<(&[String], bool)>) -> Vec<u8> {
         let mut out = Vec::new();
         for line in &self.lines {
@@ -88,7 +64,6 @@ impl Headers {
     }
 }
 
-/// 拆出「头」与「正文」。头不含终止空行。
 pub fn split_headers_body(message: &[u8]) -> (&[u8], &[u8]) {
     if let Some(position) = find(message, b"\r\n\r\n") {
         (&message[..position + 2], &message[position + 4..])
@@ -137,7 +112,7 @@ pub fn parse_headers(message: &[u8]) -> Headers {
                 }
                 continue;
             }
-            // 首个头之前的折行是坏数据；忽略。
+
             continue;
         }
         let Some(colon) = trimmed.iter().position(|byte| *byte == b':') else {
@@ -162,10 +137,6 @@ pub fn parse_headers(message: &[u8]) -> Headers {
     headers
 }
 
-// ---------------------------------------------------------------------------
-// 地址与 ENVELOPE
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Address {
     pub name: String,
@@ -173,8 +144,6 @@ pub struct Address {
     pub host: String,
 }
 
-/// 解析地址头。只支持最常见的 `Name <local@host>` / `local@host` 形式；
-/// group 语法（`Group: a@b;`）里的成员会被当作普通地址，组名被丢弃。
 pub fn parse_addresses(value: &str) -> Vec<Address> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -220,7 +189,7 @@ fn push_address(out: &mut Vec<Address>, raw: &str) {
     if token.is_empty() {
         return;
     }
-    // group 的 `Name:` 前缀。
+
     if let Some(position) = token.find(':') {
         if !token[..position].contains('@') && !token[..position].contains('<') {
             token = token[position + 1..].trim();
@@ -302,7 +271,6 @@ fn address_list(value: Option<&str>) -> String {
     out
 }
 
-/// 完整的 IMAP ENVELOPE。
 pub fn envelope(headers: &Headers) -> String {
     let from = headers.get("from");
     let sender = headers.get("sender").or(from);
@@ -321,10 +289,6 @@ pub fn envelope(headers: &Headers) -> String {
         render::nstring(headers.get("message-id")),
     )
 }
-
-// ---------------------------------------------------------------------------
-// 结构
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct ContentType {
@@ -430,7 +394,6 @@ pub fn parse_content_type_value(value: Option<&str>) -> ContentType {
     }
 }
 
-/// 按 boundary 切分 multipart 正文（不含边界行本身，去掉部件尾部的分隔 CRLF）。
 pub fn multipart_parts<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
     let marker = format!("--{boundary}");
     let closing = format!("--{boundary}--");
@@ -496,8 +459,6 @@ fn line_count(body: &[u8]) -> usize {
     }
 }
 
-/// IMAP BODYSTRUCTURE。刻意不输出扩展字段（disposition / MD5 / 语言）：
-/// 扩展字段是**可选**的，省略后客户端仍能正确展示；输出错的扩展比不输出更糟。
 pub fn body_structure(message: &[u8]) -> String {
     part_structure(message, 0)
 }
@@ -507,8 +468,6 @@ fn part_structure(message: &[u8], depth: usize) -> String {
     let headers = parse_headers(message);
     let mut content = content_type(&headers);
 
-    // 深度上限必须同时约束 multipart **与** message/rfc822：后者此前无条件
-    // 递归，一封嵌套上千层的邮件会让 BODYSTRUCTURE 栈溢出（进程 abort）。
     if depth >= MAX_DEPTH {
         content = ContentType {
             mime_type: "application".to_string(),
@@ -531,9 +490,7 @@ fn part_structure(message: &[u8], depth: usize) -> String {
                 return out;
             }
         }
-        // 声称是 multipart 却切不出部件（缺 boundary 或 boundary 不出现）：
-        // 按 `application/octet-stream` 报告。回一个没有子部件的 multipart
-        // 结构会让严格解析器直接报错，比「结构不精确」更糟。
+
         content = ContentType {
             mime_type: "application".to_string(),
             subtype: "octet-stream".to_string(),
@@ -601,10 +558,6 @@ fn part_structure(message: &[u8], depth: usize) -> String {
     }
 }
 
-/// 按 Content-Transfer-Encoding 解码正文（RFC 2045）。未知编码原样返回。
-///
-/// `BINARY`（RFC 3516）需要它；普通 `BODY[...]` 仍返回原始字节（客户端自己解）。
-/// base64 解码失败时退回原始字节，而不是丢数据。
 pub fn decode_transfer_encoding(body: &[u8], encoding: &str) -> Vec<u8> {
     match encoding.trim().to_ascii_lowercase().as_str() {
         "base64" => {
@@ -631,7 +584,7 @@ fn decode_quoted_printable(input: &[u8]) -> Vec<u8> {
             index += 1;
             continue;
         }
-        // 软换行 `=CRLF` / `=LF` 直接删除。
+
         if input.get(index + 1) == Some(&b'\r') && input.get(index + 2) == Some(&b'\n') {
             index += 3;
             continue;
@@ -795,24 +748,21 @@ QUJD\r\n\
 
     #[test]
     fn transfer_decoding_handles_base64_and_quoted_printable() {
-        // base64，允许折行空白。
         assert_eq!(
             decode_transfer_encoding(b"aGVs\r\nbG8=", "BASE64"),
             b"hello".to_vec()
         );
-        // 非法 base64 原样返回，不丢数据。
+
         assert_eq!(
             decode_transfer_encoding(b"not*base64", "base64"),
             b"not*base64".to_vec()
         );
 
-        // quoted-printable：=XX 与软换行。
         assert_eq!(
             decode_transfer_encoding(b"line1=\r\nline2 =3D ok =ZZ", "quoted-printable"),
             b"line1line2 = ok =ZZ".to_vec()
         );
 
-        // 7bit / 8bit / 未知编码原样返回。
         assert_eq!(decode_transfer_encoding(b"raw", "8bit"), b"raw".to_vec());
         assert_eq!(decode_transfer_encoding(b"raw", ""), b"raw".to_vec());
     }

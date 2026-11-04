@@ -1,14 +1,3 @@
-//! 出站端口探测（规格书 §5.10.2；INV-19）。
-//!
-//! 大量 VPS/ISP 封禁出站 25 端口 —— 这是**中继功能存在的首要理由**。
-//! 探测能力必须保留并**前置到初始化向导**，让「25 被封」成为一等公民场景，
-//! 而不是靠用户自己排查。
-//!
-//! **必须修的历史盲区（INV-19）**：`setup.relay.test` 的 direct 模式探的是
-//! **本机** `127.0.0.1:25`，只证明本地 MTA 存活，**不证明出站 25 可用**。
-//! 用户可能看到 direct 探测「通过」，实际外投全部堆积在重试队列里。
-//! 因此本模块的结论必须作为 direct 模式可用性的判据，两者不可混淆。
-
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -16,7 +5,6 @@ use serde_json::{json, Value};
 use crate::target::{resolve_pinned, AddressPolicy, PinnedTarget};
 use crate::{DEFAULT_PORT_PROBE_TARGETS, PORT_PROBE_TIMEOUT_SECS};
 
-/// 探测结果状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortStatus {
     Open,
@@ -32,7 +20,6 @@ impl PortStatus {
     }
 }
 
-/// 单个探测目标的结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeTargetOutcome {
     pub target: String,
@@ -41,13 +28,12 @@ pub struct ProbeTargetOutcome {
     pub detail: String,
 }
 
-/// 出站端口探测结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortProbeResult {
     pub port: u16,
     pub open: bool,
     pub status: PortStatus,
-    /// 命中的首个可达目标；全部不可达时是最后一个被尝试的目标。
+
     pub target: String,
     pub latency_ms: Option<u64>,
     pub details: Vec<ProbeTargetOutcome>,
@@ -55,7 +41,6 @@ pub struct PortProbeResult {
 }
 
 impl PortProbeResult {
-    /// 线上结构（§5.10.2 的名义字段）。
     pub fn to_json(&self) -> Value {
         json!({
             "port": self.port,
@@ -74,9 +59,6 @@ impl PortProbeResult {
     }
 }
 
-/// 解析探测目标清单。
-///
-/// `MAILSTACK_PORT_PROBE_TARGETS` 环境变量可覆盖默认清单（逗号分隔，最多取 8 个）。
 pub fn probe_targets_from_env() -> Vec<String> {
     match std::env::var("MAILSTACK_PORT_PROBE_TARGETS") {
         Ok(raw) if !raw.trim().is_empty() => raw
@@ -92,28 +74,14 @@ pub fn probe_targets_from_env() -> Vec<String> {
     }
 }
 
-/// 探测出站端口是否可达。
-///
-/// 逐个目标解析（含出站 IP 校验）、按 [`PORT_PROBE_TIMEOUT_SECS`] 超时做 TCP 连接，
-/// **命中首个可达目标即停止**。
 pub async fn probe_outbound_port(port: u16) -> PortProbeResult {
     probe_outbound_port_with(port, probe_targets_from_env()).await
 }
 
-/// 指定目标清单的探测（便于测试与显式调用）。
 pub async fn probe_outbound_port_with(port: u16, targets: Vec<String>) -> PortProbeResult {
-    // 探测目标是公网 SMTP 服务，一律走公网地址策略。
     probe_outbound_port_with_policy(port, targets, AddressPolicy::public_only()).await
 }
 
-/// 指定目标清单**与地址策略**的探测。
-///
-/// 策略参数化是 R3-016 的修复点：测试要构造「第一个目标真实可达」的场景，
-/// 而环回地址会被公网策略拒掉 —— 原先的测试因此只能测到「全部不可达」，
-/// 名字承诺的「命中即停止」一个字节都没覆盖到（删掉 `break` 仍然全绿）。
-///
-/// 生产调用方只应经 [`probe_outbound_port_with`] / [`probe_outbound_port`]；
-/// 这个入口存在是为了让「提前停止」可被**真实可达目标**验证。
 pub async fn probe_outbound_port_with_policy(
     port: u16,
     targets: Vec<String>,
@@ -148,7 +116,7 @@ pub async fn probe_outbound_port_with_policy(
                     detail: format!("connected to {}", resolved.pinned),
                 });
                 hit = Some((target.clone(), latency));
-                break; // 命中首个可达目标即停止
+                break;
             }
             Err(detail) => {
                 details.push(ProbeTargetOutcome {
@@ -169,7 +137,6 @@ pub async fn probe_outbound_port_with_policy(
         .unwrap_or_else(|| "unknown".to_string());
     let latency_ms = hit.as_ref().map(|(_, l)| *l);
 
-    // 结论文案：出站 25 被封时给出明确结论，避免用户误判为「服务没起来」。
     let message = if open {
         format!("Outbound port {port} is reachable")
     } else if port == 25 {
@@ -193,7 +160,6 @@ pub async fn probe_outbound_port_with_policy(
     }
 }
 
-/// 尝试建立 TCP 连接（不做 TLS —— 探测只需证明端口可达）。
 async fn try_connect(target: &PinnedTarget, timeout: Duration) -> Result<(), String> {
     match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(target.dial_addr())).await {
         Ok(Ok(_stream)) => Ok(()),
@@ -202,15 +168,10 @@ async fn try_connect(target: &PinnedTarget, timeout: Duration) -> Result<(), Str
     }
 }
 
-/// direct 模式可用性判据（INV-19 的落点）。
-///
-/// 规格书要求：**把出站 25 探测的结论作为 direct 模式可用性的判定依据**，
-/// 与本机提交端点探测（[`crate::stages::run_direct_probe`]）不可混淆。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectModeVerdict {
-    /// 出站 25 可达 → direct 直投可用。
     Usable,
-    /// 出站 25 被封 → **必须**配置 smarthost 中继，不得推荐 direct。
+
     BlockedNeedsRelay,
 }
 
@@ -222,13 +183,11 @@ impl DirectModeVerdict {
         }
     }
 
-    /// 向导是否应推荐 direct 模式。
     pub fn recommends_direct(&self) -> bool {
         matches!(self, DirectModeVerdict::Usable)
     }
 }
 
-/// 由出站探测结果推导 direct 模式可用性。
 pub fn direct_mode_verdict(probe: &PortProbeResult) -> DirectModeVerdict {
     if probe.open {
         DirectModeVerdict::Usable
@@ -280,7 +239,6 @@ mod tests {
 
     #[test]
     fn blocked_port_25_uses_the_documented_conclusion_text() {
-        // §5.10.2 原文的结论文案。
         let result = PortProbeResult {
             port: 25,
             open: false,
@@ -313,7 +271,6 @@ mod tests {
 
     #[test]
     fn direct_verdict_follows_the_probe_not_the_local_submission_endpoint() {
-        // INV-19：出站 25 被封时**不得**推荐 direct，即使本机 25 上的 MTA 活着。
         let blocked = PortProbeResult {
             port: 25,
             open: false,
@@ -345,7 +302,6 @@ mod tests {
 
     #[tokio::test]
     async fn probe_reports_all_targets_when_none_are_reachable() {
-        // 用不可解析的域名做目标：全部失败，details 必须逐条记录，不能只报第一条。
         let result = probe_outbound_port_with(
             25,
             vec![
@@ -363,9 +319,6 @@ mod tests {
 
     #[tokio::test]
     async fn probe_stops_at_the_first_reachable_target() {
-        // R3-016：用**真实可达**的本地监听构造命中场景，断言 details 只含第一条。
-        // 删掉循环里的 `break` 时，第二条（不可解析的域名）会被追加，
-        // `details.len() == 1` 立刻变红 —— 这正是原测试缺失的性质。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let result = probe_outbound_port_with_policy(
@@ -400,7 +353,6 @@ mod tests {
 
     #[test]
     fn env_override_is_capped_at_eight_targets() {
-        // 通过直接测试解析逻辑的等价行为（避免在测试里改进程环境变量）。
         let raw = "a,b,c,d,e,f,g,h,i,j";
         let parsed: Vec<String> = raw
             .split(',')

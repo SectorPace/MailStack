@@ -3,13 +3,9 @@
 **/*.rs.bk
 *.pdb
 
-# 前端依赖与产物（`webui/` 是管理控制台，Vite + React）。
-# `node_modules` 有数百 MB 且**可由 `package-lock.json` 完全重建**，
-# 进版本历史只会拖慢每个 clone；`dist` 同理（`npm run build` 产物）。
 /webui/node_modules/
 /webui/dist/
 
-# 发布产物
 /dist
 /release
 *.tar.gz
@@ -17,13 +13,9 @@
 SHA256SUMS
 SHA256SUMS.sig
 
-# 本地运行时状态
 /tmp
 /.env
 
-# IDE 本地状态。
-# 里面有 workspace.xml（窗口布局、最近打开的文件、临时草稿），每次启动都在变，
-# 进版本历史只会制造与产品代码无关的噪声。
 /.idea/
 *.iml
 .vscode/

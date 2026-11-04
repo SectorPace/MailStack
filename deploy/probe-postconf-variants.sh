@@ -1,5 +1,3 @@
-#!/usr/bin/env bash
-# 探测 postconf 各变体的语义差异，为「快照/回滚需要知道是否显式设置」找到正确读法。
 set -uo pipefail
 export PATH="/usr/sbin:/sbin:$PATH"
 
@@ -17,7 +15,6 @@ done
 
 echo
 echo "=== C) postconf -n 对已知未显式设置的键 ==="
-# mynetworks 通常有默认值且常被显式设置；用 smtp_tls_wrappermode（默认 no、通常不写）
 for k in smtp_tls_wrappermode smtp_sasl_password_maps; do
   printf '  %-28s -h=[%s]  -n=[%s]\n' "$k" \
     "$(postconf -h "$k" 2>/dev/null || true)" \

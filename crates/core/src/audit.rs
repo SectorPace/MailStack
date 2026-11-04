@@ -1,14 +1,3 @@
-//! 审计哈希链（规格书 §5.6；INV-4）。
-//!
-//! 每条记录带 `prev_hash`（前一条的 hash，链首为创世值 `'0' * 64`）与 `hash`
-//! （本条**规范化 JSON** 的 SHA256，排除 `hash` 字段自身）。文件旁的 `.head`
-//! 锚文件记录最后一条的 hash，用于检测**截尾**。
-//!
-//! **新实现必须能继续写同一条链**（读取现有 `.head` 作为起点），且必须能读
-//! 现有历史日志。历史记录格式不得改变。
-//!
-//! 注意 "no anchor (pre-B3 log)" 是**合法状态**，不得当作错误。
-
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -18,16 +7,12 @@ use sha2::{Digest, Sha256};
 use crate::atomic::atomic_as;
 use crate::error::{CoreError, CoreResult};
 
-/// 创世 hash：64 个 `0`。
 pub const AUDIT_GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-/// 锚文件后缀。
 pub const AUDIT_HEAD_SUFFIX: &str = ".head";
 
-/// 读尾部时最多读取的字节数（单条记录远小于 2 KB，256 KB 覆盖数千条）。
 const TAIL_READ_BYTES: u64 = 262_144;
 
-/// 锚文件路径：`<log>.head`。
 pub fn audit_head_path(log_path: &Path) -> PathBuf {
     let name = log_path
         .file_name()
@@ -36,7 +21,6 @@ pub fn audit_head_path(log_path: &Path) -> PathBuf {
     log_path.with_file_name(format!("{name}{AUDIT_HEAD_SUFFIX}"))
 }
 
-/// 单条审计记录的线格式。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct AuditRecord {
     pub time: String,
@@ -49,14 +33,7 @@ pub struct AuditRecord {
     pub hash: String,
 }
 
-/// 记录 hash：对其余字段的**规范化 JSON** 取 SHA256。
-///
-/// 规范化 = 键排序 + 无多余空白 + 不转义非 ASCII（对应 Python 的
-/// `json.dumps(..., sort_keys=True, ensure_ascii=False, separators=(',', ':'))`）。
-/// 必须与 Python 侧产出逐字节一致，否则历史链校验会失败。
 pub fn record_hash(record: &AuditRecord) -> String {
-    // 手工构造规范化 JSON，保证与 Python 的 json.dumps 输出一致：
-    // 键按字典序：action, error, ok, prev_hash, target, time, uid
     let canonical = format!(
         "{{\"action\":{},\"error\":{},\"ok\":{},\"prev_hash\":{},\"target\":{},\"time\":{},\"uid\":{}}}",
         json_string(&record.action),
@@ -72,9 +49,6 @@ pub fn record_hash(record: &AuditRecord) -> String {
     hex::encode(h.finalize())
 }
 
-/// 对任意 JSON 对象（来自历史文件）重算 hash —— 用 `serde_json` 的排序语义。
-///
-/// 校验历史记录时必须走这条路径，因为历史记录可能含其它字段。
 pub fn record_hash_from_value(value: &serde_json::Value) -> Option<String> {
     let obj = value.as_object()?;
     let mut keys: Vec<&String> = obj.keys().filter(|k| k.as_str() != "hash").collect();
@@ -116,7 +90,6 @@ fn json_value_canonical(v: &serde_json::Value) -> String {
     }
 }
 
-/// 转义为 JSON 字符串字面量（含引号），与 Python `json.dumps` 的转义规则一致。
 fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -137,9 +110,6 @@ fn json_string(s: &str) -> String {
     out
 }
 
-/// 读取最后一条链上记录的 hash；无记录返回 `None`。
-///
-/// 只读文件尾部；并发写入者写了一半的尾行会被丢弃而不是被解析。
 pub fn read_last_audit_hash(log_path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(log_path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -151,7 +121,6 @@ pub fn read_last_audit_hash(log_path: &Path) -> Option<String> {
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).ok()?;
 
-    // 尾行不完整（无结尾换行）时截掉它——可能正有并发写入者。
     let text = if buf.last() == Some(&b'\n') {
         buf
     } else {
@@ -171,20 +140,6 @@ pub fn read_last_audit_hash(log_path: &Path) -> Option<String> {
     None
 }
 
-/// [`read_last_audit_hash`] 的**如实报错**版本（6.10）。
-///
-/// 语义严格区分四件事，这正是原实现混为一谈的地方：
-///
-/// * 文件**不存在** → `Ok(None)`：这是一条新链，用创世值合法。
-/// * 文件存在但**为空** → `Ok(None)`：同上。
-/// * 文件存在、非空，尾部是 **legacy（无 hash 字段）记录** → `Ok(None)`：
-///   B3 之前的日志从未写过 hash，[`audit_verify`] 把它判为合法状态
-///   （"no anchor (pre-B3 log)"）；追加端必须接受同一口径 —— 首条链上记录
-///   从创世值起步，正好接上这条 legacy 尾巴。若这里报错，`audit()` 会在
-///   一份完全合法的 legacy 日志上永久拒绝写入，与校验端自相矛盾。
-/// * 文件存在、非空，尾部却**连一条可解析的 JSON 记录都没有** → `Err`：
-///   truncate、权限错误、尾部只剩半行、尾行 JSON 损坏 —— 都不能当成「新链」，
-///   否则审计链会在没有任何告警的情况下被分叉。
 pub fn read_last_audit_hash_strict(log_path: &Path) -> CoreResult<Option<String>> {
     let mut file = match std::fs::File::open(log_path) {
         Ok(file) => file,
@@ -205,14 +160,12 @@ pub fn read_last_audit_hash_strict(log_path: &Path) -> CoreResult<Option<String>
     file.read_to_end(&mut buf)
         .map_err(|e| CoreError::io(log_path, e))?;
 
-    // 尾部不完整（无结尾换行）时截掉它 —— 可能正有并发写入者。
     let text = if buf.last() == Some(&b'\n') {
         buf
     } else {
         match buf.iter().rposition(|&b| b == b'\n') {
             Some(pos) => buf[..=pos].to_vec(),
-            // 整个 TAIL_READ_BYTES 窗口里一个换行都没有：这不是「空链」，
-            // 而是文件格式已经不可解释。
+
             None => {
                 return Err(CoreError::invalid(format!(
                     "{}: cannot locate a complete audit record within the tail window",
@@ -235,23 +188,17 @@ pub fn read_last_audit_hash_strict(log_path: &Path) -> CoreResult<Option<String>
         if let Some(h) = value.get("hash").and_then(|v| v.as_str()) {
             return Ok(Some(h.to_string()));
         }
-        // 无 hash 的 JSON 对象 = legacy 记录：继续向前找链上记录；
-        // 整个窗口都没有链上记录时按 legacy 尾部处理（见函数文档）。
     }
     if saw_any_record {
         return Ok(None);
     }
-    // 非空文件里一条可解析记录都没有 —— 绝不当成新链。
+
     Err(CoreError::invalid(format!(
         "{}: audit log is non-empty but no parseable record was found near the tail",
         log_path.display()
     )))
 }
 
-/// 追加一条审计记录（对应 `audit()`）。
-///
-/// 整个「读尾 → 追加 → 重设锚」序列在 `locked()` 临界区内，避免并发的一次性 CLI
-/// 与常驻进程交错而分叉哈希链。
 pub fn audit(
     log_path: &Path,
     action: &str,
@@ -264,20 +211,11 @@ pub fn audit(
     }
 
     crate::atomic::locked(log_path, || {
-        // 6.10：**区分「没有记录」与「读不出来」**。
-        //
-        // 原实现是 `read_last_audit_hash(..).unwrap_or_else(|| AUDIT_GENESIS)`：
-        // 只要读尾失败（文件被 truncate、权限错误、尾部只剩半行），就会**静默
-        // 从创世值重新开一条链**。结果是审计链被悄悄分叉成两条互不相连的链，
-        // 而表面上一切正常 —— 一次故障被伪装成了「新链的第一次写入」。
-        //
-        // 现在：文件不存在或长度为 0 才用创世值；其余任何读失败都如实报错。
         let prev_hash = match read_last_audit_hash_strict(log_path)? {
             Some(hash) => hash,
             None => AUDIT_GENESIS.to_string(),
         };
 
-        // target 截断到 120 字符、error 截断到 500 字符（与原文一致）。
         let mut record = AuditRecord {
             time: crate::now_iso8601_utc(),
             uid: crate::atomic::current_uid(),
@@ -299,20 +237,13 @@ pub fn audit(
                 .map_err(|e| CoreError::io(log_path, e))?;
             f.write_all(line.as_bytes())
                 .map_err(|e| CoreError::io(log_path, e))?;
-            // 6.11：先 `sync_all` 再写 `.head` 锚。
-            //
-            // 原实现 `write_all` 之后直接去写锚文件，两边没有任何顺序保证：
-            // 掉电时可能落成「锚已更新、日志行没落盘」，下一次 `audit_verify`
-            // 就会把一份**完好的**日志判成**截尾篡改**（假告警）。
-            // 反过来（日志落了、锚没落）则是一次可容忍的滞后。
-            // 先把日志行刷到稳定介质，再更新锚，代价是一行 fsync，换掉一整类假篡改告警。
+
             f.sync_all().map_err(|e| CoreError::io(log_path, e))?;
         }
 
         let head = audit_head_path(log_path);
         atomic_as(&head, format!("{}\n", record.hash).as_bytes(), 0o600, None)?;
 
-        // 日志本体权限收紧到 0600（尽力而为）。
         set_audit_log_mode(log_path);
 
         Ok(record)
@@ -330,7 +261,6 @@ fn set_audit_log_mode(path: &Path) {
 #[cfg(not(unix))]
 fn set_audit_log_mode(_path: &Path) {}
 
-/// 链校验结果（对应 `audit_verify` 的返回结构）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditVerdict {
     pub ok: bool,
@@ -339,20 +269,6 @@ pub struct AuditVerdict {
     pub error: String,
 }
 
-/// 校验 `prev_hash` 链与 `.head` 锚（对应 `audit_verify`）。
-///
-/// 规则（`core.py:320-349` 逐条保留）：
-///
-/// * B3 之前写的无 hash 记录按 legacy 跳过；一旦见过链上记录，之后任何无 hash
-///   记录都是失败（格式回滚会断链）
-/// * 首条链上记录的 `prev_hash` 必须等于创世值
-/// * 每条记录的 `prev_hash` 必须等于前一条的 hash，且自身 hash 必须重算一致
-/// * `.head` 存在且非空时必须等于最后一条链上记录的 hash（截尾检测）
-/// * 空锚是 logrotate 后的状态，不参与比对；锚缺失则跳过检查（B3 前日志从未写过）
-///
-/// 日志按行**流式**读取：审计日志会无界增长，`read_to_string` 把整个文件
-/// 一次性搬进内存只为一个逐行校验。逐行语义与整串读取完全一致
-/// （包括「任意一行非 UTF-8 即整个校验失败」）。
 pub fn audit_verify(log_path: &Path) -> AuditVerdict {
     let head_path = audit_head_path(log_path);
     let mut errors: Vec<String> = Vec::new();
@@ -364,7 +280,6 @@ pub fn audit_verify(log_path: &Path) -> AuditVerdict {
     let file = match std::fs::File::open(log_path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // 不存在的日志视为空链：与原 `read_to_string` 的 NotFound 分支一致。
             return finish_verify(&head_path, errors, entries, last_hash);
         }
         Err(e) => {
@@ -385,8 +300,6 @@ pub fn audit_verify(log_path: &Path) -> AuditVerdict {
             let raw = match line {
                 Ok(raw) => raw,
                 Err(e) => {
-                    // 原 `read_to_string` 对非 UTF-8 日志整体报错；流式读到坏行
-                    // 时给出同一个失败判定。
                     return AuditVerdict {
                         ok: false,
                         entries: 0,
@@ -441,7 +354,6 @@ pub fn audit_verify(log_path: &Path) -> AuditVerdict {
     finish_verify(&head_path, errors, entries, last_hash)
 }
 
-/// `.head` 锚比对 + 组装最终结论（[`audit_verify`] 的收尾段）。
 fn finish_verify(
     head_path: &Path,
     mut errors: Vec<String>,
@@ -478,7 +390,6 @@ fn finish_verify(
     }
 }
 
-/// `audit_verify_cli` 的等价实现：返回退出码。
 pub fn audit_verify_cli(log_path: &Path) -> i32 {
     let verdict = audit_verify(log_path);
     if verdict.ok {
@@ -503,7 +414,6 @@ pub fn audit_verify_cli(log_path: &Path) -> i32 {
     }
 }
 
-/// 按字符数截断（Python 的 `str[:n]` 语义，不是字节）。
 fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
@@ -529,8 +439,6 @@ mod tests {
 
     #[test]
     fn canonical_hash_matches_python_json_dumps_shape() {
-        // 与 Python 侧 `json.dumps(payload, sort_keys=True, ensure_ascii=False,
-        // separators=(',',':'))` 的输出逐字节对齐是 INV-4 的前提。
         let record = AuditRecord {
             time: "2026-09-30T12:00:00+00:00".into(),
             uid: 0,
@@ -544,7 +452,6 @@ mod tests {
         let recomputed = record_hash(&record);
         assert_eq!(recomputed.len(), 64, "SHA256 hex 应为 64 字符");
 
-        // 通过 Value 路径重算必须得到同一结果。
         let mut value = serde_json::to_value(&record).unwrap();
         value["hash"] = serde_json::Value::String(recomputed.clone());
         assert_eq!(record_hash_from_value(&value).unwrap(), recomputed);
@@ -564,7 +471,7 @@ mod tests {
         };
         let mut value = serde_json::to_value(&record).unwrap();
         value["hash"] = serde_json::Value::String(record_hash(&record));
-        // ensure_ascii=False：中文按原字符参与哈希。
+
         assert_eq!(
             record_hash_from_value(&value).unwrap(),
             record_hash(&record)
@@ -595,7 +502,6 @@ mod tests {
         audit(&log, "a", true, "", "").unwrap();
         assert_eq!(audit_verify_cli(&log), 0);
 
-        // 篡改内容 → 必须报失败且退出码 1。
         let text = fs::read_to_string(&log).unwrap();
         fs::write(&log, text.replace("\"action\":\"a\"", "\"action\":\"b\"")).unwrap();
         assert_eq!(audit_verify_cli(&log), 1);
@@ -610,7 +516,6 @@ mod tests {
         audit(&log, "b", true, "", "").unwrap();
         assert!(audit_verify(&log).ok);
 
-        // 删掉最后一条：纯链校验看不出来，锚必须抓住它。
         let text = fs::read_to_string(&log).unwrap();
         let first = text.lines().next().unwrap().to_string();
         fs::write(&log, format!("{first}\n")).unwrap();
@@ -651,7 +556,7 @@ mod tests {
 
         let text = fs::read_to_string(&log).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        // 交换第 2、3 条 → prev_hash 断裂。
+
         fs::write(&log, format!("{}\n{}\n{}\n", lines[0], lines[2], lines[1])).unwrap();
 
         let verdict = audit_verify(&log);
@@ -668,7 +573,7 @@ mod tests {
     fn legacy_log_without_anchor_is_valid_state() {
         let dir = temp_dir("legacy");
         let log = dir.join("audit.log");
-        // B3 之前的记录：无 hash/prev_hash 字段。
+
         fs::write(
             &log,
             "{\"time\":\"2020-01-01T00:00:00\",\"action\":\"old\"}\n",
@@ -740,11 +645,11 @@ mod tests {
         let dir = temp_dir("partial");
         let log = dir.join("audit.log");
         audit(&log, "a", true, "", "").unwrap();
-        // 追加一个没有结尾换行的半条记录（模拟并发写入者写到一半）。
+
         let mut text = fs::read_to_string(&log).unwrap();
         text.push_str("{\"partial\":");
         fs::write(&log, text).unwrap();
-        // read_last_audit_hash 必须丢弃半行并返回第一条的 hash。
+
         let last = read_last_audit_hash(&log).unwrap();
         let verdict_first = {
             let t = fs::read_to_string(&log).unwrap();
@@ -756,17 +661,11 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// 6.10：非空但读不出尾 hash 时，**不得**把它当成新链。
-    ///
-    /// 原实现 `read_last_audit_hash(..).unwrap_or_else(|| AUDIT_GENESIS)` 会在
-    /// 读尾失败时静默从创世值重开一条链 —— 审计链被悄悄分叉成两条互不相连的链，
-    /// 表面上却一切正常。
     #[test]
     fn a_non_empty_but_unreadable_log_is_an_error_not_a_fresh_chain() {
         let dir = temp_dir("unreadable-tail");
         let log = dir.join("audit.log");
 
-        // 文件非空，但通篇没有一条可解析记录（模拟 truncate / 尾部损坏）。
         fs::write(&log, b"\x00\x01\x02 not a json record \xff\xfe").unwrap();
 
         let error = audit(&log, "a", true, "", "").expect_err("不得静默重开新链");
@@ -776,7 +675,6 @@ mod tests {
             "错误必须说明「读不出尾记录」，实际：{error}"
         );
 
-        // 文件内容未被改动（没有追加一条基于创世值的记录）。
         assert_eq!(
             fs::read(&log).unwrap(),
             b"\x00\x01\x02 not a json record \xff\xfe".to_vec(),
@@ -785,7 +683,6 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// 空文件与不存在的文件仍然是合法的「新链」。
     #[test]
     fn an_absent_or_empty_log_still_starts_from_genesis() {
         let dir = temp_dir("fresh-chain");
@@ -800,18 +697,11 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// legacy（无 hash）尾部必须被**追加端与校验端一致地**接受。
-    ///
-    /// `audit_verify` 把「整份无 hash 记录 + 无锚」判为合法状态
-    /// （"no anchor (pre-B3 log)"）；若 `read_last_audit_hash_strict` 在同一份
-    /// 日志上报错，`audit()` 就会在一份完全合法的 legacy 日志上永久拒绝写入。
-    /// 对齐后的口径：legacy 尾部 → `Ok(None)` → 首条链上记录从创世值起步，
-    /// 正好接上这条尾巴，`audit_verify` 也认。
     #[test]
     fn a_legacy_hashless_tail_is_accepted_and_the_chain_continues_from_genesis() {
         let dir = temp_dir("legacy-append");
         let log = dir.join("audit.log");
-        // B3 之前的记录：无 hash/prev_hash 字段，无锚。
+
         fs::write(
             &log,
             "{\"time\":\"2020-01-01T00:00:00\",\"action\":\"old\"}\n",
@@ -836,8 +726,6 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// 对照组：非空但**连一条可解析记录都没有**的尾部仍然是错误 ——
-    /// 「legacy」只豁免像样的 JSON 记录，不豁免二进制垃圾。
     #[test]
     fn a_tail_of_unparseable_garbage_is_still_an_error() {
         let dir = temp_dir("garbage-tail");

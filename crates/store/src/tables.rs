@@ -1,28 +1,3 @@
-//! Postfix 表文件读写：虚拟域名表与别名表（规格书 §2.5、§3.3）。
-//!
-//! 两个文件是**对外契约**：
-//!
-//! ```text
-//! virtual_alias_domains = hash:/etc/postfix/mailstack_domains
-//! virtual_alias_maps    = hash:/etc/postfix/mailstack_aliases
-//! ```
-//!
-//! 因此格式必须与 Postfix 的 `hash:` 表兼容（每行 `<key> [value...]`，`#` 注释），
-//! 且每次写入后必须 `postmap` 重新编译 `.db` —— 否则 Postfix 读到的仍是旧表。
-//!
-//! ## 两条注入防护（Python 基线的注释明确点名）
-//!
-//! 表文件是**按空白分词**的：一个值里混入空格或换行，就不再是「一个值」，而是
-//! 「多列 / 多行」——等于往 Postfix 的路由表里塞进任意条目。因此：
-//!
-//! * 别名的**每个目标**都必须是合法用户名或完整地址（`USER_RE` / `ADDRESS_RE`），
-//!   这两条正则都不含空白字符；
-//! * 别名的**删除**同样要校验 id —— 未校验的 id 会被直接写进表文件，
-//!   一个换行不是「删掉一行」而是「注入几行」。
-//!
-//! 两条都在 [`has_no_whitespace_or_control`] 上再加了一层显式拒绝：正则表达式的
-//! 语义若被改坏，这里仍拦得住。
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -36,28 +11,18 @@ use mailstack_core::Paths;
 
 use crate::error::{StoreError, StoreResult};
 
-/// 表文件权限：`0644 root:root`。
-///
-/// 与安装脚本 `install -m 0644 /etc/postfix/mailstack_{domains,aliases}` 一致。
-/// 刻意**不**用 `atomic()` 的默认 `0640`（`core.py` 的默认值）：这两张表由非特权的
-/// Postfix 进程读取，且内容只是路由信息、不含机密；`0640 root:root` 会把它挡在门外。
-/// 顺带也不 chown 到 `mailstack-admin` 组（属主保持当前用户，生产下即 root）。
 const TABLE_FILE_MODE: u32 = 0o644;
 
-/// 单个别名的最大目标数（`mail.py` 的上限）。
 pub const MAX_ALIAS_DESTINATIONS: usize = 50;
 
-/// 表文件的一行：按空白分词后的各列。
 pub type TableRow = Vec<String>;
 
-/// 别名表的一行。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AliasEntry {
     pub source: String,
     pub destinations: Vec<String>,
 }
 
-/// Postfix 表文件的读写入口。
 #[derive(Clone)]
 pub struct TableStore {
     paths: Paths,
@@ -116,7 +81,6 @@ fn assert_waits_for_table_lock<T: Send + 'static>(
 }
 
 impl TableStore {
-    /// 生产构造：真实命令运行器 + 真实环境探测。
     pub fn new(paths: Paths) -> Self {
         Self {
             paths,
@@ -125,7 +89,6 @@ impl TableStore {
         }
     }
 
-    /// 注入运行器与环境探测（让表文件逻辑能在没有 Postfix 的机器上测试）。
     pub fn with_parts(
         paths: Paths,
         runner: Arc<dyn CommandRunner>,
@@ -142,9 +105,6 @@ impl TableStore {
         &self.paths.aliases
     }
 
-    // ───────────────────────────── 域名表 ─────────────────────────────
-
-    /// 虚拟域名表的第一列（`mail.py: domain_list`）。
     pub fn domains(&self) -> Vec<String> {
         read_rows(&self.paths.domains)
             .into_iter()
@@ -152,25 +112,19 @@ impl TableStore {
             .collect()
     }
 
-    /// 添加域名（`domain_add`）：校验 → 去重写入 → `postmap` → 返回新列表。
     pub fn add_domain(&self, name: &str) -> StoreResult<Vec<String>> {
         let domain = validated_domain(name)?;
         let path = self.paths.domains.clone();
         locked_with(&path, || {
             let mut table = read_rows_for_update(&path)?;
             table.retain(|row| row.first() != Some(&domain));
-            // Postfix 的 virtual_alias_domains 只关心 key；`OK` 是基线的占位值，
-            // 保持逐字一致以免 .db 内容与历史部署出现差异。
+
             table.push(vec![domain, "OK".to_string()]);
             require_postfix_sync(self.write_rows(&path, &table)?)?;
             Ok(self.domains())
         })
     }
 
-    /// 删除域名（`domain_delete`）：**同时删除该域下的所有别名行**。
-    ///
-    /// 不删别名会留下指向已删除域的孤儿映射，Postfix 会照旧接受它们 —— 等于
-    /// 「删了域名但收信路由没变」。
     pub fn delete_domain(&self, name: &str) -> StoreResult<Vec<String>> {
         let domain = validated_domain(name)?;
         let domains_path = self.paths.domains.clone();
@@ -187,12 +141,6 @@ impl TableStore {
                         .unwrap_or(false)
                 });
 
-                // 两张表都读成功后才开始写，避免第二张表不可读时先删掉域名。
-                //
-                // 写入顺序：**先别名表（引用这个域的一方），后域名表**。两步之间
-                // 崩溃时留下的是「域名还在、别名已删」的中间态 —— 无害，重试即
-                // 修复；反过来（先删域名）崩溃时留下孤儿别名，Postfix 会继续为
-                // 一个已删除的域路由收信。
                 require_postfix_sync(self.write_rows(&aliases_path, &aliases)?)?;
                 require_postfix_sync(self.write_rows(&domains_path, &domains)?)?;
                 Ok(self.domains())
@@ -200,9 +148,6 @@ impl TableStore {
         })
     }
 
-    // ───────────────────────────── 别名表 ─────────────────────────────
-
-    /// 别名表（`aliases`）：只返回真正有目标的行（单列行没有意义）。
     pub fn aliases(&self) -> Vec<AliasEntry> {
         read_rows(&self.paths.aliases)
             .into_iter()
@@ -214,11 +159,6 @@ impl TableStore {
             .collect()
     }
 
-    /// 添加/覆盖别名（`alias_add`）。
-    ///
-    /// 目标必须成组提供：基线里 `destinations` 若被当成裸字符串，会**逐字符**迭代，
-    /// 于是 `"ab"` 静默变成两个目标 `a` 与 `b`。Rust 侧用 `&[String]` 从类型上
-    /// 排除这种误用。
     pub fn add_alias(&self, source: &str, destinations: &[String]) -> StoreResult<Vec<AliasEntry>> {
         let source = source.trim().to_ascii_lowercase();
         if !is_valid_address(&source) {
@@ -241,7 +181,7 @@ impl TableStore {
         let mut normalised = Vec::with_capacity(destinations.len());
         for destination in destinations {
             let destination = destination.trim().to_ascii_lowercase();
-            // 这一条同时挡住空格与换行注入：两者都不被 USER_RE / ADDRESS_RE 接受。
+
             if !has_no_whitespace_or_control(&destination)
                 || !(USER_RE.is_match(&destination) || ADDRESS_RE.is_match(&destination))
             {
@@ -266,7 +206,6 @@ impl TableStore {
         })
     }
 
-    /// 删除别名（`alias_del`）。id 同样要校验 —— 见模块文档的第二条注入防护。
     pub fn delete_alias(&self, source: &str) -> StoreResult<Vec<AliasEntry>> {
         let source = source.trim().to_ascii_lowercase();
         if !is_valid_address(&source) {
@@ -289,7 +228,6 @@ impl TableStore {
         })
     }
 
-    /// 原子写入表文件并让 Postfix 重读（`postmap` + `postfix check` + `reload`）。
     fn write_rows(&self, path: &Path, table: &[TableRow]) -> StoreResult<PostmapOutcome> {
         let mut text = String::new();
         for row in table {
@@ -305,16 +243,6 @@ impl TableStore {
     }
 }
 
-/// 把 postmap 序列的结果钉成调用方可见的错误。
-///
-/// [`postmap_and_reload`] 刻意不返回 `Result`（写表本身已成功，每步失败都非致命
-/// 并已 `warn`）；但「表文件写成了、Postfix 却还在读旧表」若被压成 `Ok`，改路由
-/// 不生效就成了无日志的悬案。这里把失败步聚合成一个显式错误向上传播 ——
-/// 调用方（管理台/CLI）能给运维一句可行动的结论。
-///
-/// **本机没有 Postfix 不算失败**：`postmap_and_reload` 会把「找不到 postmap」判成
-/// `postfix_absent` 并让三步都为成功 —— 纯 MailStack 主机上表文件由本进程读取，
-/// 不存在需要同步的 Postfix。只有「Postfix 在、但同步失败」才走到下面的错误分支。
 fn require_postfix_sync(outcome: PostmapOutcome) -> StoreResult<()> {
     let mut failed: Vec<&'static str> = Vec::new();
     if !outcome.postmap_ok {
@@ -335,7 +263,6 @@ fn require_postfix_sync(outcome: PostmapOutcome) -> StoreResult<()> {
     )))
 }
 
-/// 读表文件（`rows`）：跳过空行与 `#` 注释、按空白分词；文件缺失视为空表。
 pub fn read_rows(path: &Path) -> Vec<TableRow> {
     rows(path)
 }
@@ -350,13 +277,6 @@ fn read_rows_for_update(path: &Path) -> StoreResult<Vec<TableRow>> {
     Ok(rows_from_text(&text))
 }
 
-/// 表文件**文本** → 行：分词规则与 [`read_rows`] 完全一致。
-///
-/// 为什么要单独暴露：有些调用方需要**先自己 `read_to_string`** 才能区分
-/// 「文件不存在（= 空表）」与「文件存在但读不了（权限/IO 错误）」——
-/// 这两种情况在 [`read_rows`] 里被合并成空表，而调用方需要据此决定
-/// fail-closed 还是 fail-open。抽出这一层是为了让它们与 [`read_rows`]
-/// 共用**同一个**分词实现：两处各写一遍，语义迟早漂移。
 pub fn rows_from_text(text: &str) -> Vec<TableRow> {
     text.lines()
         .filter_map(|line| {
@@ -369,7 +289,6 @@ pub fn rows_from_text(text: &str) -> Vec<TableRow> {
         .collect()
 }
 
-/// 校验并归一化域名。
 pub fn validated_domain(input: &str) -> StoreResult<String> {
     let domain = input.trim().to_ascii_lowercase();
     if !is_valid_domain(&domain) {
@@ -386,12 +305,10 @@ fn is_valid_address(address: &str) -> bool {
     has_no_whitespace_or_control(address) && ADDRESS_RE.is_match(address)
 }
 
-/// 显式的空白/控制字符拒绝（正则之外的纵深防护）。
 fn has_no_whitespace_or_control(value: &str) -> bool {
     !value.is_empty() && !value.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// 表文件对应的 hash 数据库路径。
 pub fn hash_db_path(table: &Path) -> PathBuf {
     mailstack_core::exec::hash_db_path(table)
 }
@@ -445,10 +362,6 @@ mod tests {
         }
     }
 
-    /// 确定性环境探测：只暴露 `postfix`，不带 systemd。
-    ///
-    /// 真实探测会看宿主机有没有 `systemctl` 与 `/run/systemd/system`，那样测试
-    /// 结果就随机器而变。这里固定走 `postfix` 专用分支，断言才有意义。
     struct FixedEnv;
 
     impl mailstack_core::exec::ServiceEnv for FixedEnv {
@@ -488,8 +401,6 @@ mod tests {
         }
     }
 
-    // ───────────────────────────── 域名表 ─────────────────────────────
-
     #[test]
     fn domains_list_skips_comments_and_blank_lines() {
         let f = Fixture::new();
@@ -513,9 +424,8 @@ mod tests {
         let f = Fixture::new();
         f.store.add_domain("example.com").unwrap();
 
-        // 表文件格式：`<domain> OK`，行尾换行。
         assert_eq!(f.read(&f.paths.domains), "example.com OK\n");
-        // 写完必须编译 hash 表，否则 Postfix 读到的还是旧表。
+
         assert_eq!(f.runner.programs(), vec!["postmap", "postfix", "postfix"]);
         assert_eq!(
             f.runner.calls()[0].1,
@@ -562,7 +472,6 @@ mod tests {
 
     #[test]
     fn domain_add_rejects_newline_injection() {
-        // 域名里塞换行 = 往虚拟域名表里注入任意行。
         let f = Fixture::new();
         let err = f
             .store
@@ -574,7 +483,6 @@ mod tests {
 
     #[test]
     fn delete_domain_also_removes_its_aliases() {
-        // 否则会留下指向已删除域的孤儿映射：删了域名但收信路由没变。
         let f = Fixture::new();
         f.store.add_domain("example.com").unwrap();
         f.store.add_domain("other.test").unwrap();
@@ -601,8 +509,6 @@ mod tests {
             "invalid domain"
         );
     }
-
-    // ───────────────────────────── 别名表 ─────────────────────────────
 
     #[test]
     fn aliases_skip_rows_without_destinations() {
@@ -636,7 +542,7 @@ mod tests {
             aliases[0].destinations,
             vec!["alice".to_string(), "bob@remote.test".to_string()]
         );
-        // 写盘格式：一行、空格分隔。
+
         assert_eq!(
             f.read(&f.paths.aliases),
             "sales@example.com alice bob@remote.test\n"
@@ -645,7 +551,6 @@ mod tests {
 
     #[test]
     fn alias_add_rejects_newline_injection_into_the_table() {
-        // 基线注释点名的第一条注入：目标里的换行会往表里塞进任意条目。
         let f = Fixture::new();
         let err = f
             .store
@@ -660,7 +565,6 @@ mod tests {
 
     #[test]
     fn alias_add_rejects_space_separated_injection() {
-        // 空格会让「一个目标」变成「两个目标」，等于悄悄改了路由。
         let f = Fixture::new();
         let err = f
             .store
@@ -686,7 +590,6 @@ mod tests {
 
     #[test]
     fn alias_source_domain_is_validated_separately() {
-        // ADDRESS_RE 的域名部分允许 `..` 之类，必须再过一遍 DOMAIN_RE。
         let f = Fixture::new();
         let err = f
             .store
@@ -739,8 +642,6 @@ mod tests {
 
     #[test]
     fn delete_alias_validates_the_id_before_writing() {
-        // 基线注释点名的第二条注入：未校验的 id 写进表文件，换行不是「删一行」
-        // 而是「注入几行」。
         let f = Fixture::new();
         f.store
             .add_alias("sales@example.com", &["alice".to_string()])
@@ -854,7 +755,6 @@ mod tests {
         assert_eq!(f.runner.programs(), vec!["postmap", "postfix", "postfix"]);
     }
 
-    /// 所有命令都失败（非零状态）的运行器。
     struct FailingRunner;
 
     impl CommandRunner for FailingRunner {
@@ -876,8 +776,6 @@ mod tests {
         }
     }
 
-    /// 表文件写成功但 Postfix 侧（postmap/check/reload）失败：必须作为错误上报，
-    /// 而不是压成 Ok —— 否则「改了路由却没生效」就是一个无日志的悬案。
     #[test]
     fn a_failed_postmap_is_surfaced_as_an_error_not_swallowed() {
         let dir = tempfile::tempdir().unwrap();
@@ -893,11 +791,9 @@ mod tests {
             "错误应指明失败在哪一步：{error}"
         );
 
-        // 错误的语义是「Postfix 未同步」，不是「写入失败」—— 表文件本身已落盘。
         assert_eq!(store.domains(), vec!["example.com".to_string()]);
     }
 
-    /// 模拟「本机没有安装 Postfix」：所有命令都返回 NotFound。
     struct NoPostfixRunner;
 
     impl CommandRunner for NoPostfixRunner {
@@ -915,11 +811,6 @@ mod tests {
         }
     }
 
-    /// 纯 MailStack 主机（Postfix 已移除）上写表必须成功。
-    ///
-    /// 回归背景：`domains.add` 曾把「找不到 postmap」当成 Postfix 同步失败，
-    /// 于是全新安装的服务器上第一次加域名就报错。Postfix 不存在时表文件由
-    /// MailStack 自己按文本读取，同步这一步本来就不存在。
     #[test]
     fn a_host_without_postfix_accepts_table_writes() {
         let dir = tempfile::tempdir().unwrap();
@@ -937,9 +828,6 @@ mod tests {
         assert_eq!(store.aliases().len(), 1);
     }
 
-    /// 删除域时**先写别名表、后写域名表**（postmap 的先后 = 写入的先后）。
-    /// 两步之间崩溃留下「域名在、别名已删」的无害中间态，重试即修复；
-    /// 反过来的顺序会留下继续为已删域路由收信的孤儿别名。
     #[test]
     fn delete_domain_writes_the_aliases_table_before_the_domains_table() {
         let f = Fixture::new();
@@ -972,7 +860,6 @@ mod tests {
 
     #[test]
     fn table_files_are_world_readable_like_the_installer_creates_them() {
-        // 非特权的 Postfix 进程要能读这两张表；它们不含机密。
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

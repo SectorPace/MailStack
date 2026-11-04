@@ -1,55 +1,3 @@
-//! Maildir 存储后端：文件夹、UID 映射、Maildir 标志与关键字。
-//!
-//! ## 磁盘布局（与 Dovecot 的 Maildir 本体兼容）
-//!
-//! ```text
-//! <root>/                        ← INBOX
-//!   cur/ new/ tmp/
-//!   .mailstack-uidlist           ← UID 映射（本实现私有，见下）
-//!   .mailstack-keywords          ← 关键字字母表（本实现私有）
-//!   subscriptions                ← 订阅清单
-//!   .Sent/                       ← 文件夹 "Sent"（IMAP 层级分隔符 '.'）
-//!   .Sent.2026/                  ← 文件夹 "Sent.2026"
-//! ```
-//!
-//! ## UID 稳定的关键：映射键是 **unique base**，不是文件名
-//!
-//! Maildir 的文件名由 `<unique>` + `:2,<flags>` 组成，flags 会随 `\Seen` /
-//! `\Deleted` 变化 —— 也就是**文件名会变**。若 UID 映射以文件名为键，一次
-//! `STORE \Seen` 就会让同一封邮件换一个 UID，客户端缓存全部失效。因此：
-//!
-//! * 映射键 = `:2,` 之前的 unique 部分；
-//! * `new/` → `cur/` 的搬迁、标志重命名都不影响映射；
-//! * 只有文件消失（EXPUNGE / 外部删除）才移除条目。
-//!
-//! ## uidlist 的损坏处理：换 UIDVALIDITY，而不是猜
-//!
-//! 文件缺失/损坏/形状不对时，本实现**重建**映射并分配新的 `UIDVALIDITY`。
-//! 这是 RFC 3501 §2.3.1.1 要求的语义：UID 只有在 UIDVALIDITY 不变时才必须稳定。
-//! 静默复用旧 UID 会让客户端把 A 邮件的内容贴到 B 邮件上，比「重新同步」危险得多。
-//!
-//! ## 关键字
-//!
-//! Maildir 只规定 `S/F/R/T/D/P` 六个字母；IMAP 的 `$Junk`、`$Forwarded` 等
-//! 需要额外字母。本实现用 `.mailstack-keywords`（`<letter> <keyword>`）持久化
-//! 字母表，字母 a–z、每个文件夹最多 26 个关键字。字母一旦分配就不再回收 ——
-//! 回收会让「删掉关键字再重建」复用字母，导致历史文件名被误读。
-//!
-//! ## 并发与崩溃一致性
-//!
-//! * 所有 uidlist/keywords/subscriptions 的读改写都在 `flock` 临界区内；
-//! * 投递先写 `tmp/`、`sync_all` 后 `rename` 到 `cur|new/`（同文件系统原子）；
-//! * uidlist 用「临时文件 + rename」写入；崩溃最多丢掉「刚刚分配、尚未提交」的
-//!   UID，下次打开会重新分配并换 UIDVALIDITY（客户端重新同步，但不串信）。
-//!
-//! ## 有意不做的事
-//!
-//! * **运行期不读写 Dovecot `dovecot-uidlist`**：两套实现同时写一个 Maildir 会
-//!   产生两套 UID。切换实现时用 [`crate::migration::migrate_maildir`] **离线**把
-//!   Dovecot 的 UID 与关键字接管过来；之后只由本实现维护 `.mailstack-uidlist`。
-//! * **扫描是 O(邮件数)**：单次打开最多索引 [`MAX_SCAN_ENTRIES`] 封，超过返回
-//!   存储错误而不是把内存吃光。大信箱调优（缓存 mtime、索引文件）是后续版本。
-
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -70,25 +18,24 @@ const UIDLIST_LOCK: &str = ".mailstack-uidlist.lock";
 const KEYWORDS: &str = ".mailstack-keywords";
 const KEYWORDS_LOCK: &str = ".mailstack-keywords.lock";
 const SPECIAL_USE: &str = ".mailstack-special-use";
-/// QRESYNC 的消失记录：`<uid> <modseq>`，每次 EXPUNGE 追加。
+
 const EXPUNGED: &str = ".mailstack-expunged";
 const EXPUNGED_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const QUOTA: &str = ".mailstack-quota";
 const QUOTA_LOCK: &str = ".mailstack-quota.lock";
-/// RFC 5464 METADATA：邮箱级元数据（`<entry> <base64-value>` 每行一条）。
+
 const METADATA: &str = ".mailstack-metadata";
 const METADATA_LOCK: &str = ".mailstack-metadata.lock";
-/// 服务器级元数据（`GETMETADATA ""`）存放在存储根目录。
+
 const SERVER_METADATA: &str = ".mailstack-metadata-server";
 const SERVER_METADATA_LOCK: &str = ".mailstack-metadata-server.lock";
-/// RFC 4314 ACL：`<identifier> <rights>` 每行一条。
+
 const ACL: &str = ".mailstack-acl";
 const ACL_LOCK: &str = ".mailstack-acl.lock";
 const USAGE: &str = ".mailstack-usage";
 const SUBSCRIPTIONS: &str = "subscriptions";
 const SUBSCRIPTIONS_LOCK: &str = "subscriptions.lock";
 
-/// RFC 6154 + RFC 8457 的特殊用途属性。
 pub const SPECIAL_USE_ATTRS: [&str; 8] = [
     "\\All",
     "\\Archive",
@@ -135,7 +82,6 @@ const MAX_FOLDER_NAME: usize = 200;
 const MAX_SCAN_ENTRIES: usize = 200_000;
 const MAX_KEYWORDS: usize = 26;
 
-/// 时间源（Unix 秒）。注入让 UIDVALIDITY 与 unique 名的生成可被确定性验证。
 pub trait Clock: Send + Sync + 'static {
     fn now_secs(&self) -> i64;
 }
@@ -151,10 +97,6 @@ impl Clock for SystemClock {
             .unwrap_or(0)
     }
 }
-
-// ---------------------------------------------------------------------------
-// 标志
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SystemFlag {
@@ -208,7 +150,6 @@ impl SystemFlag {
         }
     }
 
-    /// 固定顺序，保证同一个标志集合生成的文件名稳定（测试与缓存都依赖它）。
     const ORDER: [SystemFlag; 5] = [
         SystemFlag::Draft,
         SystemFlag::Flagged,
@@ -240,8 +181,6 @@ impl Flag {
         }
     }
 
-    /// 解析 IMAP 标志 token。`\Recent` 不可设置，返回 `None`；未知的 `\Xxx`
-    /// 视为非法（由调用方回 `BAD`），关键字则归一化为小写。
     pub fn parse_imap(token: &str) -> Option<Self> {
         if let Some(system) = SystemFlag::from_imap(token) {
             return Some(Flag::System(system));
@@ -264,7 +203,6 @@ impl Flag {
 
 pub type FlagSet = BTreeSet<Flag>;
 
-/// IMAP 关键字的字符集：可见 ASCII，排除 IMAP 语法特殊字符。
 fn validate_keyword(keyword: &str) -> Result<()> {
     if keyword.is_empty() || keyword.len() > 64 {
         return Err(MailError::invalid("keyword must be 1-64 characters"));
@@ -279,29 +217,24 @@ fn validate_keyword(keyword: &str) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// 数据模型
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone)]
 pub struct MessageMeta {
     pub uid: u32,
-    /// Maildir unique 部分（`:2,` 之前）。UID 映射的键。
+
     pub base: String,
-    /// 当前文件名（可能带 `:2,<flags>`）。
+
     pub filename: String,
     pub path: PathBuf,
     pub size: u64,
-    /// Unix 秒（文件 mtime；APPEND 可显式指定）。
+
     pub internal_date: i64,
-    /// CONDSTORE 修改序列。每次标志变化都会递增并持久化到 uidlist。
+
     pub modseq: u64,
     pub flags: FlagSet,
-    /// 本次 SELECT 之前位于 `new/` 的邮件。RECENT 语义只对「第一次打开」成立。
+
     pub recent: bool,
 }
 
-/// 一封待投递的邮件（MULTIAPPEND 与 LMTP 共用）。
 #[derive(Debug, Clone)]
 pub struct NewMessage {
     pub data: Vec<u8>,
@@ -309,11 +242,10 @@ pub struct NewMessage {
     pub internal_date: Option<i64>,
 }
 
-/// 用户级配额（覆盖整个 MailStore 的所有文件夹）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QuotaLimits {
     pub messages: Option<u32>,
-    /// 字节数（IMAP 侧显示为 KiB）。
+
     pub storage_bytes: Option<u64>,
 }
 
@@ -339,11 +271,6 @@ pub struct Status {
     pub uidvalidity: u32,
 }
 
-/// `cur/` 与 `new/` 目录 mtime 的轻量指纹。
-///
-/// Maildir 的增删、改名（`STORE` 改标志）都会更新目录 mtime，因此指纹不变时
-/// 可以跳过整次目录扫描。会话层每 N 次仍强制全量扫描一次，防止粗粒度时间戳
-/// 或异常文件系统漏掉变化。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FolderStamp {
     pub cur: (i64, u32),
@@ -355,7 +282,7 @@ pub struct FolderState {
     pub name: String,
     pub uidvalidity: u32,
     pub uidnext: u32,
-    /// CONDSTORE 的 HIGHESTMODSEQ。
+
     pub highest_modseq: u64,
     pub messages: Vec<MessageMeta>,
 }
@@ -379,7 +306,6 @@ impl FolderState {
         }
     }
 
-    /// `*` 在 UID 语义下的值。
     pub fn max_uid(&self) -> u32 {
         self.messages.last().map(|message| message.uid).unwrap_or(0)
     }
@@ -393,24 +319,12 @@ impl FolderState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 文件夹名
-// ---------------------------------------------------------------------------
-
 pub fn is_inbox(name: &str) -> bool {
     name.eq_ignore_ascii_case(INBOX)
 }
 
-/// 侧车文件的保留前缀：磁盘路径是 `.{name}`，`mailstack-…` 会与
-/// `.mailstack-uidlist` 等私有文件撞名（大小写不敏感地拒绝，兼容大小写
-/// 不敏感的文件系统）。
 const RESERVED_FOLDER_PREFIX: &str = "mailstack-";
 
-/// 规范化并校验邮箱名。
-///
-/// 允许层级（`.` 分隔），但拒绝：空段、前导/尾随点、控制字符、路径分隔符、
-/// Windows 保留字符、LIST 通配符 `*`/`%`（允许它们会让 LIST 模式产生歧义）、
-/// 以及保留前缀 `mailstack-`。
 pub fn normalize_folder_name(name: &str) -> Result<String> {
     if is_inbox(name) {
         return Ok(INBOX.to_string());
@@ -437,7 +351,6 @@ pub fn normalize_folder_name(name: &str) -> Result<String> {
             return Err(MailError::invalid("mailbox name has an empty segment"));
         }
         if segment.starts_with('.') {
-            // 磁盘布局用前导 `.` 表示文件夹；允许这一前缀会造成映射歧义。
             return Err(MailError::invalid(
                 "mailbox name segment may not start with '.'",
             ));
@@ -458,17 +371,12 @@ pub fn normalize_folder_name(name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// MailStore
-// ---------------------------------------------------------------------------
-
 pub struct MailStore {
     root: PathBuf,
     clock: Arc<dyn Clock>,
 }
 
 impl MailStore {
-    /// 打开（必要时初始化）INBOX 目录树。
     pub fn new(root: impl Into<PathBuf>, clock: Arc<dyn Clock>) -> Result<Self> {
         let root = root.into();
         ensure_maildir_dirs(&root)?;
@@ -528,8 +436,7 @@ impl MailStore {
                 "mailbox {normalized} has children and cannot be deleted"
             )));
         }
-        // RFC 3501 §6.3.4：删除邮箱会连同其中的邮件一起删除。拒绝非空邮箱会让
-        // 客户端（Thunderbird 等）无法删除任何有邮件的文件夹 —— 那才是 bug。
+
         let mut removed_messages = 0u64;
         let mut removed_bytes = 0u64;
         scan_usage_dir(&path, &mut removed_messages, &mut removed_bytes)?;
@@ -554,7 +461,6 @@ impl MailStore {
         let folders = self.folders()?;
 
         if old == INBOX {
-            // RFC 3501 §6.3.5：重命名 INBOX 是「把内容搬到新邮箱」，INBOX 本身保留。
             let destination = self.folder_path(&new)?;
             ensure_maildir_dirs(&destination)?;
             for sub in ["cur", "new"] {
@@ -575,7 +481,6 @@ impl MailStore {
         let destination = self.folder_path(&new)?;
         fs::rename(&source, &destination).map_err(|error| MailError::io(&destination, error))?;
 
-        // 子文件夹在磁盘上是独立目录（`.Old.Child`），必须逐个改名。
         let prefix = format!("{old}.");
         let mut renames: Vec<(String, String)> = folders
             .iter()
@@ -586,8 +491,7 @@ impl MailStore {
             })
             .collect();
         renames.sort();
-        // 已完成的改名（现路径, 原路径）：中途失败时按逆序 rename 回去，
-        // 否则一个冲突的子文件夹会让 rename 半途而废、邮箱树自相矛盾。
+
         let mut completed: Vec<(PathBuf, PathBuf)> = vec![(destination, source)];
         for (from, to) in renames {
             let from_path = self.folder_path(&from)?;
@@ -687,10 +591,6 @@ impl MailStore {
         })
     }
 
-    /// 打开文件夹：索引文件、同步 UID、可选地把 `new/` 搬进 `cur/`。
-    ///
-    /// `promote_recent` 只在 SELECT 时为 `true`：STATUS 与 POP3 的快照不应改变
-    /// 「这封邮件还是不是 Recent」的判定。
     pub fn open_folder(&self, name: &str, promote_recent: bool) -> Result<FolderState> {
         let normalized = normalize_folder_name(name)?;
         let path = self.folder_path(&normalized)?;
@@ -716,9 +616,7 @@ impl MailStore {
                 .filter(|(_, file)| file.recent)
                 .map(|(base, _)| base.clone())
                 .collect();
-            // 提升同样要持 uidlist 锁：EXPUNGE 在锁内先按 base 找文件再删除，
-            // 两者交错会让「文件刚改名、删除落空、映射却被移除」，同一封邮件
-            // 随后会在 UIDVALIDITY 不变的情况下拿到新 UID。
+
             with_lock(&path.join(UIDLIST_LOCK), || {
                 for base in recent_bases {
                     if let Some(file) = scanned.get_mut(&base) {
@@ -734,7 +632,6 @@ impl MailStore {
                                     .unwrap_or_default();
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                // 另一个会话刚刚搬过它；本次打开跳过这封邮件即可。
                                 file.filename = target
                                     .file_name()
                                     .map(|name| name.to_string_lossy().to_string())
@@ -752,7 +649,6 @@ impl MailStore {
         let mut messages = Vec::with_capacity(scanned.len());
         for (base, file) in scanned {
             let Some((uid, modseq)) = mapping.by_base.get(&base).copied() else {
-                // 映射刚同步过，缺失说明这封邮件在同步与 stat 之间被删除。
                 continue;
             };
             let full_path = path.join(file.directory).join(&file.filename);
@@ -794,7 +690,6 @@ impl MailStore {
         Ok(self.open_folder(name, false)?.status())
     }
 
-    /// 目录 mtime 指纹（不做目录扫描）。用于 NOOP/IDLE 的快速路径。
     pub fn folder_stamp(&self, name: &str) -> Result<FolderStamp> {
         let path = self.folder_path(name)?;
         let stamp = |directory: &str| -> (i64, u32) {
@@ -811,8 +706,6 @@ impl MailStore {
         })
     }
 
-    /// 读取特殊用途（RFC 6154）。文件存在时以其为准（空文件表示刻意清空），
-    /// 否则按标准文件夹名推导默认值。
     pub fn special_use(&self, name: &str) -> Result<Vec<String>> {
         let normalized = normalize_folder_name(name)?;
         let path = self.folder_path(&normalized)?;
@@ -842,7 +735,6 @@ impl MailStore {
         }
     }
 
-    /// 写入特殊用途（空列表写空文件，用于压掉默认推导）。
     pub fn set_special_use(&self, name: &str, uses: &[String]) -> Result<()> {
         let normalized = normalize_folder_name(name)?;
         let path = self.folder_path(&normalized)?;
@@ -864,7 +756,6 @@ impl MailStore {
         write_atomic(&path.join(SPECIAL_USE), buffer.as_bytes())
     }
 
-    /// 所有非空特殊用途邮箱（LIST 一次读取，避免逐名字开文件）。
     pub fn special_use_map(&self) -> Result<BTreeMap<String, Vec<String>>> {
         let mut map = BTreeMap::new();
         for name in self.folders()? {
@@ -876,7 +767,6 @@ impl MailStore {
         Ok(map)
     }
 
-    /// 读取配额上限（文件不存在 = 无限制）。
     pub fn quota_limits(&self) -> Result<QuotaLimits> {
         let path = self.root.join(QUOTA);
         let contents = match fs::read_to_string(&path) {
@@ -910,11 +800,8 @@ impl MailStore {
         Ok(limits)
     }
 
-    /// 设置配额。两者都为 `None` 时删除配额文件（无限制）。
     pub fn set_quota(&self, messages: Option<u32>, storage_bytes: Option<u64>) -> Result<()> {
         with_lock(&self.root.join(QUOTA_LOCK), || {
-            // 用量缓存可能是在「无配额」期间产生的（那时投递不更新它），
-            // 设置配额后必须作废，下一次投递会重新扫描。
             let _ = fs::remove_file(self.root.join(USAGE));
             let path = self.root.join(QUOTA);
             if messages.is_none() && storage_bytes.is_none() {
@@ -946,7 +833,6 @@ impl MailStore {
         })
     }
 
-    /// 重新扫描所有文件夹并刷新用量缓存（迁移或缓存丢失后调用）。
     pub fn recompute_usage(&self) -> Result<(u64, u64)> {
         let usage = self.scan_usage()?;
         self.write_usage(usage)?;
@@ -1006,7 +892,6 @@ impl MailStore {
         }
     }
 
-    /// 预留配额（投递前调用）。无配额时返回 `None`，不维护用量缓存。
     fn reserve_quota(&self, messages: u64, bytes: u64) -> Result<Option<(u64, u64)>> {
         let limits = self.quota_limits()?;
         if limits.is_unlimited() {
@@ -1055,7 +940,6 @@ impl MailStore {
         }
     }
 
-    /// 投递一封邮件。返回 `(uidvalidity, uid)`。
     pub fn append(
         &self,
         folder: &str,
@@ -1063,7 +947,6 @@ impl MailStore {
         flags: &FlagSet,
         internal_date: Option<i64>,
     ) -> Result<(u32, u32)> {
-        // APPEND 未指定任何标志时，邮件是 Recent（RFC 3501 §6.3.11）。
         let recent = flags.is_empty();
         self.append_internal(folder, data, flags, internal_date, recent)
     }
@@ -1098,8 +981,7 @@ impl MailStore {
         recent: bool,
     ) -> Result<(u32, u32)> {
         let base = self.unique_base();
-        // 关键字字母分配可能失败（>26 个关键字）；必须在写 tmp 之前完成，
-        // 否则失败路径会在 tmp/ 里留下一个孤儿文件。
+
         let destination = if recent {
             path.join("new").join(&base)
         } else {
@@ -1120,19 +1002,12 @@ impl MailStore {
         match assign_uid(path, &base, self.clock.as_ref()) {
             Ok(result) => Ok(result),
             Err(error) => {
-                // 分配失败时撤回落盘，否则客户端重试会产生重复邮件。
                 let _ = fs::remove_file(&destination);
                 Err(error)
             }
         }
     }
 
-    /// 原子性尽量高的批量投递（MULTIAPPEND）。
-    ///
-    /// 步骤：全部先写 `tmp/`（fsync）→ 全部 rename 到 `cur|new` → 在**一次**
-    /// uidlist 锁内分配 UID 并写映射。任一步失败都会回滚已落盘的文件，因此
-    /// 「客户端收到 NO」时不留下部分消息（进程崩溃落在 rename 中间是例外：
-    /// 文件已落盘但未入映射，下次打开会补分配 UID）。
     pub fn append_many(&self, folder: &str, messages: &[NewMessage]) -> Result<(u32, Vec<u32>)> {
         if messages.is_empty() {
             return Err(MailError::invalid("no messages to append"));
@@ -1221,15 +1096,6 @@ impl MailStore {
         }
     }
 
-    /// 把同一封邮件投递到多个文件夹（Sieve 的多目标 `fileinto`）。
-    ///
-    /// 与 [`Self::append_many`] 相同的三段式（全部写 tmp → 全部 rename → 分配
-    /// UID），但横跨多个文件夹：先校验**所有**目标、一次预留**所有**副本的配额，
-    /// 任一步失败都回滚全部已落盘文件并释放配额 —— 多目标投递要么每个文件夹各
-    /// 一份、要么一份都没有（进程崩溃落在 rename 中间是例外，未入映射的文件
-    /// 下次打开会补分配 UID，与 append_many 一致）。
-    ///
-    /// 返回值与 `folders` 顺序对齐：每个文件夹的 `(uidvalidity, [uid])`。
     pub fn append_many_folders(
         &self,
         folders: &[&str],
@@ -1238,7 +1104,7 @@ impl MailStore {
         if folders.is_empty() {
             return Err(MailError::invalid("no folders to deliver to"));
         }
-        // 第一遍：解析并校验所有目标文件夹，不存在的在动第一份拷贝前就失败。
+
         let mut paths = Vec::with_capacity(folders.len());
         for folder in folders {
             let path = self.folder_path(folder)?;
@@ -1299,8 +1165,6 @@ impl MailStore {
             renamed.push(stage.destination.clone());
         }
 
-        // 逐文件夹分配 UID（各持各的 uidlist 锁）。失败时撤掉所有已落盘文件：
-        // 已分配的映射条目由下次 open 的同步清理（文件已不在）。
         let mut results = Vec::with_capacity(paths.len());
         let assign: Result<()> = (|| {
             for (index, path) in paths.iter().enumerate() {
@@ -1325,14 +1189,12 @@ impl MailStore {
         Ok(results)
     }
 
-    /// 更新标志。返回更新后的元数据（会话用它刷新 EXISTS/FETCH 缓存）。
     pub fn set_flags(&self, folder: &str, uid: u32, flags: &FlagSet) -> Result<MessageMeta> {
         let path = self.folder_path(folder)?;
         if !path.is_dir() {
             return Err(MailError::not_found(folder));
         }
-        // 改名必须与 EXPUNGE 互斥：EXPUNGE 在 uidlist 锁内「查文件 → 删文件」，
-        // 若这里在锁外改名，删除会落空而映射已被移除（邮件以新 UID 复活）。
+
         with_lock(&path.join(UIDLIST_LOCK), || {
             let uidlist_path = path.join(UIDLIST);
             let mut list = load_uidlist(&uidlist_path)?
@@ -1351,7 +1213,6 @@ impl MailStore {
                 fs::rename(&source, &target).map_err(|error| MailError::io(&target, error))?;
             }
 
-            // CONDSTORE：每次标志变化分配新的 modseq，并与映射一起落盘。
             list.highest_modseq = list.highest_modseq.saturating_add(1);
             let modseq = list.highest_modseq;
             if let Some(entry) = list.by_uid.get_mut(&uid) {
@@ -1380,7 +1241,6 @@ impl MailStore {
         })
     }
 
-    /// 物理删除给定 UID。返回实际删除的邮件数。
     pub fn expunge(&self, folder: &str, uids: &[u32]) -> Result<usize> {
         let path = self.folder_path(folder)?;
         if !path.is_dir() {
@@ -1388,24 +1248,19 @@ impl MailStore {
         }
         with_lock(&path.join(UIDLIST_LOCK), || {
             let mut list = load_uidlist(&path.join(UIDLIST))?.unwrap_or_default();
-            // 先删文件、全部成功后再删映射：删文件失败时直接返回，磁盘上的
-            // 映射保持原样（UID 语义不被破坏）。已成功删除但尚未写回映射的
-            // 条目会在下次 open 的同步中被清理。
+
             let mut removed_uids: Vec<u32> = Vec::new();
             let mut removed_bytes = 0u64;
             for uid in uids {
                 let Some((base, _)) = list.by_uid.get(uid) else {
                     continue;
                 };
-                // 文件早已不在（外部删除 / 上次 expunge 已删但映射未及写回）：
-                // 用量统计里本就没有这封邮件，若仍计入 removed_uids，配额会按
-                // 「删掉一封」递减 ⇒ usage 永久偏低。映射条目留给下次 open 的
-                // 同步清理（sync_uidlist 只保留磁盘上存在的 base）。
+
                 let Some((directory, filename)) = find_file(&path, base)? else {
                     continue;
                 };
                 let file = path.join(directory).join(&filename);
-                // 只为真实存在的文件计字节：stat 在 remove 之前。
+
                 if let Ok(metadata) = fs::metadata(&file) {
                     removed_bytes = removed_bytes.saturating_add(metadata.len());
                 }
@@ -1420,7 +1275,6 @@ impl MailStore {
                 list.by_uid.remove(uid);
             }
             if !removed_uids.is_empty() {
-                // QRESYNC：每个消失事件推进 modseq 并写入消失日志。
                 let mut events = Vec::with_capacity(removed_uids.len());
                 for uid in &removed_uids {
                     list.highest_modseq = list.highest_modseq.saturating_add(1);
@@ -1434,12 +1288,6 @@ impl MailStore {
         })
     }
 
-    /// 复制多封邮件到另一文件夹。一次打开源邮箱、一次读取索引，避免
-    /// 「每复制一封就全量扫描一遍源文件夹」的 O(k·n)。
-    ///
-    /// 全部源 UID 先经一次读取校验存在，再动第一份拷贝：否则第 k 个 UID 不存在
-    /// 时前 k-1 份已落盘，客户端收到 NO 却留下成堆副本。校验之后源邮件仍可能
-    /// 被并发删除（竞态不可避免）：此时报告错误并保留已完成的副本。
     pub fn copy_many(&self, from: &str, uids: &[u32], to: &str) -> Result<(u32, Vec<u32>)> {
         if uids.is_empty() {
             return Ok((0, Vec::new()));
@@ -1476,7 +1324,6 @@ impl MailStore {
         Ok((uidvalidity, copies))
     }
 
-    /// QRESYNC：返回在 `since` 之后消失的 UID。
     pub fn expunged_since(&self, name: &str, since: u64) -> Result<Vec<u32>> {
         let path = self.folder_path(name)?;
         if !path.is_dir() {
@@ -1503,7 +1350,6 @@ impl MailStore {
         Ok(uids.into_iter().collect())
     }
 
-    /// 复制一封邮件到另一文件夹，保留标志与内部日期。副本不是 Recent。
     pub fn copy(&self, from: &str, uid: u32, to: &str) -> Result<(u32, u32)> {
         let (uidvalidity, copies) = self.copy_many(from, &[uid], to)?;
         let new_uid = copies
@@ -1525,11 +1371,6 @@ impl MailStore {
         format!("{now}.M{nanos}P{}Q{sequence}.{host}", std::process::id())
     }
 
-    /// 只读打开邮件内容。调用方负责限制大小（`size` 已带在元数据里）。
-    ///
-    /// 路径可能在两处被并发改名（`new → cur` 提升、`STORE` 改标志）。若按旧
-    /// 路径读不到，按 base 在当前目录里重查一次 —— 这比把一次正常的 FETCH
-    /// 变成 `NO [SERVERBUG]` 更符合客户端的预期。
     pub fn read(&self, message: &MessageMeta) -> Result<Vec<u8>> {
         match fs::read(&message.path) {
             Ok(data) => Ok(data),
@@ -1543,7 +1384,6 @@ impl MailStore {
         }
     }
 
-    /// 只读邮件头前缀（用于 ENVELOPE / BODY[HEADER] 这类只需要头部的 FETCH）。
     pub fn read_prefix(&self, message: &MessageMeta, limit: usize) -> Result<Vec<u8>> {
         use std::io::Read;
 
@@ -1565,7 +1405,6 @@ impl MailStore {
         }
     }
 
-    /// 按 base 在当前文件夹里重查被并发改名的文件。
     fn locate_after_rename(&self, message: &MessageMeta) -> Result<Option<std::path::PathBuf>> {
         let folder = message.path.parent().and_then(std::path::Path::parent);
         let Some(folder) = folder else {
@@ -1666,8 +1505,6 @@ fn move_directory_contents(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 尽力回滚已完成的改名：按逆序 rename 回原路径，失败只记日志（返回给调用方
-/// 的仍是触发回滚的原始错误）。订阅清单不回滚 —— 与既有行为一致。
 fn rollback_renames(completed: &[(PathBuf, PathBuf)]) {
     for (current, original) in completed.iter().rev() {
         if let Err(error) = fs::rename(current, original) {
@@ -1681,11 +1518,6 @@ fn rollback_renames(completed: &[(PathBuf, PathBuf)]) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 文件名 / 标志
-// ---------------------------------------------------------------------------
-
-/// 解析文件名里的标志后缀。返回 `(base, flags)`。
 fn parse_flags_from_name<'a>(
     name: &'a str,
     keywords: &BTreeMap<char, String>,
@@ -1701,8 +1533,6 @@ fn parse_flags_from_name<'a>(
         } else if let Some(keyword) = keywords.get(&ch) {
             flags.insert(Flag::Keyword(keyword.clone()));
         }
-        // 未知字母（含 P）忽略：Maildir 的 P=Passed、以及别家实现的关键字，
-        // 本实现不认识就不声称自己认识。
     }
     (base, flags)
 }
@@ -1764,11 +1594,9 @@ fn scan_folder(
             }
             let (base, flags) = parse_flags_from_name(name, keywords);
             if !is_valid_base(base) {
-                // 不认识的（含空白/控制字符的）文件名不能被 uidlist 安全表示；
-                // 跳过它，而不是让整次 SELECT 失败。
                 continue;
             }
-            // `cur` 里的同名副本覆盖 `new` 里的（崩溃恢复的残留）。
+
             scanned.insert(
                 base.to_string(),
                 ScannedFile {
@@ -1816,16 +1644,12 @@ fn find_file(path: &Path, base: &str) -> Result<Option<(&'static str, String)>> 
     Ok(None)
 }
 
-// ---------------------------------------------------------------------------
-// uidlist
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Default)]
 struct UidList {
     uidvalidity: u32,
     uidnext: u32,
     highest_modseq: u64,
-    /// uid → (unique base, modseq)
+
     by_uid: BTreeMap<u32, (String, u64)>,
 }
 
@@ -1932,7 +1756,6 @@ fn load_uidlist(path: &Path) -> Result<Option<UidList>> {
         }
     }
     let highest_modseq = if version == 1 {
-        // v1 → v2 迁移：按 UID 顺序赋予递增 modseq。
         let mut counter = 0u64;
         for entry in by_uid.values_mut() {
             counter += 1;
@@ -1971,7 +1794,6 @@ fn write_uidlist(path: &Path, list: &UidList) -> Result<()> {
     write_atomic(path, buffer.as_bytes())
 }
 
-/// 追加 QRESYNC 消失记录；超过 8 MiB 时只保留最近 5 万条。
 fn append_expunged(folder: &Path, events: &[(u32, u64)]) -> Result<()> {
     if events.is_empty() {
         return Ok(());
@@ -2011,11 +1833,6 @@ fn append_expunged(folder: &Path, events: &[(u32, u64)]) -> Result<()> {
     Ok(())
 }
 
-/// 生成新的 UIDVALIDITY。
-///
-/// 只在「映射缺失/损坏」时调用。要求两次重建得到不同的值（哪怕时钟同一秒），
-/// 否则客户端会以为旧 UID 仍然有效，把旧缓存贴到新邮件上。混合进程内序号与
-/// 当前纳秒，既保证同进程内单调，又让跨进程的同一秒重建也几乎不可能相同。
 fn fresh_uidvalidity(now_secs: i64) -> u32 {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -2048,7 +1865,6 @@ fn sync_uidlist(path: &Path, bases: &BTreeSet<String>, clock: &dyn Clock) -> Res
 
         let mut changed = rebuilt || !uidlist_path.exists();
         if rebuilt {
-            // UIDVALIDITY 已改变，旧的 VANISHED 历史不再有语义。
             let _ = fs::remove_file(path.join(EXPUNGED));
         }
         let before = list.by_uid.len();
@@ -2104,7 +1920,6 @@ fn assign_uid(path: &Path, base: &str, clock: &dyn Clock) -> Result<(u32, u32)> 
     Ok((uidvalidity, uid))
 }
 
-/// 在**一次** uidlist 锁内为一批 base 分配 UID（保持输入顺序）。
 fn assign_uids_many(path: &Path, bases: &[String], clock: &dyn Clock) -> Result<(u32, Vec<u32>)> {
     with_lock(&path.join(UIDLIST_LOCK), || {
         let uidlist_path = path.join(UIDLIST);
@@ -2166,7 +1981,6 @@ fn assign_uids_many(path: &Path, bases: &[String], clock: &dyn Clock) -> Result<
     })
 }
 
-/// 写 `tmp/<unique>` 并 fsync；失败时清理半成品。
 fn write_tmp_file(
     folder: &Path,
     base: &str,
@@ -2194,10 +2008,6 @@ fn write_tmp_file(
     }
     Ok(tmp)
 }
-
-// ---------------------------------------------------------------------------
-// keywords
-// ---------------------------------------------------------------------------
 
 fn read_keywords(path: &Path) -> BTreeMap<char, String> {
     let mut map = BTreeMap::new();
@@ -2229,7 +2039,6 @@ fn write_keywords(path: &Path, map: &BTreeMap<char, String>) -> Result<()> {
     write_atomic(&path.join(KEYWORDS), buffer.as_bytes())
 }
 
-/// 为标志集合分配关键字字母（必要时写回关键字表），返回 Maildir 后缀。
 fn suffix_with_keyword_allocation(path: &Path, flags: &FlagSet) -> Result<String> {
     with_lock(&path.join(KEYWORDS_LOCK), || {
         let mut keywords = read_keywords(path);
@@ -2255,16 +2064,6 @@ fn suffix_with_keyword_allocation(path: &Path, flags: &FlagSet) -> Result<String
     })
 }
 
-// ---------------------------------------------------------------------------
-// Dovecot 迁移接缝（仅供 crate 内 `migration` 模块调用）
-// ---------------------------------------------------------------------------
-
-/// 导入一份 Dovecot 关键字字母表。
-///
-/// 只在目标文件夹**尚未**有 `.mailstack-keywords` 时写入；已存在则返回
-/// [`MailError::AlreadyExists`]，绝不覆盖 MailStack 自己分配的字母（覆盖会让
-/// 历史文件名里的字母被重新解释）。非法字母/关键字被逐条跳过而不是让整次导入
-/// 失败。返回实际写入的关键字数量（0 表示没有可导入的条目，不创建文件）。
 pub(crate) fn import_keywords(folder: &Path, map: &BTreeMap<char, String>) -> Result<usize> {
     with_lock(&folder.join(KEYWORDS_LOCK), || {
         if folder.join(KEYWORDS).exists() {
@@ -2285,32 +2084,13 @@ pub(crate) fn import_keywords(folder: &Path, map: &BTreeMap<char, String>) -> Re
     })
 }
 
-/// 一次 Dovecot UID 映射导入的结果。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct UidImport {
-    /// 在磁盘上确认存在、成功保留 Dovecot UID 的消息数。
     pub mapped: usize,
-    /// Dovecot 记录里 base 不在磁盘上（已删除/解析不出）或自相矛盾而被丢弃的条数。
+
     pub unresolved: usize,
 }
 
-/// 导入 Dovecot 的 `dovecot-uidlist`，尽最大努力保留原 UID 与 UIDVALIDITY。
-///
-/// 安全不变量（迁移正确性的全部依据）：
-///
-/// * **只保留落盘成功的候选**：`base` 必须出现在 `scan_folder` 的结果里，否则
-///   丢弃并计入 `unresolved`。Dovecot 的 uidlist 可能领先于磁盘（崩溃、外部
-///   删除），照单全收会把不存在的消息也占住一个 UID。
-/// * **`mapped == 0` 时什么都不写**：没有任何 Dovecot 记录能对上磁盘，就**不**
-///   写 uidlist，让首次 `open_folder` 用全新的 UIDVALIDITY 重建。保留旧
-///   UIDVALIDITY 却换了一套 UID，会让客户端把缓存里的旧 UID 贴到别的邮件上 ——
-///   这比强制重新同步危险得多（见模块级文档「换 UIDVALIDITY，而不是猜」）。
-/// * **未映射的磁盘文件由后续 `sync_uidlist` 分配 >= `uidnext` 的新 UID**，
-///   绝不复用旧 UID 指向不同消息。`uidnext` 取 `max(hint, max_uid + 1, 1)`。
-/// * modseq 按 UID 升序赋 `1..=n`（CONDSTORE 要求非零、单调）。
-///
-/// 只在目标文件夹**尚未**有 `.mailstack-uidlist` 时写入；已存在则返回
-/// [`MailError::AlreadyExists`]。`uidvalidity` 必须 > 0。
 pub(crate) fn import_uidlist(
     folder: &Path,
     uidvalidity: u32,
@@ -2324,7 +2104,7 @@ pub(crate) fn import_uidlist(
         if folder.join(UIDLIST).exists() {
             return Err(MailError::already_exists(UIDLIST));
         }
-        // 关键字表此时应已导入；但 base 提取只看 `:2,` 之前，传空表即可。
+
         let on_disk = scan_folder(folder, &BTreeMap::new())?;
         let mut by_uid: BTreeMap<u32, (String, u64)> = BTreeMap::new();
         let mut seen_bases: HashSet<String> = HashSet::new();
@@ -2365,15 +2145,7 @@ pub(crate) fn import_uidlist(
     })
 }
 
-// ---------------------------------------------------------------------------
-// 元数据（RFC 5464 METADATA）：邮箱级与服务器级
-// ---------------------------------------------------------------------------
-
 impl MailStore {
-    /// 读取元数据表：`Some(folder)` 为邮箱级，`None` 为服务器级。
-    ///
-    /// 邮箱不存在时返回 [`MailError::NotFound`]；元数据文件缺失视为空表。值按
-    /// base64 存储，因此可以是任意字节（不做文本假设）。
     pub fn read_metadata(&self, folder: Option<&str>) -> Result<BTreeMap<String, Vec<u8>>> {
         let (file, _lock) = self.metadata_paths(folder)?;
         if let Some(name) = folder {
@@ -2400,7 +2172,6 @@ impl MailStore {
         Ok(map)
     }
 
-    /// 原子写入元数据表（`flock` 保护读改写）。邮箱不存在时返回 `NotFound`。
     pub fn write_metadata(
         &self,
         folder: Option<&str>,
@@ -2437,7 +2208,6 @@ impl MailStore {
         }
     }
 
-    /// 读取邮箱 ACL（`<identifier> <rights>`）。邮箱不存在返回 `NotFound`。
     pub fn read_acl(&self, folder: &str) -> Result<BTreeMap<String, String>> {
         let dir = self.folder_path(folder)?;
         if !dir.is_dir() {
@@ -2460,7 +2230,6 @@ impl MailStore {
         Ok(map)
     }
 
-    /// 原子写入邮箱 ACL（`flock` 保护读改写）。邮箱不存在返回 `NotFound`。
     pub fn write_acl(&self, folder: &str, map: &BTreeMap<String, String>) -> Result<()> {
         let dir = self.folder_path(folder)?;
         if !dir.is_dir() {
@@ -2481,11 +2250,6 @@ impl MailStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 文件原语
-// ---------------------------------------------------------------------------
-
-/// 模块级文件锁原语（`sieve` 的 vacation 状态也复用同一把锁纪律）。
 pub(crate) fn with_lock<T>(lock_path: &Path, action: impl FnOnce() -> Result<T>) -> Result<T> {
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).map_err(|error| MailError::io(parent, error))?;
@@ -2493,19 +2257,13 @@ pub(crate) fn with_lock<T>(lock_path: &Path, action: impl FnOnce() -> Result<T>)
     let file = open_private(lock_path, false).map_err(|error| MailError::io(lock_path, error))?;
     fs2::FileExt::lock_exclusive(&file).map_err(|error| MailError::io(lock_path, error))?;
     let result = action();
-    // 解锁失败不会让语义变错（close 也会释放），但如果是权限/句柄问题，
-    // 下一次加锁会失败并留下日志。
+
     if let Err(error) = fs2::FileExt::unlock(&file) {
         tracing::warn!(path = %lock_path.display(), %error, "failed to unlock");
     }
     result
 }
 
-/// 以 0600 打开/创建敏感文件（uidlist、关键字表、邮件本体、锁 sidecar）。
-///
-/// Unix 上默认 umask 022 会让 `File::create` 产出 0644 —— 邮件与 UID 映射是
-/// 私密数据，不能靠部署机的 umask 碰运气。Windows 没有「创建时指定权限」的
-/// 概念，权限由 ACL 决定。
 fn open_private(path: &Path, create_new: bool) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true);
@@ -2522,8 +2280,6 @@ fn open_private(path: &Path, create_new: bool) -> std::io::Result<File> {
     options.open(path)
 }
 
-/// 临时文件 + rename。`rename` 在同目录内原子；调用方必须持有相应锁。
-/// `sieve` 的脚本/vacation 状态写入复用同一实现（唯一临时名 + fsync）。
 pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -2552,10 +2308,6 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// 目录 fsync：让「文件已改名」这件事在掉电后也成立。
-///
-/// 某些文件系统（Windows 的目录句柄、部分 FUSE）不支持打开目录；失败只记日志，
-/// 不应让写入整体失败 —— 那些文件系统本来也不提供目录级持久化保证。
 fn fsync_dir_best_effort(dir: &Path) {
     match File::open(dir) {
         Ok(handle) => {
@@ -2634,20 +2386,17 @@ mod tests {
         store.write_metadata(Some("Notes"), &map).unwrap();
         assert_eq!(store.read_metadata(Some("Notes")).unwrap(), map);
 
-        // 服务器级与邮箱级互不干扰。
         let mut server = BTreeMap::new();
         server.insert("/private/vendor/example".to_string(), b"s".to_vec());
         store.write_metadata(None, &server).unwrap();
         assert_eq!(store.read_metadata(None).unwrap(), server);
         assert_eq!(store.read_metadata(Some("Notes")).unwrap(), map);
 
-        // 删除一个条目再写回。
         let mut trimmed = map.clone();
         trimmed.remove("/private/comment");
         store.write_metadata(Some("Notes"), &trimmed).unwrap();
         assert_eq!(store.read_metadata(Some("Notes")).unwrap(), trimmed);
 
-        // 不存在的邮箱返回 NotFound（而不是静默成功）。
         assert!(store.read_metadata(Some("Missing")).is_err());
         assert!(store.write_metadata(Some("Missing"), &map).is_err());
     }
@@ -2663,7 +2412,6 @@ mod tests {
         store.write_acl("Shared", &acl).unwrap();
         assert_eq!(store.read_acl("Shared").unwrap(), acl);
 
-        // 不存在的邮箱：读写都返回 NotFound。
         assert!(store.read_acl("Missing").is_err());
         assert!(store.write_acl("Missing", &acl).is_err());
     }
@@ -2909,7 +2657,7 @@ mod tests {
             .unwrap();
         let state = store.open_folder("INBOX", false).unwrap();
         let stale = state.messages[0].clone();
-        // 模拟另一个会话改了标志（文件名变化，base 不变）。
+
         store.set_flags("INBOX", stale.uid, &seen()).unwrap();
         assert_eq!(
             store.read(&stale).unwrap(),
@@ -2945,7 +2693,7 @@ mod tests {
         }
         let state = store.open_folder("INBOX", false).unwrap();
         let first = state.messages[0].uid;
-        // 第二个 UID 不存在：整批必须在落盘前被拒绝，不能留下第一份副本。
+
         let missing = state.messages.last().unwrap().uid + 999;
         assert!(matches!(
             store.copy_many("INBOX", &[first, missing], "Archive"),
@@ -2966,14 +2714,13 @@ mod tests {
             flags: FlagSet::new(),
             internal_date: None,
         };
-        // 第二个目标不存在：整个调用失败，第一个目标不得留下副本。
+
         assert!(matches!(
             store.append_many_folders(&["Keep", "Missing"], &message),
             Err(MailError::NotFound(_))
         ));
         assert_eq!(store.open_folder("Keep", false).unwrap().messages.len(), 0);
 
-        // 全部目标可用：每个文件夹各一份，顺序与入参对齐。
         store.create("Too").unwrap();
         let results = store
             .append_many_folders(&["Keep", "Too"], &message)
@@ -2988,7 +2735,7 @@ mod tests {
     #[test]
     fn reserved_mailstack_prefix_is_rejected_as_a_mailbox_name() {
         let (_dir, _clock, store) = store();
-        // `.{name}` 会与 `.mailstack-uidlist` 等侧车文件撞名。
+
         for name in [
             "mailstack-uidlist",
             "MailStack-UidList.lock",
@@ -2997,7 +2744,7 @@ mod tests {
             assert!(store.create(name).is_err(), "{name:?} 必须被拒绝");
             assert!(normalize_folder_name(name).is_err(), "{name:?} 必须被拒绝");
         }
-        // 不带保留前缀的近名不受影响。
+
         assert!(store.create("mailstack").is_ok());
         assert!(store.create("my-mailstack-uidlist").is_ok());
     }
@@ -3008,11 +2755,11 @@ mod tests {
         store.create("Old").unwrap();
         store.create("Old.A").unwrap();
         store.create("Old.B").unwrap();
-        // 预置一个冲突目录：父目录已改名、前几个子目录改完之后才会撞上它。
+
         std::fs::create_dir_all(_dir.path().join(".New.B")).unwrap();
 
         assert!(store.rename("Old", "New").is_err());
-        // 已改名的父目录与子目录全部回滚。
+
         assert!(store.exists("Old").unwrap());
         assert!(store.exists("Old.A").unwrap());
         assert!(store.exists("Old.B").unwrap());
@@ -3030,7 +2777,7 @@ mod tests {
         let (_, second) = store
             .append("INBOX", b"two\r\n", &FlagSet::new(), None)
             .unwrap();
-        // 外部删除第二封的文件（映射条目还在）：expunge 两封只应释放一封的用量。
+
         let base = store.open_folder("INBOX", false).unwrap();
         let second_base = base
             .messages
@@ -3039,7 +2786,7 @@ mod tests {
             .unwrap()
             .base
             .clone();
-        // 文件在 new/（未带标志），按 base 找到并删除。
+
         let new_dir = store.root().join("new");
         let victim = std::fs::read_dir(&new_dir)
             .unwrap()
@@ -3137,7 +2884,7 @@ mod tests {
             store.append_many("NoSuch", &messages),
             Err(MailError::NotFound(_))
         ));
-        // INBOX 的 tmp/cur/new 不应出现任何残留。
+
         for directory in ["tmp", "cur", "new"] {
             let count = std::fs::read_dir(dir.path().join(directory))
                 .unwrap()
@@ -3295,7 +3042,7 @@ mod tests {
     #[test]
     fn setting_a_quota_discards_a_stale_usage_cache() {
         let (_dir, _clock, store) = store();
-        // 先算一次用量（写入 0），再在无配额状态下投递一封（当时不更新缓存）。
+
         assert_eq!(store.quota_status().unwrap().messages, 0);
         store
             .append("INBOX", b"one\r\n", &FlagSet::new(), None)

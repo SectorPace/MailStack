@@ -1,28 +1,3 @@
-//! 系统时序遥测（`GET /api/metrics/telemetry`）—— 等价移植基线的
-//! `SystemMetricsCollector`（`backend/server.production.ts`）。
-//!
-//! **为什么由 Web 进程自己采样，而不是走特权助手**：契约里这条路由的 `action`
-//! 是 `None`（进程内应答），而动作白名单已冻结为 50 条 —— 不能为它新增一个动作。
-//! 因此采样只能在本进程内完成。
-//!
-//! 与基线一致的四点语义（都是有意保留的，不是巧合）：
-//!
-//! 1. **7 档时间窗各一个环形缓冲**，采样间隔与容量见 [`RANGES`]。
-//! 2. **CPU 是差分采样**：由两次 `/proc/stat` 快照相减得出。因此 `sample()`
-//!    连续调用两次，第二次测到的是两次调用之间的空档（接近 0）——
-//!    每个上报周期只能消费一次。
-//! 3. **读不到的守护进程显示为 `STOPPED`，而不是从列表里消失**：界面据此区分
-//!    「没在跑」与「没读到」。`mailstack-webmail` 恒为 `STOPPED`（基线把 `node`
-//!    这个 comm 归为「无法安全归属」而刻意排除）。
-//! 4. `points` 为空时 `samplingCount` 就是 0：此时响应用一次**即时采样**填充
-//!    `current`，但**不**把它塞进 `points` —— 否则前端会看到一个只含单点的曲线，
-//!    误以为历史只有一段。
-//!
-//! **为什么不复用 `mailstack_core::sysinfo::read_meminfo`**：那个函数的契约是
-//! 「缺 `MemAvailable` 就回 `None`」（fail-loud，服务 `/api/status`）。而遥测这条
-//! 路由的基线契约允许在缺 `MemAvailable` 时退到 `MemFree` 并给出一个数字。两者
-//! 语义不同，**不把两种纪律揉进同一个函数**，故这里单独解析 `/proc/meminfo`。
-
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -31,10 +6,8 @@ use std::time::Duration;
 use mailstack_core::exec::{CommandOutput, CommandRunner, SystemCommandRunner};
 use serde_json::{json, Value};
 
-/// 毫秒时钟。注入是为了让「环形缓冲是否到期」这类断言不随真实时间漂移。
 pub type MillisClock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
-/// 7 档时间窗：`(范围, 采样间隔 ms, 容量)`。顺序即契约顺序。
 pub const RANGES: &[(&str, i64, usize)] = &[
     ("1m", 2_000, 30),
     ("5m", 5_000, 60),
@@ -45,37 +18,18 @@ pub const RANGES: &[(&str, i64, usize)] = &[
     ("3d", 3_600_000, 72),
 ];
 
-/// 1h 档在 [`RANGES`] 中的下标（也是默认档）。非法 `range` 回落到它。
 const DEFAULT_RANGE_INDEX: usize = 3;
 
-/// 每隔多少个采样周期做一次全量 `/proc` 扫描。
-///
-/// 全量扫描每个进程要读两次文件；守护进程的 comm 一旦确定就不会变，因此
-/// 只对「缓存里已有的 pid」与「从未见过的新 pid」重读。磁盘每 60 秒刷新一次。
 const FULL_SCAN_EVERY_CYCLES: u32 = 30;
 
-/// `/proc/<pid>/statm` 的页大小。基线硬编码 4096，本项目的构建目标
-/// （`x86_64-unknown-linux-gnu`）也是 4 KiB 页。
 const PAGE_SIZE_BYTES: u64 = 4096;
 
-/// 磁盘用量刷新间隔（与基线的 60 秒定时器一致）。
 const DISK_REFRESH_MS: i64 = 60_000;
 
-/// `postqueue -j` 的刷新间隔（R5-007）。
-///
-/// `postqueue -j` 会把整个队列（含已延迟条目）的元数据全量导出，条目上千时
-/// 单次是几十到几百毫秒 CPU + 磁盘；而原实现**每个采样周期**（2 秒）都跑一次，
-/// 每天 43 200 次，且整个调用都在采集器互斥锁内 —— 队列积压最大时（也正是
-/// 磁盘压力最大时）开销最大。队列积压不是秒级指标，60 秒与 `df` 同级足够。
 const QUEUE_REFRESH_MS: i64 = 60_000;
 
-/// `df` / `postqueue` 的最长等待时长。
-///
-/// 子进程卡死时按「读不到」处理：宁可丢一个读数，不可让一次挂起的
-/// `postqueue` 把采样（连同它持有的内部缓存锁）无限期占住。
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 守护进程展示顺序（即基线对象字面量的插入顺序）。
 const DAEMON_ORDER: &[&str] = &[
     "postfix",
     "dovecot",
@@ -85,12 +39,7 @@ const DAEMON_ORDER: &[&str] = &[
     "fail2ban",
 ];
 
-/// 进程 `comm` → 守护进程 id。
-///
-/// 刻意排除过于通用、无法安全归属的名字：Dovecot 的 `config` / `log` / `stats`，
-/// 以及 webmail 的 `node`（它与任意其它 Node 进程无法由名字区分）。
 const COMM_TO_DAEMON: &[(&str, &str)] = &[
-    // Postfix
     ("master", "postfix"),
     ("pickup", "postfix"),
     ("qmgr", "postfix"),
@@ -112,7 +61,6 @@ const COMM_TO_DAEMON: &[(&str, &str)] = &[
     ("postscreen", "postfix"),
     ("dnsblog", "postfix"),
     ("trivial-rewrite", "postfix"),
-    // Dovecot
     ("dovecot", "dovecot"),
     ("doveadm", "dovecot"),
     ("dsync", "dovecot"),
@@ -125,21 +73,17 @@ const COMM_TO_DAEMON: &[(&str, &str)] = &[
     ("pop3-login", "dovecot"),
     ("managesieve", "dovecot"),
     ("managesieve-login", "dovecot"),
-    // OpenDKIM
     ("opendkim", "opendkim"),
-    // fail2ban
     ("fail2ban", "fail2ban"),
     ("fail2ban-server", "fail2ban"),
 ];
 
-/// 一次 `/proc/stat` 的 CPU 计数器。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CpuTimes {
     idle: u64,
     total: u64,
 }
 
-/// 内存读数（MB）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct MemDetail {
     total_mb: f64,
@@ -147,7 +91,6 @@ struct MemDetail {
     percent: f64,
 }
 
-/// 根分区用量。
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DiskInfo {
     total_gb: f64,
@@ -155,14 +98,12 @@ struct DiskInfo {
     percent: f64,
 }
 
-/// 队列读数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct QueueMetrics {
     total: u64,
     deferred: u64,
 }
 
-/// 某个守护进程的即时读数。
 #[derive(Debug, Clone, PartialEq)]
 struct DaemonStat {
     id: &'static str,
@@ -172,12 +113,11 @@ struct DaemonStat {
     status: &'static str,
 }
 
-/// 一个采样点。
 #[derive(Debug, Clone, PartialEq)]
 struct Point {
     ts_ms: i64,
     cpu_percent: f64,
-    /// 守护进程内存合计（MB）。
+
     memory_mb: f64,
     sys_mem_percent: f64,
     sys_mem_used_mb: f64,
@@ -190,7 +130,6 @@ struct Point {
     daemons: Vec<DaemonStat>,
 }
 
-/// 一档时间窗的环形缓冲。
 struct Ring {
     interval_ms: i64,
     cap: usize,
@@ -204,26 +143,24 @@ struct Inner {
     seen_pids: HashSet<u32>,
     cycles_since_full_scan: u32,
     disk: DiskInfo,
-    /// 上次刷新磁盘用量的时刻；`None` 表示还没刷过。
+
     disk_updated_ms: Option<i64>,
-    /// 最近一次 `postqueue -j` 的读数（R5-007：60 秒缓存）。
+
     queue: QueueMetrics,
-    /// 上次跑 `postqueue -j` 的时刻；`None` 表示还没跑过。
+
     queue_updated_ms: Option<i64>,
 }
 
-/// 时序遥测采集器。
 pub struct TelemetryCollector {
     inner: Mutex<Inner>,
     proc_root: PathBuf,
     runner: Arc<dyn CommandRunner>,
     clock: MillisClock,
-    /// 本进程 pid（用于 `mailstack-web` 那一行）。
+
     web_pid: u32,
 }
 
 impl TelemetryCollector {
-    /// 生产构造：真实 `/proc`、真实 `df` / `postqueue`、真实时钟。
     pub fn system() -> Self {
         Self::new(
             mailstack_core::sysinfo::system_proc_root(),
@@ -233,7 +170,6 @@ impl TelemetryCollector {
         )
     }
 
-    /// 注入构造（测试用）。
     pub fn new(
         proc_root: PathBuf,
         runner: Arc<dyn CommandRunner>,
@@ -271,16 +207,11 @@ impl TelemetryCollector {
         }
     }
 
-    /// 采一个样并推入各档环形缓冲。
     fn sample(&self) -> Point {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         self.sample_locked(&mut inner)
     }
 
-    /// 启动后台采样任务（2 秒一次）。返回句柄，调用方可据此停机。
-    ///
-    /// 直到 Web 服务入口落地前，这个任务没有宿主进程 —— 端点依赖
-    /// [`TelemetryCollector::telemetry`] 的「按需采样」兜底仍然可用。
     pub fn start_sampling(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
         let this = Arc::clone(self);
         tokio::spawn(async move {
@@ -288,15 +219,13 @@ impl TelemetryCollector {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                // 采样持锁做 /proc 遍历并跑子进程 —— 必须搬进阻塞线程池，
-                // 否则一个挂起的 `postqueue` 就把 async worker 整个占住。
+
                 let sampler = Arc::clone(&this);
                 let _ = tokio::task::spawn_blocking(move || sampler.sample()).await;
             }
         })
     }
 
-    /// 组装 `GET /api/metrics/telemetry` 的响应体。
     pub fn telemetry(&self, range: Option<&str>) -> Value {
         let timeframe = crate::contract::normalize_telemetry_range(range);
         let index = RANGES
@@ -307,8 +236,6 @@ impl TelemetryCollector {
 
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
-        // `points` 取的是**本轮采样之前**的快照：环里本来没有点时，
-        // `samplingCount` 就该是 0（基线同样如此），即时采样只填 `current`。
         let points: Vec<Point> = inner.rings[index].points.iter().cloned().collect();
         let latest = match points.last() {
             Some(point) => point.clone(),
@@ -324,9 +251,7 @@ impl TelemetryCollector {
         let hostname = read_hostname(&self.proc_root);
 
         let (avg_cpu, max_cpu, avg_mem, max_mem, avg_sys_mem, max_sys_mem) = summarize(&points);
-        // R5-023：读不到的字段给 `null` 并登记进 `unavailable`，**不**拿 0 冒充
-        // 「刚启动 / 空闲 / 内存零占用」。0 是一个合法读数，与「没数据」混淆后，
-        // 运维看到的是一台「非常健康」的机器。
+
         let loads = load.map(|l| [l.one, l.five, l.fifteen]);
         let mem_available = self.proc_root.join("meminfo").is_file();
         let mut unavailable: Vec<&str> = Vec::new();
@@ -376,14 +301,12 @@ impl TelemetryCollector {
         })
     }
 
-    // ── 内部实现 ──
-
     fn sample_locked(&self, inner: &mut Inner) -> Point {
         let now = (self.clock)();
         let cpu = self.sample_cpu_locked(inner);
         let mem = self.read_mem();
         let (total_daemon_mb, daemons) = self.daemons_locked(inner);
-        // R5-007：队列读数走 60 秒缓存，而不是每个采样周期跑一次 `postqueue`。
+
         let queue = self.queue_locked(inner);
         let load = mailstack_core::sysinfo::read_loadavg(&self.proc_root);
         let loads = load.map(|l| [l.one, l.five, l.fifteen]).unwrap_or([0.0; 3]);
@@ -404,7 +327,6 @@ impl TelemetryCollector {
         };
 
         for (i, ring) in inner.rings.iter_mut().enumerate() {
-            // 1m 档每个周期都进点；其余各档按各自的间隔节流。
             let due = i == 0
                 || ring
                     .points
@@ -421,14 +343,12 @@ impl TelemetryCollector {
         point
     }
 
-    /// 差分 CPU 百分比（0..=100，保留 1 位小数）。
     fn sample_cpu_locked(&self, inner: &mut Inner) -> f64 {
         let now = read_cpu_times(&self.proc_root);
         if now.is_empty() {
             return 0.0;
         }
-        // 核心数可能变化（CPU 热插拔 / cgroup 调整）：长度不一致时退化成
-        // 「零增量基线」，而不是越界读旧数组。
+
         let prev = if inner.prev_cpu.len() == now.len() {
             inner.prev_cpu.clone()
         } else {
@@ -446,7 +366,6 @@ impl TelemetryCollector {
         usage(total, idle, old_total, old_idle)
     }
 
-    /// `/proc/meminfo`。缺 `MemAvailable` 时退到 `MemFree`（基线即如此）。
     fn read_mem(&self) -> MemDetail {
         let Ok(text) = std::fs::read_to_string(self.proc_root.join("meminfo")) else {
             return MemDetail {
@@ -489,9 +408,6 @@ impl TelemetryCollector {
         }
     }
 
-    /// 遍历各守护进程的内存与存活状态。
-    ///
-    /// 返回 `(守护进程内存合计 MB, 有序列表)`。
     fn daemons_locked(&self, inner: &mut Inner) -> (f64, Vec<DaemonStat>) {
         let mut stats: Vec<DaemonStat> = DAEMON_ORDER
             .iter()
@@ -504,7 +420,6 @@ impl TelemetryCollector {
             })
             .collect();
 
-        // 本进程那一行：恒为 ACTIVE，内存取自自身 RSS。
         if let Some(entry) = stats.iter_mut().find(|s| s.id == "mailstack-web") {
             entry.pid = self.web_pid;
             entry.memory_mb = read_process_rss_mb(&self.proc_root, self.web_pid);
@@ -550,8 +465,6 @@ impl TelemetryCollector {
 
             inner.pid_cache.insert(pid, key);
             if let Some(entry) = stats.iter_mut().find(|s| s.id == key) {
-                // 同一守护进程常有多个进程（Postfix 尤甚）：内存相加，
-                // pid 取第一个被看到的。
                 entry.memory_mb = round1(entry.memory_mb + rss_mb);
                 entry.status = "ACTIVE";
                 if entry.pid == 0 {
@@ -560,7 +473,6 @@ impl TelemetryCollector {
             }
         }
 
-        // 已经消失的 pid 从缓存剔除，避免缓存随进程生命周期无限增长。
         inner.pid_cache.retain(|pid, _| all_pids.contains(pid));
         inner.seen_pids = all_pids;
         inner.cycles_since_full_scan = if full_scan {
@@ -573,7 +485,6 @@ impl TelemetryCollector {
         (total, stats)
     }
 
-    /// `df -k /`（每 60 秒刷新一次，其余时间返回缓存）。
     fn disk_locked(&self, inner: &mut Inner) -> DiskInfo {
         let now = (self.clock)();
         let stale = inner
@@ -584,15 +495,12 @@ impl TelemetryCollector {
             if let Some(disk) = self.read_disk() {
                 inner.disk = disk;
             }
-            // 读失败也要更新时间戳：否则每个上报周期都会重跑一次 `df`。
+
             inner.disk_updated_ms = Some(now);
         }
         inner.disk
     }
 
-    /// `df -kP /`：`-P`（POSIX 输出）强制**一行一个文件系统**。
-    /// 基线用的 `df -k /` 在设备名过长时会把记录折成两行，只认 `lines[1]`
-    /// 会解析到残缺行；换成 `-P` 后列序与含义都不变，但不再折行。
     fn read_disk(&self) -> Option<DiskInfo> {
         let output = self.run_subprocess("df", &["-kP", "/"])?;
         if output.status != 0 {
@@ -601,13 +509,6 @@ impl TelemetryCollector {
         parse_df_k(output.stdout.as_str())
     }
 
-    /// 跑一个外部采样命令，带超时；超时/失败按「读不到」处理（`None`）。
-    ///
-    /// 优先用 runner 自带的 `run_with_timeout`（真实现会 kill 超时子进程并
-    /// 回收）；只实现 `run` 的测试 runner，其默认 `run_with_timeout` 会显式
-    /// 报错 —— 此时退回本地镜像：临时线程里跑 `run`，超过时限就**放弃等待**
-    /// （读数按缺省处理；被放弃的子进程自身是只读短命命令，自行结束）。
-    /// 与 `mailstack_core::exec` 的纪律一致：不可让调用方无限期挂住。
     fn run_subprocess(&self, program: &str, args: &[&str]) -> Option<CommandOutput> {
         if let Ok(output) = self
             .runner
@@ -620,15 +521,12 @@ impl TelemetryCollector {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            // CommandRunner::run 收 `&[&str]`：引用视图在闭包内构造，
-            // 借用被移动进来的 args —— 生命周期整个落在闭包里，不逃逸。
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let _ = tx.send(runner.run(&program, &arg_refs).ok());
         });
         rx.recv_timeout(SUBPROCESS_TIMEOUT).ok().flatten()
     }
 
-    /// `postqueue -j`（每 60 秒刷新一次，其余时间返回缓存，R5-007）。
     fn queue_locked(&self, inner: &mut Inner) -> QueueMetrics {
         let now = (self.clock)();
         let stale = inner
@@ -637,13 +535,12 @@ impl TelemetryCollector {
             .unwrap_or(true);
         if stale {
             inner.queue = self.queue_metrics();
-            // 读失败也要更新时间戳：否则每个上报周期都会重跑一次 `postqueue`。
+
             inner.queue_updated_ms = Some(now);
         }
         inner.queue
     }
 
-    /// `postqueue -j`：逐行 JSON 统计总数与延迟数。
     fn queue_metrics(&self) -> QueueMetrics {
         let Some(output) = self.run_subprocess("postqueue", &["-j"]) else {
             return QueueMetrics::default();
@@ -677,11 +574,6 @@ impl TelemetryCollector {
     }
 }
 
-/// 差分 CPU 百分比。
-///
-/// 总量按 Linux 口径取 `user..steal` 八项之和，`idle` 只取 `idle` 一项。
-/// 基线的 Node 用 `os.cpus().times`（不含 iowait），两者只在 iowait/softirq/steal
-/// 这几项上有别；这里取 Linux 通行口径（「非 idle 即忙」），语义更直白。
 fn usage(total: u64, idle: u64, old_total: u64, old_idle: u64) -> f64 {
     let diff_total = total.saturating_sub(old_total);
     let diff_idle = idle.saturating_sub(old_idle);
@@ -692,7 +584,6 @@ fn usage(total: u64, idle: u64, old_total: u64, old_idle: u64) -> f64 {
     round1((ratio * 100.0).clamp(0.0, 100.0))
 }
 
-/// 读 `/proc/stat` 的**每核** CPU 计数器（不含汇总的 `cpu ` 行）。
 fn read_cpu_times(proc_root: &Path) -> Vec<CpuTimes> {
     let Ok(text) = std::fs::read_to_string(proc_root.join("stat")) else {
         return Vec::new();
@@ -702,15 +593,14 @@ fn read_cpu_times(proc_root: &Path) -> Vec<CpuTimes> {
         let Some(rest) = line.strip_prefix("cpu") else {
             continue;
         };
-        // 汇总行是 `cpu `（紧跟空格），每核行是 `cpu0` / `cpu1`。
+
         let Some(first) = rest.chars().next() else {
             continue;
         };
         if !first.is_ascii_digit() {
             continue;
         }
-        // 先剥掉核心序号（`cpu0` 的 `0`），剩下的才是计数器；
-        // 不剥的话它会占掉 `user` 的位置，整列都会错位一格。
+
         let counters = rest.trim_start_matches(|c: char| c.is_ascii_digit());
         let fields: Vec<u64> = counters
             .split_whitespace()
@@ -719,7 +609,7 @@ fn read_cpu_times(proc_root: &Path) -> Vec<CpuTimes> {
         if fields.len() < 8 {
             continue;
         }
-        // user nice system idle iowait irq softirq steal guest guest_nice
+
         out.push(CpuTimes {
             idle: fields[3],
             total: fields[..8].iter().sum(),
@@ -728,11 +618,6 @@ fn read_cpu_times(proc_root: &Path) -> Vec<CpuTimes> {
     out
 }
 
-/// 解析 `df -kP /` 的输出。
-///
-/// 要求字段数 ≥ 6（POSIX 列：Filesystem 1024-blocks Used Available Capacity
-/// Mounted-on）且第 2/3 列是数字 —— 表头行（`1K-blocks` / `1024-blocks`）
-/// 正因为不是数字而被跳过。解析不出来就回 `None`，**不拿残缺行凑一个数字**。
 fn parse_df_k(stdout: &str) -> Option<DiskInfo> {
     for line in stdout.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -754,7 +639,6 @@ fn parse_df_k(stdout: &str) -> Option<DiskInfo> {
     None
 }
 
-/// `/proc` 下的数字目录名（pid）。
 fn read_numeric_pids(proc_root: &Path) -> HashSet<u32> {
     let Ok(entries) = std::fs::read_dir(proc_root) else {
         return HashSet::new();
@@ -771,7 +655,6 @@ fn read_trimmed(path: &Path) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// 进程常驻内存（MB），取自 `/proc/<pid>/statm` 的 RSS 页数。
 fn read_process_rss_mb(proc_root: &Path, pid: u32) -> f64 {
     let Some(statm) = read_trimmed(&proc_root.join(pid.to_string()).join("statm")) else {
         return 0.0;
@@ -788,7 +671,6 @@ fn read_hostname(proc_root: &Path) -> String {
     read_trimmed(&proc_root.join("sys/kernel/hostname")).unwrap_or_else(|| "unknown".to_string())
 }
 
-/// 汇总一组采样点的均值与峰值（都保留 1 位小数）。
 fn summarize(points: &[Point]) -> (f64, f64, f64, f64, f64, f64) {
     let count = points.len().max(1);
     let mut sum_cpu = 0.0;
@@ -854,8 +736,6 @@ fn daemon_metric_json(daemon: &DaemonStat) -> Value {
     })
 }
 
-/// 毫秒时间戳 → ISO 8601。与其它接口共用 `core` 的格式串，
-/// 因此带 `+00:00` 偏移与微秒位（JS 的 `new Date()` 两者都能解析）。
 fn ms_to_iso(ms: i64) -> String {
     let seconds = ms.div_euclid(1000);
     let sub_ms = ms.rem_euclid(1000) as u32;
@@ -866,7 +746,6 @@ fn ms_to_iso(ms: i64) -> String {
     mailstack_core::time_fmt::format_iso8601(dt)
 }
 
-/// 四舍五入到 1 位小数（基线的 `Math.round(x * 10) / 10`）。
 fn round1(value: f64) -> f64 {
     if !value.is_finite() {
         return 0.0;
@@ -874,10 +753,6 @@ fn round1(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
 }
 
-/// 构造一个**不碰真实系统**的采集器：既不读 `/proc`，也不跑外部命令。
-///
-/// 供其它模块的测试使用 —— 那些测试关心的是「路由是否接线、认证是否正确」，
-/// 不该顺手在开发机上跑一次 `df` / `postqueue`。
 #[cfg(test)]
 pub(crate) fn inert_collector(proc_root: PathBuf) -> TelemetryCollector {
     struct NoProbe;
@@ -906,7 +781,6 @@ mod tests {
     use mailstack_core::CoreResult;
     use std::sync::atomic::{AtomicI64, Ordering};
 
-    /// 记账用的假命令运行器：测试**绝不**真的去跑 `df` / `postqueue`。
     struct FakeRunner {
         calls: Mutex<Vec<String>>,
         df: String,
@@ -964,7 +838,6 @@ mod tests {
         }
     }
 
-    /// 一个临时 `/proc` 夹具。
     struct Fixture {
         root: PathBuf,
     }
@@ -1001,7 +874,6 @@ mod tests {
         }
     }
 
-    /// 两个核的初始快照；`CPU_B` 是它之后的一次快照（idle +200、总量 +400）。
     const CPU_A: &str = "cpu  200 0 100 2000 0 0 0 0 0 0\n\
                          cpu0 100 0 50 1000 0 0 0 0 0 0\n\
                          cpu1 100 0 50 1000 0 0 0 0 0 0\n";
@@ -1051,7 +923,6 @@ mod tests {
             assert_eq!(body["intervalMs"], *interval_ms, "{range} 的采样间隔");
         }
 
-        // 非法 range 不得被透传（因而也无从注入），一律回落 1h。
         let bogus = c.telemetry(Some("../../etc/passwd"));
         assert_eq!(bogus["timeframe"], "1h");
         assert_eq!(bogus["intervalMs"], 60_000);
@@ -1064,10 +935,8 @@ mod tests {
         base_proc(&f);
         let c = collector(&f, FakeRunner::new("", ""), clock(0).1);
 
-        // 构造时把基线设成当前快照 ⇒ 第一次差分是 0（基线的构造函数亦然）。
         assert_eq!(c.sample().cpu_percent, 0.0);
 
-        // idle +200、总量 +400 ⇒ 一半忙。
         f.write("stat", CPU_B);
         assert_eq!(c.sample().cpu_percent, 50.0);
     }
@@ -1077,12 +946,12 @@ mod tests {
         let f = Fixture::new("daemons");
         base_proc(&f);
         f.write("100/comm", "qmgr\n");
-        f.write("100/statm", "500 100 0 0 0 0 0\n"); // 100 页 → 0.4 MB
+        f.write("100/statm", "500 100 0 0 0 0 0\n");
         f.write("101/comm", "dovecot\n");
-        f.write("101/statm", "500 256 0 0 0 0 0\n"); // 1.0 MB
-        f.write("102/comm", "bash\n"); // 不是守护进程
-        f.write("103/comm", "node\n"); // 基线刻意排除的通用名
-        f.write("4242/statm", "1 512 0 0 0 0 0\n"); // 本进程 → 2.0 MB
+        f.write("101/statm", "500 256 0 0 0 0 0\n");
+        f.write("102/comm", "bash\n");
+        f.write("103/comm", "node\n");
+        f.write("4242/statm", "1 512 0 0 0 0 0\n");
 
         let c = collector(&f, FakeRunner::new("", ""), clock(0).1);
         let body = c.telemetry(None);
@@ -1108,7 +977,7 @@ mod tests {
         assert_eq!(by_id("mailstack-web")["memoryMb"], 2.0);
         assert_eq!(by_id("mailstack-webmail")["status"], "STOPPED");
         assert_eq!(by_id("fail2ban")["status"], "STOPPED");
-        // 守护进程的 CPU 份额基线从不计算，保持 0（不是「读不到」）。
+
         assert_eq!(by_id("postfix")["cpuPercent"], 0.0);
         assert_eq!(body["current"]["totalDaemonMemoryMb"], 3.4);
     }
@@ -1118,9 +987,9 @@ mod tests {
         let f = Fixture::new("summing");
         base_proc(&f);
         f.write("100/comm", "qmgr\n");
-        f.write("100/statm", "500 100 0 0 0 0 0\n"); // 0.4 MB
+        f.write("100/statm", "500 100 0 0 0 0 0\n");
         f.write("104/comm", "pickup\n");
-        f.write("104/statm", "500 256 0 0 0 0 0\n"); // 1.0 MB
+        f.write("104/statm", "500 256 0 0 0 0 0\n");
 
         let c = collector(&f, FakeRunner::new("", ""), clock(0).1);
         let body = c.telemetry(None);
@@ -1157,8 +1026,6 @@ mod tests {
         );
     }
 
-    /// R5-007：`postqueue -j` 不得每个采样周期都跑（原实现每 2 秒一次全队列列举，
-    /// 且整段调用都在采集器互斥锁内）。队列积压是分钟级指标，缓存 60 秒足够。
     #[test]
     fn postqueue_is_not_run_on_every_sample() {
         let f = Fixture::new("queuecache");
@@ -1168,7 +1035,6 @@ mod tests {
         let runner = FakeRunner::new(DF_OK, postqueue);
         let c = collector(&f, Arc::clone(&runner), clock);
 
-        // 30 个采样周期（2 秒一个 = 60 秒）。原实现会跑 30 次 `postqueue`。
         for tick in 0..30 {
             now.store(tick * 2_000, Ordering::SeqCst);
             c.sample();
@@ -1178,7 +1044,7 @@ mod tests {
             "60 秒内跑了 {} 次 postqueue（应 ≤ 2：首采一次 + 60 秒后一次）",
             runner.postqueue_calls()
         );
-        // 缓存期间读数仍然真实：队列计数取自上一次成功采样，而不是被清零。
+
         let point = c.sample();
         assert_eq!(point.queue_total, 1, "缓存期间队列读数不得退化成 0");
 
@@ -1187,10 +1053,8 @@ mod tests {
         assert_eq!(runner.postqueue_calls(), 2, "60 秒后应刷新一次");
     }
 
-    /// R5-023：`/proc` 读不到时必须如实标「不可用」，不能拿 0 冒充读数。
     #[test]
     fn unreadable_proc_entries_are_reported_as_unavailable_not_as_zero() {
-        // 一个空的 `/proc`：uptime / loadavg / meminfo 全都读不到。
         let f = Fixture::new("unavailable");
         let c = collector(&f, FakeRunner::new("", ""), clock(0).1);
 
@@ -1213,7 +1077,6 @@ mod tests {
             );
         }
 
-        // 对照：读得到时不得再标不可用。
         let ok = Fixture::new("available");
         base_proc(&ok);
         let c = collector(&ok, FakeRunner::new(DF_OK, ""), clock(0).1);
@@ -1237,7 +1100,6 @@ mod tests {
         assert_eq!(first["current"]["diskUsagePercent"], 25.0);
         assert_eq!(runner.df_calls(), 1);
 
-        // 一分钟之内不重跑：磁盘用量不是每 2 秒就会变的东西。
         c.telemetry(None);
         assert_eq!(runner.df_calls(), 1);
 
@@ -1270,14 +1132,14 @@ mod tests {
         let (now, clock) = clock(0);
         let c = collector(&f, FakeRunner::new("", ""), clock);
 
-        c.sample(); // t = 0：所有档都进第一个点
+        c.sample();
         now.store(1_000, Ordering::SeqCst);
-        c.sample(); // t = 1s：只有 1m 档到期
+        c.sample();
         assert_eq!(c.telemetry(Some("1m"))["samplingCount"], 2);
         assert_eq!(c.telemetry(Some("1h"))["samplingCount"], 1);
 
         now.store(3_600_000, Ordering::SeqCst);
-        c.sample(); // t = 1h：所有档都到期
+        c.sample();
         assert_eq!(c.telemetry(Some("1m"))["samplingCount"], 3);
         assert_eq!(c.telemetry(Some("1h"))["samplingCount"], 2);
         assert_eq!(c.telemetry(Some("3d"))["samplingCount"], 2);
@@ -1292,7 +1154,7 @@ mod tests {
         let body = c.telemetry(Some("1m"));
         assert_eq!(body["samplingCount"], 0, "没采过样就该是 0，而不是 1");
         assert_eq!(body["points"].as_array().unwrap().len(), 0);
-        // 即时采样只填 `current`，不进 `points` —— 否则前端会以为历史只有一段。
+
         assert_eq!(body["current"]["cores"], 2);
         assert_eq!(body["current"]["hostname"], "mail.example.test");
         assert_eq!(body["current"]["uptimeSec"], 12345);
@@ -1302,8 +1164,6 @@ mod tests {
 
     #[test]
     fn missing_mem_available_falls_back_to_mem_free_instead_of_reporting_nothing() {
-        // 与 `core::sysinfo::read_meminfo` 的 fail-loud 契约不同：遥测这条路由的
-        // 形状里没有「读不到」的位置，基线也是退到 MemFree。
         let f = Fixture::new("memfallback");
         base_proc(&f);
         f.write(
@@ -1383,7 +1243,7 @@ mod tests {
         ] {
             assert!(point.get(key).is_some(), "point 缺字段 {key}");
         }
-        // 时间戳必须是前端 `new Date()` 能解析的 ISO 8601。
+
         let timestamp = point["timestamp"].as_str().unwrap();
         assert!(
             timestamp.contains('T') && (timestamp.ends_with("+00:00") || timestamp.ends_with('Z')),

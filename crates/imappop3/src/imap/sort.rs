@@ -1,9 +1,3 @@
-//! SORT（RFC 5256）排序键与比较器。
-//!
-//! 与 SEARCH 共用条件解析；这里只负责把命中的邮件按 `(SORT criteria)` 排序。
-//! 头字段类排序（FROM/TO/CC/SUBJECT/DATE）需要读取邮件头；调用方按
-//! [`needs_headers`] 决定是否读文件。
-
 use crate::date;
 use crate::error::{MailError, Result};
 use crate::imap::parser::Token;
@@ -15,7 +9,7 @@ pub enum SortField {
     Arrival,
     Cc,
     Date,
-    /// RFC 5957：按 From 的显示名（无显示名时用地址）排序。
+
     Display,
     From,
     Size,
@@ -107,7 +101,7 @@ pub fn values(meta: &MessageMeta, message: &[u8], keys: &[SortKey]) -> SortValue
     values.from = headers.get("from").unwrap_or("").to_ascii_lowercase();
     values.subject = headers.get("subject").unwrap_or("").to_ascii_lowercase();
     values.to = headers.get("to").unwrap_or("").to_ascii_lowercase();
-    // RFC 5957：DISPLAY 用第一个 From 地址的显示名，缺省用地址本身。
+
     values.display = mime::parse_addresses(headers.get("from").unwrap_or(""))
         .first()
         .map(|address| {
@@ -140,7 +134,6 @@ fn compare_key(key: &SortKey, a: &SortValues, b: &SortValues) -> std::cmp::Order
     }
 }
 
-/// 排序并返回编号（序号或 UID，由调用方决定）。同键时按编号升序稳定。
 pub fn sort(mut items: Vec<(u32, SortValues)>, keys: &[SortKey]) -> Vec<u32> {
     items.sort_by(|(a_number, a), (b_number, b)| {
         for key in keys {
@@ -257,7 +250,7 @@ mod tests {
             .iter()
             .map(|(meta, message)| (meta.uid, values(meta, message, &keys)))
             .collect();
-        // alice（无显示名 → 地址）、bob、zoe 升序。
+
         assert_eq!(sort(items, &keys), vec![2, 3, 1]);
         assert!(matches!(keys[0].field, SortField::Display));
     }

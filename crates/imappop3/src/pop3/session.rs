@@ -1,21 +1,3 @@
-//! POP3 会话（RFC 1939）与扩展 `CAPA` / `STLS` / `TOP` / `UIDL`。
-//!
-//! ## 与 IMAP 的语义差异（不是「简化版 IMAP」）
-//!
-//! * **独占邮箱**：RFC 1939 要求同一邮箱同时只能有一个 POP3 事务。本实现用
-//!   `<root>/.mailstack-pop3.lock` 的排他文件锁保证跨进程互斥；拿不到锁回
-//!   `-ERR [IN-USE]`，而不是让两个客户端互相删信。
-//! * **删除是会话级的**：`DELE` 只做标记；`QUIT` 才真正落盘。客户端断线 =
-//!   全部回滚（`RSET` 语义），这是 RFC 的硬要求。
-//! * **UIDL 稳定**：`<uidvalidity>-<uid>`。UID 映射由 Maildir 层维护，因此
-//!   同一封邮件在多次会话之间 UIDL 不变。
-//!
-//! ## 行协议
-//!
-//! 正文必须按 CRLF 发送，行首 `.` 加倍；`QUIT` 之外的断线不能提交删除。
-//! 本模块只使用 [`LineIo`]，不自己做缓冲 —— 这样 `STLS` 升级点可以丢弃明文
-//! 残留（与 IMAP 的 STARTTLS 同一个防护）。
-
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::net::SocketAddr;
@@ -40,7 +22,7 @@ pub struct Pop3Config {
     pub max_auth_failures: u32,
     pub max_line: usize,
     pub read_timeout: Duration,
-    /// RETR/TOP 的单封邮件上限。
+
     pub max_message_size: u64,
 }
 
@@ -48,7 +30,7 @@ impl Default for Pop3Config {
     fn default() -> Self {
         Self {
             server_name: "mailstack".to_string(),
-            // 与 IMAP 同一安全默认：明文口令必须由部署者显式允许。
+
             require_tls: true,
             max_auth_failures: 5,
             max_line: 1024,
@@ -58,17 +40,12 @@ impl Default for Pop3Config {
     }
 }
 
-/// 每个监听器（110 / 995）各拿一份上下文；`resolver` 让同一份上下文服务所有账号。
 #[derive(Clone)]
 pub struct Pop3SessionContext {
-    /// 单用户部署的默认邮箱；声明了 `resolver` 时它只是认证前的占位。
     pub store: Arc<MailStore>,
     pub auth: AuthBackend,
     pub config: Pop3Config,
-    /// 按登录名解析 Maildir 的解析器。`None` = 单用户部署（沿用 `store`）。
-    ///
-    /// 与 IMAP 侧的 `ImapSessionContext::resolver` 语义一致：多用户装配必须在
-    /// 认证成功后切到该用户的 Maildir，而不是所有人共用一个。
+
     pub resolver: Option<Arc<dyn crate::resolver::MailboxResolver>>,
 }
 
@@ -102,7 +79,7 @@ where
         starttls: options.starttls_available && !options.secured,
         state: State::Authorization { user: None },
         failures: 0,
-        // 认证通过后若有 resolver，会在这里换成本人邮箱。
+
         store: Arc::clone(&ctx.store),
     }
     .run(options.greet)
@@ -114,7 +91,6 @@ enum State {
         user: Option<String>,
     },
     Transaction {
-        /// 排他锁必须活到事务结束；字段本身不被读取，持有即生效。
         _lock: File,
         uidvalidity: u32,
         messages: Vec<MessageMeta>,
@@ -137,7 +113,7 @@ struct Pop3Session<'a, S> {
     starttls: bool,
     state: State,
     failures: u32,
-    /// 当前账号的 Maildir。认证成功后按 `ctx.resolver` 换成登录用户自己的。
+
     store: Arc<MailStore>,
 }
 
@@ -308,8 +284,6 @@ where
         };
         match self.ctx.auth.as_dyn().authenticate(request).await {
             AuthOutcome::Success { user } => {
-                // 多用户装配：声明了 `resolver` 就按登录名切到本人 Maildir。
-                // 解析失败必须拒绝，不能退回 `ctx.store`（那是默认账号的邮箱）。
                 if let Some(resolver) = self.ctx.resolver.as_ref() {
                     let Some(store) = resolver.resolve(&user) else {
                         tracing::warn!(peer = %self.peer, user = %user, "pop3 login rejected: mailbox is not provisioned");
@@ -710,7 +684,6 @@ fn sanitize(text: &str) -> String {
         .collect()
 }
 
-/// 拿排他锁。返回 [`MailError::AlreadyExists`] 表示「被别的会话占用」。
 fn acquire_mailbox_lock(root: &Path) -> Result<File> {
     let path = root.join(".mailstack-pop3.lock");
     let mut options = OpenOptions::new();
@@ -732,10 +705,6 @@ fn acquire_mailbox_lock(root: &Path) -> Result<File> {
     }
 }
 
-/// POP3 数据区流式写出：CRLF 行尾 + 行首 `.` 加倍。
-///
-/// `top: Some(n)` 时只输出「头 + 空行 + 前 n 行正文」。逐行写而不构造整封副本：
-/// 一封 50 MiB 的邮件不会在内存里出现第二份拷贝。
 async fn write_transfer<W: AsyncWrite + Unpin>(
     writer: &mut W,
     message: &[u8],
@@ -832,8 +801,6 @@ mod tests {
 
     #[test]
     fn flags_are_not_used_but_the_type_stays_exported_for_uidl_stability() {
-        // UIDL 只依赖 (uidvalidity, uid)；这里用一个最小断言防止未来把 UID 换成
-        // 文件名（文件名会随 \Seen 变化，UIDL 就不再稳定）。
         let mut flags = FlagSet::new();
         flags.insert(Flag::System(crate::maildir::SystemFlag::Seen));
         assert!(flags.iter().any(|flag| flag.imap_name() == "\\Seen"));

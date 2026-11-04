@@ -1,17 +1,7 @@
-//! RPC 帧格式（规格书 §5.4.3）。
-//!
-//! 传输：Unix domain socket。
-//! 帧：`uint32be(length)` + UTF-8 JSON，**双向**。
-//!
-//! 请求上限 256 KB（与 `mailstackctl.py` 一致），响应上限 16 MB
-//! （超出报 `PRIVILEGED_OPERATION_FAILED`）。
-
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// 通用帧最大字节数上限（用于服务端响应与客户端接收响应，规格书 §5.4.3）。
 pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
-/// 请求体上限 256 KB（与 `mailstackctl.py` 的 stdin 上限一致）。
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,10 +18,6 @@ pub enum FrameError {
     Json(#[from] serde_json::Error),
 }
 
-/// 读取一帧：先读 4 字节长度前缀，再读负载。
-///
-/// 长度前缀为 big-endian `uint32`。超限时立即报错，**不**尝试读取负载
-/// ——避免恶意对端用超大长度值诱导内存分配。
 pub async fn read_frame<R>(reader: &mut R) -> Result<Vec<u8>, FrameError>
 where
     R: AsyncReadExt + Unpin,
@@ -63,7 +49,6 @@ where
     Ok(payload)
 }
 
-/// 读取一帧并反序列化为 `T`。
 pub async fn read_json_frame<T, R>(reader: &mut R) -> Result<T, FrameError>
 where
     T: serde::de::DeserializeOwned,
@@ -73,7 +58,6 @@ where
     Ok(serde_json::from_slice(&payload)?)
 }
 
-/// 读取并解析 RPC 请求帧；在按声明长度分配内存前执行 256 KB 上限检查。
 pub(crate) async fn read_json_request_frame<T, R>(reader: &mut R) -> Result<T, FrameError>
 where
     T: serde::de::DeserializeOwned,
@@ -83,7 +67,6 @@ where
     Ok(serde_json::from_slice(&payload)?)
 }
 
-/// 写入一帧：长度前缀 + 负载。
 pub async fn write_frame<W>(writer: &mut W, payload: &[u8]) -> Result<(), FrameError>
 where
     W: AsyncWriteExt + Unpin,
@@ -99,7 +82,6 @@ where
     Ok(())
 }
 
-/// 序列化并写入一帧。
 pub async fn write_json_frame<W, T>(writer: &mut W, value: &T) -> Result<(), FrameError>
 where
     W: AsyncWriteExt + Unpin,
@@ -109,7 +91,6 @@ where
     write_frame(writer, &payload).await
 }
 
-/// 读满整个缓冲区；返回实际读到的字节数（对端提前关闭时 < len）。
 async fn read_fully<R>(reader: &mut R, buf: &mut [u8]) -> Result<usize, std::io::Error>
 where
     R: AsyncReadExt + Unpin,
@@ -135,7 +116,6 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(&mut buf, b"hello world").await.unwrap();
 
-        // 前 4 字节必须是 big-endian 长度。
         assert_eq!(&buf[..4], &11u32.to_be_bytes());
         assert_eq!(&buf[4..], b"hello world");
 
@@ -174,7 +154,6 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_oversized_length_prefix_without_allocating() {
-        // 恶意长度值必须被立即拒绝，而不是先分配 4 GB。
         let mut buf = Vec::new();
         buf.extend_from_slice(&u32::MAX.to_be_bytes());
         let mut cursor = Cursor::new(buf);
@@ -206,7 +185,7 @@ mod tests {
     async fn reports_truncated_frame() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&100u32.to_be_bytes());
-        buf.extend_from_slice(b"only-ten-b"); // 10 字节，声明 100
+        buf.extend_from_slice(b"only-ten-b");
         let mut cursor = Cursor::new(buf);
         let err = read_frame(&mut cursor).await.unwrap_err();
         assert!(

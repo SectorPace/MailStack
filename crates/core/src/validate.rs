@@ -1,37 +1,26 @@
-//! 输入校验正则 —— 与 `core.py:12-16` 逐字一致。
-//!
-//! 任何改动都会改变对外契约（域名/邮箱/队列 ID 的接受面），故必须保持等价。
-
 use std::sync::LazyLock;
 
 use regex::Regex;
 
-/// `^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$`
 pub static DOMAIN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$").unwrap()
 });
 
-/// `^[a-z_][a-z0-9_-]{0,30}$`
 pub static USER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z_][a-z0-9_-]{0,30}$").unwrap());
 
-/// `^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}@[A-Za-z0-9.-]+$`
 pub static ADDRESS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}@[A-Za-z0-9.-]+$").unwrap());
 
-/// `^[A-F0-9]{5,20}[*!]?$`
 pub static QUEUE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-F0-9]{5,20}[*!]?$").unwrap());
 
-/// `^[A-Za-z][A-Za-z0-9_.-]{2,31}$` —— 管理员名 3–32 字符。
 pub static ADMIN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z][A-Za-z0-9_.-]{2,31}$").unwrap());
 
-/// `^[A-Za-z0-9_-]{1,63}$` —— DKIM selector。
 pub static DKIM_SELECTOR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]{1,63}$").unwrap());
 
-/// 中继主机名：`[A-Za-z0-9.-]{1,253}`，且不得以 `.` 开头/结尾、不得含 `..`。
 pub fn is_valid_relay_host(host: &str) -> bool {
     if host.is_empty() || host.len() > 253 {
         return false;

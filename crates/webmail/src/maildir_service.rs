@@ -1,31 +1,3 @@
-//! Maildir 业务服务：文件夹、列表、详情、标志、移动、删除、批量、搜索、配额。
-//!
-//! ## 分层
-//!
-//! 本模块是**同步**的（Maildir 是 `std::fs`），所有方法都在 `spawn_blocking`
-//! 里被 HTTP 层调用。每次操作重新 `MailStore::new`：MailStore 本身只是
-//! `(root, clock)` 两个字段的薄封装，构造成本可忽略，这样就不必维护跨请求缓存
-//! 与缓存失效（缓存失效是并发出错的高发点）。
-//!
-//! ## 路径与 uid 的安全边界
-//!
-//! * `folder` 一律先经 `maildir::normalize_folder_name`（拒绝 `..`、`/`、`\`、
-//!   NUL、保留前缀）；`INBOX` 归一为大写；
-//! * `uid` **不接受任意路径**：先在文件夹元数据里定位到 `MessageMeta`，
-//!   后续读写都用它给出的真实路径。这样「构造一个 uid 指向别的文件」不可能成立。
-//!
-//! ## 列表性能
-//!
-//! 列表只读每封邮件的前 [`MESSAGE_PREFIX_BYTES`] 字节（头部 + 正文开头）来构造
-//! 摘要，绝不为了一页 50 封去读 50 个全文。详情才读全文（且受
-//! [`MAX_DETAIL_BYTES`] 限制）。
-//!
-//! ## 搜索的诚实截断
-//!
-//! 搜索最多扫描 [`MAX_SEARCH_SCAN`] 封（按内部日期倒序，优先新邮件），
-//! 被截断时 `truncated: true` 如实返回。`total` 是「在扫描范围内匹配到的数量」，
-//! 不是「全邮箱匹配数」——这两者的差别必须在响应里可见，不能假装搜完了。
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -46,7 +18,6 @@ use crate::{
     MAX_SEARCH_SCAN, MAX_SUBJECT_CHARS, MESSAGE_PREFIX_BYTES, SEARCH_TEXT_BYTES,
 };
 
-/// 一个文件夹的视图（契约 §2 `GET /mail/api/folders`）。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderItem {
@@ -57,7 +28,6 @@ pub struct FolderItem {
     pub unseen: u32,
 }
 
-/// 列表里的邮件摘要（契约 §2.1 `MessageSummary`）。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageSummary {
@@ -74,7 +44,6 @@ pub struct MessageSummary {
     pub thread_key: String,
 }
 
-/// 列表 / 搜索响应（契约 §2 `GET /mail/api/messages` 与 `GET /mail/api/search`）。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageList {
@@ -83,24 +52,19 @@ pub struct MessageList {
     pub offset: usize,
     pub limit: usize,
     pub messages: Vec<MessageSummary>,
-    /// 搜索是否因扫描上限被截断（非搜索恒为 `false`）。
-    ///
-    /// 契约的 messages 形状没有这个字段，但「假装搜完了全部邮箱」是比多一个
-    /// 字段更糟的失真；前端可以忽略它。
+
     pub truncated: bool,
 }
 
-/// 正文视图（契约 §2.1 `MessageDetail.body`）。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BodyView {
     pub text: Option<String>,
-    /// **已消毒**的 HTML；没有 HTML 正文时为 `None`（前端回退到 text）。
+
     pub html: Option<String>,
     pub truncated: bool,
 }
 
-/// 邮件详情（契约 §2.1 `MessageDetail`）。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageDetail {
@@ -114,15 +78,13 @@ pub struct MessageDetail {
     pub remote_images_blocked: u32,
 }
 
-/// 原始邮件（`.eml` 下载）。
 #[derive(Debug, Clone)]
 pub struct RawMessage {
     pub data: Vec<u8>,
-    /// 清洗后的建议文件名（含 `.eml`）。
+
     pub filename: String,
 }
 
-/// 单个 MIME 部件的下载数据。
 #[derive(Debug, Clone)]
 pub struct PartData {
     pub data: Vec<u8>,
@@ -132,7 +94,6 @@ pub struct PartData {
     pub inline: bool,
 }
 
-/// 配额视图（契约 §2 `GET /mail/api/quota`）。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaView {
@@ -141,7 +102,6 @@ pub struct QuotaView {
     pub limits: QuotaLimitsView,
 }
 
-/// 配额上限（`null` = 无限制）。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaLimitsView {
@@ -149,7 +109,6 @@ pub struct QuotaLimitsView {
     pub storage_bytes: Option<u64>,
 }
 
-/// 标志补丁（只改给出的字段）。
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct FlagPatch {
@@ -158,7 +117,6 @@ pub struct FlagPatch {
     pub answered: Option<bool>,
 }
 
-/// 列表查询选项。
 #[derive(Debug, Clone)]
 pub struct ListOptions {
     pub offset: usize,
@@ -166,7 +124,7 @@ pub struct ListOptions {
     pub unread_only: bool,
     pub flagged_only: bool,
     pub sort: SortOrder,
-    /// 非空时走搜索路径。
+
     pub query: Option<String>,
 }
 
@@ -183,7 +141,6 @@ impl Default for ListOptions {
     }
 }
 
-/// 排序方式（契约 `sort=date_desc`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOrder {
     DateDesc,
@@ -191,7 +148,6 @@ pub enum SortOrder {
 }
 
 impl SortOrder {
-    /// 解析契约里的排序名；未知值返回 `None`（调用方回 400）。
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "date_desc" => Some(SortOrder::DateDesc),
@@ -201,7 +157,6 @@ impl SortOrder {
     }
 }
 
-/// 批量操作请求（契约 §2 `POST /mail/api/messages/batch`）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchRequest {
@@ -214,7 +169,6 @@ pub struct BatchRequest {
     pub target: Option<String>,
 }
 
-/// 移动 / 复制结果（契约 §2）。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MoveResult {
@@ -222,25 +176,18 @@ pub struct MoveResult {
     pub folder: String,
 }
 
-/// Maildir 业务服务。
 #[derive(Debug, Clone)]
 pub struct MaildirService {
     maildir: std::path::PathBuf,
 }
 
 impl MaildirService {
-    /// 从已认证账号构造。
     pub fn new(account: &Account) -> Self {
         Self {
             maildir: account.maildir.clone(),
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 文件夹
-    // -----------------------------------------------------------------------
-
-    /// 列出全部文件夹（INBOX 优先，其余按字母序）。
     pub fn list_folders(&self) -> WebmailResult<Vec<FolderItem>> {
         let store = self.open_store()?;
         let names = store.folders().map_err(WebmailError::from_mail)?;
@@ -267,7 +214,7 @@ impl MaildirService {
                 unseen: status.unseen,
             });
         }
-        // INBOX 优先，其余字母序（大小写不敏感，再按原串稳定排序）。
+
         items.sort_by(|a, b| {
             let inbox_a = a.name != maildir::INBOX;
             let inbox_b = b.name != maildir::INBOX;
@@ -278,7 +225,7 @@ impl MaildirService {
         });
         Ok(items)
     }
-    /// 创建文件夹，返回规范化后的名字。
+
     pub fn create_folder(&self, name: &str) -> WebmailResult<String> {
         let normalized = maildir::normalize_folder_name(name).map_err(WebmailError::from_mail)?;
         if normalized == maildir::INBOX {
@@ -292,7 +239,6 @@ impl MaildirService {
         Ok(normalized)
     }
 
-    /// 重命名文件夹。
     pub fn rename_folder(&self, from: &str, to: &str) -> WebmailResult<String> {
         let from = maildir::normalize_folder_name(from).map_err(WebmailError::from_mail)?;
         let to = maildir::normalize_folder_name(to).map_err(WebmailError::from_mail)?;
@@ -307,11 +253,6 @@ impl MaildirService {
         Ok(to)
     }
 
-    /// 删除文件夹：**只允许空文件夹**（契约 §2.2，防误删数据）。
-    ///
-    /// 与 `MailStore::delete`（IMAP 语义：连邮件一起删）刻意不同：Webmail 的
-    /// DELETE 是「删这个空壳」，邮箱里还有邮件就拒绝。子文件夹也算非空——
-    /// 删掉父节点会让子节点变成孤儿路径。
     pub fn delete_folder(&self, name: &str) -> WebmailResult<()> {
         let normalized = maildir::normalize_folder_name(name).map_err(WebmailError::from_mail)?;
         if normalized == maildir::INBOX {
@@ -339,11 +280,6 @@ impl MaildirService {
         store.delete(&normalized).map_err(WebmailError::from_mail)
     }
 
-    // -----------------------------------------------------------------------
-    // 列表 / 搜索
-    // -----------------------------------------------------------------------
-
-    /// 列出邮件（分页 + 过滤 + 可选搜索）。
     pub fn list_messages(&self, folder: &str, options: &ListOptions) -> WebmailResult<MessageList> {
         if let Some(query) = options.query.as_deref().filter(|q| !q.trim().is_empty()) {
             return self.search(folder, query, options.offset, options.limit);
@@ -383,7 +319,6 @@ impl MaildirService {
         })
     }
 
-    /// 搜索：subject / from / to / cc + 正文前 256 KB，大小写不敏感。
     pub fn search(
         &self,
         folder: &str,
@@ -419,7 +354,7 @@ impl MaildirService {
         let mut scanned = 0usize;
         for meta in candidates.iter().take(MAX_SEARCH_SCAN) {
             scanned += 1;
-            // 单封信读失败（并发删除 / 临时 IO）不应让整次搜索失败：跳过并继续。
+
             let Ok(prefix) = store.read_prefix(meta, SEARCH_TEXT_BYTES) else {
                 continue;
             };
@@ -443,7 +378,6 @@ impl MaildirService {
         })
     }
 
-    /// 批量构造摘要（每封只读头部前缀）。
     fn summaries(
         &self,
         store: &MailStore,
@@ -456,7 +390,6 @@ impl MaildirService {
         Ok(out)
     }
 
-    /// 构造单封摘要；读不出来的邮件也返回一个**如实**的最小摘要。
     fn summary(&self, store: &MailStore, meta: &MessageMeta) -> MessageSummary {
         let prefix = store
             .read_prefix(meta, MESSAGE_PREFIX_BYTES)
@@ -482,11 +415,6 @@ impl MaildirService {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 详情 / 原始 / 部件
-    // -----------------------------------------------------------------------
-
-    /// 邮件详情（HTML 已消毒；远程图片默认阻断）。
     pub fn message_detail(
         &self,
         folder: &str,
@@ -504,7 +432,6 @@ impl MaildirService {
         };
         let parsed = mime_view::parse_message(&data);
 
-        // cid → 本站部件 URL（契约 §2.2）。文件名/文件夹都做 URL 编码。
         let mut cid_urls: HashMap<String, String> = HashMap::new();
         for attachment in &parsed.attachments {
             if let Some(cid) = attachment.cid.as_deref() {
@@ -546,7 +473,6 @@ impl MaildirService {
         })
     }
 
-    /// 原始邮件（`.eml`）。
     pub fn raw_message(&self, folder: &str, uid: u32) -> WebmailResult<RawMessage> {
         let (_normalized, store, meta) = self.locate(folder, uid)?;
         if meta.size > MAX_RAW_BYTES as u64 {
@@ -563,7 +489,6 @@ impl MaildirService {
         Ok(RawMessage { data, filename })
     }
 
-    /// 单个 MIME 部件（附件 / 内嵌资源）。
     pub fn part(&self, folder: &str, uid: u32, part_id: &str) -> WebmailResult<PartData> {
         let (_normalized, store, meta) = self.locate(folder, uid)?;
         if meta.size > MAX_DETAIL_BYTES as u64 {
@@ -597,11 +522,6 @@ impl MaildirService {
         })
     }
 
-    // -----------------------------------------------------------------------
-    // 标志 / 移动 / 删除 / 批量
-    // -----------------------------------------------------------------------
-
-    /// 只改给出的标志字段，返回更新后的标志列表。
     pub fn patch_flags(
         &self,
         folder: &str,
@@ -619,7 +539,6 @@ impl MaildirService {
         Ok(flag_names(&updated.flags))
     }
 
-    /// 移动 / 复制一封邮件，返回目标文件夹里的新 uid。
     pub fn move_message(
         &self,
         folder: &str,
@@ -648,8 +567,6 @@ impl MaildirService {
             .copy(&normalized_from, uid, &normalized_to)
             .map_err(WebmailError::from_mail)?;
         if !copy_only {
-            // 先拷贝后删除：反序会让「拷贝失败」变成丢信。删除失败时返回错误，
-            // 但目标文件夹里已有副本（数据重复，不是丢失）。
             store
                 .expunge(&normalized_from, &[uid])
                 .map_err(WebmailError::from_mail)?;
@@ -660,7 +577,6 @@ impl MaildirService {
         })
     }
 
-    /// 永久删除一封邮件（`\Deleted` + expunge 该 uid，契约 §2）。
     pub fn delete_message(&self, folder: &str, uid: u32) -> WebmailResult<()> {
         let (normalized, store, meta) = self.locate(folder, uid)?;
         let mut flags = meta.flags.clone();
@@ -674,7 +590,6 @@ impl MaildirService {
         Ok(())
     }
 
-    /// 批量操作，返回实际影响的邮件数。
     pub fn batch(&self, request: &BatchRequest) -> WebmailResult<usize> {
         if request.uids.is_empty() {
             return Ok(0);
@@ -780,11 +695,6 @@ impl MaildirService {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 配额
-    // -----------------------------------------------------------------------
-
-    /// 配额与用量。
     pub fn quota(&self) -> WebmailResult<QuotaView> {
         let store = self.open_store()?;
         let status = store.quota_status().map_err(WebmailError::from_mail)?;
@@ -798,15 +708,10 @@ impl MaildirService {
         })
     }
 
-    // -----------------------------------------------------------------------
-    // 内部工具
-    // -----------------------------------------------------------------------
-
     fn open_store(&self) -> WebmailResult<MailStore> {
         MailStore::new(&self.maildir, Arc::new(SystemClock)).map_err(WebmailError::from_mail)
     }
 
-    /// 定位一封邮件：先 normalize 文件夹名，再在元数据里按 uid 找。
     fn locate(&self, folder: &str, uid: u32) -> WebmailResult<(String, MailStore, MessageMeta)> {
         let normalized = maildir::normalize_folder_name(folder).map_err(WebmailError::from_mail)?;
         let store = self.open_store()?;
@@ -821,11 +726,6 @@ impl MaildirService {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 视图辅助
-// ---------------------------------------------------------------------------
-
-/// 特殊用途名字：`\Sent` → `sent`；INBOX 额外带 `inbox`；按契约顺序输出。
 fn special_use_names(name: &str, raw: Option<&[String]>) -> Vec<String> {
     let mut names: Vec<String> = raw
         .map(|attributes| {
@@ -863,7 +763,6 @@ fn special_use_names(name: &str, raw: Option<&[String]>) -> Vec<String> {
     names
 }
 
-/// FlagSet → 契约里的标志名（小写、不带反斜杠）。
 pub fn flag_names(flags: &FlagSet) -> Vec<String> {
     let mut names = Vec::with_capacity(flags.len());
     for flag in flags {
@@ -919,7 +818,6 @@ fn internal_date_string(timestamp: i64) -> Option<String> {
         .map(mime_view::format_rfc3339_utc)
 }
 
-/// 本站部件 URL（cid 图片改写目标）。
 fn part_url(folder: &str, uid: u32, part_id: &str) -> String {
     format!(
         "/mail/api/messages/{}/{}/parts/{}",
@@ -929,7 +827,6 @@ fn part_url(folder: &str, uid: u32, part_id: &str) -> String {
     )
 }
 
-/// RFC 3986 的百分号编码（保留 unreserved 字符）。
 pub fn url_encode_segment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
@@ -942,7 +839,6 @@ pub fn url_encode_segment(value: &str) -> String {
     out
 }
 
-/// 创建文件夹的错误映射：重名 → 409，非法名 → 400。
 fn map_folder_create_error(error: mailstack_imappop3::error::MailError) -> WebmailError {
     match error {
         mailstack_imappop3::error::MailError::AlreadyExists(_) => {
@@ -1010,7 +906,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.service.create_folder("Projects").unwrap();
         fixture.append(&plain_message("hello", "body"));
-        // 把邮件搬进 Projects，让它非空。
+
         let store = fixture.store();
         let inbox = store.open_folder("INBOX", false).unwrap();
         let uid = inbox.messages[0].uid;
@@ -1022,7 +918,6 @@ mod tests {
         assert_eq!(error.code, "FOLDER_NOT_EMPTY");
         assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
 
-        // 清空后可以删除。
         let projects = store.open_folder("Projects", false).unwrap();
         fixture
             .service
@@ -1049,7 +944,7 @@ mod tests {
                 error.status,
                 error.code
             );
-            // 删除路径同样经 normalize：穿越名不得落到文件系统。
+
             assert!(fixture.service.delete_folder(bad).is_err());
         }
     }
@@ -1123,7 +1018,6 @@ mod tests {
         assert_eq!(by_body.total, 1);
         assert_eq!(by_body.messages[0].subject, "Hello");
 
-        // 空搜索词被拒绝（不是「返回全部」）。
         assert_eq!(
             fixture
                 .service

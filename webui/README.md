@@ -36,7 +36,6 @@ auth:    /api/auth/login · session · logout · sessions · sessions/revoke
 admin:   /api/admin (POST 改用户名/密码) · /api/admin/2fa [·begin ·enable ·disable]
 数据:    /api/snapshot · domains[/id] · users[/status] · aliases[/id] · certificates[/renew]
          /api/logs · queue/action · services/action · settings · setup/status
-AI/中继: /api/ai/config · ai/models · ai/test · setup/relay/test · network/check-port
 ```
 未映射的动作自动回退 RPC 桥。登录响应的 `csrf` 由前端自动捕获并回传。
 
@@ -78,7 +77,6 @@ async fn rpc_bridge(State(state): State<App>, Json(req): Json<Value>) -> Respons
 | 服务管理 | `services.list`² | `services.action`（op=`start/stop/restart`） |
 | 安全中心 | `security.scan` | `security.unban` `security.ban` |
 | 系统设置 | `settings.get` | `settings.set` |
-| AI 智能中心 | `ai.config.get` `ai.models.list` | `ai.chat` `ai.diagnose` `ai.config.set` |
 
 > ¹ 白名单暂无 `users.list`，后端可在 `snapshot` 中返回 `users` 数组，或为 admin-web 增加该 RO 动作。
 > ² admin-web 聚合层动作：由 admin-web 把 helper 的底层数据组装后返回（前端字段结构见 `src/api/client.ts` 的 mock 分发器，即数据契约）。
@@ -89,7 +87,6 @@ async fn rpc_bridge(State(state): State<App>, Json(req): Json<Value>) -> Respons
 > - `snapshot.healthPanel` `{ overall, items:[{ key, label, status, value? }] }` —— 综合健康度环 + 服务清单（disk 项带 value 百分比）
 > - `activity.list` → `[{ kind: user|domain|queue|service|cert, title, sub, time }]` —— 最近动态
 > - `admin.set` / `admin.2fa.status|begin|enable|disable` / `sessions.list|revoke` —— 管理员账户、TOTP 绑定、会话管理（设置 → 安全策略）
-> - `ai.config.get/set` `ai.models.list` `ai.test` —— AI 服务商配置与连通测试
 > - `network.check_port` —— 中继端口连通检测（25/465/587）
 
 ### 2. `GET /api/health` —— 探活

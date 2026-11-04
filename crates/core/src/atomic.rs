@@ -1,25 +1,10 @@
-//! 文件写入原语（规格书 §5.7.1、§5.7.2、§5.7.4；INV-31 ~ INV-33）。
-//!
-//! 两把锁的 sidecar **必须不同名**，否则自死锁（INV-31）：
-//!
-//! | 原语 | sidecar | 覆盖范围 |
-//! |---|---|---|
-//! | [`atomic`] | `.<name>.lock` | 仅最终写入阶段 |
-//! | [`locked`] | `<name>.lock` | 整个 read-modify-write 临界区 |
-//!
-//! [`locked`] 存在的理由：`atomic` 只串行化最后的写阶段，一个 load-modify-save
-//! 序列仍会丢更新——两次并发的恢复码消费可能各自写回「码仍然存在」的文件
-//! （"double spend"）。
-
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use crate::error::{CoreError, CoreResult};
 
-/// 写入 secret 时的默认组（`atomic` 会把临时文件 chown 到该组）。
 pub const ADMIN_GROUP: &str = "mailstack-admin";
 
-/// `atomic()` 使用的锁 sidecar 路径：`.<name>.lock`。
 fn atomic_lock_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
@@ -28,10 +13,6 @@ fn atomic_lock_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.lock"))
 }
 
-/// `locked()` 使用的锁 sidecar 路径：`<name>.lock`。
-///
-/// **刻意与 [`atomic_lock_path`] 不同**——同名会在「持 locked 时再调 atomic」的
-/// 合法用法下自死锁（INV-31）。
 fn locked_lock_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
@@ -40,29 +21,12 @@ fn locked_lock_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.lock"))
 }
 
-/// 临时文件路径：同目录下 `<name>.tmp.<pid>.<seq>.<nanos>`。
-///
-/// ## 为什么带唯一后缀
-///
-/// 原实现是固定 `<name>.tmp`，有三个问题：
-///
-/// 1. **固定名会交错**：两个无锁写者（`locked()` 的降级路径）各自打开同一个
-///    `<name>.tmp`，写的内容互相覆盖，最终 `rename` 出去的是**半写文件**。
-/// 2. **跟随符号链接**：`File::create` 是 `O_CREAT|O_TRUNC`，**不**拒绝已存在的
-///    符号链接。能在目标目录写文件的人可以预置一个指向自选路径的 `.tmp`，
-///    于是密钥内容被引到那里（本地提权跳板）。
-/// 3. **失败无清理**：`rename` 出错时 `.tmp` 就留在盘上，长期留一份机密副本。
-///
-/// 唯一后缀让「(2) 预置符号链接」不再可能（`create_new` 要求不存在），
-/// 同时让「(1) 交错」的两个写者落在不同文件上。仍固定同目录，rename 才是
-/// 同文件系统内的原子操作。
 fn temp_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    // 进程内自增计数：同一进程内多次写同一目标也不会撞名
-    // （时间戳在快速连续写入下可能相同）。
+
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
@@ -72,11 +36,6 @@ fn temp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.tmp.{}.{seq}.{nanos}", std::process::id()))
 }
 
-// 测试观测点：临时文件已创建、**第一字节尚未写入**时回调。
-//
-// 用 `thread_local` 而不是全局 `Mutex<Option<Box<dyn Fn>>>`：这样的闭包既不是
-// `Send` 也不是 `Sync`，全局静态放不进去；而测试天然是一线程一个用例，线程局部
-// 已经足够，还顺带避免了并行用例互相干扰（CI 的 `--test-threads` 默认 > 1）。
 #[cfg(test)]
 type TempCreatedHook = Option<Box<dyn Fn(&Path)>>;
 
@@ -89,8 +48,6 @@ thread_local! {
 #[cfg(test)]
 fn notify_temp_created(path: &Path) {
     ON_TEMP_CREATED.with(|hook| {
-        // 先取出引用再调用：回调里若再调 `atomic` 也只是读这个 thread_local，
-        // 不会与 `borrow` 冲突（回调只允许读元数据，不允许重入写）。
         let borrowed = hook.borrow();
         if let Some(callback) = borrowed.as_ref() {
             callback(path);
@@ -101,27 +58,10 @@ fn notify_temp_created(path: &Path) {
 #[cfg(not(test))]
 fn notify_temp_created(_path: &Path) {}
 
-/// 原子写入 `data` 到 `path`，权限 `mode` 在 **首字节落盘之前**就已确定（INV-33）。
-///
-/// 步骤与 `core.py:621-662` 逐条对应：
-/// 1. `mkdir -p` 目标目录
-/// 2. 在 sidecar `.<name>.lock` 上取排他锁
-/// 3. 以 `O_CREAT|O_EXCL` + `mode(mode)` 创建**唯一**临时文件（权限此刻即生效）
-/// 4. 写 → `flush` → `fsync`
-/// 5. `chown(tmp, -1, mailstack-admin)`（尽力而为，失败仅 warn）
-/// 6. `rename(tmp, path)`，随后 **fsync 父目录**
-///
-/// ## 为什么第 3 步就用 `mode`
-///
-/// 基线与本模块文档原本都写「`chmod` 在 rename 之前」—— 那只保证了 rename 时
-/// 权限已收紧，却**没有覆盖真正的风险窗口**：临时文件从 `create` 到 `chmod`
-/// 之间已经写入了完整机密，而这段时间它的权限是 `0666 & ~umask`（root ⇒ 0644）。
-/// 用 inotify 守着目录即可稳定命中。真正要的是「首字节落盘之前就是 0600」。
 pub fn atomic(path: &Path, data: &[u8], mode: u32) -> CoreResult<()> {
     atomic_as(path, data, mode, Some(ADMIN_GROUP))
 }
 
-/// 可指定目标组的 [`atomic`]，`group = None` 表示跳过 chown（测试用）。
 pub fn atomic_as(path: &Path, data: &[u8], mode: u32, group: Option<&str>) -> CoreResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| CoreError::io(parent, e))?;
@@ -131,28 +71,10 @@ pub fn atomic_as(path: &Path, data: &[u8], mode: u32, group: Option<&str>) -> Co
     let _guard = FileLock::acquire(open_lock_sidecar(&lock_path)?, &lock_path)?;
 
     let tmp = temp_path(path);
-    // `OpenOptions` 而不是 `File::create`：三处差别都指向同一个不变量（INV-33）。
-    //
-    // * `mode(mode)` —— **在 create(2) 那一刻**就把权限定死。原实现用
-    //   `File::create`（`0666 & ~umask`，root 常见 umask 022 ⇒ **0644**）写完
-    //   完整内容、fsync 之后才 `set_mode`。于是 `admin.json`（口令哈希）、
-    //   `totp.key`（AES 主密钥）、`tls/<domain>/privkey.pem`（TLS 私钥）、
-    //   `ai-provider.json`（API Key）在「写完 → chmod」这段窗口里是
-    //   **0644 明文**，目录 0755 可列、文件名可预测 ⇒ 用 inotify 守着目录就能
-    //   稳定命中。这与本函数文档第 4 步写的「secret 不得以进程 umask 落盘」
-    //   **直接相反**：文档承诺 chmod 在 rename 之前，但真正的风险窗口是
-    //   「首字节落盘之前」，比 rename 早得多。
-    // * `create_new(true)` —— `O_EXCL`，已存在（含符号链接）即失败。不加它，
-    //   能在目标目录写文件的人可预置一个指向自选路径的同名临时文件，
-    //   把密钥内容引过去（本地提权跳板）。
-    // * 失败路径显式删除临时文件 —— 否则一次 rename 失败就在盘上留一份
-    //   长期存在的机密副本。
+
     let write_result = (|| -> CoreResult<()> {
         use std::io::Write;
-        // `.mode(..)` 是 `OpenOptionsExt`（Unix）的方法。生产目标是 Linux，
-        // 与 `backup.rs` 里 `open_no_follow` 的做法一致；Windows 上没有「创建时
-        // 指定权限」这回事，整个 builder 链按平台分两支 —— `.mode(..)` 挂在
-        // Unix 分支上，否则非 Unix 目标根本编译不过。
+
         #[cfg(unix)]
         let mut f = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -172,12 +94,7 @@ pub fn atomic_as(path: &Path, data: &[u8], mode: u32, group: Option<&str>) -> Co
                 .open(&tmp)
                 .map_err(|e| CoreError::io(&tmp, e))?
         };
-        // INV-33 的观测点：`create(2)` 已返回、**还没写第一个字节**。
-        //
-        // 守卫测试 `atomic_applies_mode_before_the_first_byte_lands` 在这里读临时
-        // 文件的权限。若实现退回「`File::create`（0666 & ~umask）→ 写 → chmod」，
-        // 此处读到的是 0644（root 常见 umask 022）—— 测试随即变红。只断言
-        // 「rename 后的最终 mode」的旧测试对这类回退**完全没有**分辨力。
+
         notify_temp_created(&tmp);
         f.write_all(data).map_err(|e| CoreError::io(&tmp, e))?;
         f.flush().map_err(|e| CoreError::io(&tmp, e))?;
@@ -185,7 +102,6 @@ pub fn atomic_as(path: &Path, data: &[u8], mode: u32, group: Option<&str>) -> Co
         Ok(())
     })();
     if let Err(err) = write_result {
-        // 尽力清理：失败不是关键路径，不能让它掩盖真正的错误。
         let _ = fs::remove_file(&tmp);
         return Err(err);
     }
@@ -198,19 +114,13 @@ pub fn atomic_as(path: &Path, data: &[u8], mode: u32, group: Option<&str>) -> Co
         let _ = fs::remove_file(&tmp);
         return Err(CoreError::io(path, err));
     }
-    // `rename` 只保证「同一次挂起内可见」，**不保证已落盘**：掉电时目录项可能
-    // 尚未写回。fsync 父目录才把这次重命名固化，否则「断电不丢件」只在
-    // 不掉电时成立。
+
     if let Some(parent) = path.parent() {
         fsync_dir(parent);
     }
     Ok(())
 }
 
-/// fsync 目录本身（`rename` 落盘的持久化保证）。
-///
-/// 失败只 warn：某些文件系统（如某些网络/FUSE 挂载）不支持目录 fsync，
-/// 那时它也不支持掉电持久化，不该让写入整体失败。
 fn fsync_dir(dir: &Path) {
     match File::open(dir) {
         Ok(handle) => {
@@ -222,10 +132,6 @@ fn fsync_dir(dir: &Path) {
     }
 }
 
-/// 在整个 read-modify-write 临界区持排他锁（`core.py:664-724`）。
-///
-/// 锁 sidecar 为 `<name>.lock`，与 [`atomic`] 的 `.<name>.lock` 不同名。
-/// POSIX 使用 `flock`，Windows 使用字节锁；无法打开或取得锁时返回错误，不进入临界区。
 pub fn locked<T, F>(path: &Path, f: F) -> CoreResult<T>
 where
     F: FnOnce() -> CoreResult<T>,
@@ -233,7 +139,6 @@ where
     locked_with(path, f)
 }
 
-/// 在整个读改写临界区持锁，并把锁错误转换为调用方的错误类型。
 pub fn locked_with<T, E, F>(path: &Path, f: F) -> Result<T, E>
 where
     E: From<CoreError>,
@@ -258,15 +163,12 @@ fn open_lock_sidecar(path: &Path) -> CoreResult<File> {
         .map_err(|e| CoreError::io(path, e))
 }
 
-/// RAII 排他锁；句柄由 guard 持有，析构时关闭并释放内核锁。
 struct FileLock {
     _file: File,
 }
 
 impl FileLock {
     fn acquire(file: File, path: &Path) -> CoreResult<Self> {
-        // `fs2` 在 Unix 上走 flock(LOCK_EX)、Windows 上走 LockFileEx，
-        // 语义与 `core.py` 的 fcntl.flock 降级链一致。
         fs2::FileExt::lock_exclusive(&file).map_err(|e| CoreError::io(path, e))?;
         Ok(Self { _file: file })
     }
@@ -280,11 +182,9 @@ fn set_mode(path: &Path, mode: u32) -> CoreResult<()> {
 
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) -> CoreResult<()> {
-    // Windows 无 POSIX 权限位；生产目标是 Linux，此处仅为让测试可跑。
     Ok(())
 }
 
-/// 尝试把文件属组改为 `group`；失败仅 warn（`core.py` 同样只忽略异常）。
 #[cfg(unix)]
 fn chown_group_best_effort(path: &Path, group: &str) {
     let Some(gid) = gid_by_name(group) else {
@@ -299,18 +199,8 @@ fn chown_group_best_effort(path: &Path, group: &str) {
 #[cfg(not(unix))]
 fn chown_group_best_effort(_path: &Path, _group: &str) {}
 
-/// 通过 NSS 解析组名到 gid（等价 `grp.getgrnam`）。
-///
-/// `getgrnam_r` 在调用方缓冲区装不下成员列表时返回 `ERANGE`（POSIX 定义的行为）。
-/// 原实现把 `ERANGE` 与「组不存在」一样折成 `None`，于是
-/// `atomic_as(..., Some(ADMIN_GROUP))` **静默跳过 chown**：`admin.json` 落成
-/// `0640 root:root`，靠组权限读凭据的管理台从此读不到它 —— 表现是「口令/2FA 都
-/// 正确但控制台说未配置」，排障方向被完全带偏。方向是 fail-closed（不会放宽权限），
-/// 但契约被静默改变了。这里按 POSIX 的用法**倍增缓冲重试**（上限 1 MiB）；
-/// 只有真正的「没这个组」才返回 `None`。
 #[cfg(unix)]
 pub fn gid_by_name(name: &str) -> Option<u32> {
-    /// 组行里成员列表的合理上限（远超真实系统的 `/etc/group` 行长）。
     const MAX_BUFFER: usize = 1024 * 1024;
 
     use std::ffi::CString;
@@ -333,7 +223,6 @@ pub fn gid_by_name(name: &str) -> Option<u32> {
             return (!result.is_null()).then_some(grp.gr_gid);
         }
         if rc == libc::ERANGE && size < MAX_BUFFER {
-            // 缓冲区不够：翻倍重试，而不是假装「组不存在」。
             size = (size * 2).min(MAX_BUFFER);
             continue;
         }
@@ -341,7 +230,6 @@ pub fn gid_by_name(name: &str) -> Option<u32> {
     }
 }
 
-/// 当前进程 uid（`os.getuid()`）；非 Unix 返回 0。
 #[cfg(unix)]
 pub fn current_uid() -> u32 {
     unsafe { libc::getuid() }
@@ -352,7 +240,6 @@ pub fn current_uid() -> u32 {
     0
 }
 
-/// 文件快照，用于写入前保存、失败时回滚（`file_snapshot`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSnapshot {
     pub exists: bool,
@@ -360,7 +247,6 @@ pub struct FileSnapshot {
     pub mode: Option<u32>,
 }
 
-/// 记录 `path` 的 `{exists, content, mode}`。
 pub fn file_snapshot(path: &Path) -> CoreResult<FileSnapshot> {
     match fs::symlink_metadata(path) {
         Ok(_) => {}
@@ -381,7 +267,6 @@ pub fn file_snapshot(path: &Path) -> CoreResult<FileSnapshot> {
     })
 }
 
-/// 恢复快照：原本不存在则 `unlink`，否则写回内容并恢复 mode。
 pub fn file_restore(path: &Path, snapshot: &FileSnapshot, mode: Option<u32>) -> CoreResult<()> {
     if !snapshot.exists {
         match fs::remove_file(path) {
@@ -393,12 +278,10 @@ pub fn file_restore(path: &Path, snapshot: &FileSnapshot, mode: Option<u32>) -> 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| CoreError::io(parent, e))?;
     }
-    // 回滚复制不能退回 `fs::write` —— 那是 `0666 & ~umask` 落盘且会**跟随**预置在
-    // 原路径上的符号链接。走本模块自己的原子写：`O_EXCL` 唯一临时文件 + 创建即
-    // `mode` + rename，与正常写入路径共用同一套不变量（INV-33）。
+
     let effective = mode.or(snapshot.mode).unwrap_or(0o640);
     atomic_as(path, &snapshot.content, effective, None)?;
-    // belt-and-braces：rename 之后权限必然已是 effective，再设一次不做失败传播。
+
     set_mode(path, effective)
 }
 
@@ -415,23 +298,10 @@ fn current_mode(_path: &Path) -> Option<u32> {
     None
 }
 
-/// 读表文件（`rows`）：跳过空行与 `#` 注释行，按空白分词。
-///
-/// ## ⚠️ 这是「读不到就当空表」的宽松版本
-///
-/// `fs::read_to_string` 失败（EACCES、IO 错、坏 UTF-8）一律返回空 `Vec`。
-/// 对**展示面**这是可接受的降级，但对**读改写路径**是致命的：
-/// `add_domain` 是 read → filter → write，一次读错误就会把整张 Postfix 路由表
-/// 清空（5.13）。凡是「读到的东西会被写回去」的地方，必须用 [`try_rows`]。
 pub fn rows(path: &Path) -> Vec<Vec<String>> {
     try_rows(path).unwrap_or_default()
 }
 
-/// [`rows`] 的**如实报错**版本（5.13）。
-///
-/// 只把 `NotFound` 当作「空表」（文件确实不存在 = 尚无条目，这是合法状态）；
-/// EACCES、IO 错、坏 UTF-8 一律返回错误 —— 「读不出来」与「读到了但没有内容」
-/// 是两件事，把前者说成后者就是在拿故障冒充正常。
 pub fn try_rows(path: &Path) -> CoreResult<Vec<Vec<String>>> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -484,17 +354,12 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
-            // 临时文件名是 `<name>.tmp.<pid>.<seq>.<nanos>`，旧断言用的
-            // `ends_with(".tmp")` 永远匹配不上 —— 空断言，等于没测。
             .filter(|n| n.contains(".tmp."))
             .collect();
         assert!(leftovers.is_empty(), "不得残留临时文件: {leftovers:?}");
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// 在一次 `atomic_as` 期间观察「临时文件已创建、首字节未写」的那一刻。
-    ///
-    /// 用 `Rc<RefCell<_>>` 而不是 channel：回调在调用线程上同步执行。
     #[cfg(test)]
     struct TempHookGuard;
 
@@ -511,15 +376,6 @@ mod tests {
         TempHookGuard
     }
 
-    /// INV-33 的**真正**守卫：权限必须在**第一字节落盘之前**就生效。
-    ///
-    /// 旧测试 `atomic_applies_mode_before_rename` 只断言 rename 之后的最终 mode ——
-    /// 把实现退回「`File::create`（0666 & ~umask，root 常见 0644）→ 写完整机密 →
-    /// fsync → `set_mode(0600)`」，它**照样全绿**，而那正是 `admin.json`（口令哈希）、
-    /// `totp.key`（AES 主密钥）、TLS 私钥在全系统可读窗口里躺着的那段时间。
-    ///
-    /// 用 inotify 守着目录能稳定命中那个窗口；本测试把同一个观测点做成了
-    /// `#[cfg(test)]` 回调，在这个窗口里读临时文件的权限。
     #[cfg(unix)]
     #[test]
     fn atomic_applies_mode_before_the_first_byte_lands() {
@@ -556,11 +412,6 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// 失败路径守卫：`rename` 失败时不得把机密临时文件留在盘上。
-    ///
-    /// 目标路径是一个**非空目录**，`rename(2)` 必然失败（EISDIR/ENOTDIR）。
-    /// 旧实现只在成功路径上 rename，失败时临时文件（内容完整、权限正确，
-    /// 但仍是明文机密）长期留在目录里。
     #[test]
     fn a_failed_rename_leaves_no_temp_file() {
         let dir = temp_dir("failed-rename");
@@ -585,7 +436,6 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// 临时路径必须每次调用都不同，否则并发写者会互相覆盖出半写文件。
     #[test]
     fn temp_paths_are_unique_per_call() {
         let target = PathBuf::from("/etc/mailstack/admin.json");
@@ -629,7 +479,6 @@ mod tests {
 
     #[test]
     fn lock_sidecar_names_never_collide() {
-        // INV-31：同名会自死锁，这条断言是安全门禁。
         let p = PathBuf::from("/etc/mailstack/admin.json");
         assert_ne!(atomic_lock_path(&p), locked_lock_path(&p));
         assert_eq!(
@@ -644,7 +493,6 @@ mod tests {
 
     #[test]
     fn locked_can_nest_atomic_without_deadlock() {
-        // 这正是两把锁必须不同名的原因：持 locked 时调用 atomic 是合法用法。
         let dir = temp_dir("nest");
         let target = dir.join("admin.json");
         let result = locked(&target, || {
@@ -756,10 +604,6 @@ mod tests {
         assert!(rows(Path::new("/nonexistent/mailstack/table")).is_empty());
     }
 
-    /// 组解析的两个基本事实：存在的组能解析，不存在的组返回 `None`（不是 panic）。
-    ///
-    /// `ERANGE`（缓冲区不够）那条路径无法在普通测试里造出真实的大组，代码已按
-    /// POSIX 的用法倍增重试；这里守住最容易回归的两端。
     #[cfg(unix)]
     #[test]
     fn group_resolution_finds_existing_groups_and_reports_missing_ones() {

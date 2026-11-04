@@ -1,19 +1,3 @@
-//! 证书签发与续期（`certs.renew` / `setup.cert.issue`）。
-//!
-//! ## ACME 依赖选择：调用外部 `acme.sh`，不引入 Rust ACME crate
-//!
-//! 这不是本模块的即兴决定，而是基线的答案（`backend/mailstackctl/certs.py`）：
-//! 续期与签发都通过子进程调用 `/root/.acme.sh/acme.sh`。因此这里**不新增任何依赖**，
-//! 只经 [`CommandRunner`] 调子进程 —— 与 `postconf` / `systemctl` 走同一条通道。
-//!
-//! ## 三处有意偏离基线（理由见各自注释）
-//!
-//! 1. **自定义证书校验不落盘**：openssl 的输入全部走 **stdin**，私钥根本不写临时文件。
-//! 2. **校验先于副作用**：基线先 `mkdir -p /etc/tls/<domain>` 再校验邮箱/method，
-//!    于是「邮箱非法」会留下一个空目录。这里改成**全部校验通过后才建目录**。
-//! 3. **子进程超时**：基线给 acme.sh 设了 180/300/120 秒超时；本 runner 通过
-//!    [`CommandRunner::run_with_timeout`] 实现同一约束。
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,41 +12,28 @@ use serde_json::{json, Value};
 use crate::handlers::HandlerError;
 use crate::readers::Clock;
 
-/// `acme.sh` 的**硬编码**位置。
-///
-/// 不从请求体取：那会把这两个动作变成一个「任意脚本执行器」。基线同样是写死的。
 const ACME_BIN: &str = "/root/.acme.sh/acme.sh";
 
-/// `acme.sh` 的 home（证书与账号元数据所在）。
 const ACME_HOME: &str = "/root/.acme.sh";
 
-/// 安装证书时交给 acme.sh 的重载脚本路径（硬编码，理由同上）。
 const RELOAD_SCRIPT: &str = "/usr/local/sbin/mailstack-reload-certificates";
 
-/// 重载脚本正文。与基线逐字一致：优先 systemd，其次 OpenRC/init，最后裸命令。
 const RELOAD_SCRIPT_BODY: &str = "#!/bin/sh\npostfix check 2>/dev/null && (systemctl reload postfix 2>/dev/null || rc-service postfix reload 2>/dev/null || postfix reload 2>/dev/null)\ndoveconf >/dev/null 2>&1 && (systemctl reload dovecot 2>/dev/null || rc-service dovecot reload 2>/dev/null || dovecot reload 2>/dev/null)\n";
 
-/// 三处子进程超时（与基线逐字一致）。
 const RENEW_TIMEOUT: Duration = Duration::from_secs(180);
 const ISSUE_TIMEOUT: Duration = Duration::from_secs(300);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// 文件与程序探测。
-///
-/// 抽成 trait 的理由与 `users.rs` 的 `ProgramEnv` 相同：单测绝不能真的读写
-/// `/usr/local/sbin`、探测真实的 `/root/.acme.sh`。
 pub trait AcmeProbes: Send + Sync {
-    /// 等价 `shutil.which(program)`。
     fn which(&self, program: &str) -> Option<PathBuf>;
-    /// 等价 `Path.is_file()`。
+
     fn is_file(&self, path: &Path) -> bool;
-    /// 等价 `Path.is_dir()`。
+
     fn is_dir(&self, path: &Path) -> bool;
-    /// 原子写文件（重载脚本）。走探测是为了让测试不碰真实 `/usr/local/sbin`。
+
     fn write_file(&self, path: &Path, contents: &[u8], mode: u32) -> CoreResult<()>;
 }
 
-/// 生产探测：真实 `PATH` / 文件系统 / `atomic` 写入。
 #[derive(Debug, Default)]
 pub struct SystemAcmeProbes;
 
@@ -85,11 +56,10 @@ impl AcmeProbes for SystemAcmeProbes {
     }
 }
 
-/// `certs.*` 的执行体。
 pub struct Acme {
     paths: Paths,
     probes: Arc<dyn AcmeProbes>,
-    /// 重载 Postfix / Dovecot 用的服务探测。
+
     services: Arc<dyn ServiceEnv>,
     runner: Arc<dyn CommandRunner>,
     clock: Clock,
@@ -112,7 +82,6 @@ impl Acme {
         }
     }
 
-    /// 生产构造。
     pub fn system(paths: Paths) -> Self {
         Self::new(
             paths,
@@ -123,7 +92,6 @@ impl Acme {
         )
     }
 
-    /// 覆盖探测（测试用）。
     pub fn with_probes(mut self, probes: Arc<dyn AcmeProbes>) -> Self {
         self.probes = probes;
         self
@@ -134,7 +102,6 @@ impl Acme {
             .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
     }
 
-    /// 证书列表（与 `certs.list` 同源），供 `certs.renew` 成功后返回新状态。
     fn certificates(&self) -> Vec<Value> {
         mailstack_core::certs::list_certificates(&self.paths.etc, self.now_dt())
             .into_iter()
@@ -142,10 +109,6 @@ impl Acme {
             .collect()
     }
 
-    /// `certs.renew`：强制续期一个域名的证书。
-    ///
-    /// **失败是「数据」不是「错误」**：只有域名非法才抛错，`acme.sh` 缺失或续期
-    /// 失败都返回 `{status: failed, error}`。这个不对称是基线的真实行为，照抄。
     pub fn renew(&self, data: &Value) -> Result<Value, HandlerError> {
         let domain = str_field(data, "domain").trim().to_ascii_lowercase();
         if !DOMAIN_RE.is_match(&domain) {
@@ -187,14 +150,6 @@ impl Acme {
         }))
     }
 
-    /// `setup.cert.issue`：签发/导入一个域名的证书。
-    ///
-    /// ## 为什么校验先于建目录（偏离基线）
-    ///
-    /// 基线在函数开头就 `out_dir.mkdir(parents=True, exist_ok=True)`，于是「邮箱
-    /// 非法」这类纯校验失败也会在 `/etc/mailstack/tls/` 下留下一个空目录 —— 一个
-    /// 没人会去清理、又会让 `certs.list` 多出一条「未配置证书」的垃圾。这里把建目录
-    /// 推迟到所有校验之后：成功路径行为不变，失败路径不再留痕。
     pub fn issue(&self, data: &Value) -> Result<Value, HandlerError> {
         let domain = ["domain", "mailHost", "customDomain"]
             .iter()
@@ -237,7 +192,7 @@ impl Acme {
                     "Invalid private key PEM format (missing PRIVATE KEY)",
                 ));
             }
-            // 全部校验通过后才落盘。
+
             self.validate_custom_certificate(&cert_pem, &key_pem, &domain)?;
             std::fs::create_dir_all(&out_dir).map_err(|e| HandlerError::new(e.to_string()))?;
             atomic::atomic_as(&fullchain, format!("{cert_pem}\n").as_bytes(), 0o644, None)?;
@@ -248,7 +203,6 @@ impl Acme {
                 return Err(HandlerError::new("invalid certificate email for ACME"));
             }
             if !self.probes.is_file(Path::new(ACME_BIN)) {
-                // 基线这里是 RuntimeError（基础设施缺失），不是 ValueError。
                 return Err(HandlerError::new("acme.sh is not installed"));
             }
 
@@ -283,7 +237,6 @@ impl Acme {
                 }
             }
 
-            // 校验全部通过，以下开始产生副作用。
             std::fs::create_dir_all(&out_dir).map_err(|e| HandlerError::new(e.to_string()))?;
 
             let issue_outcome = self
@@ -291,10 +244,7 @@ impl Acme {
                 .run_with_timeout(ACME_BIN, &issue_args, ISSUE_TIMEOUT);
             match issue_outcome {
                 Ok(output) if output.success() => {}
-                // 签发失败：尽力把刚建的（此刻还是空的）目标目录清掉 —— 与
-                // 「校验先于建目录」的纪律同源，失败路径不在 /etc/mailstack/tls/
-                // 下留一个没人清理的空目录。`remove_dir` 只删空目录，acme.sh 若
-                // 已经写了别的文件进来则原样保留（best-effort）。
+
                 Ok(_) => {
                     self.remove_empty_dir_best_effort(&out_dir);
                     return Err(HandlerError::new("ACME certificate issue failed"));
@@ -350,7 +300,6 @@ impl Acme {
         }
 
         if self.probes.which("postconf").is_some() {
-            // 基线一律 `check=False`：postconf 失败不中止。
             let cert_line = format!("smtpd_tls_cert_file = {}", fullchain.display());
             let key_line = format!("smtpd_tls_key_file = {}", privkey.display());
             let _ = self.runner.run("postconf", &["-e", cert_line.as_str()]);
@@ -359,8 +308,7 @@ impl Acme {
                 .runner
                 .run("postconf", &["-e", "smtpd_tls_security_level = may"]);
         }
-        // reload 是**尽力而为**的收尾，成败不能固定报 true：运维要据此判断
-        // 新证书是否已实际生效 —— reload 失败时旧证书仍在跑，必须让人看见。
+
         let postfix_reloaded = service_ctl(
             self.services.as_ref(),
             self.runner.as_ref(),
@@ -390,9 +338,6 @@ impl Acme {
         }))
     }
 
-    /// best-effort 删除一个**空**目录（签发失败后的目标目录清理）。
-    ///
-    /// 只用 `remove_dir`：非空（acme.sh 已经写过东西）就原样保留，不做递归删除。
     fn remove_empty_dir_best_effort(&self, dir: &Path) {
         if let Err(error) = std::fs::remove_dir(dir) {
             if error.kind() != std::io::ErrorKind::NotFound {
@@ -404,12 +349,6 @@ impl Acme {
         }
     }
 
-    /// 校验自定义证书与私钥是否匹配、是否覆盖该域名、是否未过期。
-    ///
-    /// ## 为什么走 stdin 而不是临时文件（偏离基线）
-    ///
-    /// 基线把两段 PEM 写成 `0600` 临时文件再让 openssl 读。这里改成把 PEM 从 stdin
-    /// 喂进去：**私钥根本不落盘**（哪怕只是短暂的），也省掉了一个临时目录。
     fn validate_custom_certificate(
         &self,
         cert_pem: &str,
@@ -433,7 +372,7 @@ impl Acme {
                 } else {
                     output.stderr
                 };
-                // 基线取 detail[-500:]：错误详情可能很长，截尾保留。
+
                 let detail = detail.trim();
                 let count = detail.chars().count();
                 let tail: String = if count <= 500 {
@@ -465,7 +404,6 @@ impl Acme {
     }
 }
 
-/// 取字符串字段（缺失/非字符串 → 空串）。
 fn str_field<'a>(data: &'a Value, key: &str) -> &'a str {
     data.get(key).and_then(Value::as_str).unwrap_or("")
 }
@@ -542,7 +480,6 @@ mod tests {
     use std::fs;
     use std::sync::Mutex;
 
-    /// 固定时钟：2026-01-01T00:00:00Z。
     const NOW: i64 = 1_767_225_600;
 
     #[derive(Clone, Debug)]
@@ -553,21 +490,20 @@ mod tests {
         timeout: Option<Duration>,
     }
 
-    /// 脚本化的假运行器：记录 program/args/stdin/timeout，并按配置返回结果。
     struct FakeRunner {
         calls: Mutex<Vec<Call>>,
         renew_status: i32,
         issue_status: i32,
         install_status: i32,
-        /// 非 acme.sh 程序（`service_ctl` 的 service/reload、postconf）的状态码。
+
         service_status: i32,
-        /// `x509 -checkhost` 的输出；不含 `does match` 即表示 SAN 不匹配。
+
         checkhost_output: String,
         cert_pubkey: String,
         key_pubkey: String,
-        /// 任一 openssl 调用返回非 0。
+
         openssl_failure: bool,
-        /// `--install-cert` 时把 cert/key 落到真实（rooted）路径，模拟 acme.sh 产物。
+
         materialize_on_install: bool,
     }
 
@@ -735,7 +671,6 @@ mod tests {
         }
     }
 
-    /// 可编排的文件 / 程序探测。
     #[derive(Default)]
     struct FakeProbes {
         programs: BTreeMap<String, PathBuf>,
@@ -745,7 +680,6 @@ mod tests {
     }
 
     impl FakeProbes {
-        /// 默认存在 acme.sh / openssl / postconf，且证书已是受管邮箱的惯用布局。
         fn ready() -> Self {
             let mut programs = BTreeMap::new();
             programs.insert("openssl".to_string(), PathBuf::from("/usr/bin/openssl"));
@@ -787,7 +721,6 @@ mod tests {
         }
     }
 
-    /// 只声明给定程序 / 路径存在的服务探测。
     struct FakeServices {
         programs: Vec<&'static str>,
     }
@@ -799,7 +732,6 @@ mod tests {
             })
         }
 
-        /// 只有 `service`：`service_ctl` 会走 `service <unit> reload` 分支。
         fn with_service() -> Arc<Self> {
             Arc::new(Self {
                 programs: vec!["service"],
@@ -863,8 +795,6 @@ mod tests {
     const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
     const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----";
 
-    // ───────────────────────── certs.renew ─────────────────────────
-
     #[test]
     fn cert_renew_rejects_an_invalid_domain() {
         let f = Fixture::new("renewbad");
@@ -879,7 +809,6 @@ mod tests {
 
     #[test]
     fn cert_renew_reports_a_missing_acme_sh_as_data_not_an_error() {
-        // 基线：acme.sh 缺失是**返回值**（status: failed），不是异常。
         let f = Fixture::new("renewnoacme");
         let runner = Arc::new(FakeRunner::default());
         let a = f.acme(
@@ -940,8 +869,6 @@ mod tests {
         );
         assert_eq!(calls[0].timeout, Some(RENEW_TIMEOUT));
     }
-
-    // ───────────────────────── setup.cert.issue: custom ─────────────────────────
 
     fn custom_payload(domain: &str) -> Value {
         json!({
@@ -1018,7 +945,6 @@ mod tests {
         assert_eq!(out["status"], "ok");
         assert_eq!(out["method"], "custom");
 
-        // openssl 全部经 stdin 收到 PEM，且没有任何临时文件路径出现在 argv 里。
         let openssl_calls: Vec<Call> = runner
             .calls()
             .into_iter()
@@ -1038,14 +964,13 @@ mod tests {
                 "不得落盘临时文件: {call:?}"
             );
         }
-        // 私钥那次调用拿到的是 key PEM，其余是 cert PEM。
+
         let pkey = openssl_calls
             .iter()
             .find(|c| c.args.first().map(String::as_str) == Some("pkey"))
             .unwrap();
         assert_eq!(pkey.stdin.as_deref(), Some(KEY_PEM));
 
-        // 落盘内容与权限位。
         let dir = f.paths.etc.join("tls").join("example.com");
         assert_eq!(
             fs::read_to_string(dir.join("fullchain.pem")).unwrap(),
@@ -1068,7 +993,7 @@ mod tests {
                 "TLS 私钥不应 chown 到 mailstack-admin 组"
             );
         }
-        // custom 分支不写 reload 脚本。
+
         assert!(probes.writes().is_empty());
     }
 
@@ -1081,8 +1006,6 @@ mod tests {
         assert!(error.to_string().contains("chmod "));
     }
 
-    // ───────────────────────── setup.cert.issue: ACME ─────────────────────────
-
     #[test]
     fn acme_issue_validates_before_creating_any_directory() {
         let f = Fixture::new("acmebad");
@@ -1092,19 +1015,16 @@ mod tests {
             FakeServices::none(),
         );
 
-        // 邮箱非法。
         let err = a
             .issue(&json!({ "domain": "example.com", "method": "standalone", "email": "nope" }))
             .unwrap_err();
         assert_eq!(err.to_string(), "invalid certificate email for ACME");
 
-        // method 非法（邮箱合法、acme.sh 在）。
         let err = a
             .issue(&json!({ "domain": "example.com", "method": "dns", "email": "ops@example.com" }))
             .unwrap_err();
         assert_eq!(err.to_string(), "unsupported ACME method: dns");
 
-        // 偏离 #2 的落点：校验失败不得留下 /etc/tls/<domain> 目录。
         assert!(
             !f.paths.etc.join("tls").join("example.com").exists(),
             "校验失败不得建目录"
@@ -1129,7 +1049,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.to_string(), "invalid ACME webroot");
 
-        // 绝对路径但目录不存在，同样拒绝。
         let err = a
             .issue(&json!({
                 "domain": "example.com",
@@ -1144,7 +1063,7 @@ mod tests {
     #[test]
     fn acme_issue_reports_a_missing_acme_sh_as_an_error() {
         let f = Fixture::new("acmenoacme");
-        // 存在 openssl/postconf 但没有 acme.sh。
+
         let mut probes = FakeProbes::ready();
         probes.files.clear();
         let a = f.acme(
@@ -1183,8 +1102,7 @@ mod tests {
             }))
             .unwrap_err();
         assert_eq!(err.to_string(), "ACME certificate issue failed");
-        // 签发失败不得在 /etc/mailstack/tls/ 下留下一个空目录 —— 与
-        // 「校验先于建目录」同一纪律，失败路径不留痕。
+
         assert!(!f.paths.etc.join("tls").join("example.com").exists());
 
         let install_runner = Arc::new(FakeRunner {
@@ -1209,16 +1127,13 @@ mod tests {
 
     #[test]
     fn acme_issue_reports_actual_reload_results() {
-        // reload 是尽力而为的收尾：成败不能固定报 true —— reload 失败时
-        // 旧证书仍在跑，运维必须能看见。
         let f = Fixture::new("acmereloadfail");
         let runner = Arc::new(FakeRunner {
             service_status: 1,
             materialize_on_install: true,
             ..FakeRunner::default()
         });
-        // `service` 可用（service_ctl 会真的跑 `service <unit> reload`），
-        // 但命令返回非 0。
+
         let a = f.acme(
             Arc::new(FakeProbes::ready()),
             runner,
@@ -1240,7 +1155,6 @@ mod tests {
 
     #[test]
     fn acme_issue_treats_a_timed_out_child_as_a_failure() {
-        // 超时在 `SystemCommandRunner` 里折算成非 0（status=-1）；动作只需把它当失败。
         let f = Fixture::new("acmetimeout");
         let runner = Arc::new(FakeRunner {
             renew_status: -1,
@@ -1281,14 +1195,12 @@ mod tests {
         assert_eq!(out["method"], "standalone");
         assert_eq!(out["reloaded"], true);
 
-        // reload 脚本经探测写入，路径硬编码、权限 0750。
         let writes = probes.writes();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, PathBuf::from(RELOAD_SCRIPT));
         assert_eq!(writes[0].2, 0o750);
         assert!(String::from_utf8_lossy(&writes[0].1).starts_with("#!/bin/sh\n"));
 
-        // issue 命令逐字正确。
         let issue = runner
             .acme_calls()
             .into_iter()
@@ -1344,7 +1256,6 @@ mod tests {
             );
         }
 
-        // postconf 三条 -e 与两次服务重载的顺序与参数。
         let tail: Vec<Call> = runner
             .calls()
             .into_iter()
@@ -1389,7 +1300,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_kills_a_process_that_exceeds_its_timeout() {
-        // 真实超时路径：`sleep 5` 配 100ms 超时必须被杀掉并如实上报，而不是挂 5 秒。
         let runner = mailstack_core::exec::SystemCommandRunner;
         let started = std::time::Instant::now();
         let out = runner

@@ -1,43 +1,19 @@
-//! IP 自动封禁：失败计数 → 临时 / 永久封禁（替代 fail2ban 的「封禁」那一半）。
-//!
-//! ## 触发源有两类，且都是「攻击者主动暴露的行为」
-//!
-//! 1. **连接建立失败**：TLS 握手失败、会话中途 I/O 出错。
-//! 2. **触发限速**：见 [`crate::ratelimit`]。
-//!
-//! 两者都由 [`BanList::record_failure`] 记录，窗口内的失败次数达到阈值即封禁。
-//! 之所以用**滑动窗口**而不是「累计总数」：后者会让一个正常跑了几天的对端因为
-//! 几次无关的抖动而被永久拉黑。
-//!
-//! ## 升级路径：临时 → 永久
-//!
-//! 每次触发封禁记一次 `strike`。前 `permanent_after - 1` 次是临时封禁（到时间自动
-//! 解除），第 `permanent_after` 次转为**永久**。临时封禁到期只清空失败计数，
-//! **不清** `strike` —— 否则「屡教不改」永远不会升级为永久。
-//!
-//! ## 时钟注入
-//!
-//! 与限速器一样，所有判定都接收 `now`（Unix 秒），因此「临时封禁到期自动解除」这种
-//! 时间相关的行为可以在测试里被确定性地验证，而不是靠 `sleep`。
-
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
 
 use crate::peer::PeerKey;
 
-/// 封禁策略参数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BanConfig {
-    /// 窗口内失败多少次后封禁。
     pub max_failures: u32,
-    /// 失败计数的滑动窗口（秒）。
+
     pub window_secs: i64,
-    /// 单次临时封禁的时长（秒）。
+
     pub temp_ban_secs: i64,
-    /// 第几次触发封禁转为永久（`0` 表示永不永久）。
+
     pub permanent_after: u32,
-    /// 记录表的最大条目数（内存上限）。
+
     pub max_entries: usize,
 }
 
@@ -53,27 +29,21 @@ impl Default for BanConfig {
     }
 }
 
-/// 一条封禁记录（对外视图）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ban {
     pub ip: IpAddr,
-    /// 临时封禁的解除时刻；永久封禁为 `None`。
+
     pub until_unix: Option<i64>,
     pub permanent: bool,
-    /// 已触发封禁的次数（升级为永久的判据）。
+
     pub strikes: u32,
-    /// 当前窗口内的失败次数。
+
     pub failures: u32,
-    /// 是否来自管理台的**手工**封禁（而不是由失败计数自动触发）。
-    ///
-    /// 这个区分不是装饰：手工封禁由运维的文件驱动，自动封禁由对端行为驱动，
-    /// 两者在「谁有权解除」上完全不同 —— 手工封禁只能由文件变更解除，
-    /// 一次失败计数或到期都不该让一条手工封禁消失。
+
     pub manual: bool,
 }
 
 impl Ban {
-    /// 该封禁在 `now` 时刻是否仍然生效。
     pub fn is_active(&self, now: i64) -> bool {
         if self.permanent {
             return true;
@@ -88,14 +58,10 @@ struct Entry {
     strikes: u32,
     banned_until: Option<i64>,
     permanent: bool,
-    /// 见 [`Ban::manual`]。
+
     manual: bool,
     last_seen: i64,
-    /// 最近一次触达这个键的具体地址。
-    ///
-    /// IPv6 的键是 /64 前缀，一条记录可能对应整段里任意地址；记录最近触达的
-    /// 那个地址只是为了让 `banned()`/日志能给出一个可读的代表值（也用于
-    /// 手工封禁的对齐），不参与任何阈值判定。
+
     last_ip: Option<IpAddr>,
 }
 
@@ -112,15 +78,10 @@ impl Entry {
     }
 }
 
-/// [`BanList::apply_manual`] 的结果，供调用方记日志。
-///
-/// 之所以要把它返回出来：热重载是一条**静默**的路径 —— 没有它，运维只能看到
-/// 「封禁生效了」而看不到「有 5 条手工封禁刚刚被解除」。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ManualBanDiff {
-    /// 本次开始被手工封禁的地址（新建，或由自动封禁升格为手工）。
     pub added: Vec<IpAddr>,
-    /// 本次被解除的手工封禁（文件里已不再列出）。
+
     pub removed: Vec<IpAddr>,
 }
 
@@ -130,11 +91,6 @@ impl ManualBanDiff {
     }
 }
 
-/// IP 封禁表。
-///
-/// 键是 [`PeerKey`]：IPv4 /32、IPv6 **/64**。同一个 /64 内的地址共享失败计数、
-/// 封禁与 strike —— 否则拥有一个 /64 的攻击者只要每次换地址，`max_failures`
-/// 就永远攒不满（R3-007）。
 #[derive(Debug)]
 pub struct BanList {
     config: BanConfig,
@@ -160,24 +116,20 @@ impl BanList {
         self.config
     }
 
-    /// 当前被封禁的 IP 数量。
     pub fn banned_count(&self, now: i64) -> usize {
         self.entries(now).len()
     }
 
-    /// 跟踪的 IP 条目总数（测试内存上界用）。
     pub fn tracked(&self) -> usize {
         self.lock().len()
     }
 
-    /// 查询某 IP 当前是否被封禁（IPv6 按 /64 聚合）。
     pub fn check(&self, ip: IpAddr, now: i64) -> Option<Ban> {
         let mut guard = self.lock();
         let entry = guard.get_mut(&PeerKey::from_ip(ip))?;
         Self::active_ban(entry, ip, now)
     }
 
-    /// 记录一次失败；若本次失败触发了封禁则返回该封禁，否则返回 `None`。
     pub fn record_failure(&self, ip: IpAddr, now: i64) -> Option<Ban> {
         let config = self.config;
         let key = PeerKey::from_ip(ip);
@@ -185,10 +137,7 @@ impl BanList {
 
         if guard.len() >= config.max_entries && !guard.contains_key(&key) {
             let freed = evict(&mut guard, config.max_entries, now);
-            // 淘汰不动（表被永久/手工/活跃封禁填满）时不再插入：条目数越过
-            // `max_entries` 的无界增长正是内存保护要防的。此刻丢掉一次 strike
-            // 是可接受的取舍 —— 表已饱和说明需要运维清理，而不是让守护进程
-            // 无界吃内存。
+
             if !freed && !guard.contains_key(&key) {
                 return None;
             }
@@ -198,7 +147,6 @@ impl BanList {
         entry.last_seen = now;
         entry.last_ip = Some(ip);
 
-        // 已在封禁中：不重复计数（否则单次攻击会自我叠加成永久封禁）。
         if entry.permanent {
             return Some(entry.to_ban(ip));
         }
@@ -206,12 +154,11 @@ impl BanList {
             if until > now {
                 return Some(entry.to_ban(ip));
             }
-            // 临时封禁已到期：清空窗口，允许重新计数（strike 保留）。
+
             entry.banned_until = None;
             entry.failures.clear();
         }
 
-        // 滑动窗口：丢弃窗口之外的旧失败。
         entry
             .failures
             .retain(|at| now.saturating_sub(*at) < config.window_secs);
@@ -221,7 +168,6 @@ impl BanList {
             return None;
         }
 
-        // 达到阈值：封禁。
         entry.failures.clear();
         entry.strikes = entry.strikes.saturating_add(1);
         let permanent = config.permanent_after > 0 && entry.strikes >= config.permanent_after;
@@ -234,39 +180,20 @@ impl BanList {
         Some(entry.to_ban(ip))
     }
 
-    /// 解除某 IP 的封禁（含永久封禁），并清空其计数。返回此前是否存在记录。
-    ///
-    /// IPv6 作用于该地址所在的 /64（与自动封禁的聚合口径一致）。
     pub fn unban(&self, ip: IpAddr) -> bool {
         self.lock().remove(&PeerKey::from_ip(ip)).is_some()
     }
 
-    /// 当前生效的封禁列表。
     pub fn banned(&self, now: i64) -> Vec<Ban> {
         self.entries(now)
     }
 
-    /// 用管理台的**手工封禁集合**对齐内存表，返回本次的变化。
-    ///
-    /// 这是「封禁文件是唯一真相源」的落地点：每次热重载都拿文件的完整集合来对齐，
-    /// 而不是增量地「加一条 / 删一条」—— 增量在丢包、人工编辑文件、回滚文件版本
-    /// 这些情况下都会与文件产生分歧。
-    ///
-    /// 两条必须守住的边界：
-    ///
-    /// 1. **绝不碰自动封禁**。只有 `manual == true` 的条目才可能被本次调用删除。
-    ///    否则一次文件重载就会把正在攻击的地址全部放行 —— 而且不留下任何痕迹。
-    /// 2. **手工封禁是永久的，且不受失败计数影响**。它只能由文件变更解除；
-    ///    到期与 strike 升级都与它无关。
     pub fn apply_manual(&self, ips: &[IpAddr]) -> ManualBanDiff {
-        // 键是聚合后的 PeerKey；值保留一个具体的代表地址（同 /64 出现多个时取列表
-        // 里最后一个），这样手工封禁的「新增/解除」diff 仍能给出可读的 IP。
         let wanted: HashMap<PeerKey, IpAddr> =
             ips.iter().map(|ip| (PeerKey::from_ip(*ip), *ip)).collect();
         let mut diff = ManualBanDiff::default();
         let mut guard = self.lock();
 
-        // 先解除：文件里已不再列出的手工封禁。
         let stale: Vec<(PeerKey, IpAddr)> = guard
             .iter()
             .filter(|(key, entry)| entry.manual && !wanted.contains_key(key))
@@ -284,7 +211,6 @@ impl BanList {
             diff.removed.push(ip);
         }
 
-        // 再新增：文件里列出但尚未是手工封禁的地址。
         for (key, ip) in &wanted {
             let entry = guard.entry(*key).or_default();
             entry.last_ip = Some(*ip);
@@ -294,7 +220,7 @@ impl BanList {
             entry.manual = true;
             entry.permanent = true;
             entry.banned_until = None;
-            // 手工封禁不记账：它不参与 strike 升级，失败计数对它也没有意义。
+
             entry.failures.clear();
         }
 
@@ -316,7 +242,6 @@ impl BanList {
             .collect()
     }
 
-    /// 若封禁生效则返回，否则顺带清理到期的临时封禁状态。
     fn active_ban(entry: &mut Entry, ip: IpAddr, now: i64) -> Option<Ban> {
         if entry.permanent {
             return Some(entry.to_ban(ip));
@@ -339,22 +264,6 @@ impl BanList {
     }
 }
 
-/// 内存上限保护：优先淘汰「未封禁且无计数」的陈旧条目，其次淘汰「已过期封禁」，
-/// 最后才是最久未活动的窗口内计数者。**绝不**淘汰永久/手工封禁，也**绝不**淘汰
-/// 仍在生效期内的临时封禁 —— 淘汰活跃封禁等于悄悄解封，此前第二阶段的过滤只排除了
-/// permanent/manual，表满时最旧的活跃临时封禁会被静默删除。
-///
-/// 「已过期封禁」必须参与淘汰：`banned_until` 只在**按 IP 触达时**被惰性清理，
-/// 没有任何后台清扫会把过期条目变成空壳 —— 若把它们排除在候选之外，表一旦被
-/// 过期条目+永久条目填满，`evict` 将永远腾不出位置，配合调用方的「淘汰不动就
-/// 不插入」，攻击者可以用陈旧封禁把整个封禁表变成只进不出的死表。
-///
-/// `manual` 单独再判一次：手工封禁当前必然是永久的，所以这条判断今天不会改变行为；
-/// 它存在是为了让「手工封禁不可被淘汰」成为本函数自己的约束，而不是依赖
-/// [`BanList::apply_manual`] 恰好把它设成了永久。
-///
-/// 返回本次是否真的腾出了位置；淘汰不动时调用方不得再插入新条目，
-/// 否则表会越过 `max_entries` 无界增长（内存保护本身失效）。
 fn evict(entries: &mut HashMap<PeerKey, Entry>, max_entries: usize, now: i64) -> bool {
     entries.retain(|_, entry| {
         entry.permanent
@@ -367,9 +276,6 @@ fn evict(entries: &mut HashMap<PeerKey, Entry>, max_entries: usize, now: i64) ->
         return true;
     }
 
-    // 候选 = 永久/手工之外、且当前**未在封禁中**的条目。优先级：
-    // 已过期封禁（strike 历史价值最低）排最前，其后是无失败历史的空壳
-    //（第 1 步通常会清掉），最后按最久未活动淘汰窗口内的计数者。
     let mut candidates: Vec<(PeerKey, i64, i64)> = entries
         .iter()
         .filter(|(_, entry)| {
@@ -381,7 +287,7 @@ fn evict(entries: &mut HashMap<PeerKey, Entry>, max_entries: usize, now: i64) ->
             (*key, entry.last_seen, history_value)
         })
         .collect();
-    // 历史价值低者先走，同组内最旧者优先。
+
     candidates.sort_by_key(|(_, last_seen, history_value)| (*history_value, *last_seen));
 
     let target = max_entries.saturating_sub(1);
@@ -447,7 +353,7 @@ mod tests {
         let bans = list();
         bans.record_failure(ip(1), 0);
         bans.record_failure(ip(1), 1);
-        // 第三次远在窗口之外：前两次应被丢弃，不该凑够阈值。
+
         assert!(
             bans.record_failure(ip(1), 10_000).is_none(),
             "窗口外的失败不得被计入"
@@ -457,14 +363,13 @@ mod tests {
     #[test]
     fn repeated_offences_escalate_to_a_permanent_ban_that_never_expires() {
         let bans = list();
-        // 第 1 回合：t=0..2 触发，临时封禁到 302。
+
         for at in 0..3 {
             bans.record_failure(ip(1), at);
         }
         assert!(bans.check(ip(1), 301).is_some(), "到期前仍应生效");
         assert!(bans.check(ip(1), 302).is_none(), "到期后应解除");
 
-        // 第 2 回合：仍是临时封禁，strike 累加到 2。
         for at in 1000..1003 {
             bans.record_failure(ip(1), at);
         }
@@ -473,7 +378,6 @@ mod tests {
         assert!(!ban.permanent, "第二次仍是临时封禁");
         assert!(bans.check(ip(1), 1350).is_none(), "第二回合的封禁也应到期");
 
-        // 第 3 回合：升级为永久。
         for at in 2000..2003 {
             bans.record_failure(ip(1), at);
         }
@@ -492,7 +396,7 @@ mod tests {
         for at in 0..3 {
             bans.record_failure(ip(1), at);
         }
-        // 封禁中继续失败：不重复计数，也就不会自己升级成永久。
+
         for at in 3..50 {
             bans.record_failure(ip(1), at);
         }
@@ -511,9 +415,6 @@ mod tests {
         assert!(bans.check(ip(2), 5).is_none(), "另一个 IP 不受影响");
     }
 
-    /// R3-007 反例：IPv6 轮换地址不得绕过封禁 —— 同一 /64 共享失败计数。
-    ///
-    /// 修复前每个 /128 都是新条目，100 个地址各失败 1 次也不会触发阈值。
     #[test]
     fn one_ipv6_slash_64_cannot_rotate_addresses_to_dodge_the_ban() {
         let bans = BanList::new(BanConfig {
@@ -526,9 +427,7 @@ mod tests {
         let base: std::net::Ipv6Addr = "2001:db8:aa:bb::".parse().unwrap();
         let segment = |index: u16| {
             let mut octets = base.octets();
-            // 改写低 64 位，保持高 64 位（/64 前缀）不变。
-            // 注意：`octets[8..]` 是 8 字节，而 `u16::to_be_bytes` 只有 2 字节 ——
-            // 必须写到 16 字节地址的最后 2 字节（[14..]），否则 copy_from_slice 会 panic。
+
             octets[14..].copy_from_slice(&index.to_be_bytes());
             IpAddr::V6(std::net::Ipv6Addr::from(octets))
         };
@@ -544,12 +443,11 @@ mod tests {
             .expect("同一 /64 的第 8 次失败必须触发封禁");
         assert!(!ban.permanent);
 
-        // 换一个同 /64 内从未出现过的地址：仍然被封。
         assert!(
             bans.check(segment(999), 1).is_some(),
             "同一 /64 内的任意地址都必须在封禁中"
         );
-        // 另一个 /64 不受影响。
+
         let other: IpAddr = "2001:db8:aa:bc::1".parse().unwrap();
         assert!(bans.check(other, 1).is_none(), "不同 /64 不得连坐");
     }
@@ -557,7 +455,7 @@ mod tests {
     #[test]
     fn unban_clears_even_a_permanent_ban() {
         let bans = list();
-        // 三个回合，各在相隔足够远的时间点触发（每次都超出上一回合的封禁时长）。
+
         for round in 0..3i64 {
             let base = round * 1000;
             for at in base..base + 3 {
@@ -579,7 +477,7 @@ mod tests {
             max_failures: 1,
             window_secs: 60,
             temp_ban_secs: 10_000,
-            permanent_after: 0, // 永不永久，便于制造大量临时条目
+            permanent_after: 0,
             max_entries: 16,
         });
         for last in 0..64u8 {
@@ -591,8 +489,6 @@ mod tests {
             bans.tracked()
         );
     }
-
-    // ───────────────────── 手工封禁（管理台文件驱动） ─────────────────────
 
     #[test]
     fn a_manual_ban_is_permanent_and_needs_no_failure_counting() {
@@ -613,15 +509,12 @@ mod tests {
 
     #[test]
     fn reloading_the_file_never_lifts_automatic_bans() {
-        // 这是本组最重要的一条：若热重载会顺手清掉自动封禁，一次文件重载就等于
-        // 把正在攻击的地址全部放行，而且不留痕迹。
         let bans = list();
         for at in 0..3 {
-            bans.record_failure(ip(1), at); // 自动（临时）封禁
+            bans.record_failure(ip(1), at);
         }
         assert!(bans.check(ip(1), 5).is_some());
 
-        // 文件里只有另一个地址 —— 与 ip(1) 无关。
         bans.apply_manual(&[ip(2)]);
 
         let auto = bans.check(ip(1), 5).expect("自动封禁必须原样保留");
@@ -634,7 +527,7 @@ mod tests {
         let bans = list();
         bans.apply_manual(&[ip(1), ip(2)]);
         for at in 0..3 {
-            bans.record_failure(ip(3), at); // 自动封禁，不该被碰
+            bans.record_failure(ip(3), at);
         }
 
         let diff = bans.apply_manual(&[ip(2)]);
@@ -695,7 +588,6 @@ mod tests {
         let bans = list();
         bans.apply_manual(&[ip(1)]);
 
-        // 手工封禁期间继续失败：既不重复计数（那会自我升级），也不改变封禁性质。
         for at in 0..50 {
             bans.record_failure(ip(1), at);
         }
@@ -716,7 +608,6 @@ mod tests {
         });
         bans.apply_manual(&[ip(200)]);
 
-        // 制造大量会自动过期的条目，把表挤到上限之上。
         for last in 0..64u8 {
             bans.record_failure(ip(last), 0);
         }

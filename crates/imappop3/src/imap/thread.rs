@@ -1,12 +1,3 @@
-//! THREAD（RFC 5256）：ORDEREDSUBJECT 与 REFERENCES 两种线程算法。
-//!
-//! ORDEREDSUBJECT 按「归一化主题」分组；REFERENCES 按 `Message-ID` /
-//! `In-Reply-To` / `References` 建父子关系。两者都只使用邮件头，不依赖索引库。
-//!
-//! REFERENCES 对「父消息不在结果集中」的引用采取**根化**处理（而不是生成
-//! 占位容器）：这比伪造一个不存在的父节点更接近客户端期望，也避免输出悬空
-//! 容器。
-
 use crate::date;
 use crate::maildir::MessageMeta;
 use crate::mime;
@@ -31,7 +22,6 @@ impl ThreadAlgorithm {
 
 #[derive(Debug, Clone)]
 pub struct ThreadMessage {
-    /// 返回给客户端的编号（序号或 UID，由调用方决定）。
     pub number: u32,
     pub arrival: i64,
     pub date: i64,
@@ -67,7 +57,6 @@ fn parse_id_list(value: &str) -> Vec<String> {
     value.split_whitespace().filter_map(normalize_id).collect()
 }
 
-/// 归一化主题：小写、压缩空白、循环剥离 `Re:` / `Fwd:` / `Fw:` / `Aw:` / `Sv:`。
 fn normalize_subject(value: &str) -> String {
     let mut subject = value
         .split_whitespace()
@@ -121,7 +110,7 @@ fn render_ordered_subject(messages: &[ThreadMessage]) -> String {
             _ => groups.push(vec![index]),
         }
     }
-    // 线程之间按首封邮件的日期排序（与客户端会话视图一致）。
+
     groups.sort_by(|a, b| {
         let first = &messages[a[0]];
         let second = &messages[b[0]];
@@ -171,7 +160,7 @@ fn render_references(messages: &[ThreadMessage]) -> String {
         }
     }
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); messages.len()];
-    // 环形 References（畸形邮件）会把所有节点都变成非根；断开环上的一个节点。
+
     for start in 0..messages.len() {
         let mut seen = std::collections::HashSet::new();
         let mut current = start;
@@ -216,14 +205,6 @@ fn render_references(messages: &[ThreadMessage]) -> String {
     out
 }
 
-/// REFERENCES 渲染的递归深度上限。环已由调用方断开，但一条 10 万封的深链
-/// 线程会把递归推到同样深 —— 超过上限的子树按孤立消息输出（与环形处理
-/// 一致），保证最坏情况的栈深度是常数。
-///
-/// **已声明的 RFC 5256 偏差**：规范要求被搜索的每封消息都出现在 THREAD
-/// 响应里；超过本上限的子树中除根节点外的消息会被省略。这是栈安全与
-/// 规范完备性之间的显式取舍 —— 真实邮箱的引用链深度远达不到 512，
-/// 只有刻意构造的超深链才会触发。
 const MAX_REFERENCE_DEPTH: usize = 512;
 
 fn render_reference_node(
@@ -234,8 +215,6 @@ fn render_reference_node(
     stack: &mut Vec<usize>,
 ) {
     if stack.contains(&index) || stack.len() > MAX_REFERENCE_DEPTH {
-        // 环形 References（畸形邮件）或超过深度上限的嵌套按孤立消息输出，
-        // 避免无限递归 / 深递归爆栈；热路径不记日志，输出保持确定性。
         out.push('(');
         out.push_str(&messages[index].number.to_string());
         out.push(')');
@@ -319,8 +298,6 @@ mod tests {
 
     #[test]
     fn reference_rendering_is_depth_capped() {
-        // 600 层的回复链：超过 MAX_REFERENCE_DEPTH 的子树按孤立消息输出，
-        // 递归深度保持有界（不会因邮箱大而爆栈）。
         let messages: Vec<ThreadMessage> = (1u32..=600)
             .map(|number| {
                 let mut message = message(number, "topic", number as i64);

@@ -1,27 +1,3 @@
-//! IMAP 命令解析：tag、命令名、参数、literal（RFC 3501 §9）。
-//!
-//! ## 为什么需要自己的 tokenizer
-//!
-//! 通用「按空格切」在 IMAP 上会立刻出错，至少四处：
-//!
-//! * quoted string 里的空格与括号（`"a b(c)"`）；
-//! * literal：`APPEND INBOX {310}\r\n<310 字节原始正文>` —— 长度是声明的，
-//!   正文里可以出现任意字节，包括 CRLF 与畸形 UTF-8；
-//! * FETCH 的 section：`BODY[HEADER.FIELDS (SUBJECT FROM)]<0.1024>` 里的括号与
-//!   空格属于 section 语法，不能当成通用列表；
-//! * `FETCH 1:* (UID FLAGS)` 的 `*` 是数据而不是通配。
-//!
-//! 本模块把「读到一条完整命令」与「把命令切成 token」分开：前者负责 literal 的
-//! 继续读取（同步 literal 还要先发 `+`），后者在内存里建树。FETCH 的 section
-//! 单独由 [`crate::imap::fetch`] 从原始参数文本解析（见 `raw_args`）。
-//!
-//! ## 防线
-//!
-//! * 单行、单条命令、literal、token 数各有上限；超限是协议错，不是内存问题；
-//! * literal 声明 2 GiB 而实际只发 1 字节，会停在读满处等待，而不是分配 2 GiB
-//!   （上限先拒绝）；
-//! * 括号不平衡、引号未闭合、控制字符出现在 atom 里，都在进入会话状态机之前被拒。
-
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::{MailError, Result};
@@ -41,7 +17,7 @@ impl Default for ParserLimits {
             max_line: 8 * 1024,
             max_literal: 32 * 1024 * 1024,
             max_tokens: 1024,
-            // 多条 literal 拼接后的文本上限；正文本身不计入（另受 max_literal 约束）。
+
             max_command: 64 * 1024,
         }
     }
@@ -63,7 +39,6 @@ impl Token {
         }
     }
 
-    /// Atom / Quoted / Literal 统一转成字符串（literal 按 UTF-8 lossy）。
     pub fn text(&self) -> Option<String> {
         match self {
             Token::Atom(value) | Token::Quoted(value) => Some(value.clone()),
@@ -94,11 +69,10 @@ impl Token {
 #[derive(Debug, Clone)]
 pub struct Command {
     pub tag: String,
-    /// 已转大写。
+
     pub name: String,
     pub args: Vec<Token>,
-    /// 不含 literal 时，命令名之后的原始参数文本（FETCH 的 section 语法靠它）；
-    /// 含 literal 时为 `None`。
+
     pub raw_args: Option<String>,
 }
 
@@ -107,7 +81,6 @@ enum Chunk {
     Literal(Vec<u8>),
 }
 
-/// 读一条完整命令（含全部 literal）。EOF 且未读到任何字节时返回 `Ok(None)`。
 pub async fn read_command<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut LineIo<S>,
     limits: ParserLimits,
@@ -145,8 +118,6 @@ pub async fn read_command<S: AsyncRead + AsyncWrite + Unpin>(
         }
         literal_total = literal_total.saturating_add(size);
         if literal_total > limits.max_literal {
-            // 单条命令里的多个 literal 也要有总上限，否则 32 × max_literal
-            // 可以在一瞬间吞掉接近 1 GiB 内存。
             return Err(MailError::protocol(
                 "total literal size of a command exceeds the limit",
             ));
@@ -159,7 +130,6 @@ pub async fn read_command<S: AsyncRead + AsyncWrite + Unpin>(
         chunks.push(Chunk::Literal(data));
     }
 
-    // 原始参数文本必须在移动 chunks 之前取出：FETCH 的 section 语法依赖它。
     let raw_args = match chunks.as_slice() {
         [Chunk::Text(bytes)] => std::str::from_utf8(bytes)
             .ok()
@@ -170,10 +140,8 @@ pub async fn read_command<S: AsyncRead + AsyncWrite + Unpin>(
     finish(tokens, raw_args)
 }
 
-/// 行内 literal 标记的拆分结果：`(标记之前的文本, Some((字节数, 是否同步)))`。
 type LiteralSplit<'a> = (&'a [u8], Option<(usize, bool)>);
 
-/// 识别行尾的 `{n}`（同步）或 `{n+}`（LITERAL+，RFC 7888）。
 fn split_literal_marker(line: &[u8], max_literal: usize) -> Result<LiteralSplit<'_>> {
     if line.last() != Some(&b'}') {
         return Ok((line, None));
@@ -181,8 +149,7 @@ fn split_literal_marker(line: &[u8], max_literal: usize) -> Result<LiteralSplit<
     let Some(open) = line.iter().rposition(|byte| *byte == b'{') else {
         return Ok((line, None));
     };
-    // literal marker 必须处于 token 边界：前面是行首、空格或 '('。
-    // 否则 `LOGIN user "{4}"` 这样的 quoted string 会被误判成 literal。
+
     let boundary = match open {
         0 => true,
         _ => matches!(line[open - 1], b' ' | b'('),
@@ -219,8 +186,6 @@ fn tokenize(chunks: Vec<Chunk>, max_tokens: usize) -> Result<Vec<Token>> {
     for chunk in chunks {
         match chunk {
             Chunk::Literal(bytes) => {
-                // 移动而不是 clone：32 MiB 的 literal 再复制一份会让单条命令的
-                // 峰值内存翻倍。
                 push_token(&mut frames, Token::Literal(bytes), &mut count, max_tokens)?;
             }
             Chunk::Text(bytes) => tokenize_text(&bytes, &mut frames, &mut count, max_tokens)?,
@@ -309,8 +274,7 @@ fn parse_quoted(bytes: &[u8], start: usize) -> Result<(String, usize)> {
         index += 1;
         if escaped {
             escaped = false;
-            // RFC 3501 禁止 quoted string 里出现 CR/LF，转义字节也不例外：
-            // 否则 `"a\<CR>b"` 会从下面的检查绕过去。
+
             if byte == b'\r' || byte == b'\n' {
                 return Err(MailError::protocol("CR/LF inside a quoted string"));
             }
@@ -486,7 +450,6 @@ mod tests {
             b"A1 LOGIN {99999999999999999999}\r\n",
             b"A1 LOGIN {4\r\n",
             b"A1 NOOP\x07\r\n",
-            // 转义过的 CR 也算 quoted string 里的 CR/LF。
             b"A1 LOGIN \"a\\\rb\"\r\n",
         ] {
             assert!(

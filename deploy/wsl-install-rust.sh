@@ -1,17 +1,5 @@
-#!/usr/bin/env bash
-# 在 WSL Ubuntu 24.04 内装配 Rust 工具链（规格书 §7：构建在 WSL Ubuntu 24.04 环境）。
-#
-# 本机网络要点：WSL 通过 Clash 混合端口出网。实测 **7897 会接受 TCP 连接但不能代理**
-# （/etc/profile.d/99-clash-proxy.sh 恰好优先探测 7897，且它探测成功 → 于是导出了一个
-# 不可用的代理），真正可用的是 **7890**。故本脚本显式使用 7890。
-#
-# rustup-init.sh 完整性：默认仅依赖 HTTPS 传输（TOFU）。三种模式：
-#   * MAILSTACK_RUSTUP_SHA256=<sha256> —— 钉住安装脚本哈希，不符即失败（任何模式）；
-#   * MAILSTACK_REQUIRE_SHA256=1      —— **未提供**钉扎值也直接失败（强制钉扎）；
-#   * 都不设置                        —— 宽松模式，仅打印无钉扎告警（现状默认）。
 set -euo pipefail
 
-# 6.7：代理不再写死开发机地址，默认值可被 MAILSTACK_PROXY 覆盖。
 PROXY="${MAILSTACK_PROXY:-http://127.0.0.1:7890}"
 RUST_VERSION="1.98.1"
 
@@ -45,16 +33,6 @@ echo "=== 2) 安装 rustup + ${RUST_VERSION} ==="
 if [ -x "$HOME/.cargo/bin/cargo" ]; then
   echo "已存在 cargo: $($HOME/.cargo/bin/cargo --version)"
 else
-  # 6.4：原先是 `curl -o /tmp/rustup-init.sh` 然后 `sh` 它 —— 三个问题：
-  #   1. 落盘到**可预测的** `/tmp/rustup-init.sh`：其他本地用户可预先占位
-  #      （符号链接 / 文件所有权），这是经典的 /tmp 竞态面；
-  #   2. 下载内容**不做任何完整性校验**就直接交给 shell；
-  #   3. 脚本本身只有 `set -u`，中间步骤失败会被静默吞掉（现已升为 -euo）。
-  #
-  # 现在：mktemp -d 建私有目录（0700、名字不可预测），并支持显式哈希钉扎。
-  # **诚实说明**：默认只依赖 HTTPS 传输完整性（TOFU），能挡传输损坏/截断/缓存
-  # 投毒，挡不住源站本身被攻破。需要更强保证时用 MAILSTACK_RUSTUP_SHA256 钉住，
-  # 或设 MAILSTACK_REQUIRE_SHA256=1 使「无钉扎」直接失败（见文件头）。
   workdir=$(mktemp -d "${TMPDIR:-/tmp}/mailstack-rustup.XXXXXXXX") || {
     echo "无法创建临时目录" >&2; exit 1
   }

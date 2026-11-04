@@ -1,27 +1,21 @@
-//! 中继端点校验（规格书 §5.9.2；INV-13、INV-15）。
-//!
-//! 全部规则逐条保留 —— 中继是重写中最容易被做弱化的安全子系统。
-
 use mailstack_core::validate::is_valid_relay_host;
 
 use crate::dial::TlsMode;
 use crate::error::{SmtpError, SmtpResult};
 use crate::ALLOWED_RELAY_PORTS;
 
-/// 请求中的中继端点（未校验）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayValidationRequest {
     pub host: String,
     pub port: u16,
-    /// 原始 tlsMode 字符串（`STARTTLS` / `SSL/TLS`）。
+
     pub tls_mode: String,
     pub username: String,
     pub password: String,
-    /// 请求方是否要求允许私网目标。
+
     pub allow_private_network: bool,
 }
 
-/// 已校验的中继端点。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayEndpoint {
     pub host: String,
@@ -32,43 +26,31 @@ pub struct RelayEndpoint {
 }
 
 impl RelayEndpoint {
-    /// 是否有凭证。
     pub fn has_credentials(&self) -> bool {
         !self.username.is_empty()
     }
 
-    /// `relayhost` 形式：`[host]:port`（方括号表示不做 MX 解析，§5.9.5）。
     pub fn relayhost(&self) -> String {
         format!("[{}]:{}", self.host, self.port)
     }
 
-    /// 隐式 TLS 时是否需要 `smtp_tls_wrappermode = yes`（INV-20）。
-    ///
-    /// 这正是现状已确认的缺陷：`port=465` 时测试通过、界面显示鉴权成功，
-    /// 但因为从未写 `smtp_tls_wrappermode`，实际以明文连 465，投递卡在队列。
     pub fn requires_wrappermode(&self) -> bool {
         self.tls_mode == TlsMode::Implicit || self.port == 465
     }
 }
 
-/// 校验中继端点。
-///
-/// `private_network_enabled` 是**部署策略**（不是请求参数）：请求方要求
-/// `allowPrivateNetwork` 时，若部署侧未开启，必须拒绝。
 pub fn validate_relay(
     request: &RelayValidationRequest,
     private_network_enabled: bool,
 ) -> SmtpResult<RelayEndpoint> {
     let host = request.host.trim().to_string();
 
-    // host：字符集 + 不得以 `.` 开头/结尾 + 不得含 `..`
     if !is_valid_relay_host(&host) {
         return Err(SmtpError::InvalidEndpoint(format!(
             "invalid relay host: {host}"
         )));
     }
 
-    // port：白名单
     if !ALLOWED_RELAY_PORTS.contains(&request.port) {
         return Err(SmtpError::InvalidEndpoint(format!(
             "relay port {} is not allowed (permitted: 25, 465, 587, 2525)",
@@ -76,14 +58,12 @@ pub fn validate_relay(
         )));
     }
 
-    // tlsMode：仅 STARTTLS / SSL/TLS，**明文中继一律拒绝**
     let tls_mode = match request.tls_mode.trim() {
         "STARTTLS" => TlsMode::StartTls,
         "SSL/TLS" => TlsMode::Implicit,
         _ => return Err(SmtpError::TlsRequired),
     };
 
-    // 凭证：长度上限 + 禁止 CR/LF/NUL（SMTP 头注入防护）+ 禁止空白（载体保真）。
     if request.username.len() > 256 {
         return Err(SmtpError::InvalidEndpoint(
             "SMTP username must be at most 256 characters".to_string(),
@@ -98,10 +78,6 @@ pub fn validate_relay(
         ("username", &request.username),
         ("password", &request.password),
     ] {
-        // CR/LF/NUL：命令流注入。空格/Tab：`sasl_passwd` 是**空白分隔**的载体
-        // （见 `relay_store::parse_sasl_passwd`），含空白的凭证写进去再读回来
-        // 会被静默截断 —— 「apply 显示成功、实际认证永远失败」比直接报错更糟。
-        // 与 `client::SmtpSession::authenticate` 的线上闸同一套字符集。
         if value.contains(['\r', '\n', '\0', ' ', '\t']) {
             return Err(SmtpError::InvalidEndpoint(format!(
                 "SMTP {label} must not contain CR, LF, NUL or whitespace"
@@ -109,13 +85,6 @@ pub fn validate_relay(
         }
     }
 
-    // 用户名里的 `:` 必须硬拒（R3-013）。
-    //
-    // `sasl_passwd` 的行格式是 `<relayhost> <user>:<password>`，读侧在**第一个**
-    // 冒号处切分。用户名 `svc:mail` + 口令 `pw` 写盘后读回成
-    // `username="svc"`、`password="mail:pw"` —— apply 回报成功、回读只看
-    // relayhost 也通过，但认证用的是错的凭据，表现为「配置好了却一直 535」。
-    // 口令里的冒号是安全的（切分发生在第一个冒号），只拒用户名。
     if request.username.contains(':') {
         return Err(SmtpError::InvalidEndpoint(
             "SMTP username must not contain ':' (it is the sasl_passwd user/password separator)"
@@ -123,14 +92,12 @@ pub fn validate_relay(
         ));
     }
 
-    // 凭证必须成对提供。
     let has_user = !request.username.is_empty();
     let has_pass = !request.password.is_empty();
     if has_user != has_pass {
         return Err(SmtpError::IncompleteCredentials);
     }
 
-    // 私网策略：请求要求私网但部署未开启 → 拒绝。
     if request.allow_private_network && !private_network_enabled {
         return Err(SmtpError::PrivateRelayDisabled);
     }
@@ -144,16 +111,6 @@ pub fn validate_relay(
     })
 }
 
-/// 由请求推导地址筛选策略。
-///
-/// 只有在请求显式要求私网**且**部署策略已开启时，才放宽到允许私网地址；
-/// 其余一律公网策略（不主动放宽）。
-///
-/// `private_network_enabled` 是**部署**策略（不是请求字段）。把它做成必需参数
-/// 而不是让调用方先 `validate_relay` 再记得传对策略，是 R3-015 的修复点：
-/// 这个函数原先只看 `request.allow_private_network`，签名里根本没有部署策略，
-/// 文档承诺的「且部署策略已开启」在实现上不可能成立 —— 任何未来调用者只要
-/// 忘了先 validate，就会得到一次 SSRF 放宽。
 pub fn address_policy_for(
     request: &RelayValidationRequest,
     private_network_enabled: bool,
@@ -220,7 +177,6 @@ mod tests {
 
     #[test]
     fn rejects_ports_outside_the_whitelist() {
-        // INV-13：端口限定 25/465/587/2525。
         for good in [25u16, 465, 587, 2525] {
             let mut req = base_request();
             req.port = good;
@@ -239,7 +195,6 @@ mod tests {
 
     #[test]
     fn rejects_plaintext_relay_with_the_documented_message() {
-        // INV-13：明文中继一律拒绝，文案是契约。
         for plaintext in ["none", "", "plain", "NONE", "TLS"] {
             let mut req = base_request();
             req.tls_mode = plaintext.to_string();
@@ -261,8 +216,6 @@ mod tests {
 
     #[test]
     fn port_465_with_starttls_still_requires_wrappermode() {
-        // 现状缺陷的边界：判定依据是「端口 465 **或** tlsMode=SSL/TLS」，
-        // 取并集而不是只看 tlsMode。
         let mut req = base_request();
         req.port = 465;
         req.tls_mode = "STARTTLS".to_string();
@@ -281,7 +234,6 @@ mod tests {
 
     #[test]
     fn rejects_credential_injection_via_crlf_and_nul() {
-        // INV-15：CRLF 注入 SMTP 头。
         for (user, pass) in [
             ("api\rkey", "x"),
             ("api\nkey", "x"),
@@ -303,9 +255,6 @@ mod tests {
 
     #[test]
     fn rejects_whitespace_in_relay_credentials() {
-        // sasl_passwd 按空白切字段：含空格/Tab 的凭证写进去再读回来会被静默截断
-        // （`relay_store::parse_sasl_passwd`）。与其「apply 成功、认证永远失败」，
-        // 不如在入口硬拒。
         for (user, pass) in [
             ("api key", "x"),
             ("apikey", "sec ret"),
@@ -336,7 +285,6 @@ mod tests {
         req.password = "p".repeat(4097);
         assert!(validate_relay(&req, false).is_err());
 
-        // 边界内应通过。
         let mut req = base_request();
         req.username = "u".repeat(256);
         req.password = "p".repeat(4096);
@@ -364,7 +312,6 @@ mod tests {
 
     #[test]
     fn credentials_are_optional_as_a_pair() {
-        // 无凭证的中继（如内网 smarthost）应被接受。
         let mut req = base_request();
         req.username = String::new();
         req.password = String::new();
@@ -374,8 +321,6 @@ mod tests {
 
     #[test]
     fn rejects_colon_in_username_but_allows_it_in_password() {
-        // R3-013：`sasl_passwd` 在第一个冒号处切分。用户名含冒号会让
-        // 「写进去的 user」与「读回来的 user」不一致 —— apply 成功但认证永远 535。
         let mut req = base_request();
         req.username = "svc:mail".to_string();
         req.password = "pw".to_string();
@@ -385,7 +330,6 @@ mod tests {
             "用户名含冒号必须被拒绝，实际: {err:?}"
         );
 
-        // 口令里的冒号是安全的：读侧 split_once 只切第一个冒号。
         let mut req = base_request();
         req.username = "svc".to_string();
         req.password = "pa:ss:word".to_string();
@@ -395,8 +339,6 @@ mod tests {
 
     #[test]
     fn address_policy_requires_both_the_request_and_the_deployment_to_opt_in() {
-        // R3-015：文档承诺「请求要求私网**且**部署已开启」。原签名没有部署策略，
-        // 实现也只看请求字段 —— 这里把四种组合全部钉住。
         let mut request = base_request();
         request.allow_private_network = true;
 
@@ -426,7 +368,6 @@ mod tests {
 
     #[test]
     fn private_network_requires_deployment_opt_in() {
-        // INV-15：部署策略未开启时一律拒绝，文案是契约。
         let mut req = base_request();
         req.allow_private_network = true;
 
@@ -437,13 +378,11 @@ mod tests {
             "Private SMTP relay access is disabled by deployment policy"
         );
 
-        // 部署侧开启后放行。
         assert!(validate_relay(&req, true).is_ok());
     }
 
     #[test]
     fn private_policy_does_not_widen_when_not_requested() {
-        // 部署开了私网，但请求没要求 → 仍按公网策略（不主动放宽）。
         let endpoint = validate_relay(&base_request(), true).unwrap();
         assert_eq!(endpoint.host, "smtp.sendgrid.net");
     }

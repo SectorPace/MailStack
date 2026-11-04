@@ -1,8 +1,5 @@
-#!/usr/bin/env bash
-# 重试安装 rustfmt/clippy —— 代理链路偶发中断，需要重试。
 set -euo pipefail
 export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-# 6.7：代理不再写死开发机地址，默认值可被 MAILSTACK_PROXY 覆盖。
 export HTTP_PROXY="${MAILSTACK_PROXY:-http://127.0.0.1:7890}"
 export HTTPS_PROXY="$HTTP_PROXY"
 export http_proxy="$HTTP_PROXY"

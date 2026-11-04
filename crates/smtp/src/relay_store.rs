@@ -1,21 +1,3 @@
-//! `RelayConfigStore` 的真实落盘实现（规格书 §5.9.5、§5.9.6）。
-//!
-//! 两种配置载体：
-//!
-//! | 实现 | 载体 | 适用阶段 |
-//! |---|---|---|
-//! | [`PostfixRelayStore`] | `postconf` 键 + `/etc/postfix/sasl_passwd` | 迁移期（Postfix 仍在） |
-//! | [`NativeRelayStore`] | `/etc/mailstack/relay.json`（0600） | Phase 5 之后（Postfix 已移除） |
-//!
-//! 迁移期必须能**读取**旧的 `sasl_passwd`（格式 `<relayhost> <user>:<password>`），
-//! 见 [`parse_sasl_passwd`]；`postmap` 生成的 `.db` 视为可忽略。
-//!
-//! ## 关于同步 IO
-//!
-//! [`crate::relay_apply::apply_relay`] 是同步函数，故本模块也用同步 IO。
-//! 这条路径由特权助手进程执行、且是低频的管理操作，阻塞是可接受的；
-//! 若在异步运行时内调用，请包一层 `tokio::task::spawn_blocking`。
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,19 +7,13 @@ use mailstack_core::Paths;
 use crate::error::SmtpError;
 use crate::relay_apply::{RelayConfigStore, SASL_PASSWORD_PATH};
 
-// 外部命令执行原语统一由 `mailstack-core` 提供（`postmap` 序列被 store 的表文件
-// 与这里的中继凭证共用，不能各写一份）。此处**重新导出**以保持本 crate 既有的
-// 公开 API 不变（`mailstack_smtp::SystemCommandRunner` 等）。
 pub use mailstack_core::exec::{
     resolve_program, CommandOutput, CommandRunner, SystemCommandRunner,
 };
 
-// ───────────────────────── Postfix 载体（迁移期） ─────────────────────────
-
-/// 迁移期载体：`postconf` 键 + `sasl_passwd`。
 pub struct PostfixRelayStore {
     runner: Arc<dyn CommandRunner>,
-    /// 凭证文件路径（默认 `/etc/postfix/sasl_passwd`）。
+
     pub sasl_passwd: PathBuf,
     postconf: String,
     postmap: String,
@@ -45,7 +21,6 @@ pub struct PostfixRelayStore {
 }
 
 impl PostfixRelayStore {
-    /// 生产实例：真实运行命令、使用默认路径。
     pub fn production() -> Self {
         Self {
             runner: Arc::new(SystemCommandRunner),
@@ -56,7 +31,6 @@ impl PostfixRelayStore {
         }
     }
 
-    /// 注入运行器与路径（测试用）。
     pub fn with_runner(runner: Arc<dyn CommandRunner>, sasl_passwd: PathBuf) -> Self {
         Self {
             runner,
@@ -73,12 +47,10 @@ impl PostfixRelayStore {
             return Err(SmtpError::Config(out.diagnostic(&self.postconf)));
         }
         let value = out.stdout.trim().to_string();
-        // `postconf -h` 对未设置的键输出空行 —— 视为“未设置”。
+
         Ok(if value.is_empty() { None } else { Some(value) })
     }
 
-    /// 读取**有效值**（含默认）。仅用于诊断/展示，**不要**用于快照与回滚 ——
-    /// 那需要 [`RelayConfigStore::read_key`] 的「显式配置」语义。
     pub fn effective_value(&self, key: &str) -> Result<Option<String>, SmtpError> {
         self.postconf_get(key)
     }
@@ -94,17 +66,6 @@ impl PostfixRelayStore {
 }
 
 impl RelayConfigStore for PostfixRelayStore {
-    /// 读取**显式配置**的值。
-    ///
-    /// 必须用 `postconf -n`（仅非默认项）而不是 `-h`（有效值含默认）：
-    /// 后者无法区分「未设置」与「显式设为默认值」。实测差异：
-    ///
-    /// | 键 | `-h`（有效值） | `-n`（显式） |
-    /// |---|---|---|
-    /// | `smtp_tls_wrappermode`（未设置） | `no` | *（空）* |
-    /// | `relayhost`（设空） | *（空）* | `relayhost =` |
-    ///
-    /// 若用 `-h`，快照会把从未设置过的键记成「已设置」，回滚时便无法正确移除它们。
     fn read_key(&mut self, key: &str) -> Result<Option<String>, SmtpError> {
         let out = self.runner.run(&self.postconf, &["-n", key])?;
         if !out.success() {
@@ -117,7 +78,6 @@ impl RelayConfigStore for PostfixRelayStore {
         self.postconf_set(key, value)
     }
 
-    /// `postconf -X` 移除该参数，使其回到「未设置」状态。
     fn remove_key(&mut self, key: &str) -> Result<(), SmtpError> {
         let out = self.runner.run(&self.postconf, &["-X", key])?;
         if !out.success() {
@@ -137,14 +97,9 @@ impl RelayConfigStore for PostfixRelayStore {
         }
     }
 
-    /// 原子写入凭证文件，权限 `0600`。
-    ///
-    /// 权限不是可选项：`telemetry.key_permission_scan` 会检查该文件必须是 `0600`，
-    /// 不合规时报 FAIL。凭证含明文口令，绝不能以进程 umask 落盘。
     fn write_credentials(&mut self, content: &str) -> Result<(), SmtpError> {
         mailstack_core::atomic::atomic_as(&self.sasl_passwd, content.as_bytes(), 0o600, None)?;
 
-        // 紧接着 postmap 重建 hash 表（§5.9.6 的顺序：写凭证 → postmap → postconf → check → reload）。
         let out = self
             .runner
             .run(&self.postmap, &[&self.sasl_passwd.to_string_lossy()])?;
@@ -165,7 +120,6 @@ impl RelayConfigStore for PostfixRelayStore {
         Ok(())
     }
 
-    /// `postfix check` + 重载服务。
     fn reload(&mut self) -> Result<(), SmtpError> {
         let check = self.runner.run(&self.postfix, &["check"])?;
         if !check.success() {
@@ -179,13 +133,6 @@ impl RelayConfigStore for PostfixRelayStore {
     }
 }
 
-/// 解析 `postconf -n <key>` 的输出。
-///
-/// 输出格式为 `key = value`（**注意带空格**，与 `-h` 的裸值不同）。
-/// 键未显式设置时输出为空 → 返回 `None`。
-///
-/// 只认以该键开头的那一行，其余行（例如 stderr 混入的 warning）一律忽略，
-/// 避免把警告文本当成配置值。
 pub fn parse_postconf_n(stdout: &str, key: &str) -> Option<String> {
     for line in stdout.lines() {
         let line = line.trim();
@@ -202,23 +149,8 @@ pub fn parse_postconf_n(stdout: &str, key: &str) -> Option<String> {
     None
 }
 
-/// `postmap` 生成的 hash 表路径（`sasl_passwd` → `sasl_passwd.db`）。
 pub use mailstack_core::exec::hash_db_path;
 
-/// 解析旧 `sasl_passwd` 的内容，用于迁移。
-///
-/// 每行格式 `<relayhost> <user>:<password>`；跳过空行与 `#` 注释；
-/// 不符合格式的行被忽略（不报错——迁移不应因一行脏数据而中断）。
-///
-/// ## 两点格式边界（与 `relay_apply::plan_relay_apply` 的写侧拼装互为镜像）
-///
-/// * `user:password` 在**第一个**冒号处切分（`split_once`，等价于
-///   `splitn(2, ':')`）：口令里允许再有冒号，写侧也是这个语义，两侧往返一致。
-///   反向注意：**用户名**里的冒号无法往返（读回时其后部分会被当成口令），
-///   配置时应避免。
-/// * 凭证中的空格/Tab 无法在此格式中表示（字段按空白切分，含空白的凭证读回时
-///   被静默截断）。新配置已由 `validate_relay` 在入口硬拒空白；本函数只负责
-///   如实读旧文件，不做修正。
 pub fn parse_sasl_passwd(content: &str) -> Vec<SaslEntry> {
     content
         .lines()
@@ -232,7 +164,7 @@ pub fn parse_sasl_passwd(content: &str) -> Vec<SaslEntry> {
             let credentials = parts.next().unwrap_or("");
             let (username, password) = match credentials.split_once(':') {
                 Some((u, p)) => (u.to_string(), p.to_string()),
-                // 只有用户名没有口令：保留用户名，口令为空。
+
                 None => (credentials.to_string(), String::new()),
             };
             Some(SaslEntry {
@@ -244,7 +176,6 @@ pub fn parse_sasl_passwd(content: &str) -> Vec<SaslEntry> {
         .collect()
 }
 
-/// 旧 `sasl_passwd` 的一条记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaslEntry {
     pub relayhost: String,
@@ -252,12 +183,6 @@ pub struct SaslEntry {
     pub password: String,
 }
 
-// ───────────────────────── 原生载体（Phase 5 目标） ─────────────────────────
-
-/// Phase 5 之后的载体：`/etc/mailstack/relay.json`（`0600`）。
-///
-/// 与 Postfix 载体的区别：不再调用任何外部命令，读写都在本进程内完成。
-/// 这也让它在没有 Postfix 的机器上**可以被端到端测试**。
 pub struct NativeRelayStore {
     pub config_path: PathBuf,
 }
@@ -286,26 +211,23 @@ impl NativeRelayStore {
                 )))
             }
         };
-        // 文件损坏时**不**静默当作空配置 —— 那会让人以为中继没配过。
+
         serde_json::from_str(&text)
             .map_err(|e| SmtpError::Config(format!("parse {}: {e}", self.config_path.display())))
     }
 
     fn store(&self, doc: &BTreeMap<String, String>) -> Result<(), SmtpError> {
-        // 凭证与配置同文件，故整体 0600（§5.9.6：relay.json 属机密文件）。
         let data = format!("{}\n", serde_json::to_string_pretty(doc)?);
         mailstack_core::atomic::atomic_as(&self.config_path, data.as_bytes(), 0o600, None)?;
         Ok(())
     }
 
-    /// 整体持锁的读-改-写，避免并发丢更新（与 INV-32 同一考量）。
     fn update<F>(&self, mutate: F) -> Result<(), SmtpError>
     where
         F: FnOnce(&mut BTreeMap<String, String>),
     {
         let path = self.config_path.clone();
-        // `locked()` 的签名要求 `CoreResult`，故在闭包内做一次错误类型转换。
-        // 只转换外层类型、保留原始消息，调用方看到的诊断信息不变。
+
         mailstack_core::atomic::locked(&path, || {
             let mut doc = self.load().map_err(to_core_error)?;
             mutate(&mut doc);
@@ -315,7 +237,6 @@ impl NativeRelayStore {
     }
 }
 
-/// 把 SMTP 侧错误适配为 core 的错误类型（供 `locked()` 这类核心原语复用）。
 fn to_core_error(e: SmtpError) -> mailstack_core::CoreError {
     mailstack_core::CoreError::Invalid(e.to_string())
 }
@@ -353,16 +274,11 @@ impl RelayConfigStore for NativeRelayStore {
         })
     }
 
-    /// 原生载体没有外部守护进程需要重载 —— 配置在下次读取时生效。
-    ///
-    /// 保留空实现而不是删掉该方法：`apply_relay` 的顺序里「写入后重载」是
-    /// 语义的一部分，且未来若引入配置缓存/世代号，这里就是挂载点。
     fn reload(&mut self) -> Result<(), SmtpError> {
         Ok(())
     }
 }
 
-/// 原生载体中保存凭证内容的键名。
 pub const CREDENTIALS_KEY: &str = "saslPasswd";
 
 #[cfg(test)]
@@ -419,8 +335,6 @@ mod tests {
         }
     }
 
-    // ───────────────── 原生载体：真实磁盘 IO ─────────────────
-
     #[test]
     fn native_store_round_trips_keys_on_disk() {
         let dir = temp_dir("native");
@@ -435,7 +349,6 @@ mod tests {
             Some("[smtp.sendgrid.net]:587")
         );
 
-        // 再写一个键不得覆盖前一个（读-改-写正确）。
         store.write_key(KEY_SASL_AUTH_ENABLE, "yes").unwrap();
         assert_eq!(
             store.read_key(KEY_RELAYHOST).unwrap().as_deref(),
@@ -501,7 +414,6 @@ mod tests {
 
     #[test]
     fn native_store_end_to_end_apply_and_readback() {
-        // INV-16 的**真实落盘**路径：不只是内存替身。
         let dir = temp_dir("nativee2e");
         let path = dir.join("relay.json");
         let mut store = NativeRelayStore::at(&path);
@@ -511,7 +423,6 @@ mod tests {
         assert!(result.applied);
         assert_eq!(result.relayhost, "[smtp.sendgrid.net]:587");
 
-        // 文件真的落在磁盘上，且内容可被独立读回。
         let raw = std::fs::read_to_string(&path).unwrap();
         let doc: BTreeMap<String, String> = serde_json::from_str(&raw).unwrap();
         assert_eq!(doc[KEY_RELAYHOST], "[smtp.sendgrid.net]:587");
@@ -519,8 +430,7 @@ mod tests {
         assert_eq!(doc[KEY_TLS_SECURITY_LEVEL], "encrypt");
         assert_eq!(doc[KEY_SASL_SECURITY_OPTIONS], "noanonymous");
         assert!(doc[CREDENTIALS_KEY].contains("apikey:"));
-        // R3-004：这个键**恒写**，587 + STARTTLS 时显式落 `no`。
-        // 原实现「需要才写」，导致 465 → 587 切换后旧的 `yes` 留在盘上。
+
         assert_eq!(
             doc[KEY_TLS_WRAPPERMODE], "no",
             "587 + STARTTLS 必须显式写 no（而不是留空/不写）"
@@ -532,7 +442,6 @@ mod tests {
 
     #[test]
     fn native_store_end_to_end_writes_wrappermode_for_465() {
-        // INV-20 的真实落盘断言。
         let dir = temp_dir("native465");
         let path = dir.join("relay.json");
         let mut store = NativeRelayStore::at(&path);
@@ -551,10 +460,6 @@ mod tests {
 
     #[test]
     fn native_store_rollback_restores_the_file_on_disk() {
-        // 真实回滚：磁盘上的旧配置必须被还原。
-        //
-        // 替身**只在写入之后**才开始说谎。若在快照阶段就说谎，快照会被污染，
-        // 回滚会把谎言写回磁盘 —— 测试会「通过」但什么都没验证到。
         struct LyingNative {
             inner: NativeRelayStore,
             writes_done: bool,
@@ -591,7 +496,6 @@ mod tests {
         let dir = temp_dir("nativerollback");
         let path = dir.join("relay.json");
 
-        // 先建立一份「旧配置」，用真实实现写盘。
         NativeRelayStore::at(&path)
             .write_key(KEY_RELAYHOST, "[old.example.com]:25")
             .unwrap();
@@ -604,7 +508,6 @@ mod tests {
             apply_relay(&mut lying, &endpoint(587, "STARTTLS"), &passed_test()).unwrap_err();
         assert!(failure.rolled_back, "回滚应成功");
 
-        // 用**独立读者**（不复用替身）确认磁盘已还原。
         let doc: BTreeMap<String, String> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -628,16 +531,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ───────────────── Postfix 载体：用注入运行器验证命令序列 ─────────────────
-
     #[derive(Default)]
     struct RecordingRunner {
         calls: Mutex<Vec<(String, Vec<String>)>>,
-        /// 预置的 postconf 读值。
+
         values: Mutex<BTreeMap<String, String>>,
-        /// 会失败的命令前缀。
+
         fail_on: Mutex<Vec<String>>,
-        /// 忽略写入、始终返回预置值（模拟回读不一致）。
+
         ignore_writes: bool,
     }
 
@@ -683,11 +584,6 @@ mod tests {
                 });
             }
 
-            // postconf 各变体的语义（与真实 Postfix 3.8.6 实测一致）：
-            //   -h <key>  → 有效值（含默认），裸值
-            //   -n <key>  → 仅显式设置的值，格式 `key = value`；未设置则输出为空
-            //   -e k=v    → 设置
-            //   -X <key>  → 移除
             if program == "postconf" {
                 let mut values = self.values.lock().unwrap();
                 match args.first().copied() {
@@ -753,16 +649,10 @@ mod tests {
 
     #[test]
     fn rollback_removes_keys_that_were_originally_absent() {
-        // 安全回归测试（依据 Postfix 3.8.6 实测）：
-        //
-        // 若回滚用「写空串」代替「移除」，`smtp_sasl_security_options` 的默认值
-        // `noplaintext, noanonymous` 会被抹掉 —— 一次静默的安全策略弱化。
-        // 本测试固定「回滚必须移除原本不存在的键」。
         let dir = temp_dir("pfrollbackremove");
         let runner = Arc::new(RecordingRunner::new());
         let mut store = postfix_store(runner.clone(), &dir);
 
-        // 从未设置过任何键 → 快照里全是 None。
         let snapshot = ConfigSnapshot {
             keys: vec![
                 (KEY_RELAYHOST.to_string(), None),
@@ -771,10 +661,8 @@ mod tests {
             credentials: None,
         };
 
-        // 模拟「写入后回读不一致」触发回滚：直接调用回滚逻辑。
         assert!(rollback_snapshot(&mut store, &snapshot), "回滚应成功");
 
-        // 必须调用 postconf -X 移除，而不是写空串。
         let calls = runner.calls();
         let removed: Vec<String> = calls
             .iter()
@@ -790,7 +678,6 @@ mod tests {
             "必须用 postconf -X 移除原本未设置的 relayhost"
         );
 
-        // 且**不得**对这两个键写空串。
         let wrote_empty: Vec<String> = calls
             .iter()
             .filter(|(p, a)| p == "postconf" && a.first().map(String::as_str) == Some("-e"))
@@ -845,12 +732,11 @@ mod tests {
 
         store.write_credentials("[h]:587 apikey:secret\n").unwrap();
 
-        // 文件已落盘且内容正确。
         assert_eq!(
             std::fs::read_to_string(dir.join("sasl_passwd")).unwrap(),
             "[h]:587 apikey:secret\n"
         );
-        // 紧接着必须 postmap（§5.9.6 顺序）。
+
         let programs = runner.programs();
         assert_eq!(
             programs,
@@ -922,7 +808,7 @@ mod tests {
             !dir.join("sasl_passwd.db").exists(),
             "postmap 生成的 .db 也必须清除"
         );
-        // 幂等。
+
         store.remove_credentials().unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
@@ -930,7 +816,6 @@ mod tests {
 
     #[test]
     fn postfix_store_full_apply_sequence_is_correct() {
-        // 顺序断言：快照（postconf -h）→ 写凭证 + postmap → postconf -e → postfix check/reload → 回读。
         let dir = temp_dir("pfseq");
         let runner = Arc::new(RecordingRunner::new());
         let mut store = postfix_store(runner.clone(), &dir);
@@ -952,9 +837,6 @@ mod tests {
             index_of(&|p, a| p == "postfix" && a.first().map(String::as_str) == Some("check"))
                 .expect("必须调用 postfix check");
 
-        // 快照读取必须用 `-n`（显式配置）而不是 `-h`（有效值含默认）。
-        // 用 `-h` 会把从未设置过的键记成「已设置」，回滚时便无法正确移除它们 ——
-        // 实测：对 `smtp_sasl_security_options` 写空串会抹掉默认的 noplaintext 保护。
         assert!(
             index_of(&|p, a| p == "postconf" && a.first().map(String::as_str) == Some("-n"))
                 .is_some(),
@@ -975,7 +857,6 @@ mod tests {
             "postconf -e 必须早于 postfix check"
         );
 
-        // 磁盘上的凭证文件必须存在，且 postmap 确实指向它。
         assert!(dir.join("sasl_passwd").exists());
         let postmap_args = &calls[postmap].1;
         assert_eq!(
@@ -988,7 +869,6 @@ mod tests {
 
     #[test]
     fn postfix_store_readback_mismatch_triggers_rollback() {
-        // 运行器忽略写入 → 回读与期望不符 → 必须回滚。
         let dir = temp_dir("pflies");
         let runner = Arc::new(RecordingRunner::new().with_ignored_writes());
         let mut store = postfix_store(runner, &dir);
@@ -1004,13 +884,11 @@ mod tests {
             "实际错误: {}",
             failure.error
         );
-        // 回滚应删掉本次写入的凭证。
+
         assert!(!dir.join("sasl_passwd").exists(), "回滚应移除凭证文件");
 
         std::fs::remove_dir_all(&dir).ok();
     }
-
-    // ───────────────── 旧 sasl_passwd 解析（迁移用） ─────────────────
 
     #[test]
     fn parses_layman_sasl_passwd_lines() {
@@ -1022,7 +900,7 @@ mod tests {
         assert_eq!(entries[0].relayhost, "[smtp.sendgrid.net]:587");
         assert_eq!(entries[0].username, "apikey");
         assert_eq!(entries[0].password, "SG.abc123");
-        // 口令里的冒号必须保留。
+
         assert_eq!(entries[1].password, "p@ss:with:colons");
     }
 

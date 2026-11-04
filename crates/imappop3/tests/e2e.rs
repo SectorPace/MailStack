@@ -1,12 +1,3 @@
-//! 端到端测试：真实双工会话（内存双工）与真实 TCP 监听器。
-//!
-//! 目的不是重复单元测试，而是验证**跨层**行为：
-//!
-//! * 认证（PBKDF2 记录）→ SELECT → FETCH/SEARCH/STORE/EXPUNGE → 落盘；
-//! * literal（含 LITERAL+）在会话层的读取与应答；
-//! * POP3 的独占锁、UIDL 与 QUIT 提交语义；
-//! * 监听器的问候语与优雅停机。
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,7 +68,7 @@ fn pop3_context(fixture: &Fixture) -> Pop3SessionContext {
             read_timeout: Duration::from_secs(10),
             ..Pop3Config::default()
         },
-        // 单用户夹具：不装配按用户名解析的邮箱目录（多用户见 tests/multi_user.rs）。
+
         resolver: None,
     }
 }
@@ -681,7 +672,6 @@ async fn imap_compress_deflate_switches_after_plaintext_ok() {
         "切换应答必须是明文 OK（之后才压缩）: {ok}"
     );
 
-    // 客户端也在收到明文 OK 之后切换；之后双向都是 DEFLATE。
     client.enable_compression().unwrap();
     client.write_all(b"a3 NOOP\r\n").await.unwrap();
     client.flush().await.unwrap();
@@ -735,7 +725,6 @@ async fn imap_metadata_set_and_get_round_trip() {
         "missing entry must be NIL: {joined}"
     );
 
-    // 用 NIL 删除条目后，再取应只剩 NIL。
     client
         .send("a4 SETMETADATA INBOX (/private/comment NIL)")
         .await;
@@ -764,7 +753,6 @@ async fn imap_acl_set_get_list_and_delete() {
         "认证后应通告 ACL: {login:?}"
     );
 
-    // 自己（owner）拥有全部权限。
     client.send("a2 MYRIGHTS INBOX").await;
     let my = client.until_tag("a2").await;
     assert!(
@@ -822,12 +810,10 @@ async fn imap_searchres_saves_and_dollar_refers_to_it() {
     client.send("a2 SELECT INBOX").await;
     let _ = client.until_tag("a2").await;
 
-    // 没有 SAVE 之前用 $ 是错误（BAD），绝不静默当作空集。
     client.send("a3 UID FETCH $ (UID)").await;
     let bad = client.until_tag("a3").await;
     assert!(bad.last().unwrap().contains("BAD"), "{bad:?}");
 
-    // SAVE 只回 tagged OK，不回 untagged SEARCH/ESEARCH。
     client
         .send("a4 SEARCH RETURN (SAVE) SUBJECT \"second\"")
         .await;
@@ -835,7 +821,6 @@ async fn imap_searchres_saves_and_dollar_refers_to_it() {
     assert_eq!(save.len(), 1, "SAVE 只应有 tagged OK: {save:?}");
     assert!(save[0].starts_with("a4 OK"), "{save:?}");
 
-    // $ 指向已保存结果的最高 UID（第二封 = uid 2）。
     client.send("a5 UID FETCH $ (UID)").await;
     let fetch = client.until_tag("a5").await;
     let joined = join_lines(&fetch);
@@ -899,14 +884,12 @@ async fn imap_shared_mailbox_enforces_acl_on_selected_operations() {
         .await;
     let _ = client.until_tag("a1").await;
 
-    // 没有 ACL → 共享 SELECT 被拒。
     client
         .send("a2 SELECT shared/alice@example.com/INBOX")
         .await;
     let denied = client.until_tag("a2").await;
     assert!(denied.last().unwrap().contains("NO"), "{denied:?}");
 
-    // alice 授予 bob lrsw（不含 EXPUNGE 所需的 t）。
     let mut acl = std::collections::BTreeMap::new();
     acl.insert("bob@example.com".to_string(), "lrsw".to_string());
     alice.write_acl("INBOX", &acl).unwrap();
@@ -919,26 +902,22 @@ async fn imap_shared_mailbox_enforces_acl_on_selected_operations() {
     assert!(joined.contains("a3 OK"), "granted select failed: {joined}");
     assert!(joined.contains("2 EXISTS"), "{joined}");
 
-    // 读（r 已授予）。
     client
         .send("a4 FETCH 1 (BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
         .await;
     let fetched = client.until_tag("a4").await;
     assert!(join_lines(&fetched).contains("secret"), "{fetched:?}");
 
-    // 写标志（w 已授予）。
     client.send("a5 STORE 1 +FLAGS (\\Seen)").await;
     let stored = client.until_tag("a5").await;
     assert!(stored.last().unwrap().contains("OK"), "{stored:?}");
 
-    // EXPUNGE 需要 t，未授予 → NO。
     client.send("a6 STORE 1 +FLAGS (\\Deleted)").await;
     let _ = client.until_tag("a6").await;
     client.send("a7 EXPUNGE").await;
     let expunge = client.until_tag("a7").await;
     assert!(expunge.last().unwrap().contains("NO"), "{expunge:?}");
 
-    // NAMESPACE 通告共享命名空间。
     client.send("a8 NAMESPACE").await;
     let namespace = client.until_tag("a8").await;
     assert!(join_lines(&namespace).contains("shared/"), "{namespace:?}");
@@ -1381,7 +1360,6 @@ async fn imap_esearch_returns_requested_fields() {
     assert!(lines.contains("UID"), "{lines}");
     assert!(lines.contains("COUNT 3"), "{lines}");
 
-    // SEARCHRES：SAVE 被接受，且只回 tagged OK（不回 untagged）。
     client.send("e5 SEARCH RETURN (SAVE) ALL").await;
     let save = client.until_tag("e5").await;
     assert_eq!(save.len(), 1, "SAVE 只应有 tagged OK: {save:?}");
@@ -1423,14 +1401,12 @@ async fn imap_condstore_modseq_and_unchangedsince() {
     let lines = join_lines(&client.until_tag("z4").await);
     assert!(lines.contains("MODSEQ ("), "{lines}");
 
-    // modseq=1 > 0 → 条件不满足，不得修改，并回 MODIFIED。
     client
         .send("z5 STORE 1 +FLAGS (\\Seen) (UNCHANGEDSINCE 0)")
         .await;
     let lines = join_lines(&client.until_tag("z5").await);
     assert!(lines.contains("[MODIFIED 1]"), "{lines}");
 
-    // 条件满足 → 修改成功，modseq 递增。
     client
         .send("z6 STORE 1 +FLAGS (\\Seen) (UNCHANGEDSINCE 100)")
         .await;
@@ -1472,7 +1448,6 @@ async fn imap_qresync_uses_vanished_and_replays_missing_uids() {
         .await;
     let _ = client.until_tag("q1").await;
 
-    // 未 ENABLE 前使用 QRESYNC 参数必须被拒绝。
     client
         .send(&format!("q2 SELECT INBOX (QRESYNC ({uidvalidity} 0))"))
         .await;
@@ -1506,7 +1481,6 @@ async fn imap_qresync_uses_vanished_and_replays_missing_uids() {
     let _ = client.until_tag("q7").await;
     let _ = handle.await.unwrap().unwrap();
 
-    // 第二个会话用旧 modseq 重新同步，必须收到 VANISHED (EARLIER)。
     let (mut client, handle) = spawn_imap(&fixture);
     let _ = client.line().await;
     client
@@ -1569,7 +1543,6 @@ async fn imap_quota_reports_usage_and_rejects_over_quota_append() {
     let lines = join_lines(&client.until_tag("p6").await);
     assert!(lines.contains("NO [NOPERM]"), "{lines}");
 
-    // 删除唯一一封后配额回收，APPEND 重新可用。
     client.send("p7 SELECT INBOX").await;
     let _ = client.until_tag("p7").await;
     client.send("p8 STORE 1 +FLAGS (\\Deleted)").await;
@@ -1840,7 +1813,6 @@ fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
     result
 }
 
-/// 编译期守卫：`AuthBackend` 必须是 `Clone + Send + Sync`（服务器配置需要跨任务共享）。
 #[allow(dead_code)]
 fn assert_auth_backend_is_shareable(backend: &AuthBackend) -> impl Send + Sync + Clone + '_ {
     backend.clone()

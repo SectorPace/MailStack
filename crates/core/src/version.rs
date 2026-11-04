@@ -1,9 +1,3 @@
-//! 版本常量。
-//!
-//! 单一真相源是 workspace 根 `Cargo.toml` 的 `[workspace.package] version`，
-//! 与仓库根的 `VERSION` 文件必须一致（由 `cargo test` 中的一致性断言守护）。
-
-/// 形如 `1.0.0`。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]

@@ -1,21 +1,3 @@
-//! 队列运行器：调度、并发限流、退避重试、DSN 退信与快速失败（规格书 §5.8、§5.10.3）。
-//!
-//! ## 一次投递的决策树
-//!
-//! ```text
-//! 收到投递结果
-//!   ├─ 成功            → 移除该批收件人；条目空了就删文件
-//!   ├─ 永久失败 (5xx)  → 立即退信（不重试）
-//!   └─ 临时失败/未知   → 退避重试；达到上限则退信
-//! ```
-//!
-//! ## 快速失败（§5.10.3 R-25-3）
-//!
-//! 出站 25 被封时，「每条消息各重试 10 次」会把队列撑成重试风暴，而运维看到的
-//! 只是「队列在涨」。因此连续失败达到阈值后，运行器进入**快速失败**：每轮只允许
-//! 一次探测投递（半开），其余条目原样留在队列里，并在报告里给出**明确结论**
-//! （「出站 25 被封，请配置中继」）。结论持久化，重启后仍然可见。
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -31,17 +13,15 @@ use crate::error::QueueResult;
 use crate::signing::{MessageSigner, SigningTransport};
 use crate::store::{OutboundHealthState, QueueStore};
 
-/// 运行器配置。
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
-    /// 并发投递上限。生产值来自 `/etc/mailstack/settings.json` 的 `relayConcurrency`。
     pub relay_concurrency: u32,
     pub backoff: BackoffPolicy,
-    /// `Reporting-MTA` 与本机 `MAILER-DAEMON@` 使用的域名。
+
     pub reporting_mta: String,
-    /// 本机纳管域名（决定「本地投递」还是「外域投递」）。
+
     pub managed_domains: Vec<String>,
-    /// 连续失败多少次后判定「出站不可用」并转入快速失败。
+
     pub blocked_threshold: u32,
 }
 
@@ -51,33 +31,26 @@ impl Default for QueueConfig {
             relay_concurrency: 20,
             backoff: BackoffPolicy::default(),
             reporting_mta: "localhost".to_string(),
-            // 空表 = fail-closed：所有收件人都按外域处理，绝不把外域邮件当本地投。
+
             managed_domains: Vec::new(),
             blocked_threshold: DEFAULT_BLOCKED_THRESHOLD,
         }
     }
 }
 
-/// 出站健康判据（§5.10.3 R-25-3 的对外结论）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundHealth {
     pub consecutive_failures: u32,
-    /// 是否已判定出站不可用（转入快速失败）。
+
     pub blocked: bool,
-    /// 结论是否为「必须配置中继」。
+
     pub needs_relay: bool,
-    /// 面向运维的结论文案。
+
     pub message: String,
 }
 
-/// 连续失败达到多少次判定「出站被封」。
 pub const DEFAULT_BLOCKED_THRESHOLD: u32 = 10;
 
-/// 从**持久化的失败计数**推导出对外结论。
-///
-/// 抽成自由函数是为了让只读聚合面（`snapshot` / `metrics.realtime`）不必为了
-/// 读一个结论就构造整个 [`QueueRunner`]（那需要本地与远端两个传输、签名器与信号量）。
-/// 结论的算法只有这一份 —— 分叉出第二份就等于让管理台与调度器各说各话。
 pub fn outbound_health_from(
     failures: u32,
     blocked_threshold: u32,
@@ -110,46 +83,36 @@ pub fn outbound_health_from(
     }
 }
 
-/// 一轮调度的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueRunReport {
-    /// 本轮到期的条目数。
     pub considered: usize,
-    /// 成功投递的收件人次数。
+
     pub delivered: usize,
-    /// 仍留在队列中等待重试的条目数。
+
     pub deferred: usize,
-    /// 触发退信的收件人次数。
+
     pub bounced: usize,
-    /// 无法退信而被迫丢弃的次数（null sender 或退信自身失败）。
+
     pub discarded: usize,
-    /// 本轮是否因「出站不可用」而走了快速失败。
+
     pub fast_failed: bool,
-    /// 本轮结束时的队列积压量（待投递条目数）。
-    ///
-    /// 与出站健康一起构成 §5.10.3 R-25-5 要求的「队列积压量」检查项。
+
     pub backlog: usize,
-    /// 本轮处理中因落盘等内部错误而失败的条目数。
-    ///
-    /// 单条失败不中断整轮（只记日志），但只记日志不计数的话，运维从报告里
-    /// 看不出「这一轮有 N 条没能处理」—— 这里把 `Ok(Err)` 也计入报告。
+
     pub failed: usize,
-    /// 生效的中继并发上限（`relayConcurrency`，§5.9.8／Phase 2 验收第 5 条）。
+
     pub relay_concurrency: u32,
     pub outbound_health: OutboundHealth,
 }
 
-/// 队列的指标快照。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueMetrics {
-    /// 队列积压量（条目数）。
     pub backlog: usize,
-    /// 生效的中继并发上限。
+
     pub relay_concurrency: u32,
     pub outbound_health: OutboundHealth,
 }
 
-/// 单条条目的处理结果（内部累计量）。
 #[derive(Debug, Default, Clone, Copy)]
 struct EntryOutcome {
     delivered: usize,
@@ -159,18 +122,12 @@ struct EntryOutcome {
     fast_failed: bool,
 }
 
-/// 一笔待入队的 DSN 退信。
-///
-/// [`QueueRunner::apply_failure`] 只**决定**要退信；真正的入队由
-/// [`QueueRunner::flush_bounces`] 在原条目状态落盘之后执行 —— 顺序即修复：
-/// 先落盘、后退信，落盘失败就不会产生「磁盘收件人与退信不一致」的中间态。
 #[derive(Debug)]
 struct PendingBounce {
-    /// 投递失败的收件人（DSN 的逐收件人状态块）。
     failed: Vec<String>,
-    /// 失败原因（可能来自对端服务器，写出前会再经净化）。
+
     diagnostic: String,
-    /// 对端状态码（若有）。
+
     code: Option<u16>,
 }
 
@@ -184,7 +141,6 @@ impl EntryOutcome {
     }
 }
 
-/// 队列运行器。
 pub struct QueueRunner {
     store: QueueStore,
     local: Arc<dyn Transport>,
@@ -192,26 +148,14 @@ pub struct QueueRunner {
     config: QueueConfig,
     relay: Option<RelayEndpoint>,
     health: Mutex<OutboundHealthState>,
-    /// 半开探测标记：快速失败期间每轮只放行一次远端尝试。
+
     half_open_used: AtomicBool,
-    /// 5.9：`run_once` 重入标记。
-    ///
-    /// 原实现没有任何排他：两轮重叠时双方都会 `load_all()` 到**同一批**条目，
-    /// 各自投递一次 → 收件人收到重复邮件，并且各自重置 `half_open_used`
-    /// （快速失败期间的「只放行一次探测」也跟着失效）。
-    /// store 侧没有 per-entry claim 标志，安全性此前完全依赖调用方（daemon）串行化 ——
-    /// 而那只是一句注释，没有任何东西强制它。
+
     round_in_flight: AtomicBool,
     semaphore: Semaphore,
 }
 
 impl QueueRunner {
-    /// 构造运行器。出站健康状态从磁盘读取，因此「出站不可用」的结论跨重启保留。
-    ///
-    /// `remote` 在这里被**无条件**套上 [`SigningTransport`]：调用方无论传进来什么
-    /// 传输，外发邮件都必然经过 DKIM 签名决策，「一条未签名的出站路径」在本类型里
-    /// 不可表达（见 `signing` 模块说明）。本地传输刻意不套 —— Dovecot 是本机自己的
-    /// 用户，DKIM 的意义在于向外部接收方证明身份。
     pub fn new(
         store: QueueStore,
         local: Arc<dyn Transport>,
@@ -240,15 +184,10 @@ impl QueueRunner {
         &self.store
     }
 
-    /// 当前 生效的出站路由。
-    ///
-    /// **唯一**的路由来源：只要有中继配置就一律走中继，不存在退回直投的分支
-    /// （INV-18 / INV-21）。DSN 退信走的也是它。
     pub fn outbound_route(&self) -> OutboundRoute {
         select_outbound_route(self.relay.as_ref())
     }
 
-    /// 当前出站健康判据。
     pub fn outbound_health(&self) -> OutboundHealth {
         outbound_health_from(
             self.health_snapshot().consecutive_failures,
@@ -257,15 +196,7 @@ impl QueueRunner {
         )
     }
 
-    /// 调度一轮：处理所有已到期的条目。
-    ///
-    /// 需要 `Arc<Self>` 是因为各条目的投递要并发执行（受 `relayConcurrency` 约束）。
     pub async fn run_once(self: &Arc<Self>, now_unix: i64) -> QueueResult<QueueRunReport> {
-        // 5.9：同一时刻只允许一轮在跑。
-        //
-        // 两轮重叠的后果不是「慢一点」，而是**重复投递**：双方都 `load_all()` 到
-        // 同一批条目、都用同一份收件人列表去投，谁也看不见对方。
-        // `compare_exchange` 而不是 `swap`：必须能分辨「我拿到了」与「别人在跑」。
         if self
             .round_in_flight
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -275,25 +206,11 @@ impl QueueRunner {
                 "overlapping run_once would re-deliver the same entries",
             ));
         }
-        // 用 guard 保证任何提前返回 / `?` 提前退出都会复位标记，
-        // 否则一次错误就能让队列**永久停摆**（比重复投递更糟）。
+
         let _round_guard = RoundGuard(&self.round_in_flight);
 
-        // 每轮重置半开标记：快速失败状态下也保留「一次探测机会」，否则出站恢复后
-        // 队列会永远不再尝试，变成永久性停摆。
         self.half_open_used.store(false, Ordering::SeqCst);
 
-        // 5.10：先清掉过期租约，再排除仍被有效租约持有的条目。
-        //
-        // 一条条目在「开始投递」与「把结果写回」之间，磁盘上没有任何它的状态
-        // 变化。这段窗口里崩溃/掉电/停机取消，重启后它仍带全部收件人 —— 下一轮
-        // 会整批重投。租约把这段窗口显式化：仍在租约内的条目**先跳过**，
-        // 等租约过期再重试。
-        //
-        // 5.9（Fixer C）：租约清理、租约枚举与条目读取都是同步文件 I/O，不能占着
-        // tokio worker 跑 —— 搬进 `spawn_blocking`（与 `store.len()` 的既有先例
-        // 一致）。读取用 `load_due` 而**不是** `load_all`：后者会把整个队列（含
-        // 每条 50 MiB 的报文正文）反序列化进内存，而 `due` 过滤发生在读完之后。
         let store = self.store.clone();
         let (entries, claimed) = tokio::task::spawn_blocking(
             move || -> QueueResult<(Vec<QueueEntry>, std::collections::HashSet<String>)> {
@@ -310,8 +227,6 @@ impl QueueRunner {
             .filter(|entry| entry.is_due(now_unix) && !claimed.contains(&entry.id))
             .collect();
 
-        // RelayPolicy（连同它背后的纳管域名克隆）每轮只构建一次，传给每条
-        // 条目 —— 每条条目重建一遍纯属浪费（域名归一化 + 排序 + 去重）。
         let policy = RelayPolicy::new(self.config.managed_domains.iter().cloned());
 
         let mut totals = EntryOutcome::default();
@@ -320,25 +235,13 @@ impl QueueRunner {
         let mut join_error: Option<crate::error::QueueError> = None;
         let mut tasks = JoinSet::new();
         for entry in due.iter().cloned() {
-            // 认领必须在**这里**（spawn 之前）完成，而不是在任务内部：
-            // 任务一多，两个任务并发认领同一条时就都拿到了。
-            // `try_claim` 用 O_EXCL，只有一方能成功。
-            //
-            // 5.3（Fixer C）：认领失败**绝不能** `?` 提前返回。`?` 会让 `tasks`
-            // （`JoinSet`）在函数中途被 drop，而 drop `JoinSet` 会 **abort** 已经
-            // spawn 的任务 —— 那些任务可能正处在「对端已 250、本地还没落盘」的
-            // 窗口里，于是这一轮已投出的进度被丢掉，下一轮整批重投（与 5.18 的
-            // `select!` 丢弃 future 是同一类缺陷，只是触发点换成了目录 I/O 错误）。
-            // 认领是**逐条目**的前置条件，与整轮成败无关：记日志 + 计数 + 继续。
             match self.store.try_claim(&entry.id, now_unix) {
                 Ok(true) => {
                     let runner = Arc::clone(self);
                     let policy = policy.clone();
                     tasks.spawn(async move { runner.process(entry, now_unix, &policy).await });
                 }
-                Ok(false) => {
-                    // 别的执行者持有有效租约：本轮跳过是正常语义，不计数为失败。
-                }
+                Ok(false) => {}
                 Err(error) => {
                     mailstack_core::warn::warn_with_detail(
                         "queue claim",
@@ -356,8 +259,6 @@ impl QueueRunner {
                     totals.merge(outcome);
                 }
                 Ok(Err(e)) => {
-                    // 单条条目的落盘失败不应中断整轮调度，但要如实记录**并计数**：
-                    // 只记日志不计数的话，报告看不出这一轮有多少条没能处理。
                     mailstack_core::warn::warn_with_detail(
                         "queue entry processing",
                         &e.to_string(),
@@ -371,7 +272,6 @@ impl QueueRunner {
             }
         }
 
-        // 结论落盘：重启后运维仍能看到「出站不可用」。
         let snapshot = self.health_snapshot();
         self.store.save_health(&snapshot)?;
 
@@ -379,8 +279,6 @@ impl QueueRunner {
             mailstack_core::warn::warn_with_detail("queue run had failures", &err.to_string());
         }
 
-        // 积压量在调度之后统计，才反映「这一轮之后还剩多少」。
-        // 同样是 `read_dir`，同样不占 async worker。
         let store = self.store.clone();
         let backlog = tokio::task::spawn_blocking(move || store.len())
             .await
@@ -402,14 +300,6 @@ impl QueueRunner {
         })
     }
 
-    /// 供指标上报的快照（§5.9.8 / §5.10.3 R-25-5）。
-    ///
-    /// 遥测采样需要「队列积压量 + 中继并发上限 + 出站健康」三者同时可见，否则
-    /// 运维无法区分「投递慢」与「出站被封」。
-    ///
-    /// 积压量靠 `store.len()`（`read_dir`）统计，是同步文件 I/O —— 遥测每 2 秒
-    /// 采样一次，不该每次都占用一个 async worker，因此本方法是 `async` 并把
-    /// 计数搬进 `spawn_blocking`。
     pub async fn metrics_snapshot(&self) -> QueueMetrics {
         let store = self.store.clone();
         let backlog = tokio::task::spawn_blocking(move || store.len().unwrap_or(0))
@@ -422,34 +312,25 @@ impl QueueRunner {
         }
     }
 
-    /// 处理一条条目。
     async fn process(
         &self,
         mut entry: QueueEntry,
         now_unix: i64,
         policy: &RelayPolicy,
     ) -> QueueResult<EntryOutcome> {
-        // 5.10：无论正常返回、提前 `?`、还是任务被取消/panic，租约都必须释放 ——
-        // 否则该条目会被自己的租约挡住整整 CLAIM_TTL_SECONDS（默认 15 分钟）。
-        // 用 Drop guard 而不是在函数末尾手写 release：`process` 里有多处 `?`。
         let _claim = ClaimGuard {
             store: self.store.clone(),
             id: entry.id.clone(),
         };
 
         let mut outcome = EntryOutcome::default();
-        // 5.15：这一轮是否真的改过条目。
-        //
-        // 原实现无条件 `store.enqueue(&entry)` —— 于是「出站被封、快速失败」期间
-        // 每一轮（10 秒）都会把**全部积压条目**原样重写一遍磁盘：内容一字未变，
-        // 而恰恰是出站被封、积压最大、I/O 压力最该省的时候。
+
         let mut mutated = false;
-        // DSN 退信先攒下，等原条目的更新状态落盘之后再入队（顺序见下方注释）。
+
         let mut pending_bounces: Vec<PendingBounce> = Vec::new();
         let route = self.outbound_route();
         let (local_recipients, remote_recipients) = self.partition(&entry, policy);
 
-        // 并发限流：一次投递占用一个许可（relayConcurrency）。
         let _permit = self.semaphore.acquire().await;
 
         if !local_recipients.is_empty() {
@@ -459,15 +340,6 @@ impl QueueRunner {
                 .await
             {
                 Ok(receipt) => {
-                    // 5.12：回执必须覆盖**全部**被尝试的收件人，否则「移除」就会
-                    // 悄悄吞掉没被接受的那几个 —— 那些收件人既不会重试也不会退信，
-                    // 等于静默丢信。
-                    //
-                    // 现在三条生产传输（LMTP / SMTP 中继 / 直投 / 签名包装）在成功
-                    // 分支上都返回 `accepted == recipients.len()`，所以这个不变量今天
-                    // 成立；但此前**没有任何东西强制它**，一次「部分成功也返回 Ok」
-                    // 的实现改动就会变成静默丢信。这里把它钉成显式检查：
-                    // 不满足就报错停下，宁可见红也不要悄悄少投一个收件人。
                     if receipt.accepted != local_recipients.len() {
                         return Err(crate::error::QueueError::invalid(format!(
                             "local transport reported {} accepted of {} attempted recipients \
@@ -484,7 +356,6 @@ impl QueueRunner {
                     entry.last_code = None;
                 }
                 Err(failure) => {
-                    // 本地投递失败**不**计入出站健康：LMTP 出问题不代表外发 25 被封。
                     mutated = true;
                     self.apply_failure(
                         &mut entry,
@@ -510,19 +381,11 @@ impl QueueRunner {
                     .await
                 {
                     Ok(receipt) => {
-                        // 5.12：同本地分支，回执必须覆盖全部被尝试的收件人。
                         if receipt.accepted != remote_recipients.len() {
-                            // 宁可见红（性质不变），但**先尽力落盘已经发生的进度**：
-                            // 本地收件人可能已投递并从内存里摘掉，直接报错会把这份
-                            // 进度丢在内存里，下一轮把本地收件人**再投一遍** ——
-                            // 那是比报错更糟的静默重复投递。
                             if mutated {
                                 self.persist_best_effort(&entry);
                             }
-                            // 已判定要退信的收件人（apply_failure 已把它们从条目摘除）
-                            // 的 DSN 也必须在这里入队：条目里已经没有他们，重试无从
-                            // 补发，跳过 flush 就是静默丢信。flush 自带失败回收
-                            // （入队失败会把收件人放回条目并写回）。
+
                             if !pending_bounces.is_empty() {
                                 if let Err(error) = self.flush_bounces(
                                     &mut entry,
@@ -565,50 +428,29 @@ impl QueueRunner {
                     }
                 }
             } else {
-                // 快速失败：出站已判定不可用，本轮不再逐条重试（避免重试风暴）。
-                //
-                // 5.15：这一分支**不改动** `entry`，因此 `mutated` 保持 false ——
-                // 下面不会再把它原样重写一遍磁盘。
                 outcome.fast_failed = true;
                 outcome.deferred += 1;
             }
         }
 
-        // 先落盘原条目的**最终**状态（全部收件人摘除、退避计数、失败原因都在这）。
         if entry.recipients.is_empty() {
-            // 全部收件人已投递或已退信 → 条目使命完成。
             self.store.remove(&entry.id)?;
         } else if mutated {
-            // 仍有未完成收件人（退避等待中，或本地/远端部分成功）→ 写回更新后的状态。
             entry.validate()?;
             self.store.enqueue(&entry)?;
         }
-        // 否则：这一轮什么都没改（例如出站被封时的快速失败）。
-        // 内容一字未变还去重写，只会在积压最大时制造无谓的 I/O 风暴。
 
-        // ……然后才入队 DSN 退信。
-        //
-        // 顺序即正确性：DSN 入队**必须**发生在原条目状态落盘之后。反过来（先退信
-        // 后落盘）时，落盘一步失败会让磁盘上的条目仍带着**全部**收件人 —— 下一轮
-        // 整批重投：已投递的收件人收到重复邮件、失败的收件人收到重复退信。
-        // 而落盘失败时上面的 `?` 已经提前返回，退信不会生成 —— 磁盘上的原条目
-        // 仍带失败收件人，下一轮重投会重新生成同一封退信，不丢、不重。
         self.flush_bounces(&mut entry, &mut outcome, pending_bounces, now_unix)?;
 
         Ok(outcome)
     }
 
-    /// 尽力把条目当前状态写回磁盘（失败只记日志，不向上传播）。
-    ///
-    /// 用于「马上要以错误返回、但内存里已经有真实进度」的路径：进度丢在内存里
-    /// 等于把已投递的收件人再投一遍，那比返回错误更糟。
     fn persist_best_effort(&self, entry: &QueueEntry) {
         if let Err(error) = self.store.enqueue(entry) {
             mailstack_core::warn::warn_with_detail("queue entry write-back", &error.to_string());
         }
     }
 
-    /// 把攒下的 DSN 退信逐封入队（调用前原条目状态必须已经落盘）。
     fn flush_bounces(
         &self,
         entry: &mut QueueEntry,
@@ -627,9 +469,6 @@ impl QueueRunner {
                 Ok(true) => outcome.bounced += failed.len(),
                 Ok(false) => outcome.discarded += failed.len(),
                 Err(error) => {
-                    // 退信入队失败：把失败的收件人**放回**条目并尽力写回，
-                    // 让下一轮重投后重新生成退信 —— 而不是无声丢掉这批收件人
-                    // （它们已经从磁盘条目里摘掉了，退信再没入队就是静默丢信）。
                     for recipient in &failed {
                         if !entry.recipients.contains(recipient) {
                             entry.recipients.push(recipient.clone());
@@ -648,10 +487,6 @@ impl QueueRunner {
         }
     }
 
-    /// 应用一次已判定的投递失败。
-    ///
-    /// 本方法**不再直接入队退信**（那是 [`Self::flush_bounces`] 在原条目落盘之后的
-    /// 职责），因此不会失败：所有可能出错的 I/O 都被移出了这里。
     fn apply_failure(
         &self,
         entry: &mut QueueEntry,
@@ -661,9 +496,6 @@ impl QueueRunner {
         now_unix: i64,
         pending: &mut Vec<PendingBounce>,
     ) {
-        // 先摘掉本次**已经投出去**的收件人：它们既不重试、也不退信。
-        // 少了这一步，一次部分成功（例如 LMTP 里一个用户已落箱、另一个超配额）
-        // 会在重试时把已投递的收件人再投一遍，收件人会看到重复邮件。
         let accepted = failure.accepted.clone();
         if !accepted.is_empty() {
             outcome.delivered += accepted.len();
@@ -675,13 +507,11 @@ impl QueueRunner {
             .cloned()
             .collect();
         if failed.is_empty() {
-            // 全部收件人都已投递成功，只是整批以失败形态返回（部分成功的边界）。
             return;
         }
 
         match failure.class {
             FailureClass::Permanent => {
-                // 5xx：重试无意义，退信（退信本体在原条目落盘后由 flush_bounces 入队）。
                 remove_recipients(entry, &failed);
                 pending.push(PendingBounce {
                     failed,
@@ -697,7 +527,6 @@ impl QueueRunner {
                     failure.code,
                 );
                 if exhausted {
-                    // 超过阈值 → 生成 DSN，不再无限重试（§5.8）。
                     remove_recipients(entry, &failed);
                     pending.push(PendingBounce {
                         failed,
@@ -711,9 +540,6 @@ impl QueueRunner {
         }
     }
 
-    /// 生成一封 DSN 退信报文并**入队**（INV-21：退信与用户邮件走同一条出站路径）。
-    ///
-    /// 返回是否确实生成了退信；`false` 表示被迫丢弃（防回环）。
     fn bounce(
         &self,
         entry: &QueueEntry,
@@ -722,7 +548,6 @@ impl QueueRunner {
         code: Option<u16>,
         now_unix: i64,
     ) -> QueueResult<bool> {
-        // 双退信防护：null sender 的消息、以及退信自身，都**不得**再产生退信。
         if entry.kind == EntryKind::Bounce || entry.is_null_sender() {
             return Ok(false);
         }
@@ -737,7 +562,7 @@ impl QueueRunner {
             diagnostic,
             status_code: code,
         });
-        // 信封发件人为空（null sender）—— 退信自己失败时不会再退信。
+
         let mut dsn = QueueEntry::new(
             EntryKind::Bounce,
             dsn_envelope_from(),
@@ -745,17 +570,11 @@ impl QueueRunner {
             message,
             now_unix,
         )?;
-        // 退信是**新**条目：只新增不覆盖 —— 一封撞了 id 的退信绝不能覆盖任何
-        // 已经在队列里的邮件（撞车时 `enqueue_new` 会换 id）。
+
         self.store.enqueue_new(&mut dsn)?;
         Ok(true)
     }
 
-    /// 按纳管域名把收件人分成「本地」与「外域」。
-    ///
-    /// 复用 [`RelayPolicy`] 的域名归一化，避免两处实现出现「大小写/空白」差异。
-    /// 域名表为空时全部算外域 —— fail-closed，绝不把外部邮件当本地投递。
-    /// 策略由调用方（`run_once`）每轮构建一次传入，而不是每条条目重建。
     fn partition(&self, entry: &QueueEntry, policy: &RelayPolicy) -> (Vec<String>, Vec<String>) {
         let mut local = Vec::new();
         let mut remote = Vec::new();
@@ -781,9 +600,6 @@ impl QueueRunner {
     }
 
     fn record_remote_success(&self) {
-        // `unwrap_or_else(|p| p.into_inner())`：锁中毒只可能来自持锁线程 panic，
-        // 而这里的临界区只做赋值。静默跳过会让「连续失败计数」停更 —— 出站已经
-        // 恢复了管理台还显示被封（或反之），比 panic 更难排查。
         let mut guard = self
             .health
             .lock()
@@ -794,25 +610,14 @@ impl QueueRunner {
     }
 
     fn record_remote_failure(&self, failure: &DeliveryFailure) {
-        // 本机故障（例如 DKIM 签名失败）不是出站链路的问题。计进去会让运维看到
-        // 「出站 25 被封，请配置中继」，然后去查一个完全无关的方向。
         if failure.local_fault {
             return;
         }
-        // 5.11：**永久失败不得计入出站健康**。
-        //
-        // 这个计数驱动的结论是「25 端口被封，请配置中继」。而一次永久失败
-        // （5xx：收件人不存在、邮箱已满、被策略拒收）恰恰说明**链路是通的** ——
-        // 对端已经明确回了码。把它计进去，10 封「收件人不存在」的正常退信就能
-        // 把整条出站链路判成「被封」，转入快速失败并停止全部外域投递，
-        // 也就是**用正常退信自造一次全站故障**。
-        //
-        // 只有 Transient（连接超时、对端 4xx 过载、TLS 握手失败）才说明链路本身
-        // 可能有问题，才该推进「被封」的判定。
+
         if failure.class != crate::delivery::FailureClass::Transient {
             return;
         }
-        // 与 `record_remote_success` 相同的中毒纪律：计数停更比 panic 更难排查。
+
         let mut guard = self
             .health
             .lock()
@@ -821,10 +626,6 @@ impl QueueRunner {
         guard.last_failure = Some(failure.message.clone());
     }
 
-    /// 是否允许本轮尝试远端投递。
-    ///
-    /// 健康时恒为真；判定不可用后每轮只放行一次（半开），既避免重试风暴，
-    /// 又能在出站恢复后自动恢复投递。
     fn may_attempt_remote(&self) -> bool {
         let failures = self.health_snapshot().consecutive_failures;
         if failures < self.config.blocked_threshold.max(1) {
@@ -838,10 +639,6 @@ fn remove_recipients(entry: &mut QueueEntry, done: &[String]) {
     entry.recipients.retain(|r| !done.contains(r));
 }
 
-/// `run_once` 的重入标记守卫：任何退出路径都要复位。
-///
-/// 单独成类型而不是在函数末尾手动 store：`run_once` 里有多处 `?` 提前返回，
-/// 手写复位的正确性依赖「以后没有人再加一个 `?`」—— 那种依赖迟早会破。
 struct RoundGuard<'a>(&'a AtomicBool);
 
 impl Drop for RoundGuard<'_> {
@@ -850,10 +647,6 @@ impl Drop for RoundGuard<'_> {
     }
 }
 
-/// 投递租约守卫（5.10）：离开作用域即释放该条目的 claim。
-///
-/// `Drop` 不能返回错误，因此失败只记 warn —— 但**必须**留下痕迹：
-/// 释放失败意味着这条条目要被自己的租约挡到过期，属于可观测异常。
 struct ClaimGuard {
     store: QueueStore,
     id: String,
@@ -877,7 +670,6 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    /// 可编排的假传输：按脚本依次返回结果，并记录调用与并发峰值。
     struct ScriptedTransport {
         script: Mutex<VecDeque<Result<DeliveryReceipt, DeliveryFailure>>>,
         default: Mutex<Result<DeliveryReceipt, DeliveryFailure>>,
@@ -1009,7 +801,6 @@ mod tests {
         }
     }
 
-    /// 调度测试不关心签名：显式声明「本封不需要签名」，让报文原样透传。
     struct NoSigning;
 
     impl MessageSigner for NoSigning {
@@ -1018,7 +809,6 @@ mod tests {
         }
     }
 
-    /// 模拟「该签却没签成」。
     struct FailingSigner;
 
     impl MessageSigner for FailingSigner {
@@ -1082,8 +872,6 @@ mod tests {
 
     #[test]
     fn default_concurrency_matches_the_settings_schema() {
-        // §2.6 的 settings schema 里 `relayConcurrency` 默认 20，且是**可调项**；
-        // 队列侧的默认值必须与它一致，否则「配置里写 20、实际按别的值跑」。
         assert_eq!(QueueConfig::default().relay_concurrency, 20);
         assert_eq!(
             QueueConfig::default().relay_concurrency,
@@ -1093,12 +881,10 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_snapshot_exposes_backlog_concurrency_and_health() {
-        // §5.9.8 / R-25-5：并发上限可配置且指标可见，否则运维无法区分
-        // 「投递慢」与「出站被封」。
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
         let mut cfg = config();
         cfg.relay_concurrency = 7;
-        // 造一条未到期的积压条目，观察 backlog 是否可见。
+
         let mut entry = enqueue_outbound(&harness.store, "00000000001-0001", &["bob@example.net"]);
         entry.next_attempt_unix = 9_999_999;
         harness.store.enqueue(&entry).unwrap();
@@ -1117,7 +903,6 @@ mod tests {
 
     #[tokio::test]
     async fn zero_concurrency_is_clamped_instead_of_deadlocking() {
-        // `relayConcurrency = 0` 若照字面执行会让信号量永远无许可 ⇒ 队列死锁。
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
         enqueue_outbound(&harness.store, "00000000001-0001", &["bob@example.net"]);
         let mut cfg = config();
@@ -1177,8 +962,6 @@ mod tests {
 
     #[tokio::test]
     async fn recipients_accepted_by_a_partial_delivery_are_not_retried_or_bounced() {
-        // 部分成功（LMTP 逐收件人应答的典型形态）：一个已落箱、一个超配额。
-        // 已落箱的那个既不能再投一次（重复邮件），也不能被退信（它其实送到了）。
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
         enqueue_outbound(
             &harness.store,
@@ -1201,7 +984,6 @@ mod tests {
         assert_eq!(entries.len(), 1, "只剩未投递的收件人需要重试");
         assert_eq!(entries[0].recipients, vec!["bob@example.net".to_string()]);
 
-        // 下一轮只应重投剩下的那一个。
         harness.remote.calls.lock().unwrap().clear();
         *harness.remote.default.lock().unwrap() = Ok(DeliveryReceipt { accepted: 0 });
         runner.run_once(1_000_000).await.unwrap();
@@ -1213,7 +995,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_fully_accepted_but_failed_batch_does_not_retry_anything() {
-        // 边界：整批都以失败形态返回，但每个收件人都已投递成功。
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
         enqueue_outbound(&harness.store, "00000000001-0001", &["alice@example.net"]);
         *harness.remote.default.lock().unwrap() = Err(DeliveryFailure::transient(
@@ -1235,7 +1016,6 @@ mod tests {
 
     #[tokio::test]
     async fn empty_managed_domains_treat_every_recipient_as_remote() {
-        // fail-closed：没有配置纳管域名时，绝不能把外域邮件当本地投递。
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
         enqueue_outbound(&harness.store, "00000000001-0001", &["alice@example.org"]);
         let mut cfg = config();
@@ -1262,7 +1042,6 @@ mod tests {
         assert_eq!(report.bounced, 1);
         assert_eq!(report.deferred, 0, "5xx 不得进入重试");
 
-        // 原条目已移除，队列里只剩退信。
         let entries = harness.store.load_all().unwrap();
         assert_eq!(entries.len(), 1, "应恰好生成一封退信");
         let dsn = &entries[0];
@@ -1288,7 +1067,6 @@ mod tests {
         enqueue_outbound(&harness.store, "00000000001-0001", &["bob@example.net"]);
         let runner = harness.runner(config(), None);
 
-        // 第一轮：临时失败 → 退避重试，队列里仍只有原条目。
         let first = runner.run_once(1_000).await.unwrap();
         assert_eq!(first.deferred, 1);
         assert_eq!(first.bounced, 0);
@@ -1302,11 +1080,9 @@ mod tests {
         let after_first = entries[0].next_attempt_unix;
         assert!(after_first > 1_000, "必须推迟到未来");
 
-        // 未到时间不得重试。
         let too_early = runner.run_once(1_000).await.unwrap();
         assert_eq!(too_early.considered, 0, "未到退避时间不应被调度");
 
-        // 到时间后继续失败，直到耗尽重试预算（max_attempts = 3）。
         runner.run_once(after_first).await.unwrap();
         let third = runner.run_once(after_first + 10_000).await.unwrap();
         assert_eq!(third.bounced, 1, "超过阈值必须退信，而不是无限重试");
@@ -1322,7 +1098,6 @@ mod tests {
 
     #[tokio::test]
     async fn bounce_is_never_generated_for_a_null_sender() {
-        // 防双退信回环（RFC 5321 §4.5.5）：null sender 的消息失败后只能丢弃。
         let harness = Harness::new(
             ScriptedTransport::ok(),
             ScriptedTransport::failing(DeliveryFailure::permanent("SmtpRejected", "550 nope")),
@@ -1350,7 +1125,6 @@ mod tests {
 
     #[tokio::test]
     async fn dsn_entries_are_never_bounced_again() {
-        // 退信自身失败（例如发件人域不可达）时，只能丢弃；否则会互相触发。
         let harness = Harness::new(
             ScriptedTransport::ok(),
             ScriptedTransport::failing(DeliveryFailure::permanent(
@@ -1378,11 +1152,6 @@ mod tests {
 
     #[tokio::test]
     async fn bounces_use_the_same_outbound_route_as_user_mail() {
-        // INV-21：relay 生效后，DSN 退信必须与用户邮件走**完全相同**的出站路径，
-        // 不得有任何「退信走直投」的旁路。
-        //
-        // 原发件人刻意用**外域**地址：退信寄回本域的话它会走 LMTP 本地投递，
-        // 那样就观察不到出站路由，等于没验证到 INV-21。
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
         let endpoint = relay();
         enqueue_from(
@@ -1400,13 +1169,11 @@ mod tests {
         };
         assert_eq!(runner.outbound_route(), expected);
 
-        // 1) 用户邮件：经中继。
         runner.run_once(1_000).await.unwrap();
         let user_call = harness.remote.calls();
         assert_eq!(user_call.len(), 1);
         assert_eq!(user_call[0].1, DeliveryTarget::Remote(expected.clone()));
 
-        // 2) 让下一次投递永久失败，从而产生退信。
         *harness.remote.default.lock().unwrap() =
             Err(DeliveryFailure::permanent("SmtpRejected", "550 nope"));
         enqueue_from(
@@ -1430,7 +1197,6 @@ mod tests {
             "退信应收给原信封发件人"
         );
 
-        // 3) 让退信投递成功，观察它实际走的路由。
         *harness.remote.default.lock().unwrap() = Ok(DeliveryReceipt { accepted: 0 });
         harness.remote.calls.lock().unwrap().clear();
         runner.run_once(3_000).await.unwrap();
@@ -1459,7 +1225,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_bounce_addressed_to_a_local_sender_is_delivered_locally() {
-        // 与上一条互补：原发件人是本域时，退信应当走 LMTP（本地）而不是绕去中继。
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
         enqueue_from(
             &harness.store,
@@ -1496,7 +1261,6 @@ mod tests {
 
     #[tokio::test]
     async fn consecutive_outbound_failures_produce_the_blocked_verdict() {
-        // §5.10.3 R-25-3：连续失败达阈值必须给出**明确结论**，而不是让队列默默变长。
         let harness = Harness::new(
             ScriptedTransport::ok(),
             ScriptedTransport::failing(DeliveryFailure::transient(
@@ -1523,12 +1287,6 @@ mod tests {
         );
     }
 
-    /// 5.11：**永久失败（5xx）不得推进「出站被封」的判定**。
-    ///
-    /// 这个计数驱动的结论是「25 端口被封，请配置中继」，而一次 5xx 恰恰说明
-    /// 对端已经回了码 —— 链路是通的。原实现把永久失败也算进去，于是 10 封
-    /// 「收件人不存在」的正常退信就能把整条出站链路判成「被封」，转入快速失败
-    /// 并**停止全部外域投递**，等于用正常退信自造一次全站故障。
     #[tokio::test]
     async fn permanent_failures_never_trip_the_outbound_blocked_verdict() {
         let harness = Harness::new(
@@ -1540,7 +1298,6 @@ mod tests {
         );
         let runner = harness.runner(config(), None);
 
-        // 远超阈值（默认 3）的永久失败次数。
         for round in 0..12 {
             enqueue_outbound(
                 &harness.store,
@@ -1564,18 +1321,12 @@ mod tests {
         );
     }
 
-    /// 5.10：被有效租约持有的条目不得被本轮投递。
-    ///
-    /// 这条模拟的是「上一个进程在投递中途崩溃」：条目文件完好、收件人齐全，
-    /// 但磁盘上留着一份未过期的 claim。没有租约时，重启后第一轮就会把它
-    /// **整批重投** —— 收件人收到重复邮件，而运维完全看不出为什么。
     #[tokio::test]
     async fn an_entry_under_a_live_claim_is_skipped_and_delivered_after_expiry() {
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
         let entry = enqueue_outbound(&harness.store, "00000000001-0001", &["bob@example.net"]);
         let runner = harness.runner(config(), None);
 
-        // 「上一个进程」留下的有效租约。
         let claimed_at = 1_000;
         assert!(harness.store.try_claim(&entry.id, claimed_at).unwrap());
 
@@ -1594,7 +1345,6 @@ mod tests {
             "条目本身必须原样留在队列里，不能因为跳过而被删"
         );
 
-        // 租约过期后（例如原持有者确实崩了），必须能正常接手投递。
         let after_expiry = claimed_at + crate::store::CLAIM_TTL_SECONDS + 1;
         let report = runner.run_once(after_expiry).await.unwrap();
         assert_eq!(report.considered, 1, "租约过期后应正常处理");
@@ -1603,22 +1353,19 @@ mod tests {
             harness.store.load_all().unwrap().is_empty(),
             "投递成功后条目应被移除"
         );
-        // 处理结束后租约也要清掉，不能留孤儿。
+
         assert!(
             harness.store.claimed_ids(after_expiry).unwrap().is_empty(),
             "投递完成后租约必须被释放"
         );
     }
 
-    /// 5.9：两轮重叠必须被拒绝，而不是各投一遍。
     #[tokio::test]
     async fn overlapping_rounds_are_refused_instead_of_double_delivering() {
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
         enqueue_outbound(&harness.store, "00000000001-0001", &["bob@example.net"]);
         let runner = harness.runner(config(), None);
 
-        // 模拟「上一轮还没结束」：手工占住重入标记。
-        // 走真实的 compare_exchange 路径，而不是检查私有字段的初值。
         use std::sync::atomic::Ordering;
         assert!(runner
             .round_in_flight
@@ -1634,14 +1381,12 @@ mod tests {
             "必须是可识别的「跳过」而不是普通故障：{error}"
         );
 
-        // 队列里的条目一条都没被投递。
         assert_eq!(
             harness.remote.calls().len(),
             0,
             "被拒绝的那一轮不得投递任何条目"
         );
 
-        // 标记释放后能正常跑，且**没有**因为上一轮卡死而永久停摆。
         runner.round_in_flight.store(false, Ordering::SeqCst);
         runner.run_once(1_000).await.unwrap();
         assert_eq!(harness.remote.calls().len(), 1);
@@ -1663,7 +1408,6 @@ mod tests {
         runner.run_once(2_000_000).await.unwrap();
         assert!(runner.outbound_health().blocked);
 
-        // 「重启」：用同一个 store 新建运行器。
         let restarted = harness.runner(config(), None);
         let health = restarted.outbound_health();
         assert!(health.blocked, "出站不可用的结论必须跨重启保留");
@@ -1672,7 +1416,6 @@ mod tests {
 
     #[tokio::test]
     async fn blocked_queue_fast_fails_instead_of_hammering() {
-        // 快速失败：判定不可用后，一轮里只放行一次探测，而不是每条消息各试一次。
         let harness = Harness::new(
             ScriptedTransport::ok(),
             ScriptedTransport::failing(DeliveryFailure::transient(
@@ -1682,7 +1425,6 @@ mod tests {
         );
         let runner = harness.runner(config(), None);
 
-        // 先把健康计数顶到阈值。
         for i in 0..3 {
             enqueue_outbound(
                 &harness.store,
@@ -1693,7 +1435,6 @@ mod tests {
         }
         assert!(runner.outbound_health().blocked);
 
-        // 现在入队 5 条新消息，全部到期。
         for i in 0..5 {
             enqueue_outbound(
                 &harness.store,
@@ -1715,7 +1456,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_successful_probe_clears_the_blocked_verdict() {
-        // 出站恢复后必须能自愈，否则队列会永久停摆。
         let harness = Harness::new(
             ScriptedTransport::ok(),
             ScriptedTransport::failing(DeliveryFailure::transient(
@@ -1730,7 +1470,6 @@ mod tests {
         }
         assert!(runner.outbound_health().blocked);
 
-        // 出站恢复。
         *harness.remote.default.lock().unwrap() = Ok(DeliveryReceipt { accepted: 0 });
         enqueue_outbound(&harness.store, "00000000001-0002", &["bob@example.net"]);
         let report = runner.run_once(10_000_000).await.unwrap();
@@ -1747,7 +1486,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrency_is_bounded_by_relay_concurrency() {
-        // relayConcurrency 是配置项的语义所在：并发投递不得超过它。
         let remote =
             ScriptedTransport::with_hold(ScriptedTransport::ok(), Duration::from_millis(30));
         let harness = Harness::new(ScriptedTransport::ok(), remote);
@@ -1778,7 +1516,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_local_transport_failure_does_not_trip_the_outbound_verdict() {
-        // LMTP 出问题 ≠ 出站 25 被封。误报会让运维去查错方向。
         let harness = Harness::new(
             ScriptedTransport::failing(DeliveryFailure::transient(
                 "LmtpUnavailable",
@@ -1800,15 +1537,11 @@ mod tests {
         assert!(!entries[0].recipients.is_empty());
     }
 
-    /// 任务返回 `Ok(Err)`（单条条目处理失败）必须被计入报告，而不只是日志。
     #[tokio::test]
     async fn entry_processing_errors_are_counted_in_the_report() {
-        // 回执覆盖数与尝试数不符 → process 以错误结束（宁可见红）。
-        // 该错误不得让整轮失败，但报告里必须看得到「这一轮有 1 条失败」。
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
         enqueue_outbound(&harness.store, "00000000001-0001", &["bob@example.net"]);
-        // script 路径按**原样**返回（不像 default 会把 0 修成 recipients.len()），
-        // 才能构造「回执覆盖数与尝试数不符」。
+
         harness
             .remote
             .script
@@ -1820,12 +1553,10 @@ mod tests {
         let report = runner.run_once(1_000).await.unwrap();
         assert_eq!(report.considered, 0, "失败的条目不计入 considered");
         assert_eq!(report.failed, 1, "Ok(Err) 必须被计数");
-        // 条目原样留在队列里（未写回任何状态）。
+
         assert_eq!(harness.store.load_all().unwrap().len(), 1);
     }
 
-    /// 远端阶段报错前，本地阶段已经发生的进度必须先尽力写回 ——
-    /// 否则下次整批重投，本地收件人会收到重复邮件。
     #[tokio::test]
     async fn local_progress_is_persisted_before_a_remote_mismatch_error() {
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
@@ -1834,8 +1565,7 @@ mod tests {
             "00000000001-0001",
             &["alice@example.org", "bob@example.net"],
         );
-        // 远端对 1 个收件人声称接受了 0 个 → 触发「宁可见红」错误
-        // （script 路径按原样返回，才会出现覆盖数不符）。
+
         harness
             .remote
             .script
@@ -1847,7 +1577,6 @@ mod tests {
         let report = runner.run_once(1_000).await.unwrap();
         assert_eq!(report.failed, 1);
 
-        // 本地（alice）已投递的进度必须已经落盘：条目只剩远端收件人。
         let entries = harness.store.load_all().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(
@@ -1857,8 +1586,6 @@ mod tests {
         );
     }
 
-    /// 远端回执不符而提前报错时，本地阶段**已判定要退信**的收件人必须仍然入队 DSN：
-    /// 他们已经从条目摘除，重试无从补发 —— 随报错一起丢掉就是静默丢信。
     #[tokio::test]
     async fn a_remote_mismatch_error_still_flushes_pending_bounces() {
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
@@ -1867,7 +1594,7 @@ mod tests {
             "00000000001-0001",
             &["alice@example.org", "bob@example.net"],
         );
-        // 本地：alice 的投递被永久拒绝 → 退信待入队（攒在 pending_bounces 里）。
+
         harness
             .local
             .script
@@ -1877,7 +1604,7 @@ mod tests {
                 "RcptRejected",
                 "550 no such user",
             )));
-        // 远端：回执覆盖数与尝试数不符 → 触发「宁可见红」错误。
+
         harness
             .remote
             .script
@@ -1890,13 +1617,13 @@ mod tests {
         assert_eq!(report.failed, 1);
 
         let entries = harness.store.load_all().unwrap();
-        // 原条目：alice 已摘除，磁盘上只剩远端收件人。
+
         let original = entries
             .iter()
             .find(|e| e.id == "00000000001-0001")
             .expect("原条目必须保留（远端收件人待重试）");
         assert_eq!(original.recipients, vec!["bob@example.net".to_string()]);
-        // 本地阶段判定的退信必须已入队，而不是随报错一起丢掉。
+
         let dsn = entries
             .iter()
             .find(|e| e.kind == EntryKind::Bounce)
@@ -1907,10 +1634,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_signing_failure_defers_without_tripping_the_outbound_verdict() {
-        // 两个性质必须同时成立：
-        //   1) 失败关闭 —— 未签名的邮件不允许发出去；
-        //   2) 本机故障不得计入出站健康 —— 否则运维会看到「出站 25 被封，
-        //      请配置中继」，然后去查一个和密钥毫无关系的方向。
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
         enqueue_outbound(&harness.store, "00000000001-0001", &["bob@example.net"]);
         let runner = harness.runner_with_signer(config(), None, Arc::new(FailingSigner));
@@ -1945,20 +1668,13 @@ mod tests {
         );
     }
 
-    /// 5.3（Fixer C）：认领失败不得中止整轮 —— 已 spawn 的在途投递必须跑完并落盘。
-    ///
-    /// 原实现是 `try_claim(..)?`：任一条目认领出错（`claims/` 目录 ENOSPC /
-    /// EACCES / EMFILE —— 磁盘出问题时最可能同时出现的那几种）就会提前返回，
-    /// 而 `JoinSet` 被 drop 会 **abort** 已 spawn 的任务。那些任务可能正处在
-    /// 「对端已 250、本地还没落盘」的窗口里，于是本轮已投出的进度被丢掉，
-    /// 下一轮整批重投（收件人收到重复邮件）。
     #[tokio::test]
     async fn a_failed_claim_does_not_abort_the_entries_already_in_flight() {
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
-        // 两条都已到期，id 升序决定认领顺序。
+
         enqueue_outbound(&harness.store, "00000000001-0001", &["alice@example.net"]);
         enqueue_outbound(&harness.store, "00000000002-0002", &["bob@example.net"]);
-        // 第 2 条的认领注入一次 I/O 失败。
+
         harness.store.fail_next_claim("00000000002-0002");
         let runner = harness.runner(config(), None);
 
@@ -1973,27 +1689,19 @@ mod tests {
         assert_eq!(calls.len(), 1, "在途投递不得因为后续认领失败被取消");
         assert_eq!(calls[0].0, "00000000001-0001");
 
-        // 第 1 条已投递并从队列移除；第 2 条原样保留（下一轮重试）。
         let entries = harness.store.load_all().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, "00000000002-0002");
         assert_eq!(entries[0].recipients, vec!["bob@example.net".to_string()]);
     }
 
-    /// 5.9（Fixer C）：调度只加载**到期**条目。未到期条目即使正文巨大也不进内存。
-    ///
-    /// 这里用可观测的替身：未到期条目带一个**非法**的 `data`（空正文），如果
-    /// 调度路径把它们完整解析（`load_all` + 之后过滤），`validate` 会失败并把
-    /// 它们隔离进 `corrupt/`；`load_due` 只看 `nextAttemptUnix` 头，永远不会
-    /// 碰到它们 —— 于是文件必须仍在 `entries/` 下。
     #[tokio::test]
     async fn run_once_does_not_load_entries_that_are_not_due() {
         let harness = Harness::new(ScriptedTransport::ok(), ScriptedTransport::ok());
         enqueue_outbound(&harness.store, "00000000001-0001", &["bob@example.net"]);
 
-        // 未到期条目：正文为空（非法），只靠头部字段判断不应被解析。
         fs_write_future_entry(&harness.store, "00000000002-0002", 9_999_999_999);
-        // 已到期条目：正常正文，应被投递。
+
         enqueue_outbound(&harness.store, "00000000003-0003", &["carol@example.net"]);
 
         let runner = harness.runner(config(), None);
@@ -2016,8 +1724,6 @@ mod tests {
         assert_eq!(corrupt, 0, "调度不得把未到期条目当损坏隔离");
     }
 
-    /// 写一条「正文非法、但头部表明未到期」的条目（绕过 `QueueEntry` 校验，
-    /// 直接落盘 —— 这正是 `load_due` 必须避免完整解析的那种文件）。
     fn fs_write_future_entry(store: &QueueStore, id: &str, next_attempt_unix: i64) {
         let entries = store.entries_dir();
         std::fs::create_dir_all(&entries).unwrap();
