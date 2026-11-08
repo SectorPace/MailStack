@@ -172,25 +172,34 @@ sudo mailstack-manage access show
 `panel-domain` 模式会拒绝与邮件主机同名的面板域名（邮件域 `mail.example.com`、
 面板域 `panel.example.com`）。
 
-### 3.6 服务器管理脚本（`mailstack-manage`）
+### 3.6 服务器管理脚本（`mailstack-manage`，面板式）
 
-安装器会安装 `/usr/local/bin/mailstack-manage`（3x-ui 风格的 CLI + 交互菜单）：
+安装器会安装 `/usr/local/bin/mailstack-manage`。无参数在 TTY 进入菜单，也可以用子命令自动化：
 
 ```bash
-sudo mailstack-manage                     # 交互菜单
-sudo mailstack-manage status               # 域名/管理员/访问模式/服务/TLS/入口
+sudo mailstack-manage                      # 面板式交互菜单
+sudo mailstack-manage status --json        # 状态（机器可读）
+sudo mailstack-manage doctor               # 体检（unit/端口/证书/队列/磁盘/权限/包装器）
 sudo mailstack-manage domain set example.com --mail-host mail.example.com
 sudo mailstack-manage domain list|add|delete
 sudo mailstack-manage account add alice@example.com --password-stdin
 sudo mailstack-manage account list|passwd|delete
 sudo mailstack-manage tls issue mail.example.com --email ops@example.com
-sudo mailstack-manage access set caddy --panel-host panel.example.com --acme-email ops@example.com
-sudo mailstack-manage restart|logs
+sudo mailstack-manage tls renew
+sudo mailstack-manage access show|set <ssh|caddy|nginx|ip-acme|panel-domain|cloudflared>
+sudo mailstack-manage service start|stop|restart|status|logs [unit]
+sudo mailstack-manage backup create|list|restore|delete
+sudo mailstack-manage update check|apply
+sudo mailstack-manage security ...          # 管理员口令/2FA/防火墙/审计链
+sudo mailstack-manage repair | uninstall [--purge] [--yes]
 ```
 
-所有动作都经既有 `mailstackctl` 特权动作（RO 直连 / RW 经 sudo 包装器；
-`--privileged-stdin` 协议），脚本本身不做第二套权限逻辑。
-`MAILSTACK_PREFIX=/tmp/stage` 可用于 staging 测试（不操作宿主 systemd）。
+所有特权动作经既有 `mailstackctl`（RO 直连 / RW sudo 包装器 stdin JSON）；
+状态文件为纯 `KEY=value` 白名单解析（不 `source`，避免可写前缀下的命令执行）；
+操作审计写 `/var/log/mailstack-manage.log`（0600）。`MAILSTACK_PREFIX` 仅用于 staging。
+
+安装器新增参数：`--mirror URL`、`--upgrade`（保留数据，健康检查失败自动回滚）、
+`--repair`、`--dry-run`、`--yes/--force`、`--no-firewall`；无参数 + TTY 进入交互向导。
 
 ## 4. 方式二：源码构建
 

@@ -540,32 +540,39 @@ WantedBy=multi-user.target
 
 ---
 
-### 3.10 访问模式与 `mailstack-manage`（v1.0.0 交付）
+### 3.10 访问模式与 `mailstack-manage`（面板式运维）
 
-`deploy/install.sh` 一条命令即可完成安装并应用访问模式；安装后由
-`/usr/local/bin/mailstack-manage` 维护（域/账号/TLS/访问方式），状态唯一真相源为
-`/etc/mailstack/install-args.conf` 与 `/etc/mailstack/access/`。
+安装器为面板式一键安装（无参数 + TTY 交互向导；`--upgrade/--repair/--dry-run/--mirror/--no-firewall`），
+装好后由 `/usr/local/bin/mailstack-manage` 维护，状态唯一真相源为
+`/etc/mailstack/install-args.conf`（纯 `KEY=value`，白名单解析、不 source）与
+`/etc/mailstack/install.json`。
 
 | 访问模式 | 产物 | 说明 |
 |---|---|---|
 | `ssh` | `access/ssh/{README.txt,tunnel.sh}` | 默认；8443/8444 只绑回环 |
-| `caddy` | `access/caddy/Caddyfile`（并尝试写入 `/etc/caddy/`） | 自动 ACME HTTPS |
-| `nginx` | `access/nginx/mailstack-panel.conf`、`README.txt` | TLS 由 certbot/acme.sh 补 |
+| `caddy` | `access/caddy/Caddyfile` | 自动 ACME HTTPS |
+| `nginx` | `access/nginx/*.conf`、`README.txt` | TLS 由 certbot/acme.sh 补 |
 | `ip-acme` | `access/ip-acme/DNS-REQUIREMENTS.txt`、nginx 配置 | 证书走 `setup.cert.issue` |
 | `panel-domain` | 同 caddy/nginx + 域名冲突校验 | 面板域必须 != `mail/imap/smtp` 域 |
-| `cloudflared` | `access/cloudflared/{config.yml,mailstack-cloudflared.service,README.txt}` | Tunnel 到回环，本机不开端口 |
+| `cloudflared` | `access/cloudflared/{config.yml,unit,README.txt}` | Tunnel 到回环，本机不开端口 |
+
+运维命令（均幂等、可脚本化）：
 
 ```bash
-sudo mailstack-manage status
-sudo mailstack-manage access set nginx --panel-host panel.example.com
-sudo mailstack-manage access set cloudflared
+sudo mailstack-manage status --json
+sudo mailstack-manage doctor                 # 服务/端口/证书/队列/磁盘/权限/包装器体检
 sudo mailstack-manage domain set example.com --mail-host mail.example.com
 sudo mailstack-manage account add alice@example.com --password-stdin
 sudo mailstack-manage tls issue mail.example.com --email ops@example.com
+sudo mailstack-manage access set caddy --panel-host panel.example.com
+sudo mailstack-manage service restart mailstackd
+sudo mailstack-manage backup create --include-secrets   # backup restore/delete
+sudo mailstack-manage update check|apply                 # Release 校验+升级+健康检查/回滚
+sudo mailstack-manage repair | security | uninstall
 ```
 
-动作统一经 `mailstackctl`（RO 直连 / RW sudo 包装器，`--privileged-stdin`）；
-`MAILSTACK_PREFIX` 仅用于 staging，此时跳过 systemctl 操作。
+动作统一经 `mailstackctl`（RO 直连 / RW sudo 包装器，`--privileged-stdin`），
+管理操作审计写 `/var/log/mailstack-manage.log`（0600）；`MAILSTACK_PREFIX` 仅 staging。
 
 ## 4. 回滚
 

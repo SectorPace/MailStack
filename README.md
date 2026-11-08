@@ -163,21 +163,33 @@ printf '%s\n' "$MAILSTACK_ADMIN_PASSWORD" | sudo bash /tmp/mailstack-install.sh 
 `--webmail-host`、`--server-ip`、`--uninstall`/`--purge`。完整说明见 `deploy/install.sh --help`
 与 [`docs/INSTALL.md`](docs/INSTALL.md)。
 
-### 服务器管理（`mailstack-manage`，3x-ui 风格）
+### 服务器管理（`mailstack-manage`，面板式菜单）
 
-安装后提供 `sudo mailstack-manage`：无参数进入交互菜单，也可直接下命令（幂等、可脚本化）：
+安装器装好 `/usr/local/bin/mailstack-manage`：无参数在 TTY 进入面板式菜单，
+也可直接下命令（幂等、可脚本化、支持 `--prefix` staging）：
 
 ```bash
-sudo mailstack-manage status
+sudo mailstack-manage                      # 面板式交互菜单
+sudo mailstack-manage status --json        # 机器可读状态
+sudo mailstack-manage doctor               # 体检：服务/端口/证书/队列/磁盘/权限
 sudo mailstack-manage domain set example.com --mail-host mail.example.com
 sudo mailstack-manage domain list
 sudo mailstack-manage account add alice@example.com --password-stdin
-sudo mailstack-manage account passwd alice@example.com --password-stdin
+sudo mailstack-manage account list|passwd|delete
 sudo mailstack-manage tls issue mail.example.com --email ops@example.com
+sudo mailstack-manage tls renew
 sudo mailstack-manage access set caddy --panel-host panel.example.com --acme-email ops@example.com
-sudo mailstack-manage access set cloudflared     # 切访问方式，生成配置并 reload
-sudo mailstack-manage restart
+sudo mailstack-manage access show
+sudo mailstack-manage service restart|status|logs mailstackd
+sudo mailstack-manage backup create --include-secrets   # list / restore / delete
+sudo mailstack-manage update check|apply                 # Release 校验 + 自动升级/回滚
+sudo mailstack-manage repair | security | uninstall
 ```
+
+安装器本身也是面板式：无参数 + TTY 进入交互向导；支持 `--mirror` 镜像、
+`--upgrade`（保留数据、健康检查失败自动回滚）、`--repair`、`--dry-run`、
+`--no-firewall`（默认按访问模式放行 25/80/443/465/587/993/995/4190 等端口）、
+`--yes` 自动确认；状态文件 `/etc/mailstack/install.json` + `install-args.conf`。
 
 ### 方式二：源码构建
 
@@ -214,6 +226,11 @@ sudo deploy/install.sh --binary-dir dist --domain mail.example.com --admin-user 
    （同样经隧道/反代访问；Webmail 只绑回环）。
 5. **邮件客户端**：IMAP `imap://mail.example.com:143`（STARTTLS）或 `imaps://…:993`；
    SMTP 提交 `587`（STARTTLS）或 `465`（隐式 TLS）；口令与 Webmail 相同。
+
+## 质量复审
+
+v1.0.0 发行前完成全量 OCR 复审（287 文件 / 1411 条意见），修复 13 项确认缺陷，
+质量分 **92/100**（无未修复 critical/high）。细节见 [`docs/OCR_REVIEW.md`](docs/OCR_REVIEW.md)。
 
 ## 架构
 

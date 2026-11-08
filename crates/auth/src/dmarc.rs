@@ -241,13 +241,20 @@ pub fn parse_pct(record: &str) -> Option<u8> {
 }
 
 pub fn policy_sample_draw(domain: &str, message_id: &[u8]) -> u8 {
+    use std::hash::{BuildHasher, Hasher};
+
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    policy_sample_draw_from(domain, message_id, nanos)
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write(domain.as_bytes());
+    hasher.write(message_id);
+    hasher.write_u128(nanos);
+    (hasher.finish() % 100) as u8
 }
 
+#[cfg(test)]
 fn policy_sample_draw_from(domain: &str, message_id: &[u8], nanos: u128) -> u8 {
     use std::hash::Hasher;
 

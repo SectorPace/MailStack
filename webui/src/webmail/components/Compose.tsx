@@ -4,7 +4,7 @@ import { deleteMessage, describeError, saveDraft, sendMessage } from "../api";
 import type { ComposeInitial } from "../lib/compose";
 import { MAX_ATTACHMENT_BYTES, buildComposeRequest, canAddAttachment, totalAttachmentSize, validateCompose, } from "../lib/compose";
 import { formatFileSize } from "../lib/format";
-import { isSafeLinkUrl, normalizeLinkUrl } from "../lib/html";
+import { isSafeLinkUrl, normalizeLinkUrl, sanitizeEditorHtml } from "../lib/html";
 import { useMailPrefs } from "../store/prefs";
 import { useToast } from "./Toast";
 import { AddressChips } from "./AddressChips";
@@ -61,7 +61,7 @@ export function Compose({ initial, fullscreen, onToggleFullscreen, onClose, onSe
         const el = editorRef.current;
         if (!el)
             return;
-        el.innerHTML = initial.html || "<p><br></p>";
+        el.innerHTML = sanitizeEditorHtml(initial.html || "<p><br></p>");
         el.focus();
         try {
             const range = document.createRange();

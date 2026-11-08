@@ -14,6 +14,8 @@ pub struct ServerConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
+    #[error("invalid webmail configuration: {0}")]
+    InvalidConfig(String),
     #[error("cannot bind {addr}: {source}")]
     Bind {
         addr: SocketAddr,
@@ -25,6 +27,10 @@ pub enum ServeError {
 }
 
 pub async fn run(config: ServerConfig) -> Result<(), ServeError> {
+    config
+        .webmail
+        .validate()
+        .map_err(ServeError::InvalidConfig)?;
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .map_err(|source| ServeError::Bind {

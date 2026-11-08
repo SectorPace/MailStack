@@ -190,19 +190,27 @@ Other flags: `--from-source`, `--archive FILE|URL`, `--binary-dir DIR`, `--prefi
 `--no-systemd`, `--no-access-provision`, `--admin-port`/`--webmail-port`, `--webmail-host`,
 `--server-ip`, `--uninstall`/`--purge`. See `deploy/install.sh --help`.
 
-### Server management (`mailstack-manage`)
+### Server management (`mailstack-manage`, panel-style)
 
-Interactive menu when run without arguments; idempotent subcommands otherwise:
+The installer provides `mailstack-manage`: run without arguments on a TTY for the panel-style
+menu, or use idempotent scriptable subcommands (`--prefix`/`MAILSTACK_PREFIX` for staging):
 
 ```bash
-sudo mailstack-manage status
+sudo mailstack-manage status --json
+sudo mailstack-manage doctor
 sudo mailstack-manage domain set example.com --mail-host mail.example.com
 sudo mailstack-manage account add alice@example.com --password-stdin
 sudo mailstack-manage tls issue mail.example.com --email ops@example.com
 sudo mailstack-manage access set caddy --panel-host panel.example.com --acme-email ops@example.com
-sudo mailstack-manage access set cloudflared
-sudo mailstack-manage restart
+sudo mailstack-manage service restart|status|logs mailstackd
+sudo mailstack-manage backup create|list|restore|delete
+sudo mailstack-manage update check|apply
+sudo mailstack-manage repair | security | uninstall
 ```
+
+The installer also runs an interactive wizard when invoked without arguments on a TTY and supports
+`--mirror`, `--upgrade` (data preserved, health check + rollback), `--repair`, `--dry-run`,
+`--no-firewall`, and `--yes`; state lives in `/etc/mailstack/install.json` and `install-args.conf`.
 
 ### Option 2: build from source
 

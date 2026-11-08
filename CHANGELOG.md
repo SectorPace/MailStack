@@ -37,6 +37,20 @@ All notable changes to the MailStack project are documented in this file.
 - **六种访问模式**：SSH 隧道（默认）、Caddy、nginx、公网 IP + ACME、独立面板域名
   （panel.example.com，强制与 mail/imap/smtp 域区分）、Cloudflare Tunnel；统一生成
   反向代理/Tunnel 配置并以 `install-args.conf` 为唯一状态源。
+- **deploy 脚本体系重写（面板式）**：`install.sh` 交互向导 + 非交互全参数、镜像/发布包
+  SHA256 校验、依赖自动安装、防火墙放行、`--upgrade`（健康检查+自动回滚）/`--repair`/
+  `--dry-run`/`--yes`；`mailstack-manage.sh` 面板菜单 + 全子命令（status --json、doctor、
+  domain/account/tls/access/service/backup/update/security/repair/uninstall、审计日志）；
+  `uninstall.sh` 安全守卫重写；staging 全程不污染宿主 `/etc` 与 systemd。
+- **OCR 全量复审评级**：open-code-review + DeepSeek 复核 287 个文件、1411 条意见；
+  人工复核确认并修复 13 项缺陷，无未修复 critical/high；质量分 **92/100**
+  （口径：100 − 未修复确认缺陷加权扣分，门槛 ≥90），报告见 `docs/OCR_REVIEW.md`。
+- **OCR 全量复审修复**：DMARC pct 采样改用随机化哈希（原确定哈希可被攻击者挑选 Message-ID
+  绕过策略削弱）；`raw_message` 补 `X-Content-Type-Options: nosniff`；relay TLS 收紧
+  wrappermode=yes（仅 465/显式 wrapper，587 冲突配置拒绝）；`mailstack-manage` 状态文件
+  改为白名单解析（不再 `source` 可写前缀文件）；`verify-setup-wizard-e2e.sh` 的 `rm -rf`
+  守卫改为 realpath + 前缀/仓库根校验。
+
 - **Webmail UI 修复**：顶栏 flex 布局（此前子项堆叠导致右侧操作区被挤出）、移动端单栏
   玻璃卡片、窄窗格工具栏换行；管理台内容表面统一材质（列表/设置/域名页同一玻璃观感）。
 - **注释清理与代码精简**：删除发行代码中的非功能性注释；发布脚本瘦身并补全

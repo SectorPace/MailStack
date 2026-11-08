@@ -60,7 +60,7 @@ async fn resolve(root: &Path, path: &str) -> Option<PathBuf> {
 }
 
 fn is_safe_relative(relative: &str) -> bool {
-    if relative.contains('\0') || relative.contains('\\') {
+    if relative.contains('\0') || relative.contains('\\') || relative.contains('%') {
         return false;
     }
     relative

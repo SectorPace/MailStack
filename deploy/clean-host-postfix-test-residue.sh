@@ -1,4 +1,10 @@
 set -euo pipefail
+
+if [ "${1:-}" != "--yes" ] && [ "${MAILSTACK_CLEAN_TEST_RESIDUE:-}" != "1" ]; then
+  echo "refuse: 这是 Postfix 测试遗留清理脚本，默认不会修改宿主配置。" >&2
+  echo "确认要清理时显式执行：MAILSTACK_CLEAN_TEST_RESIDUE=1 bash $0 --yes" >&2
+  exit 2
+fi
 export PATH="/usr/sbin:/sbin:$PATH"
 
 MAIN=/etc/postfix/main.cf

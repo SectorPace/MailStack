@@ -446,7 +446,7 @@ pub async fn raw_message(
     let uid = parse_uid(&uid)?;
     let service = MaildirService::new(auth.account());
     let raw = blocking(move || service.raw_message(&folder, uid)).await?;
-    Ok((
+    let mut response = (
         StatusCode::OK,
         [
             (
@@ -460,7 +460,12 @@ pub async fn raw_message(
         ],
         raw.data,
     )
-        .into_response())
+        .into_response();
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(response)
 }
 
 pub async fn message_part(
