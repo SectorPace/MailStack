@@ -491,7 +491,11 @@ wizard_prompt() {
   local default="${2:-}"
   local value=""
   printf '%s' "$prompt" >&2
-  IFS= read -r value || value=""
+  if [ "$STDIN_IS_SCRIPT" -eq 1 ] && [ -r /dev/tty ]; then
+    IFS= read -r value < /dev/tty || value=""
+  else
+    IFS= read -r value || value=""
+  fi
   [ -n "$value" ] || value="$default"
   printf '%s' "$value"
 }
@@ -500,7 +504,11 @@ wizard_confirm() {
   local prompt="$1"
   local answer=""
   printf '%s [Y/n] ' "$prompt" >&2
-  IFS= read -r answer || answer=""
+  if [ "$STDIN_IS_SCRIPT" -eq 1 ] && [ -r /dev/tty ]; then
+    IFS= read -r answer < /dev/tty || answer=""
+  else
+    IFS= read -r answer || answer=""
+  fi
   case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
     ""|y|yes) return 0 ;;
     *) return 1 ;;
@@ -508,7 +516,7 @@ wizard_confirm() {
 }
 
 interactive_wizard() {
-  [ -t 0 ] || die "交互向导需要 TTY；非交互安装请传 --domain/--admin-password 等参数"
+  { [ -t 0 ] || [ -r /dev/tty ]; } || die "交互向导需要 TTY；非交互安装请传 --domain/--admin-password 等参数"
   echo
   printf '%sMailStack v%s 安装向导%s\n' "$C_BOLD" "$VERSION" "$C_RESET"
   echo '  Ctrl-C 随时退出（清理临时文件）'
@@ -548,9 +556,17 @@ interactive_wizard() {
     local pw1=""
     local pw2=""
     printf '管理员口令（12-256 位，含字母与数字）: ' >&2
-    IFS= read -r -s pw1 || pw1=""
+    if [ "$STDIN_IS_SCRIPT" -eq 1 ] && [ -r /dev/tty ]; then
+      IFS= read -r -s pw1 < /dev/tty || pw1=""
+    else
+      IFS= read -r -s pw1 || pw1=""
+    fi
     printf '\n再次输入: ' >&2
-    IFS= read -r -s pw2 || pw2=""
+    if [ "$STDIN_IS_SCRIPT" -eq 1 ] && [ -r /dev/tty ]; then
+      IFS= read -r -s pw2 < /dev/tty || pw2=""
+    else
+      IFS= read -r -s pw2 || pw2=""
+    fi
     printf '\n' >&2
     [ "$pw1" = "$pw2" ] || { warn "两次输入不一致"; continue; }
     ADMIN_PASSWORD="$pw1"
@@ -1776,11 +1792,16 @@ main() {
   else
     STDIN_IS_SCRIPT=1
   fi
-  if [ "$#" -eq 0 ] && [ "$STDIN_IS_SCRIPT" -eq 0 ] && [ ! -t 0 ]; then
-    usage >&2
-    exit 2
+  if [ "$#" -eq 0 ]; then
+    if [ "$STDIN_IS_SCRIPT" -eq 0 ] && [ -t 0 ]; then
+      INTERACTIVE=1
+    elif [ "$STDIN_IS_SCRIPT" -eq 1 ] && [ -r /dev/tty ]; then
+      INTERACTIVE=1
+    else
+      usage >&2
+      exit 2
+    fi
   fi
-  [ "$#" -eq 0 ] && [ "$STDIN_IS_SCRIPT" -eq 0 ] && [ -t 0 ] && INTERACTIVE=1
 
   parse_args "$@"
   normalize_prefix
@@ -1836,6 +1857,26 @@ main() {
   services_start
   print_summary
   log_line INFO "install finished successfully"
+  maybe_open_manage_menu
+}
+
+maybe_open_manage_menu() {
+  [ "$INTERACTIVE" -eq 1 ] || return 0
+  [ -r /dev/tty ] || return 0
+  local mgr="$BIN_DIR/$MANAGE_NAME"
+  [ -x "$mgr" ] || return 0
+  local answer=""
+  printf '\n安装完成。是否现在打开管理菜单？[Y/n] ' >&2
+  if ! IFS= read -r answer < /dev/tty; then
+    printf '\n' >&2
+    return 0
+  fi
+  case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
+    ""|y|yes) : ;;
+    *) return 0 ;;
+  esac
+  printf '\n' >&2
+  exec env MAILSTACK_PREFIX="$PREFIX_NORM" "$mgr" < /dev/tty
 }
 
 main "$@"

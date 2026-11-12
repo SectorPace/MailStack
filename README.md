@@ -65,8 +65,8 @@ MailStack 以自研 Rust 栈**替代** Postfix / OpenDKIM / fail2ban / Dovecot �
 
 - **一行安装**：`curl ... | sudo bash -s -- --domain ... --admin-user ... --admin-password ... --access-mode ...`
   完成系统用户/目录/权限/二进制/包装器/sudoers/systemd/前端/管理员/身份 DKIM/访问层全部前提。
-- **`mailstack-manage`**：服务器端 CLI + 交互菜单，改域名、加/删邮箱账号、重设口令、
-  签发/续期 TLS、切换访问方式；状态源 `/etc/mailstack/install-args.conf`。
+- **`mailstack-manage`**：面板式中文菜单（装完可直接进入），改域名、加/删邮箱账号、
+  重设口令、签发/续期 TLS、切换访问方式、备份/升级/体检；状态源 `/etc/mailstack/install-args.conf`。
 - **六种访问方式**：SSH 隧道（默认）、Caddy、nginx、公网 IP+ACME、独立面板域名
   （`panel.example.com`，与 `mail/imap/smtp.example.com` 区分）、Cloudflare Tunnel。
   8443/8444 恒只绑回环，公网 TLS 由反代/Tunnel 终结。
@@ -120,7 +120,102 @@ MailStack 以自研 Rust 栈**替代** Postfix / OpenDKIM / fail2ban / Dovecot �
 > glibc < 2.39（如 Rocky/Oracle Linux 9）或 Alpine 请用全静态产物
 > （`deploy/build.sh --musl` 自行构建，见方式二）。
 
-### 方式一：一行安装（推荐）
+### 一键安装（推荐，中文交互向导）
+
+像宝塔 / 1Panel / 3x-ui 一样，**一条命令、一路回车/选择** 完成安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh -o /tmp/mailstack-install.sh
+sudo bash /tmp/mailstack-install.sh          # 无参数：进入中文安装向导
+```
+
+也可以直接管道执行（安装器会从终端 `/dev/tty` 读取你的选择，不会被脚本吞掉）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh | sudo bash
+```
+
+向导按顺序询问（括号内为默认值，**直接回车即默认**）：
+
+```text
+MailStack v1.0.0 安装向导
+
+安装来源:  1) GitHub Release（默认，SHA256 校验）  2) 本地/URL 发布包
+           3) 预编译二进制目录                     4) 源码构建
+邮件主域名（例 example.com，必填）: example.com
+邮件主机名 [mail.example.com]:            ← 回车默认
+管理员用户名 [admin]:                      ← 回车默认
+管理员口令（12-256 位，含字母与数字）: ******
+再次输入: ******
+管理台端口 [8443]:      Webmail 端口 [8444]:     安装 IMAP/POP3/ManageSieve? [Y/n]:
+访问模式:  1) ssh（默认，回环+SSH 隧道）  2) caddy（自动 HTTPS）
+           3) nginx   4) ip-acme   5) panel-domain   6) cloudflared
+配置防火墙（ufw/firewalld）放行邮件与 Web 端口? [Y/n]
+
+安装摘要:
+  来源: binary-dir   域名: example.com   邮件主机: mail.example.com
+  管理员: admin      端口: 管理台 8443 / Webmail 8444 / IMAP yes
+  访问模式: ssh      前缀: /
+开始安装? [Y/n]
+...
+安装完成。是否现在打开管理菜单？[Y/n]   ← 回车直接进入管理菜单
+```
+
+安装器自动完成全部前提：系统用户/组、目录与权限、5 个二进制、特权包装器与 sudoers
+（`visudo -cf` 校验）、systemd unit、前端产物、管理员凭证、邮件身份与 DKIM、域名表、
+访问层（反向代理 / Tunnel / SSH 隧道说明）与防火墙放行，最后打印访问地址。
+
+访问模式（`--access-mode`，默认 `ssh`）：
+
+| 模式 | 入口方式 | 说明 |
+|---|---|---|
+| `ssh` | SSH 隧道 | 8443/8444 只绑回环，不装反代（默认，最安全） |
+| `caddy` | Caddy 反代 | 自动 ACME HTTPS（80/443 需公网可达） |
+| `nginx` | nginx 反代 | TLS 由 certbot/acme.sh 补；生成站点配置 |
+| `ip-acme` | 公网 IP + ACME | nginx 终止 TLS，证书走 `mailstackctl setup.cert.issue` |
+| `panel-domain` | 独立面板域名 | 如 `panel.example.com`，**必须**与 `mail/imap/smtp.example.com` 不同 |
+| `cloudflared` | Cloudflare Tunnel | 本机不开端口，cloudflared 连回环 8443/8444 |
+
+### 服务器管理菜单（傻瓜式）
+
+安装完成后输入 `sudo mailstack-manage`（或安装完成时直接回车进入）就是完整管理菜单：
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  MailStack 管理面板  v1.0.0                                  │
+└──────────────────────────────────────────────────────────────┘
+  主机: mail.example.com        前缀: /
+  域名: example.com             邮件主机: mail.example.com
+  访问: caddy                   管理台: https://panel.example.com/
+  身份: 已配置   管理员: admin（已配置）
+
+  1) 状态总览            2) 域名管理            3) 邮箱账号
+  4) 访问与 TLS          5) 服务管理            6) 备份与恢复
+  7) 更新/升级           8) 安全                9) 修复/卸载
+  i) 初始化向导（首次配置域名/DKIM/域名表）          0) 退出
+```
+
+- **i) 初始化向导**：新机器第一次用，按提示填域名/邮件主机/IP，自动生成 DKIM 并登记域名表。
+- **2) 域名管理 / 3) 邮箱账号**：改域名、加/删邮箱、重设口令，全部菜单操作。
+- **4) 访问与 TLS**：切换 ssh/caddy/nginx/ip-acme/panel-domain/cloudflared，签发/续期证书。
+- **5) 服务管理 / 6) 备份与恢复 / 7) 更新升级 / 8) 安全 / 9) 修复卸载**：日常运维全覆盖。
+
+菜单里的每个动作都可以脚本化（幂等），适合自动化：
+
+```bash
+sudo mailstack-manage status --json
+sudo mailstack-manage doctor
+sudo mailstack-manage domain set example.com --mail-host mail.example.com
+sudo mailstack-manage account add alice@example.com --password-stdin
+sudo mailstack-manage tls issue mail.example.com --email ops@example.com
+sudo mailstack-manage access set caddy --panel-host panel.example.com --acme-email ops@example.com
+sudo mailstack-manage service restart|status|logs mailstackd
+sudo mailstack-manage backup create|list|restore|delete
+sudo mailstack-manage update check|apply
+sudo mailstack-manage repair | security | uninstall
+```
+
+### 方式一：全自动一行安装（参数式，适合脚本/CI）
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh \
@@ -134,62 +229,20 @@ curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/in
 ```
 
 口令会经 argv 暴露，介意时先落盘再用 `--admin-password-stdin`（或环境变量
-`MAILSTACK_ADMIN_PASSWORD`）。安装器完成全部前提：系统用户/组、目录与权限、5 个二进制、
-特权包装器与 sudoers（`visudo -cf` 校验）、systemd unit、前端产物、管理员凭证引导、
-邮件身份与 DKIM、访问层（反向代理 / Tunnel / SSH 隧道说明），最后打印管理台/Webmail 地址。
-
-访问模式（`--access-mode`，默认 `ssh`；旧值 `local`/`caddy`/`direct` 仍兼容）：
-
-| 模式 | 入口方式 | 说明 |
-|---|---|---|
-| `ssh` | SSH 隧道 | 8443/8444 只绑回环，不装反代（默认，最安全） |
-| `caddy` | Caddy 反代 | 自动 ACME HTTPS（80/443 需公网可达） |
-| `nginx` | nginx 反代 | TLS 由 certbot/acme.sh 补；生成站点配置 |
-| `ip-acme` | 公网 IP + ACME | nginx 终止 TLS，证书走 `mailstackctl setup.cert.issue` |
-| `panel-domain` | 独立面板域名 | 如 `panel.example.com`，**必须**与 `mail/imap/smtp.example.com` 不同 |
-| `cloudflared` | Cloudflare Tunnel | 本机不开端口，cloudflared 连回环 8443/8444 |
+`MAILSTACK_ADMIN_PASSWORD`）：
 
 ```bash
-# 落盘执行（口令走 stdin，不落 argv）
 VERSION=1.0.0
 curl -fsSL "https://raw.githubusercontent.com/SectorPace/MailStack/v${VERSION}/deploy/install.sh" -o /tmp/mailstack-install.sh
-less /tmp/mailstack-install.sh
 printf '%s\n' "$MAILSTACK_ADMIN_PASSWORD" | sudo bash /tmp/mailstack-install.sh \
-  --non-interactive --domain mail.example.com --admin-user admin --admin-password-stdin --access-mode panel-domain --panel-host panel.example.com
+  --non-interactive --domain mail.example.com --admin-user admin --admin-password-stdin
 ```
 
-其它参数：`--from-source`（源码构建）、`--archive FILE|URL`、`--binary-dir DIR`、`--prefix`
-（staging）、`--no-systemd`、`--no-access-provision`、`--admin-port`/`--webmail-port`、
+其它参数：`--interactive`（有参数时也进向导）、`--from-source`、`--archive FILE|URL`、
+`--binary-dir DIR`、`--mirror`、`--prefix`（staging）、`--upgrade` / `--repair` / `--dry-run`、
+`--no-systemd`、`--no-access-provision`、`--no-firewall`、`--yes`、`--admin-port`/`--webmail-port`、
 `--webmail-host`、`--server-ip`、`--uninstall`/`--purge`。完整说明见 `deploy/install.sh --help`
 与 [`docs/INSTALL.md`](docs/INSTALL.md)。
-
-### 服务器管理（`mailstack-manage`，面板式菜单）
-
-安装器装好 `/usr/local/bin/mailstack-manage`：无参数在 TTY 进入面板式菜单，
-也可直接下命令（幂等、可脚本化、支持 `--prefix` staging）：
-
-```bash
-sudo mailstack-manage                      # 面板式交互菜单
-sudo mailstack-manage status --json        # 机器可读状态
-sudo mailstack-manage doctor               # 体检：服务/端口/证书/队列/磁盘/权限
-sudo mailstack-manage domain set example.com --mail-host mail.example.com
-sudo mailstack-manage domain list
-sudo mailstack-manage account add alice@example.com --password-stdin
-sudo mailstack-manage account list|passwd|delete
-sudo mailstack-manage tls issue mail.example.com --email ops@example.com
-sudo mailstack-manage tls renew
-sudo mailstack-manage access set caddy --panel-host panel.example.com --acme-email ops@example.com
-sudo mailstack-manage access show
-sudo mailstack-manage service restart|status|logs mailstackd
-sudo mailstack-manage backup create --include-secrets   # list / restore / delete
-sudo mailstack-manage update check|apply                 # Release 校验 + 自动升级/回滚
-sudo mailstack-manage repair | security | uninstall
-```
-
-安装器本身也是面板式：无参数 + TTY 进入交互向导；支持 `--mirror` 镜像、
-`--upgrade`（保留数据、健康检查失败自动回滚）、`--repair`、`--dry-run`、
-`--no-firewall`（默认按访问模式放行 25/80/443/465/587/993/995/4190 等端口）、
-`--yes` 自动确认；状态文件 `/etc/mailstack/install.json` + `install-args.conf`。
 
 ### 方式二：源码构建
 
@@ -230,7 +283,7 @@ sudo deploy/install.sh --binary-dir dist --domain mail.example.com --admin-user 
 ## 质量复审
 
 v1.0.0 发行前完成全量 OCR 复审（287 文件 / 1411 条意见），修复 13 项确认缺陷，
-质量分 **92/100**（无未修复 critical/high）。细节见 [`docs/OCR_REVIEW.md`](docs/OCR_REVIEW.md)。
+质量分 **91/100**（无未修复 critical/high）。细节见 [`docs/OCR_REVIEW.md`](docs/OCR_REVIEW.md)。
 
 ## 架构
 

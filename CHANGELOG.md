@@ -37,13 +37,17 @@ All notable changes to the MailStack project are documented in this file.
 - **六种访问模式**：SSH 隧道（默认）、Caddy、nginx、公网 IP + ACME、独立面板域名
   （panel.example.com，强制与 mail/imap/smtp 域区分）、Cloudflare Tunnel；统一生成
   反向代理/Tunnel 配置并以 `install-args.conf` 为唯一状态源。
+- **安装/管理交互傻瓜化**：`curl | sudo bash` 无参数时从 `/dev/tty` 进入中文安装向导
+  （来源/域名/管理员口令/端口/访问模式/防火墙逐步选择，回车即默认）；安装完成后可直接
+  回车进入 `mailstack-manage` 菜单；管理菜单新增 **i) 初始化向导**（首次配置域名/DKIM/
+  域名表），TUI 路径补 derive_paths/init_logging，状态头部正确显示已配置信息。
 - **deploy 脚本体系重写（面板式）**：`install.sh` 交互向导 + 非交互全参数、镜像/发布包
   SHA256 校验、依赖自动安装、防火墙放行、`--upgrade`（健康检查+自动回滚）/`--repair`/
   `--dry-run`/`--yes`；`mailstack-manage.sh` 面板菜单 + 全子命令（status --json、doctor、
   domain/account/tls/access/service/backup/update/security/repair/uninstall、审计日志）；
   `uninstall.sh` 安全守卫重写；staging 全程不污染宿主 `/etc` 与 systemd。
 - **OCR 全量复审评级**：open-code-review + DeepSeek 复核 287 个文件、1411 条意见；
-  人工复核确认并修复 13 项缺陷，无未修复 critical/high；质量分 **92/100**
+  人工复核确认并修复 13 项缺陷，无未修复 critical/high；质量分 **91/100**
   （口径：100 − 未修复确认缺陷加权扣分，门槛 ≥90），报告见 `docs/OCR_REVIEW.md`。
 - **OCR 全量复审修复**：DMARC pct 采样改用随机化哈希（原确定哈希可被攻击者挑选 Message-ID
   绕过策略削弱）；`raw_message` 补 `X-Content-Type-Options: nosniff`；relay TLS 收紧

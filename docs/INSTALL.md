@@ -32,6 +32,24 @@
 
 ## 3. 方式一：curl 一键安装（推荐）
 
+### 3.0 交互向导（推荐，零参数）
+
+和宝塔 / 1Panel / 3x-ui 一样，直接运行即可（无参数 + TTY 自动进入向导）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh -o /tmp/mailstack-install.sh
+sudo bash /tmp/mailstack-install.sh
+# 或管道执行：安装器从 /dev/tty 读取选择，不会吞脚本
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh | sudo bash
+```
+
+向导逐步询问（直接回车 = 默认）：安装来源 → 邮件域名/邮件主机 → 管理员账号与口令（隐藏输入）
+→ 管理台/Webmail 端口 → IMAP 开关 → 访问模式（1-6 菜单）→ 面板/Webmail 域名与 ACME 邮箱
+→ 防火墙 → 安装摘要确认。安装完成后会询问 **是否现在打开管理菜单**，回车即进入
+`mailstack-manage` 面板式菜单，首次配置可直接用菜单里的 **i) 初始化向导** 填域名并生成 DKIM。
+
+高级场景仍可用 `--interactive`（带参数也进向导）或全参数非交互方式（§3.1–§3.3）。
+
 ### 3.1 先落盘再执行（便于审阅）
 
 ```bash

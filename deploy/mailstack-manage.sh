@@ -178,14 +178,33 @@ load_state() {
       value="${line#*=}"
       value="${value%\'}"
       value="${value#\'}"
-      case "$key" in
-        ACCESS_MODE|ACCESS_MODE_DETAIL|MAILSTACK_VERSION|DOMAIN|MAIL_HOST|PANEL_HOST|WEBMAIL_HOST|PANEL_URL|WEBMAIL_URL|ACME_EMAIL|SERVER_IP|IMAP_ENABLE|ADMIN_USER|ADMIN_PORT|WEBMAIL_PORT)
-          case "$value" in
-            *'$('*|*'`'*|*';'*) warn "忽略状态文件中的可疑 $key 值"; continue ;;
-          esac
-          printf -v "$key" '%s' "$value"
-          ;;
+      case "$value" in
+        *$'\n'*|*$'\r'*|*'$('*|*'`'*|*';'*|*'|'*|*'&'*) warn "忽略状态文件中的可疑 $key 值"; continue ;;
       esac
+      case "$key" in
+        ACCESS_MODE)
+          case "$value" in local|direct|caddy) : ;; *) warn "状态文件 ACCESS_MODE 非法：$value"; continue ;; esac ;;
+        ACCESS_MODE_DETAIL)
+          case "$value" in ssh|caddy|nginx|ip-acme|panel-domain|cloudflared) : ;; *) warn "状态文件 ACCESS_MODE_DETAIL 非法：$value"; continue ;; esac ;;
+        DOMAIN|MAIL_HOST|PANEL_HOST|WEBMAIL_HOST)
+          valid_hostname "$value" || { warn "状态文件 $key 非主机名：$value"; continue; } ;;
+        ADMIN_USER)
+          printf '%s' "$value" | grep -Eq '^[A-Za-z][A-Za-z0-9_.-]{2,31}$' || { warn "状态文件 ADMIN_USER 非法"; continue; } ;;
+        ADMIN_PORT|WEBMAIL_PORT)
+          case "$value" in ''|*[!0-9]*) warn "状态文件 $key 非法：$value"; continue ;; esac
+          [ "$value" -ge 1 ] && [ "$value" -le 65535 ] || { warn "状态文件 $key 越界"; continue; } ;;
+        SERVER_IP)
+          [ -n "$value" ] && valid_ipv4 "$value" || { warn "状态文件 SERVER_IP 非法"; continue; } ;;
+        ACME_EMAIL)
+          [ -n "$value" ] && valid_email "$value" || { warn "状态文件 ACME_EMAIL 非法"; continue; } ;;
+        PANEL_URL|WEBMAIL_URL)
+          printf '%s' "$value" | grep -Eq '^https?://[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]+$' || { warn "状态文件 $key 非法"; continue; } ;;
+        IMAP_ENABLE)
+          case "$value" in 0|1) : ;; *) warn "状态文件 IMAP_ENABLE 非法"; continue ;; esac ;;
+        MAILSTACK_VERSION)
+          printf '%s' "$value" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+-]+)?$' || { warn "状态文件 MAILSTACK_VERSION 非法"; continue; } ;;
+      esac
+      printf -v "$key" '%s' "$value"
     done < "$STATE_FILE"
     STATE_LOADED=1
   fi
@@ -2200,7 +2219,7 @@ tui_menu() {
   1) 状态总览            2) 域名管理            3) 邮箱账号
   4) 访问与 TLS          5) 服务管理            6) 备份与恢复
   7) 更新/升级           8) 安全                9) 修复/卸载
-  0) 退出
+  i) 初始化向导（首次配置域名/DKIM/域名表）          0) 退出
 EOF
 }
 
@@ -2345,9 +2364,31 @@ menu_run() {
   return 0
 }
 
+tui_init() {
+  if [ -s "$ETC_DIR/setup.json" ]; then
+    warn "邮件身份已配置；如需修改请用 2) 域名管理 → d) 设置身份/DKIM"
+    return 0
+  fi
+  echo '  首次初始化：填写邮件域名，脚本会写入 setup.json、生成 DKIM 并登记域名表。'
+  local domain mail_host ip
+  domain="$(menu_read '邮件主域名（例 example.com）: ')"
+  [ -n "$domain" ] || return 0
+  if ! valid_hostname "$domain"; then
+    warn "域名不合法：$domain"
+    return 0
+  fi
+  mail_host="$(menu_read "邮件主机名 [mail.$domain]: " "mail.$domain")"
+  ip="$(menu_read '服务器公网 IP（留空自动探测）: ')"
+  local -a args=("$domain" --complete --mail-host "$mail_host")
+  [ -n "$ip" ] && args+=(--server-ip "$ip")
+  menu_run cmd_domain_set "${args[@]}"
+}
+
 tui_loop() {
   [ -t 0 ] || { usage; exit 2; }
   require_root
+  derive_paths
+  init_logging
   load_state
   while true; do
     [ -t 1 ] && printf '\033[2J\033[H'
@@ -2366,6 +2407,7 @@ tui_loop() {
       7) tui_update ;;
       8) tui_security ;;
       9) tui_repair_uninstall ;;
+      i|init) tui_init ;;
       0|q|quit|exit) break ;;
       *) warn "无效选择：$choice" ;;
     esac

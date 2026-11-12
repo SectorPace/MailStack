@@ -143,29 +143,51 @@ with its own Rust stack; running side by side with Postfix is supported during m
 
 ## Installation
 
-> Target platform: **Linux x86_64**. The glibc build requires **glibc >= 2.39** (measured).
-> On glibc < 2.39 (e.g. Rocky/Oracle Linux 9) or Alpine, use a fully static build
-> (build one yourself with `deploy/build.sh --musl`, see Option 2).
+> Target platform: **Linux x86_64**. glibc builds are tested down to **glibc 2.39**;
+> for older glibc (e.g. Rocky/Oracle Linux 9) or Alpine use the fully static musl build
+> (`deploy/build.sh --musl`, see Option 2).
 
-### Option 1: one-line install (recommended)
+### One-command install (recommended, interactive wizard)
+
+Same habit as 宝塔 / 1Panel / 3x-ui: one command, then pick menu items / press Enter for defaults.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh \\
-  | sudo bash -s -- \\
-      --domain mail.example.com \\
-      --mail-host mail.example.com \\
-      --admin-user admin \\
-      --admin-password 'My-Admin-Pass-9' \\
-      --access-mode caddy \\
-      --acme-email ops@example.com
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh -o /tmp/mailstack-install.sh
+sudo bash /tmp/mailstack-install.sh          # no args => interactive installer wizard
 ```
 
-The installer sets up everything: system users/groups, directories and permissions, the five
-binaries, the privileged wrapper plus sudoers (`visudo -cf` validated), systemd units, frontend
-bundle, admin credentials, mail identity and DKIM, and the access layer (reverse proxy / tunnel /
-SSH-tunnel notes), then prints the admin and Webmail URLs.
+Piping also works (the installer reads your choices from the terminal `/dev/tty`, so the
+script on stdin is never swallowed):
 
-Access modes (`--access-mode`, default `ssh`; legacy `local`/`caddy`/`direct` still accepted):
+```bash
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh | sudo bash
+```
+
+The wizard asks (brackets = default, just press Enter):
+
+```text
+MailStack v1.0.0 installer
+
+Install source: 1) GitHub Release (default, SHA256 verified)  2) local/URL archive
+                3) prebuilt binary directory                  4) build from source
+Primary mail domain: example.com
+Mail host [mail.example.com]:
+Admin user [admin]:
+Admin password (12-256 chars, letters + digits): ******
+Repeat password: ******
+Admin port [8443]:   Webmail port [8444]:   Install IMAP/POP3/ManageSieve? [Y/n]:
+Access mode: 1) ssh (default, loopback + SSH tunnel)  2) caddy (automatic HTTPS)
+             3) nginx   4) ip-acme   5) panel-domain   6) cloudflared
+Configure firewall (open mail/web ports)? [Y/n]
+...
+Install complete. Open the management menu now? [Y/n]   <- Enter to open it
+```
+
+It provisions everything: users/groups, directories/permissions, the 5 binaries, privileged
+wrapper + sudoers (`visudo -cf`), systemd units, frontend bundle, admin credentials, mail
+identity + DKIM, domain table, access layer (proxy / tunnel / SSH-tunnel notes) and firewall.
+
+Access modes (`--access-mode`, default `ssh`):
 
 | Mode | Entry | Notes |
 |---|---|---|
@@ -173,27 +195,34 @@ Access modes (`--access-mode`, default `ssh`; legacy `local`/`caddy`/`direct` st
 | `caddy` | Caddy reverse proxy | automatic ACME HTTPS (80/443 public) |
 | `nginx` | nginx reverse proxy | TLS via certbot/acme.sh; site config generated |
 | `ip-acme` | public IP + ACME | nginx terminates TLS, cert via `mailstackctl setup.cert.issue` |
-| `panel-domain` | separate panel hostname | e.g. `panel.example.com`, must differ from `mail/imap/smtp.example.com` |
+| `panel-domain` | dedicated panel hostname | e.g. `panel.example.com`, must differ from `mail/imap/smtp.example.com` |
 | `cloudflared` | Cloudflare Tunnel | no local ports exposed; tunnel to loopback 8443/8444 |
 
-```bash
-# download-then-run (password via stdin, not argv)
-VERSION=1.0.0
-curl -fsSL "https://raw.githubusercontent.com/SectorPace/MailStack/v${VERSION}/deploy/install.sh" -o /tmp/mailstack-install.sh
-less /tmp/mailstack-install.sh
-printf '%s\\n' "$MAILSTACK_ADMIN_PASSWORD" | sudo bash /tmp/mailstack-install.sh \\
-  --non-interactive --domain mail.example.com --admin-user admin --admin-password-stdin \\
-  --access-mode panel-domain --panel-host panel.example.com
+### Management menu (panel-style)
+
+After installation run `sudo mailstack-manage` (or press Enter at the final installer prompt):
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│  MailStack Management Panel  v1.0.0                          │
+└──────────────────────────────────────────────────────────────┘
+  Host: mail.example.com        Prefix: /
+  Domain: example.com           Mail host: mail.example.com
+  Access: caddy                 Admin: https://panel.example.com/
+  Identity: configured          Admin user: admin (configured)
+
+  1) Overview            2) Domains             3) Mailboxes
+  4) Access & TLS        5) Services            6) Backup / restore
+  7) Update / upgrade    8) Security            9) Repair / uninstall
+  i) Initial setup (domain/DKIM/domain table)      0) Exit
 ```
 
-Other flags: `--from-source`, `--archive FILE|URL`, `--binary-dir DIR`, `--prefix` (staging),
-`--no-systemd`, `--no-access-provision`, `--admin-port`/`--webmail-port`, `--webmail-host`,
-`--server-ip`, `--uninstall`/`--purge`. See `deploy/install.sh --help`.
+- **i) Initial setup** — first use: enter domain/mail host/IP, DKIM + domain table generated.
+- **2/3** manage domains, mailboxes, passwords entirely through menus.
+- **4** switch ssh/caddy/nginx/ip-acme/panel-domain/cloudflared and issue/renew TLS.
+- **5–9** service control, backups, upgrades, security and repair/uninstall.
 
-### Server management (`mailstack-manage`, panel-style)
-
-The installer provides `mailstack-manage`: run without arguments on a TTY for the panel-style
-menu, or use idempotent scriptable subcommands (`--prefix`/`MAILSTACK_PREFIX` for staging):
+Everything is also scriptable and idempotent:
 
 ```bash
 sudo mailstack-manage status --json
@@ -208,9 +237,32 @@ sudo mailstack-manage update check|apply
 sudo mailstack-manage repair | security | uninstall
 ```
 
-The installer also runs an interactive wizard when invoked without arguments on a TTY and supports
-`--mirror`, `--upgrade` (data preserved, health check + rollback), `--repair`, `--dry-run`,
-`--no-firewall`, and `--yes`; state lives in `/etc/mailstack/install.json` and `install-args.conf`.
+### Option 1: fully automatic one-line install (flags, for scripts/CI)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/install.sh \
+  | sudo bash -s -- \
+      --domain mail.example.com \
+      --mail-host mail.example.com \
+      --admin-user admin \
+      --admin-password 'My-Admin-Pass-9' \
+      --access-mode caddy \
+      --acme-email ops@example.com
+```
+
+Prefer stdin for the password (keeps it out of argv and shell history):
+
+```bash
+VERSION=1.0.0
+curl -fsSL "https://raw.githubusercontent.com/SectorPace/MailStack/v${VERSION}/deploy/install.sh" -o /tmp/mailstack-install.sh
+printf '%s\n' "$MAILSTACK_ADMIN_PASSWORD" | sudo bash /tmp/mailstack-install.sh \
+  --non-interactive --domain mail.example.com --admin-user admin --admin-password-stdin
+```
+
+Other flags: `--interactive`, `--from-source`, `--archive FILE|URL`, `--binary-dir DIR`,
+`--mirror`, `--prefix` (staging), `--upgrade` / `--repair` / `--dry-run`, `--no-systemd`,
+`--no-access-provision`, `--no-firewall`, `--yes`, `--admin-port`/`--webmail-port`,
+`--webmail-host`, `--server-ip`, `--uninstall`/`--purge`. See `deploy/install.sh --help`.
 
 ### Option 2: build from source
 
@@ -219,10 +271,12 @@ git clone https://github.com/SectorPace/MailStack.git
 cd MailStack
 deploy/build.sh
 cd webui && npm ci && npm run build && cd ..
-sudo deploy/install.sh --binary-dir dist --domain mail.example.com --admin-user admin \\
+sudo deploy/install.sh --binary-dir dist --domain mail.example.com --admin-user admin \
   --admin-password 'My-Admin-Pass-9' --access-mode ssh
 ```
 
+> The release also ships a fully static musl tarball (glibc < 2.39 / Alpine):
+> `--archive <musl-tarball>`.
 ## First-run configuration
 
 1. **Open the admin console**: `http://127.0.0.1:8443` (through an SSH tunnel or reverse proxy;

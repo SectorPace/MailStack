@@ -113,6 +113,11 @@ sudo deploy/install.sh --binary-dir dist
 * `--uninstall` / `--purge`（或独立 `deploy/uninstall.sh`）提供卸载路径；
 * 重复执行是幂等的，不覆盖既有配置（运维改动保留）。
 
+**交互方式（v1.0.0 面板式）**：无参数 + TTY（含 `curl | sudo bash` 管道，
+安装器从 `/dev/tty` 读取）进入中文安装向导；安装完成后可直接回车进入 `mailstack-manage`
+管理菜单（首次使用走菜单 **i) 初始化向导** 生成 DKIM/域名表）。全量非交互参数见
+`deploy/install.sh --help`。
+
 ### 3.1 systemd unit（安装器生成；以下为模板）
 
 ```ini

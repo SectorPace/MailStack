@@ -12,7 +12,7 @@
 
 ## 2. 复核发现与修复
 
-对 critical/high 逐条人工复核（重复渲染/同一个问题在不同文件重复出现时按一条计），确认并修复如下缺陷：
+对 critical/high 逐条人工复核（重复渲染/同一个问题在不同文件重复出现时按一条计），确认并修复如下缺陷（含第二轮 deploy 专项）：
 
 1. `crates/priv/src/lib.rs` — mailstackctl --privileged-stdin 未注册 Readers，users.*/setup.*/certs.* 全部 NOT_IMPLEMENTED（生产阻断）
 2. `crates/auth/src/dmarc.rs` — DMARC pct 采样使用确定哈希 + 攻击者可控 Message-ID，可绕过 pct 策略削弱；改为随机化 SipHash
@@ -27,6 +27,18 @@
 11. `deploy/verify-setup-wizard-e2e.sh` — rm -rf 守卫可被尾斜杠/相对路径绕过；realpath + 前缀 + 仓库根校验
 12. `deploy/clean-host-postfix-test-residue.sh` — 清理脚本可能误删真实 SendGrid relay 配置；默认拒绝执行，需显式 --yes/MAILSTACK_CLEAN_TEST_RESIDUE=1
 13. `deploy/uninstall.sh` — 卸载脚本错误处理/数据保留语义重写；--purge 显式删除
+14. `deploy/uninstall.sh` — `safe_rm_rf` 不再 realpath 后删符号链接目标（只删链接本身）；
+    rm 失败降级为 WARN 避免半卸载；非 TTY 且无 `--yes` 时拒绝卸载（尤其 --purge）
+15. `deploy/mailstack-manage.sh` — 状态文件按 key 做格式白名单校验（域名/IP/端口/URL/模式，
+    拒绝换行与控制字符），防止状态值注入生成的 nginx/Caddy/cloudflared 配置
+16. `deploy/mailstack-manage.sh` — TUI 路径补 `derive_paths`/`init_logging`（此前头部状态
+    显示未配置、初始化向导误判）；新增菜单项 **i) 初始化向导**
+17. `deploy/install.sh` — `curl | sudo bash` 无参数时从 `/dev/tty` 进入中文向导；安装完成
+    可直接回车进入管理菜单；EOF 视为不进入，避免管道/CI 挂起
+
+**第二轮 deploy 脚本专项复审**（3 个脚本，53 条意见：high=8 medium=20 low=25）：
+修复上述第 14–17 项；`install_wrapper` 自检 grep、TUI 备份选项优先级 2 条判定为误报；
+`update apply` 从 raw main 拉取脚本执行的风险作为已记录接受项（见第 3 节）。
 
 其余 critical/high 意见经复核为 OCR 误报或已由现有实现覆盖（典型：`crates/webmail/src/account.rs` 的 `nth(4)` 读取 passwd home 实际正确；`webui/src/api/client.ts` 已同时映射 `relay.test` 与 `setup.relay.test`；`deploy/verify-auth-clean-tree.sh` 已启用 `pipefail`，重试逻辑有效；`deploy/build.sh` 空可执行列表已有显式 `die` 兜底）。
 
@@ -35,6 +47,7 @@
 - **[medium]** `crates/core/src/audit.rs` — 审计日志已 append+sync 后 head 锚点写入失败会返回 Err；hash 链仍是完整可校验的，残留为已知窗口（后续可补偿），本轮接受
 - **[medium]** `bin/mailstackd/src/queue.rs` — shutdown abort 不运行 ClaimGuard::Drop，依赖 CLAIM_TTL 释放 claim；重复投递风险已被收件人去重约束，本轮接受并记录
 - **[low]** `bin/mailstackd/src/lib.rs` — 非 Unix 目标下 lmtp 模块 cfg 缺失无法编译；项目目标平台为 Linux（README/CI 明确），接受
+- **[low]** `deploy/mailstack-manage.sh` — `update apply` 从 raw.githubusercontent.com 拉取 main 分支脚本执行（TLS + `bash -n` 校验，无签名/固定校验和）；后续可改为校验 Release tarball 的 SHA256SUMS，本轮记录接受
 - **[low]** `crates/core/src/atomic.rs` — atomic 与 locked 使用不同 lock sidecar 是刻意设计（避免嵌套死锁，已有 lock_sidecar_names_never_collide 测试），接受
 
 ## 4. 质量分
@@ -43,14 +56,14 @@
 
 ```text
 质量分 = max(0, 100 - 15*C_open - 8*H_open - 3*M_open - 1*L_open)
-C_open=0  H_open=0  M_open=2  L_open=2
-质量分 = 92
+C_open=0  H_open=0  M_open=2  L_open=3
+质量分 = 91
 结果：PASS（门槛 >= 90）
 ```
 
 ## 5. 结论
 
-- 本轮全量 OCR 复审 + 人工复核修复 13 项确认缺陷，无未修复 critical/high。
-- 质量分 **92/100**（≥90，达到提交门槛）。
+- 本轮全量 OCR 复审 + 人工复核修复 17 项确认缺陷，无未修复 critical/high。
+- 质量分 **91/100**（≥90，达到提交门槛）。
 - 残余风险：见第 3 节；均为已记录的架构性/平台性取舍，不影响 v1.0.0 发布。
 - 扫描结果原始 JSON：`work/ocr-final2.json`（本地工作副本，不随仓库发布）。

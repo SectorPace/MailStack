@@ -126,10 +126,16 @@ safe_rm_rf() {
     preal="$(realpath -m -- "$PREFIX_NORM")"
     case "$real" in "$preal"/*) : ;; *) die "路径不在前缀内：$real" ;; esac
   fi
-  if [ -e "$real" ] || [ -L "$real" ]; then
-    rm -rf -- "$real"
-    info "已删除：$real"
+  if [ -L "$target" ]; then
+    rm -f -- "$target" || warn "删除符号链接失败：$target"
+    info "已删除符号链接：$target"
+    return 0
   fi
+  if [ -e "$target" ]; then
+    rm -rf -- "$target" || warn "删除目录失败：$target"
+    info "已删除：$target"
+  fi
+  return 0
 }
 
 rm_file() {
@@ -154,7 +160,9 @@ verify_staging_prefix() {
 
 confirm_or_abort() {
   [ "$ASSUME_YES" -eq 1 ] && return 0
-  [ -t 0 ] || return 0
+  if [ ! -t 0 ]; then
+    die "非交互执行卸载需要显式 --yes（尤其 --purge）；已拒绝"
+  fi
   local answer=""
   printf '确认卸载 MailStack（前缀 %s%s）？[y/N] ' "${PREFIX_NORM:-/}" \
     "$([ "$PURGE" -eq 1 ] && echo '，删除配置与数据' || echo '，保留配置与数据')" >&2
