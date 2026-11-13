@@ -19,3 +19,4 @@ SHA256SUMS.sig
 /.idea/
 *.iml
 .vscode/
+.vs/

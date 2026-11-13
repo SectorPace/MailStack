@@ -16,17 +16,10 @@ const SERVICE_META: Record<string, {
     title: string;
     sub: string;
 }> = {
-    postfix: { title: "SMTP · Postfix", sub: "25 / 465 / 587" },
-    dovecot: { title: "IMAP / POP3 · Dovecot", sub: "143 / 993" },
-    opendkim: { title: "DKIM · OpenDKIM", sub: "signing & verification" },
-    fail2ban: { title: "Fail2ban", sub: "auth brute-force bans" },
-    rspamd: { title: "Rspamd", sub: "filtering & dkim signing" },
-    smtp: { title: "SMTP · Postfix", sub: "25 / 465 / 587" },
-    imap: { title: "IMAP / POP3 · Dovecot", sub: "143 / 993" },
-    lmtp: { title: "LMTP · Dovecot", sub: "local delivery" },
-    dkim: { title: "DKIM · Rspamd", sub: "signing & filters" },
-    webmail: { title: "Webmail", sub: "roundcube" },
-    admin: { title: "Admin Console", sub: "axum · admin-web" },
+    mailstackd: { title: "MailStack Core", sub: "SMTP 25/465/587 + 出站队列" },
+    "mailstack-imap": { title: "MailStack IMAP/POP3", sub: "143/993/110/995/4190" },
+    "mailstack-web": { title: "Admin Console API", sub: "127.0.0.1:8443" },
+    "mailstack-webmail": { title: "Webmail API", sub: "127.0.0.1:8444" },
 };
 const OP_KEY: Record<"stop" | "restart" | "start", DictKey> = { start: "start", stop: "stop", restart: "restart" };
 export default function Services() {

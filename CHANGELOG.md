@@ -37,6 +37,10 @@ All notable changes to the MailStack project are documented in this file.
 - **六种访问模式**：SSH 隧道（默认）、Caddy、nginx、公网 IP + ACME、独立面板域名
   （panel.example.com，强制与 mail/imap/smtp 域区分）、Cloudflare Tunnel；统一生成
   反向代理/Tunnel 配置并以 `install-args.conf` 为唯一状态源。
+- **管理后台服务状态误报修复**：服务页/健康状态/仪表盘原先仍按 Postfix、Dovecot、
+  OpenDKIM、Fail2ban、Rspamd、ClamAV 等旧组件判断，MailStack 原生部署下会显示
+  “部分服务异常”。现统一为 `mailstackd` / `mailstack-imap` / `mailstack-web` /
+  `mailstack-webmail` 四项原生服务，服务页、仪表盘、状态快照与进程监控同步更新。
 - **密码策略调整**：管理员与邮箱口令下限由 12 位调整为 **8 位**（上限 256 位不变，
   仍要求同时包含字母与数字、不得包含账号名/邮箱地址）；后端 `validate_mailbox_password`、
   部署脚本、前端提示与文档同步更新，并补充 8 位边界测试。

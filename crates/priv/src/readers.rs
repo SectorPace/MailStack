@@ -24,18 +24,13 @@ use crate::acme::{Acme, AcmeProbes};
 use crate::handlers::{HandlerError, Registry};
 use crate::users::{Users, UsersEnv};
 
-pub const WATCHED_SERVICES: &[&str] = &["postfix", "dovecot", "fail2ban"];
+pub const WATCHED_SERVICES: &[&str] = &["mailstackd", "mailstack-imap"];
 
 pub const SERVICES: &[(&str, &str)] = &[
-    ("postfix", "postfix"),
-    ("dovecot", "dovecot"),
-    ("opendkim", "opendkim"),
-    ("fail2ban", "fail2ban"),
+    ("mailstackd", "mailstackd"),
+    ("mailstack-imap", "mailstack-imap"),
     ("mailstack-web", "mailstack-web"),
     ("mailstack-webmail", "mailstack-webmail"),
-    ("rspamd", "rspamd"),
-    ("clamav", "clamav-daemon"),
-    ("redis", "redis-server"),
 ];
 
 pub const LOGS_DEFAULT_LINES: usize = 200;
@@ -1330,21 +1325,17 @@ impl Readers {
     }
 
     fn reload_after_restore(&self) {
-        for (unit, verb) in [
-            ("postfix", ServiceVerb::Reload),
-            ("dovecot", ServiceVerb::Reload),
-            ("opendkim", ServiceVerb::Restart),
-        ] {
+        for unit in ["mailstackd", "mailstack-imap"] {
             let outcome = mailstack_core::exec::service_ctl(
                 self.env.as_ref(),
                 self.runner.as_ref(),
                 unit,
-                verb,
+                ServiceVerb::Restart,
             );
             if !outcome.success() {
                 mailstack_core::warn::warn_with_detail(
                     "reload after restore",
-                    &format!("{unit} {} did not succeed", verb.as_str()),
+                    &format!("{unit} restart did not succeed"),
                 );
             }
         }
@@ -3617,7 +3608,7 @@ mod tests {
         let readers = f.readers_with_env(runner.clone(), systemd_env());
 
         let out = readers
-            .services_action(&json!({ "id": "dovecot", "verb": "restart" }))
+            .services_action(&json!({ "id": "mailstack-imap", "verb": "restart" }))
             .unwrap();
 
         let items = out.as_array().expect("必须是数组");
@@ -3628,7 +3619,7 @@ mod tests {
         assert_eq!(calls[0].0, "systemctl");
         assert_eq!(
             calls[0].1,
-            vec!["restart".to_string(), "dovecot".to_string()]
+            vec!["restart".to_string(), "mailstack-imap".to_string()]
         );
     }
 
@@ -3639,9 +3630,9 @@ mod tests {
         let readers = f.readers_with_env(runner.clone(), systemd_env());
 
         readers
-            .services_action(&json!({ "id": "clamav-daemon", "verb": "reload" }))
+            .services_action(&json!({ "id": "mailstack-imap", "verb": "reload" }))
             .unwrap();
-        assert_eq!(runner.calls()[0].1[1], "clamav-daemon");
+        assert_eq!(runner.calls()[0].1[1], "mailstack-imap");
     }
 
     #[test]
@@ -3679,7 +3670,7 @@ mod tests {
         assert!(err.to_string().contains("invalid service"), "实际: {err}");
 
         let err = readers
-            .services_action(&json!({ "id": "dovecot", "verb": "explode" }))
+            .services_action(&json!({ "id": "mailstack-imap", "verb": "explode" }))
             .unwrap_err();
         assert!(
             err.to_string().contains("invalid service verb"),
@@ -3699,7 +3690,7 @@ mod tests {
         let readers = f.readers_with_env(runner.clone(), systemd_env());
 
         let err = readers
-            .services_action(&json!({ "id": "dovecot" }))
+            .services_action(&json!({ "id": "mailstack-imap" }))
             .unwrap_err();
         assert!(
             err.to_string().contains("missing required field"),
@@ -3718,7 +3709,7 @@ mod tests {
         let readers = f.readers_with_env(runner, systemd_env());
 
         let err = readers
-            .services_action(&json!({ "id": "dovecot", "verb": "restart" }))
+            .services_action(&json!({ "id": "mailstack-imap", "verb": "restart" }))
             .unwrap_err();
         assert!(err.to_string().contains("exited with 1"), "实际: {err}");
     }
@@ -3743,7 +3734,7 @@ mod tests {
         let readers = f.readers_with_env(Arc::new(NoTimeoutRunner), systemd_env());
 
         let error = readers
-            .services_action(&json!({ "id": "dovecot", "verb": "restart" }))
+            .services_action(&json!({ "id": "mailstack-imap", "verb": "restart" }))
             .unwrap_err();
 
         assert!(
@@ -3759,7 +3750,7 @@ mod tests {
         let readers = f.readers_with_env(runner.clone(), systemd_env());
 
         let out = readers
-            .services_action(&json!({ "id": "dovecot", "verb": "status" }))
+            .services_action(&json!({ "id": "mailstack-imap", "verb": "status" }))
             .unwrap();
         assert!(out.is_array());
 
@@ -3883,7 +3874,7 @@ mod tests {
         let readers = f.readers(always_ok_runner());
 
         let out = readers
-            .services_action(&json!({ "key": "dovecot", "op": "status" }))
+            .services_action(&json!({ "key": "mailstack-imap", "op": "status" }))
             .unwrap();
         assert!(out.is_array(), "key/op 必须能被识别");
     }

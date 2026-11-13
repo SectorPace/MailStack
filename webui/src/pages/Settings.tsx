@@ -228,12 +228,10 @@ function MailTab() {
         });
     }, []);
     const NAME: Record<string, string> = {
-        smtp: "SMTP · Postfix",
-        imap: "IMAP / POP3 · Dovecot",
-        lmtp: "LMTP · Dovecot",
-        dkim: "DKIM · Rspamd",
-        webmail: "Webmail",
-        admin: "Admin Console",
+        mailstackd: "MailStack Core（SMTP + 队列）",
+        "mailstack-imap": "MailStack IMAP/POP3",
+        "mailstack-web": "Admin Console API",
+        "mailstack-webmail": "Webmail API",
     };
     return (<div className="space-y-5">
       <Group title={t("settings_mail")}>

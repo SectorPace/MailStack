@@ -40,11 +40,6 @@ type DnsRecord = {
     value?: string;
     ok?: boolean;
 };
-type ServiceRow = {
-    key?: string;
-    running?: boolean;
-    detail?: string;
-};
 type CheckState = boolean | null;
 function recordsCheck(records: DnsRecord[] | null, match: (r: DnsRecord) => boolean): CheckState {
     if (!records)
@@ -77,7 +72,6 @@ export default function Security() {
     const [scan, setScan] = useState<Scan | null>(null);
     const [scanErr, setScanErr] = useState<string | null>(null);
     const [dns, setDns] = useState<DnsRecord[] | null>(null);
-    const [services, setServices] = useState<ServiceRow[] | null>(null);
     const load = useCallback(() => {
         rpc<Scan>("security.scan").then((r) => {
             if (r.ok && r.data) {
@@ -88,7 +82,6 @@ export default function Security() {
                 setScanErr(r.error);
         });
         rpc<DnsRecord[]>("dns.records").then((r) => r.ok && setDns(Array.isArray(r.data) ? r.data : null));
-        rpc<ServiceRow[]>("services.list").then((r) => r.ok && setServices(Array.isArray(r.data) ? r.data : null));
     }, []);
     useEffect(() => {
         load();
@@ -115,7 +108,6 @@ export default function Security() {
     const spfMatch = (r: DnsRecord) => (r.value ?? "").trim().startsWith("v=spf1");
     const dmarcMatch = (r: DnsRecord) => (r.name ?? "").trim().startsWith("_dmarc.");
     const dkimMatch = (r: DnsRecord) => (r.name ?? "").includes("._domainkey.");
-    const f2b = services?.find((s) => s.key === "fail2ban" || s.key === "fail2ban-server");
     const rows: {
         label: string;
         state: CheckState;
@@ -124,7 +116,6 @@ export default function Security() {
         { label: "SPF", state: recordsCheck(dns, spfMatch), failed: failedOf(dns, spfMatch) },
         { label: "DMARC", state: recordsCheck(dns, dmarcMatch), failed: failedOf(dns, dmarcMatch) },
         { label: "DKIM", state: recordsCheck(dns, dkimMatch), failed: failedOf(dns, dkimMatch) },
-        { label: "fail2ban", state: f2b ? f2b.running === true : null, failed: 0 },
     ];
     return (<div className="p-4">
       <PageHeader title={t("security_title")} sub={t("security_sub")} right={<span className="badge badge-neutral">{t("last_scan")} · {lastScan ? formatDayTime(lastScan) : "—"}</span>}/>

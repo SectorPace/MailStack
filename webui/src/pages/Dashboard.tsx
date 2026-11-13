@@ -23,11 +23,6 @@ type SnapRaw = {
     queues?: {
         status?: string;
     }[];
-    services?: {
-        id?: string;
-        name?: string;
-        status?: string;
-    }[];
     queue?: {
         backlog?: number;
         corrupt?: number;
@@ -51,13 +46,16 @@ type SnapRaw = {
         successRate: number;
         ports: number[];
     };
-    dovecot?: {
-        running: boolean;
-        connections: number;
-        loggedIn: number;
-        successRate: number;
-        ports: number[];
-    };
+    services?: {
+        id?: string;
+        key?: string;
+        name?: string;
+        description?: string;
+        status?: string;
+        pid?: number;
+        memoryMb?: number;
+        uptime?: string;
+    }[];
     latency?: {
         points: ChartPoint[];
     };
@@ -128,20 +126,13 @@ type VM = {
             value?: number;
         }[];
     } | null;
-    smtp: {
+    services: {
+        id: string;
+        label: string;
         running: boolean;
-        connections: Num;
-        sentToday: Num;
-        successRate: Num;
-        ports: number[];
-    } | null;
-    dovecot: {
-        running: boolean;
-        connections: Num;
-        loggedIn: Num;
-        successRate: Num;
-        ports: number[];
-    } | null;
+        pid: number;
+        memoryMb: number;
+    }[];
     resources: {
         cpu: number;
         memory: number;
@@ -189,6 +180,26 @@ function buildVM(raw: SnapRaw, users: UserRow[], metrics: {
         const running = raw.services.filter((s) => s.status === "ACTIVE").length;
         dist = { total, running, alert: 0, offline: total - running };
     }
+    const native = (raw.services ?? []).filter((s) => {
+        const id = String(s.id ?? s.key ?? s.name ?? "");
+        return ["mailstackd", "mailstack-imap", "mailstack-web", "mailstack-webmail"].includes(id);
+    });
+    const services = native.map((s) => {
+        const id = String(s.id ?? s.key ?? s.name ?? "");
+        const labels: Record<string, string> = {
+            mailstackd: "MailStack Core",
+            "mailstack-imap": "IMAP/POP3",
+            "mailstack-web": "Admin API",
+            "mailstack-webmail": "Webmail",
+        };
+        return {
+            id,
+            label: labels[id] ?? id,
+            running: s.status === "ACTIVE",
+            pid: typeof s.pid === "number" ? s.pid : 0,
+            memoryMb: typeof s.memoryMb === "number" ? s.memoryMb : 0,
+        };
+    });
     return {
         domains,
         users: usersVm,
@@ -196,8 +207,7 @@ function buildVM(raw: SnapRaw, users: UserRow[], metrics: {
         latency: raw.latency?.points ?? [],
         dist: dist ?? { total: 0, running: 0, alert: 0, offline: 0 },
         healthPanel: raw.healthPanel ?? null,
-        smtp: raw.smtp ? { running: raw.smtp.running, connections: raw.smtp.connections, sentToday: raw.smtp.sentToday, successRate: raw.smtp.successRate, ports: raw.smtp.ports } : null,
-        dovecot: raw.dovecot ? { running: raw.dovecot.running, connections: raw.dovecot.connections, loggedIn: raw.dovecot.loggedIn, successRate: raw.dovecot.successRate, ports: raw.dovecot.ports } : null,
+        services,
         resources: raw.resources ?? metrics,
     };
 }
@@ -415,16 +425,21 @@ export default function Dashboard() {
         </div>
 
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
-          {vm.smtp ? (<ServiceCard title={t("smtp_service")} running={vm.smtp.running} rows={[
-                [t("connections"), nz(vm.smtp.connections)],
-                [t("sent_today"), nz(vm.smtp.sentToday)],
-                [t("success_rate"), vm.smtp.successRate == null ? "—" : `${vm.smtp.successRate}%`],
-            ]} ports={vm.smtp.ports}/>) : (<UnavailableCard title={t("smtp_service")}/>)}
-          {vm.dovecot ? (<ServiceCard title={t("dovecot_service")} running={vm.dovecot.running} rows={[
-                [t("connections"), nz(vm.dovecot.connections)],
-                [t("logged_in_users"), nz(vm.dovecot.loggedIn)],
-                [t("success_rate"), vm.dovecot.successRate == null ? "—" : `${vm.dovecot.successRate}%`],
-            ]} ports={vm.dovecot.ports}/>) : (<UnavailableCard title={t("dovecot_service")}/>)}
+          <Card>
+            <div className="mb-2 flex items-center justify-between">
+              <h2 className="text-[13.5px] font-semibold text-[var(--text-1)]">{t("services_title")}</h2>
+              <StatusBadge kind={vm.services.length === 0 ? "neutral" : vm.services.every((s) => s.running) ? "ok" : "err"} label={vm.services.length === 0 ? "—" : vm.services.every((s) => s.running) ? t("running_normal") : t("system_degraded")}/>
+            </div>
+            {vm.services.length ? (<div className="space-y-2">
+                {vm.services.map((s) => (<div key={s.id} className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate font-medium text-[var(--text-1)]" style={{ fontSize: "var(--font-body)" }}>{s.label}</div>
+                      <div className="mono truncate" style={{ fontSize: "var(--font-caption)", color: "var(--text-3)" }}>{s.id} · {s.pid ? `pid ${s.pid}` : "stopped"} · {s.memoryMb.toFixed(1)} MB</div>
+                    </div>
+                    <StatusBadge kind={s.running ? "ok" : "err"} label={s.running ? t("running") : t("stopped")}/>
+                  </div>))}
+              </div>) : (<div className="flex h-[150px] items-center justify-center text-[12px] text-[var(--text-3)]">—</div>)}
+          </Card>
           <Card>
             <div className="mb-1 flex items-center justify-between">
               <h2 className="text-[13.5px] font-semibold text-[var(--text-1)]">{t("delivery_latency")}</h2>
@@ -609,42 +624,4 @@ function QueueBar({ label, n, total, cls }: {
       </div>
       <span className="tnum w-11 shrink-0 text-right text-[var(--text-3)]">{pct == null ? "—" : `${pct}%`}</span>
     </div>);
-}
-function UnavailableCard({ title }: {
-    title: string;
-}) {
-    return (<Card>
-      <div className="mb-2.5 flex items-center justify-between">
-        <h2 className="text-[13.5px] font-semibold text-[var(--text-1)]">{title}</h2>
-        <StatusBadge kind="neutral" label="—"/>
-      </div>
-      <div className="flex h-[104px] items-center justify-center text-[12px] text-[var(--text-3)]">—</div>
-    </Card>);
-}
-function ServiceCard({ title, running, rows, ports, }: {
-    title: string;
-    running: boolean;
-    rows: [
-        string,
-        string
-    ][];
-    ports: number[];
-}) {
-    const { t } = useSettings();
-    return (<Card>
-      <div className="mb-2.5 flex items-center justify-between">
-        <h2 className="text-[13.5px] font-semibold text-[var(--text-1)]">{title}</h2>
-        <StatusBadge kind={running ? "ok" : "err"} label={running ? t("running") : t("stopped")}/>
-      </div>
-      <div className="space-y-2">
-        {rows.map(([k, v]) => (<div key={k} className="flex items-center justify-between text-[12.5px]">
-            <span className="text-[var(--text-2)]">{k}</span>
-            <span className="tnum font-medium text-[var(--text-1)]">{v}</span>
-          </div>))}
-        <div className="flex items-center justify-between text-[12.5px]">
-          <span className="text-[var(--text-2)]">{t("port")}</span>
-          <span className="tnum font-medium text-[var(--text-1)]">{ports.length ? ports.join(" / ") : "—"}</span>
-        </div>
-      </div>
-    </Card>);
 }

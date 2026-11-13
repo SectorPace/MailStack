@@ -31,51 +31,17 @@ const QUEUE_REFRESH_MS: i64 = 60_000;
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 const DAEMON_ORDER: &[&str] = &[
-    "postfix",
-    "dovecot",
-    "opendkim",
+    "mailstackd",
+    "mailstack-imap",
     "mailstack-web",
     "mailstack-webmail",
-    "fail2ban",
 ];
 
 const COMM_TO_DAEMON: &[(&str, &str)] = &[
-    ("master", "postfix"),
-    ("pickup", "postfix"),
-    ("qmgr", "postfix"),
-    ("cleanup", "postfix"),
-    ("smtpd", "postfix"),
-    ("smtp", "postfix"),
-    ("showq", "postfix"),
-    ("flush", "postfix"),
-    ("local", "postfix"),
-    ("virtual", "postfix"),
-    ("pipe", "postfix"),
-    ("bounce", "postfix"),
-    ("defer", "postfix"),
-    ("trace", "postfix"),
-    ("verify", "postfix"),
-    ("scache", "postfix"),
-    ("proxymap", "postfix"),
-    ("tlsmgr", "postfix"),
-    ("postscreen", "postfix"),
-    ("dnsblog", "postfix"),
-    ("trivial-rewrite", "postfix"),
-    ("dovecot", "dovecot"),
-    ("doveadm", "dovecot"),
-    ("dsync", "dovecot"),
-    ("director", "dovecot"),
-    ("anvil", "dovecot"),
-    ("auth", "dovecot"),
-    ("imap", "dovecot"),
-    ("imap-login", "dovecot"),
-    ("pop3", "dovecot"),
-    ("pop3-login", "dovecot"),
-    ("managesieve", "dovecot"),
-    ("managesieve-login", "dovecot"),
-    ("opendkim", "opendkim"),
-    ("fail2ban", "fail2ban"),
-    ("fail2ban-server", "fail2ban"),
+    ("mailstackd", "mailstackd"),
+    ("mailstack-imap", "mailstack-imap"),
+    ("mailstack-webmail", "mailstack-webmail"),
+    ("mailstack-webmai", "mailstack-webmail"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -945,18 +911,19 @@ mod tests {
     fn daemons_come_from_proc_comm_and_an_absent_one_stays_stopped() {
         let f = Fixture::new("daemons");
         base_proc(&f);
-        f.write("100/comm", "qmgr\n");
+        f.write("100/comm", "mailstackd\n");
         f.write("100/statm", "500 100 0 0 0 0 0\n");
-        f.write("101/comm", "dovecot\n");
+        f.write("101/comm", "mailstack-imap\n");
         f.write("101/statm", "500 256 0 0 0 0 0\n");
         f.write("102/comm", "bash\n");
         f.write("103/comm", "node\n");
+        f.write("4242/comm", "mailstack-web\n");
         f.write("4242/statm", "1 512 0 0 0 0 0\n");
 
         let c = collector(&f, FakeRunner::new("", ""), clock(0).1);
         let body = c.telemetry(None);
         let daemons = body["current"]["daemons"].as_array().unwrap();
-        assert_eq!(daemons.len(), 6, "六个槽位恒在，缺席的也不许消失");
+        assert_eq!(daemons.len(), 4, "四个槽位恒在，缺席的也不许消失");
 
         let by_id = |id: &str| {
             daemons
@@ -965,20 +932,18 @@ mod tests {
                 .unwrap_or_else(|| panic!("缺少守护进程 {id}"))
                 .clone()
         };
-        assert_eq!(by_id("postfix")["status"], "ACTIVE");
-        assert_eq!(by_id("postfix")["pid"], 100);
-        assert_eq!(by_id("postfix")["memoryMb"], 0.4);
-        assert_eq!(by_id("dovecot")["status"], "ACTIVE");
-        assert_eq!(by_id("dovecot")["pid"], 101);
-        assert_eq!(by_id("opendkim")["status"], "STOPPED");
-        assert_eq!(by_id("opendkim")["pid"], 0);
+        assert_eq!(by_id("mailstackd")["status"], "ACTIVE");
+        assert_eq!(by_id("mailstackd")["pid"], 100);
+        assert_eq!(by_id("mailstackd")["memoryMb"], 0.4);
+        assert_eq!(by_id("mailstack-imap")["status"], "ACTIVE");
+        assert_eq!(by_id("mailstack-imap")["pid"], 101);
         assert_eq!(by_id("mailstack-web")["status"], "ACTIVE");
         assert_eq!(by_id("mailstack-web")["pid"], 4242);
         assert_eq!(by_id("mailstack-web")["memoryMb"], 2.0);
         assert_eq!(by_id("mailstack-webmail")["status"], "STOPPED");
-        assert_eq!(by_id("fail2ban")["status"], "STOPPED");
+        assert_eq!(by_id("mailstack-webmail")["pid"], 0);
 
-        assert_eq!(by_id("postfix")["cpuPercent"], 0.0);
+        assert_eq!(by_id("mailstackd")["cpuPercent"], 0.0);
         assert_eq!(body["current"]["totalDaemonMemoryMb"], 3.4);
     }
 
@@ -986,23 +951,23 @@ mod tests {
     fn several_processes_of_one_daemon_are_summed() {
         let f = Fixture::new("summing");
         base_proc(&f);
-        f.write("100/comm", "qmgr\n");
+        f.write("100/comm", "mailstackd\n");
         f.write("100/statm", "500 100 0 0 0 0 0\n");
-        f.write("104/comm", "pickup\n");
+        f.write("104/comm", "mailstackd\n");
         f.write("104/statm", "500 256 0 0 0 0 0\n");
 
         let c = collector(&f, FakeRunner::new("", ""), clock(0).1);
         let body = c.telemetry(None);
-        let postfix = body["current"]["daemons"]
+        let daemon = body["current"]["daemons"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|d| d["id"] == "postfix")
+            .find(|d| d["id"] == "mailstackd")
             .unwrap()
             .clone();
-        assert_eq!(postfix["memoryMb"], 1.4, "同一守护进程的多个进程要相加");
+        assert_eq!(daemon["memoryMb"], 1.4, "同一守护进程的多个进程要相加");
         assert_ne!(
-            postfix["pid"], 0,
+            daemon["pid"], 0,
             "pid 取第一个被看到的进程（顺序不定，但必须有）"
         );
     }
