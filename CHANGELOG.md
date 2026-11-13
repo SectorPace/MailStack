@@ -37,6 +37,12 @@ All notable changes to the MailStack project are documented in this file.
 - **六种访问模式**：SSH 隧道（默认）、Caddy、nginx、公网 IP + ACME、独立面板域名
   （panel.example.com，强制与 mail/imap/smtp 域区分）、Cloudflare Tunnel；统一生成
   反向代理/Tunnel 配置并以 `install-args.conf` 为唯一状态源。
+- **仪表盘数据与 Webmail 修复**：
+  - 仪表盘补齐邮件延迟（出站投递延迟采样）、队列统计（待处理/发送中/失败/已投递/退信/扣留）
+    与系统健康面板（服务、队列、TLS、域名综合健康度）。
+  - Webmail 修复邮件打开后不标记已读（PATCH flags 请求体格式错误）、外部图片/链接点击无反应
+    （iframe sandbox 放行弹出新标签）、阅读器内链接统一 target=_blank。
+  - 设置页二级菜单补齐与侧边栏一致的毛玻璃效果；修复命令面板弹窗定位偏移/显示不全。
 - **管理后台服务状态误报修复**：服务页/健康状态/仪表盘原先仍按 Postfix、Dovecot、
   OpenDKIM、Fail2ban、Rspamd、ClamAV 等旧组件判断，MailStack 原生部署下会显示
   “部分服务异常”。现统一为 `mailstackd` / `mailstack-imap` / `mailstack-web` /

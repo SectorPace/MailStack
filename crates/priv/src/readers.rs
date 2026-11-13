@@ -567,9 +567,27 @@ impl Readers {
                 0
             });
 
+        let now = self.now();
+        let deferred = entries
+            .iter()
+            .filter(|entry| entry.next_attempt_unix > now)
+            .count();
+        let active = entries.len().saturating_sub(deferred);
+        let failed = entries
+            .iter()
+            .filter(|entry| entry.last_error.is_some())
+            .count();
+        let traffic = store.load_traffic().unwrap_or_default();
+
         json!({
             "backlog": entries.len(),
             "corrupt": corrupt,
+            "pending": deferred,
+            "sending": active,
+            "failed": failed,
+            "delivered": traffic.delivered_total,
+            "bounced": traffic.bounced_total,
+            "hold": corrupt,
             "relayHost": relay,
             "outboundHealth": {
                 "consecutiveFailures": health.consecutive_failures,
@@ -605,6 +623,16 @@ impl Readers {
 
         let setup = mailstack_core::config::read_setup_config(&self.paths);
         let admin = mailstack_core::config::admin_public(&self.paths);
+        let services = self.service_items();
+        let queue = self.queue_summary();
+        let certificate_list =
+            mailstack_core::certs::list_certificates(&self.paths.etc, self.now_dt())
+                .into_iter()
+                .map(certificate_to_json)
+                .collect::<Vec<_>>();
+        let traffic = self.queue().load_traffic().unwrap_or_default();
+        let latency = latency_points_json(&traffic.latency, self.now());
+        let health_panel = dashboard_health_panel(&services, &queue, &certificate_list, &domains);
 
         Ok(json!({
             "ok": true,
@@ -618,13 +646,12 @@ impl Readers {
             },
             "domains": domains,
             "aliases": aliases,
-            "queue": self.queue_summary(),
+            "queue": queue,
             "queues": self.queue_items(),
-            "certificates": mailstack_core::certs::list_certificates(&self.paths.etc, self.now_dt())
-                .into_iter()
-                .map(certificate_to_json)
-                .collect::<Vec<_>>(),
-            "services": self.service_items(),
+            "certificates": certificate_list,
+            "services": services,
+            "latency": { "range": "24h", "points": latency },
+            "healthPanel": health_panel,
 
             "unavailable": Vec::<String>::new(),
         }))
@@ -2451,6 +2478,82 @@ pub const EXPIRY_WARNING_DAYS: i64 = 14;
 
 fn check(name: &str, ok: bool, detail: impl Into<String>) -> Value {
     json!({ "name": name, "ok": ok, "detail": detail.into() })
+}
+
+fn dashboard_health_panel(
+    services: &[Value],
+    queue: &Value,
+    certificates: &[Value],
+    domains: &[Value],
+) -> Value {
+    let mut items: Vec<Value> = Vec::new();
+    for id in [
+        "mailstackd",
+        "mailstack-imap",
+        "mailstack-web",
+        "mailstack-webmail",
+    ] {
+        let active = services
+            .iter()
+            .any(|service| service["id"] == id && service["status"] == "ACTIVE");
+        items.push(json!({
+            "key": id,
+            "status": if active { "ok" } else { "err" },
+        }));
+    }
+    let backlog = queue["backlog"].as_u64().unwrap_or(0);
+    let blocked = queue["outboundHealth"]["blocked"]
+        .as_bool()
+        .unwrap_or(false);
+    items.push(json!({
+        "key": "queue",
+        "status": if backlog == 0 && !blocked { "ok" } else { "err" },
+    }));
+    let certs_ok = !certificates.is_empty()
+        && certificates.iter().all(|cert| {
+            cert["daysUntilExpiry"]
+                .as_i64()
+                .map(|days| days > 0)
+                .unwrap_or(false)
+        });
+    items.push(json!({
+        "key": "tls",
+        "status": if certs_ok { "ok" } else { "err" },
+    }));
+    items.push(json!({
+        "key": "domain",
+        "status": if domains.is_empty() { "err" } else { "ok" },
+    }));
+    let ok_count = items.iter().filter(|item| item["status"] == "ok").count();
+    let overall = (ok_count * 100 / items.len().max(1)) as u64;
+    json!({ "overall": overall, "items": items })
+}
+
+fn latency_points_json(samples: &[mailstack_queue::LatencySample], now: i64) -> Vec<Value> {
+    use std::collections::BTreeMap;
+
+    const RANGE_SECONDS: i64 = 24 * 3600;
+    let start = now - RANGE_SECONDS;
+    let mut buckets: BTreeMap<i64, (u64, u64)> = BTreeMap::new();
+    for sample in samples.iter().filter(|sample| sample.at >= start) {
+        let hour = sample.at.div_euclid(3600) * 3600;
+        let entry = buckets.entry(hour).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(sample.ms);
+        entry.1 = entry.1.saturating_add(1);
+    }
+    buckets
+        .into_iter()
+        .map(|(hour, (total_ms, count))| {
+            let stamp = time::OffsetDateTime::from_unix_timestamp(hour)
+                .map(|dt| format!("{:02}:00", dt.hour()))
+                .unwrap_or_default();
+            let seconds = (total_ms as f64 / count.max(1) as f64) / 1000.0;
+            json!({
+                "t": stamp,
+                "v": (seconds * 10.0).round() / 10.0,
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn certificate_to_json(info: mailstack_core::certs::CertificateInfo) -> Value {

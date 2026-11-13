@@ -215,7 +215,7 @@ export async function getMessage(folder: string, uid: number, opts?: {
 export async function patchFlags(folder: string, uid: number, patch: FlagsPatch): Promise<string[]> {
     const payload = await request<{
         flags?: string[];
-    }>("PATCH", `/messages/${folderPath(folder)}/${uid}`, { flags: patch });
+    }>("PATCH", `/messages/${folderPath(folder)}/${uid}`, patch);
     return Array.isArray(payload?.flags) ? payload.flags : [];
 }
 export async function moveMessage(folder: string, uid: number, to: string, copy = false): Promise<{

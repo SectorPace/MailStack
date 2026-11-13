@@ -60,7 +60,7 @@ export default function Settings() {
 
       <RTabs.Root value={tab} onValueChange={setTab} orientation="vertical" className="grid grid-cols-1 items-start gap-5 lg:grid-cols-[224px_minmax(0,1fr)]">
 
-        <RTabs.List aria-label="settings sections" className="flex flex-col gap-4 lg:sticky lg:top-0">
+        <RTabs.List aria-label="settings sections" className="glass--sidebar edge-lens flex flex-col gap-4 rounded-[var(--r-sidebar)] p-2 lg:sticky lg:top-0">
           {NAV_GROUPS.map((g) => (<div key={g.id}>
               <div className="mb-1 px-2.5" style={{ fontSize: "var(--font-caption)", color: "var(--text-3)" }}>
                 {t(g.labelKey)}

@@ -22,7 +22,7 @@ pub use runner::{
 pub use signing::{
     DkimSigner, MessageSigner, SigningOutcome, SigningTransport, SIGNING_FAILURE_KIND,
 };
-pub use store::{OutboundHealthState, QueueStore};
+pub use store::{LatencySample, OutboundHealthState, QueueStore, TrafficMetrics};
 
 pub use mailstack_smtp::OutboundRoute;
 

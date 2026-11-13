@@ -17,6 +17,24 @@ pub const MAX_CORRUPT_FILES: usize = 200;
 
 pub const CLAIM_TTL_SECONDS: i64 = 900;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatencySample {
+    pub at: i64,
+    pub ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrafficMetrics {
+    #[serde(rename = "deliveredTotal", default)]
+    pub delivered_total: u64,
+    #[serde(rename = "bouncedTotal", default)]
+    pub bounced_total: u64,
+    #[serde(default)]
+    pub latency: Vec<LatencySample>,
+}
+
+pub const MAX_LATENCY_SAMPLES: usize = 500;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundHealthState {
     #[serde(rename = "consecutiveFailures", default)]
@@ -454,6 +472,49 @@ impl QueueStore {
     pub fn save_health(&self, state: &OutboundHealthState) -> QueueResult<()> {
         let payload = serde_json::to_vec_pretty(state)?;
         atomic_as(&self.health_path(), &payload, QUEUE_FILE_MODE, None)?;
+        Ok(())
+    }
+
+    fn traffic_path(&self) -> PathBuf {
+        self.root.join("traffic-metrics.json")
+    }
+
+    pub fn load_traffic(&self) -> QueueResult<TrafficMetrics> {
+        let path = self.traffic_path();
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(TrafficMetrics::default())
+            }
+            Err(error) => return Err(QueueError::io(&path, error)),
+        };
+        Ok(serde_json::from_str(&raw).unwrap_or_default())
+    }
+
+    pub fn record_delivery(
+        &self,
+        delivered: usize,
+        bounced: usize,
+        latency_ms: Option<u64>,
+    ) -> QueueResult<()> {
+        if delivered == 0 && bounced == 0 {
+            return Ok(());
+        }
+        let mut traffic = self.load_traffic()?;
+        traffic.delivered_total = traffic.delivered_total.saturating_add(delivered as u64);
+        traffic.bounced_total = traffic.bounced_total.saturating_add(bounced as u64);
+        if let Some(ms) = latency_ms {
+            traffic.latency.push(LatencySample {
+                at: time::OffsetDateTime::now_utc().unix_timestamp(),
+                ms,
+            });
+            if traffic.latency.len() > MAX_LATENCY_SAMPLES {
+                let keep_from = traffic.latency.len() - MAX_LATENCY_SAMPLES;
+                traffic.latency.drain(..keep_from);
+            }
+        }
+        let payload = serde_json::to_vec_pretty(&traffic)?;
+        atomic_as(&self.traffic_path(), &payload, QUEUE_FILE_MODE, None)?;
         Ok(())
     }
 

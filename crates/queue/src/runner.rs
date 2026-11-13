@@ -442,6 +442,23 @@ impl QueueRunner {
 
         self.flush_bounces(&mut entry, &mut outcome, pending_bounces, now_unix)?;
 
+        let latency_ms = if outcome.delivered > 0 {
+            time::OffsetDateTime::parse(
+                &entry.created_at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .ok()
+            .map(|created| ((now_unix - created.unix_timestamp()).max(0) as u64) * 1000)
+        } else {
+            None
+        };
+        if let Err(error) =
+            self.store
+                .record_delivery(outcome.delivered, outcome.bounced, latency_ms)
+        {
+            mailstack_core::warn::warn_with_detail("queue traffic metrics", &error.to_string());
+        }
+
         Ok(outcome)
     }
 

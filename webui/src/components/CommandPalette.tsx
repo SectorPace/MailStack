@@ -80,7 +80,16 @@ export function CommandPalette({ open, onOpenChange, nav, }: {
       <RDialog.Portal>
         <RDialog.Overlay className="radix-overlay"/>
 
-        <RDialog.Content className="glass--clear radix-dialog edge-lens" data-chrome={true} style={{ width: "min(560px, calc(100vw - 48px))", top: "15%", padding: 0 }} onKeyDown={onKeyDown}>
+        <RDialog.Content className="glass--clear radix-dialog command-palette edge-lens" data-chrome={true} style={{
+            width: "min(620px, calc(100vw - 40px))",
+            top: "12vh",
+            transform: "translateX(-50%)",
+            maxHeight: "min(72vh, 560px)",
+            display: "flex",
+            flexDirection: "column",
+            padding: 0,
+            overflow: "hidden",
+        }} onKeyDown={onKeyDown}>
           <RDialog.Title className="sr-only">Command palette</RDialog.Title>
           <div className="flex items-center gap-3 border-b px-4" style={{ borderColor: "var(--hairline)", height: 56 }}>
             <IconSearch size={18} className="shrink-0 text-[var(--text-3)]"/>
@@ -90,7 +99,7 @@ export function CommandPalette({ open, onOpenChange, nav, }: {
         }} placeholder={t("search_placeholder")} className="h-full min-w-0 flex-1 bg-transparent text-[15px] text-[var(--text-1)] outline-none placeholder:text-[var(--text-3)]"/>
             <span className="kbd">esc</span>
           </div>
-          <div className="max-h-[340px] overflow-y-auto p-1.5">
+          <div className="max-h-[min(50vh,360px)] overflow-y-auto p-1.5" style={{ minHeight: 0 }}>
             {items.length === 0 && (<div className="px-3 py-8 text-center text-[13px] text-[var(--text-3)]">{t("no_data")}</div>)}
             {groups.map((g) => (<div key={g.label}>
                 <div className="px-2.5 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-[0.07em] text-[var(--text-3)]">

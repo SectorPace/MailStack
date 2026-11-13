@@ -492,7 +492,7 @@ fn sanitize_attributes(
                 if let Some(url) = safe_link_url(&decoded) {
                     out.push_str(" href=\"");
                     out.push_str(&escape_attribute(&url));
-                    out.push('"');
+                    out.push_str("\" target=\"_blank\" rel=\"noopener noreferrer\"");
                 }
             }
             (_, "href") | (_, "src") => {}

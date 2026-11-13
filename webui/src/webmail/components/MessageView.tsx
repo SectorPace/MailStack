@@ -293,7 +293,7 @@ export function MessageView({ folder, uid, moveTargets, canArchive, showBack, ac
         </div>)}
 
       <div className="mail-reader-body">
-        {readerDoc ? (<iframe className="mail-reader-frame" title={subject} sandbox="" referrerPolicy="no-referrer" srcDoc={readerDoc}/>) : (<div className="mail-reader-text-wrap">
+        {readerDoc ? (<iframe className="mail-reader-frame" title={subject} sandbox="allow-popups allow-popups-to-escape-sandbox allow-downloads" referrerPolicy="no-referrer" srcDoc={readerDoc}/>) : (<div className="mail-reader-text-wrap">
             {quoted ? (<>
                 <pre className="mail-reader-text">{quoted.head}</pre>
                 {quoted.quote && (<details className="mail-quote">

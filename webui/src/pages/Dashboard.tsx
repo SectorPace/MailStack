@@ -569,9 +569,13 @@ export default function Dashboard() {
 }
 function dictItemLabel(key: string, t: (k: DictKey) => string): string {
     switch (key) {
-        case "smtp": return "SMTP";
-        case "dovecot": return "Dovecot";
+        case "mailstackd": return "MailStack Core";
+        case "mailstack-imap": return "IMAP/POP3";
+        case "mailstack-web": return "Admin API";
+        case "mailstack-webmail": return "Webmail";
         case "queue": return t("queue_label");
+        case "tls": return "TLS";
+        case "domain": return t("nav_domains");
         case "database": return t("database_label");
         case "disk": return t("disk_label");
         default: return key;
