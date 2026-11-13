@@ -1351,7 +1351,7 @@ read_account_password() {
   [ -t 0 ] || die "未提供口令：用 --password-stdin（推荐）或 --password"
   local first=""
   local second=""
-  printf '邮箱口令（12-256 位，含字母与数字）: ' >&2
+  printf '邮箱口令（8-256 位，含字母与数字）: ' >&2
   IFS= read -r -s first || first=""
   printf '\n再次输入: ' >&2
   IFS= read -r -s second || second=""
@@ -1365,7 +1365,7 @@ precheck_password() {
   local email="$2"
   local plen=${#password}
   printf '%s' "$password" | LC_ALL=C grep -q '[[:cntrl:]]' && die "口令不得包含控制字符"
-  [ "$plen" -ge 12 ] && [ "$plen" -le 256 ] || die "口令长度必须 12-256（实际 $plen）"
+  [ "$plen" -ge 8 ] && [ "$plen" -le 256 ] || die "口令长度必须 8-256（实际 $plen）"
   printf '%s' "$password" | grep -q '[A-Za-z]' || die "口令必须包含字母"
   printf '%s' "$password" | grep -q '[0-9]' || die "口令必须包含数字"
   local localpart="${email%%@*}"
@@ -1869,7 +1869,7 @@ for f in (d.get("findings") or [])[:10]:
       local pass
       pass="$(read_account_password "$password_arg" "$stdin_flag")"
       local plen=${#pass}
-      [ "$plen" -ge 12 ] && [ "$plen" -le 256 ] || die "口令长度必须 12-256"
+      [ "$plen" -ge 8 ] && [ "$plen" -le 256 ] || die "口令长度必须 8-256"
       printf '%s' "$pass" | grep -q '[A-Za-z]' && printf '%s' "$pass" | grep -q '[0-9]' \
         || die "口令必须同时包含字母与数字"
       say "重设管理员口令"

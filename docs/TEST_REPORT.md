@@ -7,7 +7,7 @@
 >
 > | 指标 | 实测值 |
 > |---|---|
-> | `cargo test --workspace --all-targets` | **1647 passed / 0 failed**（AI 功能移除后减少 55 项） |
+> | `cargo test --workspace --all-targets` | **1648 passed / 0 failed**（AI 功能移除后减少 55 项） |
 > | 前端 `npm test`（vitest，`webui/`） | **187 passed / 0 failed** |
 > | `cargo fmt --all -- --check` | 通过 |
 > | `cargo clippy --workspace --all-targets -- -D warnings` | 通过 |

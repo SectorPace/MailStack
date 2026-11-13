@@ -145,7 +145,7 @@ MailStack v1.0.0 安装向导
 邮件主域名（例 example.com，必填）: example.com
 邮件主机名 [mail.example.com]:            ← 回车默认
 管理员用户名 [admin]:                      ← 回车默认
-管理员口令（12-256 位，含字母与数字）: ******
+管理员口令（8-256 位，含字母与数字）: ******
 再次输入: ******
 管理台端口 [8443]:      Webmail 端口 [8444]:     安装 IMAP/POP3/ManageSieve? [Y/n]:
 访问模式:  1) ssh（默认，回环+SSH 隧道）  2) caddy（自动 HTTPS）
@@ -427,7 +427,7 @@ v1.0.0 发布门禁实测（Ubuntu 26.04 / WSL2 + Rust 1.98.1，2026-11-03）：
 
 | 指标 | 实测值 |
 |---|---|
-| `cargo test --workspace --all-targets` | **1647 通过 / 0 失败**（含真实 TLS/TCP/unix socket 集成测试；AI 功能移除后减少 55 项） |
+| `cargo test --workspace --all-targets` | **1648 通过 / 0 失败**（含真实 TLS/TCP/unix socket 集成测试；AI 功能移除后减少 55 项） |
 | 前端 `npm test`（vitest） | **187 通过 / 0 失败** |
 | 特权动作白名单 | **52 条**（只读 20 + 变更 32；AI 功能已移除） |
 | HTTP 契约路由 | **62 条**（含 2 条免认证；AI 路由已移除） |

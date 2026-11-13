@@ -73,7 +73,7 @@ printf '%s\n' "$MAILSTACK_ADMIN_PASSWORD" | sudo bash /tmp/mailstack-install.sh 
   --non-interactive --domain mail.example.com --admin-password-stdin
 ```
 
-口令策略：12–256 位、同时含字母与数字（与后端 `validate_mailbox_password` 的账号口令策略一致）。
+口令策略：8–256 位、同时含字母与数字（与后端 `validate_mailbox_password` 的账号口令策略一致）。
 
 ### 3.2 直接一行
 
@@ -96,7 +96,7 @@ curl -fsSL https://raw.githubusercontent.com/SectorPace/MailStack/main/deploy/in
 | `--domain DOMAIN` | 主邮件域名（非交互模式必填） |
 | `--mail-host HOST` | 邮件主机名/MX（缺省由域名推导） |
 | `--admin-user NAME` | 管理员用户名（默认 `admin`） |
-| `--admin-password-stdin` | 从 stdin 读取管理员口令（12–256 位，含字母+数字，与后端口令策略一致） |
+| `--admin-password-stdin` | 从 stdin 读取管理员口令（8–256 位，含字母+数字，与后端口令策略一致） |
 | `--admin-port PORT` | 管理台内部端口（默认 `8443`） |
 | `--webmail-port PORT` | Webmail 内部端口（默认 `8444`） |
 | `--imap yes\|no` | 是否安装/启用 IMAP/POP3 服务（默认 `yes`；也接受 `true/false/enable/disable`） |

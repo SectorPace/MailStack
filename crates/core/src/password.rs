@@ -1,7 +1,7 @@
 use crate::error::{CoreError, CoreResult};
 use crate::validate::ADMIN_RE;
 
-pub const MIN_PASSWORD_LENGTH: usize = 12;
+pub const MIN_PASSWORD_LENGTH: usize = 8;
 pub const MAX_PASSWORD_LENGTH: usize = 256;
 
 pub const PBKDF2_ITERATIONS: u32 = 310_000;
@@ -318,9 +318,18 @@ mod tests {
     }
 
     #[test]
+    fn eight_character_passwords_are_accepted() {
+        validate_mailbox_password("a1b2c3d4", ["admin"]).unwrap();
+        assert!(validate_mailbox_password("a1b2c3d", ["admin"]).is_err());
+    }
+
+    #[test]
     fn rejects_too_short_and_too_long() {
         let err = validate_mailbox_password("Sh0rt1", std::iter::empty::<&str>()).unwrap_err();
-        assert_eq!(err.to_string(), "password must contain 12-256 characters");
+        assert_eq!(
+            err.to_string(),
+            format!("password must contain {MIN_PASSWORD_LENGTH}-{MAX_PASSWORD_LENGTH} characters")
+        );
         let long = format!("a1{}", "x".repeat(300));
         assert!(validate_mailbox_password(&long, std::iter::empty::<&str>()).is_err());
     }

@@ -173,7 +173,7 @@ Install source: 1) GitHub Release (default, SHA256 verified)  2) local/URL archi
 Primary mail domain: example.com
 Mail host [mail.example.com]:
 Admin user [admin]:
-Admin password (12-256 chars, letters + digits): ******
+Admin password (8-256 chars, letters + digits): ******
 Repeat password: ******
 Admin port [8443]:   Webmail port [8444]:   Install IMAP/POP3/ManageSieve? [Y/n]:
 Access mode: 1) ssh (default, loopback + SSH tunnel)  2) caddy (automatic HTTPS)
@@ -453,7 +453,7 @@ Measured at the v1.0.0 release gate (Ubuntu 26.04 / WSL2 + Rust 1.98.1, 2026-11-
 
 | Metric | Measured |
 |---|---|
-| `cargo test --workspace --all-targets` | **1647 passed / 0 failed** (includes real TLS/TCP/unix-socket integration tests; 55 AI tests removed) |
+| `cargo test --workspace --all-targets` | **1648 passed / 0 failed** (includes real TLS/TCP/unix-socket integration tests; 55 AI tests removed) |
 | Frontend `npm test` (vitest) | **187 passed / 0 failed** |
 | Privileged action allowlist | **52** (20 read-only + 32 mutating; AI feature removed) |
 | HTTP contract routes | **62** (2 unauthenticated; AI routes removed) |

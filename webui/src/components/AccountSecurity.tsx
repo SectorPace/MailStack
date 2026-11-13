@@ -53,8 +53,8 @@ export default function AccountSecurity() {
             toast(zh ? "密码不一致" : "Passwords do not match", "err");
             return;
         }
-        if (pass1 && (pass1.length < 12 || !/[a-zA-Z]/.test(pass1) || !/[0-9]/.test(pass1))) {
-            toast(zh ? "密码至少 12 位，且需包含字母与数字" : "Password must be 12+ characters with letters and digits", "err");
+        if (pass1 && (pass1.length < 8 || !/[a-zA-Z]/.test(pass1) || !/[0-9]/.test(pass1))) {
+            toast(zh ? "密码至少 8 位，且需包含字母与数字" : "Password must be 8+ characters with letters and digits", "err");
             return;
         }
         setSavingAcct(true);

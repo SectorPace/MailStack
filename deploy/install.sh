@@ -472,7 +472,7 @@ validate_options() {
   if [ -n "$ADMIN_PASSWORD" ]; then
     printf '%s' "$ADMIN_PASSWORD" | LC_ALL=C grep -q '[[:cntrl:]]' && die "口令不得包含控制字符"
     local plen=${#ADMIN_PASSWORD}
-    [ "$plen" -ge 12 ] && [ "$plen" -le 256 ] || die "口令长度必须 12-256（实际 $plen）"
+    [ "$plen" -ge 8 ] && [ "$plen" -le 256 ] || die "口令长度必须 8-256（实际 $plen）"
     printf '%s' "$ADMIN_PASSWORD" | grep -q '[A-Za-z]' || die "口令必须包含字母"
     printf '%s' "$ADMIN_PASSWORD" | grep -q '[0-9]' || die "口令必须包含数字"
     local lowered passlower
@@ -555,7 +555,7 @@ interactive_wizard() {
   while :; do
     local pw1=""
     local pw2=""
-    printf '管理员口令（12-256 位，含字母与数字）: ' >&2
+    printf '管理员口令（8-256 位，含字母与数字）: ' >&2
     if [ "$STDIN_IS_SCRIPT" -eq 1 ] && [ -r /dev/tty ]; then
       IFS= read -r -s pw1 < /dev/tty || pw1=""
     else
@@ -625,7 +625,7 @@ password_policy_ok() {
   local password="$1"
   local user="$2"
   local plen=${#password}
-  [ "$plen" -ge 12 ] && [ "$plen" -le 256 ] || return 1
+  [ "$plen" -ge 8 ] && [ "$plen" -le 256 ] || return 1
   printf '%s' "$password" | grep -q '[A-Za-z]' || return 1
   printf '%s' "$password" | grep -q '[0-9]' || return 1
   printf '%s' "$password" | LC_ALL=C grep -q '[[:cntrl:]]' && return 1

@@ -81,7 +81,7 @@ export default function Setup({ onDone }: {
     const adminEmailForPass = `admin@${domain}`.toLowerCase();
     const passHasContext = !adminPass.toLowerCase().includes(ADMIN_ACCOUNT) &&
         !adminPass.toLowerCase().includes(adminEmailForPass);
-    const s5ok = adminPass.length >= 12 &&
+    const s5ok = adminPass.length >= 8 &&
         /[a-zA-Z]/.test(adminPass) &&
         /[0-9]/.test(adminPass) &&
         !hasWeakRun(adminPass) &&
@@ -492,7 +492,7 @@ export default function Setup({ onDone }: {
                 <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-3">
                   <Field label={zh ? "管理员邮箱" : "Mailbox"} value={`admin@${domain || "example.com"}`} disabled hint={zh ? "固定为 admin@主域名，对应系统账号 admin" : "admin@<domain>, backed by the system account admin"}/>
                   <Field label={zh ? "管理员姓名" : "Display name"} value={adminName} onChange={setAdminName}/>
-                  <Field label={zh ? "初始密码（≥12 位，含字母与数字）" : "Initial password (12+ chars)"} type="password" value={adminPass} onChange={setAdminPass} req placeholder="••••••••••••" hint={zh ? "不得包含 admin 或完整邮箱地址，也不能有 3 个连续/重复字符" : "must not contain admin or the full address, nor 3 consecutive/equal chars"}/>
+                  <Field label={zh ? "初始密码（≥8 位，含字母与数字）" : "Initial password (8+ chars)"} type="password" value={adminPass} onChange={setAdminPass} req placeholder="••••••••••••" hint={zh ? "不得包含 admin 或完整邮箱地址，也不能有 3 个连续/重复字符" : "must not contain admin or the full address, nor 3 consecutive/equal chars"}/>
                 </div>
 
                 <div className="mt-3 space-y-2">
